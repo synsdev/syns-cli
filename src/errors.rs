@@ -2,7 +2,7 @@ use std::fmt;
 
 #[derive(Debug)]
 pub enum CliError {
-    Api { status: u16, error: String },
+    Api { status: Option<u16>, error: String },
     AuthRequired,
     NotInGitRepo,
     ServerUnreachable { url: String },
@@ -23,8 +23,8 @@ impl CliError {
 impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CliError::Api { status: 0, error } => write!(f, "network error: {error}"),
-            CliError::Api { status, error } => write!(f, "server error ({status}): {error}"),
+            CliError::Api { status: None, error } => write!(f, "network error: {error}"),
+            CliError::Api { status: Some(s), error } => write!(f, "server error ({s}): {error}"),
             CliError::AuthRequired => {
                 write!(f, "authentication required \u{2014} run 'syns login' first")
             }
@@ -64,7 +64,7 @@ mod tests {
     fn exit_code_api_error() {
         assert_eq!(
             CliError::Api {
-                status: 500,
+                status: Some(500),
                 error: "internal".to_string()
             }
             .exit_code(),
@@ -87,6 +87,58 @@ mod tests {
             1
         );
     }
+
+    // ── Display tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn display_api_error_with_status() {
+        let err = CliError::Api {
+            status: Some(404),
+            error: "not found".to_string(),
+        };
+        assert_eq!(err.to_string(), "server error (404): not found");
+    }
+
+    #[test]
+    fn display_api_error_without_status() {
+        let err = CliError::Api {
+            status: None,
+            error: "parse failure".to_string(),
+        };
+        assert_eq!(err.to_string(), "network error: parse failure");
+    }
+
+    #[test]
+    fn display_auth_required() {
+        assert_eq!(
+            CliError::AuthRequired.to_string(),
+            "authentication required \u{2014} run 'syns login' first"
+        );
+    }
+
+    #[test]
+    fn display_server_unreachable() {
+        let err = CliError::ServerUnreachable {
+            url: "https://example.com".to_string(),
+        };
+        assert_eq!(err.to_string(), "could not reach server at https://example.com");
+    }
+
+    #[test]
+    fn display_io_error() {
+        let err = CliError::Io {
+            message: "disk full".to_string(),
+        };
+        assert_eq!(err.to_string(), "disk full");
+    }
+
+    #[test]
+    fn display_config_error() {
+        let err = CliError::Config {
+            message: "bad value".to_string(),
+        };
+        assert_eq!(err.to_string(), "configuration error: bad value");
+    }
 }
 
 impl From<reqwest::Error> for CliError {
@@ -98,9 +150,14 @@ impl From<reqwest::Error> for CliError {
                     .map(|u| u.to_string())
                     .unwrap_or_default(),
             }
+        } else if error.is_redirect() {
+            CliError::Api {
+                status: error.status().map(|s| s.as_u16()),
+                error: format!("unexpected redirect: {error}"),
+            }
         } else {
             CliError::Api {
-                status: error.status().map(|s| s.as_u16()).unwrap_or(0),
+                status: error.status().map(|s| s.as_u16()),
                 error: error.to_string(),
             }
         }

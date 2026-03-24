@@ -26,7 +26,12 @@ struct ApiErrorBody {
 
 // --- Domain enums ---
 
-#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+/// NOTE: `#[serde(other)]` on `Unknown` means any unrecognized server value
+/// deserializes to `Unknown`. On serialization, `Unknown` writes `"unknown"`.
+/// This is intentionally lossy — the original string is not preserved.
+/// When write commands are implemented (U14+), request types should use separate
+/// enums without `Unknown` to prevent round-trip data loss.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum RepoStatus {
     Active,
@@ -37,31 +42,19 @@ pub enum RepoStatus {
     Unknown,
 }
 
-impl Serialize for RepoStatus {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            RepoStatus::Active => serializer.serialize_str("active"),
-            RepoStatus::Draft => serializer.serialize_str("draft"),
-            RepoStatus::Completed => serializer.serialize_str("completed"),
-            RepoStatus::Abandoned => serializer.serialize_str("abandoned"),
-            RepoStatus::Unknown => serializer.serialize_str("unknown"),
-        }
-    }
-}
-
 impl fmt::Display for RepoStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RepoStatus::Active => write!(f, "active"),
-            RepoStatus::Draft => write!(f, "draft"),
-            RepoStatus::Completed => write!(f, "completed"),
-            RepoStatus::Abandoned => write!(f, "abandoned"),
-            RepoStatus::Unknown => write!(f, "unknown"),
-        }
+        f.write_str(match self {
+            Self::Active => "active",
+            Self::Draft => "draft",
+            Self::Completed => "completed",
+            Self::Abandoned => "abandoned",
+            Self::Unknown => "unknown",
+        })
     }
 }
 
-#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Visibility {
     Public,
@@ -70,27 +63,17 @@ pub enum Visibility {
     Unknown,
 }
 
-impl Serialize for Visibility {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            Visibility::Public => serializer.serialize_str("public"),
-            Visibility::Private => serializer.serialize_str("private"),
-            Visibility::Unknown => serializer.serialize_str("unknown"),
-        }
-    }
-}
-
 impl fmt::Display for Visibility {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Visibility::Public => write!(f, "public"),
-            Visibility::Private => write!(f, "private"),
-            Visibility::Unknown => write!(f, "unknown"),
-        }
+        f.write_str(match self {
+            Self::Public => "public",
+            Self::Private => "private",
+            Self::Unknown => "unknown",
+        })
     }
 }
 
-#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum EntryType {
     File,
@@ -99,27 +82,17 @@ pub enum EntryType {
     Unknown,
 }
 
-impl Serialize for EntryType {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            EntryType::File => serializer.serialize_str("file"),
-            EntryType::Dir => serializer.serialize_str("dir"),
-            EntryType::Unknown => serializer.serialize_str("unknown"),
-        }
-    }
-}
-
 impl fmt::Display for EntryType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            EntryType::File => write!(f, "file"),
-            EntryType::Dir => write!(f, "dir"),
-            EntryType::Unknown => write!(f, "unknown"),
-        }
+        f.write_str(match self {
+            Self::File => "file",
+            Self::Dir => "dir",
+            Self::Unknown => "unknown",
+        })
     }
 }
 
-#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DiffStatus {
     Added,
@@ -129,29 +102,18 @@ pub enum DiffStatus {
     Unknown,
 }
 
-impl Serialize for DiffStatus {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            DiffStatus::Added => serializer.serialize_str("added"),
-            DiffStatus::Modified => serializer.serialize_str("modified"),
-            DiffStatus::Deleted => serializer.serialize_str("deleted"),
-            DiffStatus::Unknown => serializer.serialize_str("unknown"),
-        }
-    }
-}
-
 impl fmt::Display for DiffStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            DiffStatus::Added => write!(f, "added"),
-            DiffStatus::Modified => write!(f, "modified"),
-            DiffStatus::Deleted => write!(f, "deleted"),
-            DiffStatus::Unknown => write!(f, "unknown"),
-        }
+        f.write_str(match self {
+            Self::Added => "added",
+            Self::Modified => "modified",
+            Self::Deleted => "deleted",
+            Self::Unknown => "unknown",
+        })
     }
 }
 
-#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CollaboratorRole {
     Owner,
@@ -162,27 +124,15 @@ pub enum CollaboratorRole {
     Unknown,
 }
 
-impl Serialize for CollaboratorRole {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            CollaboratorRole::Owner => serializer.serialize_str("owner"),
-            CollaboratorRole::Admin => serializer.serialize_str("admin"),
-            CollaboratorRole::Write => serializer.serialize_str("write"),
-            CollaboratorRole::Read => serializer.serialize_str("read"),
-            CollaboratorRole::Unknown => serializer.serialize_str("unknown"),
-        }
-    }
-}
-
 impl fmt::Display for CollaboratorRole {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            CollaboratorRole::Owner => write!(f, "owner"),
-            CollaboratorRole::Admin => write!(f, "admin"),
-            CollaboratorRole::Write => write!(f, "write"),
-            CollaboratorRole::Read => write!(f, "read"),
-            CollaboratorRole::Unknown => write!(f, "unknown"),
-        }
+        f.write_str(match self {
+            Self::Owner => "owner",
+            Self::Admin => "admin",
+            Self::Write => "write",
+            Self::Read => "read",
+            Self::Unknown => "unknown",
+        })
     }
 }
 
@@ -436,7 +386,7 @@ async fn check_error_response(response: reqwest::Response) -> Result<reqwest::Re
     let error = serde_json::from_str::<ApiErrorBody>(&body)
         .map(|b| b.error)
         .unwrap_or_else(|_| "unknown error".to_string());
-    Err(CliError::Api { status, error })
+    Err(CliError::Api { status: Some(status), error })
 }
 
 async fn handle_response<T: serde::de::DeserializeOwned>(
@@ -445,7 +395,7 @@ async fn handle_response<T: serde::de::DeserializeOwned>(
     let response = check_error_response(response).await?;
     let status = response.status().as_u16();
     response.json::<T>().await.map_err(|e| CliError::Api {
-        status,
+        status: Some(status),
         error: format!("invalid response body: {e}"),
     })
 }

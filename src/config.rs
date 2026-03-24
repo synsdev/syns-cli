@@ -64,7 +64,7 @@ impl Config {
                 Some(path) => path.join(CONFIG_SUBDIR),
                 None => {
                     return Err(CliError::Config {
-                        message: "Could not determine config directory".to_string(),
+                        message: "could not determine config directory".to_string(),
                     });
                 }
             },

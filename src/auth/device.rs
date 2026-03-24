@@ -104,6 +104,7 @@ impl DeviceAuthFlow {
 
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| CliError::Io {
                 message: format!("failed to build HTTP client: {e}"),
@@ -116,8 +117,8 @@ impl DeviceAuthFlow {
             .json(&serde_json::json!({}))
             .send()
             .await
-            .map_err(|_| CliError::ServerUnreachable {
-                url: server_url.to_string(),
+            .map_err(|e| CliError::ServerUnreachable {
+                url: format!("{server_url} ({e})"),
             })?;
 
         if !response.status().is_success() {
@@ -127,12 +128,12 @@ impl DeviceAuthFlow {
                 .await
                 .map(|e| e.error)
                 .unwrap_or_else(|_| format!("HTTP {status}"));
-            return Err(CliError::Api { status, error });
+            return Err(CliError::Api { status: Some(status), error });
         }
 
         let device_code_response: DeviceCodeResponse =
             response.json().await.map_err(|_| CliError::Api {
-                status: 0,
+                status: None,
                 error: "unexpected server response during login".to_string(),
             })?;
 
@@ -171,7 +172,10 @@ impl DeviceAuthFlow {
             // Check deadline BEFORE sleeping
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining < Duration::from_secs(poll_interval_secs) {
-                return Err(CliError::AuthRequired);
+                return Err(CliError::Io {
+                    message: "login timed out \u{2014} device code expired, please try again"
+                        .to_string(),
+                });
             }
 
             tokio::time::sleep(Duration::from_secs(poll_interval_secs)).await;
@@ -184,8 +188,8 @@ impl DeviceAuthFlow {
                 })
                 .send()
                 .await
-                .map_err(|_| CliError::ServerUnreachable {
-                    url: server_url.to_string(),
+                .map_err(|e| CliError::ServerUnreachable {
+                    url: format!("{server_url} ({e})"),
                 })?;
 
             let status = response.status();
@@ -193,7 +197,7 @@ impl DeviceAuthFlow {
             if status.as_u16() == 200 {
                 let success: TokenSuccessResponse =
                     response.json().await.map_err(|_| CliError::Api {
-                        status: 0,
+                        status: None,
                         error: "unexpected server response during login".to_string(),
                     })?;
                 return Ok(success.token);
@@ -202,29 +206,35 @@ impl DeviceAuthFlow {
             if status.as_u16() == 400 {
                 let error_resp: TokenErrorResponse =
                     response.json().await.map_err(|_| CliError::Api {
-                        status: 400,
+                        status: Some(400),
                         error: "unexpected server response during login".to_string(),
                     })?;
-                match error_resp.error.as_str() {
-                    "authorization_pending" => continue,
-                    "slow_down" => {
+                match classify_poll_error(&error_resp.error) {
+                    PollResult::Pending => continue,
+                    PollResult::SlowDown => {
                         poll_interval_secs = poll_interval_secs
                             .saturating_add(SLOW_DOWN_INCREMENT_SECS)
                             .min(MAX_POLL_INTERVAL_SECS);
                         continue;
                     }
-                    "expired_token" => {
-                        return Err(CliError::AuthRequired);
-                    }
-                    "access_denied" => {
-                        return Err(CliError::AuthRequired);
-                    }
-                    other => {
-                        return Err(CliError::Api {
-                            status: 400,
-                            error: format!("login failed: {other}"),
+                    PollResult::Expired => {
+                        return Err(CliError::Io {
+                            message: "login timed out \u{2014} device code expired, please try again"
+                                .to_string(),
                         });
                     }
+                    PollResult::AccessDenied => {
+                        return Err(CliError::Io {
+                            message: "login denied \u{2014} authorization was rejected".to_string(),
+                        });
+                    }
+                    PollResult::Error(msg) => {
+                        return Err(CliError::Api {
+                            status: Some(400),
+                            error: msg,
+                        });
+                    }
+                    PollResult::Success(_) => unreachable!(),
                 }
             }
 
@@ -235,7 +245,7 @@ impl DeviceAuthFlow {
                 .map(|e| e.error)
                 .unwrap_or_else(|_| format!("HTTP {}", status.as_u16()));
             return Err(CliError::Api {
-                status: status.as_u16(),
+                status: Some(status.as_u16()),
                 error: error_msg,
             });
         }

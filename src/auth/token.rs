@@ -89,8 +89,12 @@ impl TokenStore {
             })?;
         }
 
-        std::fs::rename(&tmp_path, &self.credentials_path).map_err(|err| CliError::Io {
-            message: format!("could not write credentials: {err}"),
+        std::fs::rename(&tmp_path, &self.credentials_path).map_err(|err| {
+            // Clean up the temp file to avoid leaving plaintext tokens on disk.
+            let _ = std::fs::remove_file(&tmp_path);
+            CliError::Io {
+                message: format!("could not write credentials: {err}"),
+            }
         })?;
 
         Ok(())
@@ -180,6 +184,21 @@ mod tests {
         let result = store.write("   ");
         assert!(result.is_err());
         assert!(std::fs::metadata(dir.path().join("credentials.json")).is_err());
+    }
+
+    #[test]
+    fn token_read_returns_error_for_corrupt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        std::fs::write(&path, "not valid json {{{").unwrap();
+
+        let store = TokenStore::new(path);
+        let result = store.read();
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("credentials"),
+            "error message should mention credentials"
+        );
     }
 
     #[test]
