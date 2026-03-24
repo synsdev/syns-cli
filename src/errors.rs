@@ -40,6 +40,55 @@ impl fmt::Display for CliError {
 
 impl std::error::Error for CliError {}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_code_not_in_git_repo() {
+        assert_eq!(CliError::NotInGitRepo.exit_code(), 2);
+    }
+
+    #[test]
+    fn exit_code_server_unreachable() {
+        assert_eq!(
+            CliError::ServerUnreachable {
+                url: "https://example.com".to_string()
+            }
+            .exit_code(),
+            3
+        );
+    }
+
+    #[test]
+    fn exit_code_api_error() {
+        assert_eq!(
+            CliError::Api {
+                status: 500,
+                error: "internal".to_string()
+            }
+            .exit_code(),
+            1
+        );
+    }
+
+    #[test]
+    fn exit_code_auth_required() {
+        assert_eq!(CliError::AuthRequired.exit_code(), 1);
+    }
+
+    #[test]
+    fn exit_code_config_error() {
+        assert_eq!(
+            CliError::Config {
+                message: "bad".to_string()
+            }
+            .exit_code(),
+            1
+        );
+    }
+}
+
 impl From<reqwest::Error> for CliError {
     fn from(error: reqwest::Error) -> Self {
         if error.is_connect() || error.is_timeout() {

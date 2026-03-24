@@ -12,7 +12,7 @@ fn encode_path_param(value: &str) -> String {
     urlencoding::encode(value).into_owned()
 }
 
-fn encode_file_path(path: &str) -> String {
+pub(crate) fn encode_file_path(path: &str) -> String {
     path.split('/')
         .map(|seg| urlencoding::encode(seg))
         .collect::<Vec<_>>()
@@ -26,7 +26,7 @@ struct ApiErrorBody {
 
 // --- Domain enums ---
 
-#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum RepoStatus {
     Active,
@@ -35,6 +35,20 @@ pub enum RepoStatus {
     Abandoned,
     #[serde(other)]
     Unknown,
+}
+
+impl Serialize for RepoStatus {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            RepoStatus::Active => serializer.serialize_str("active"),
+            RepoStatus::Draft => serializer.serialize_str("draft"),
+            RepoStatus::Completed => serializer.serialize_str("completed"),
+            RepoStatus::Abandoned => serializer.serialize_str("abandoned"),
+            RepoStatus::Unknown => Err(serde::ser::Error::custom(
+                "cannot serialize unknown RepoStatus variant",
+            )),
+        }
+    }
 }
 
 impl fmt::Display for RepoStatus {
@@ -49,13 +63,25 @@ impl fmt::Display for RepoStatus {
     }
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Visibility {
     Public,
     Private,
     #[serde(other)]
     Unknown,
+}
+
+impl Serialize for Visibility {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Visibility::Public => serializer.serialize_str("public"),
+            Visibility::Private => serializer.serialize_str("private"),
+            Visibility::Unknown => Err(serde::ser::Error::custom(
+                "cannot serialize unknown Visibility variant",
+            )),
+        }
+    }
 }
 
 impl fmt::Display for Visibility {
@@ -68,13 +94,25 @@ impl fmt::Display for Visibility {
     }
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum EntryType {
     File,
     Dir,
     #[serde(other)]
     Unknown,
+}
+
+impl Serialize for EntryType {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            EntryType::File => serializer.serialize_str("file"),
+            EntryType::Dir => serializer.serialize_str("dir"),
+            EntryType::Unknown => Err(serde::ser::Error::custom(
+                "cannot serialize unknown EntryType variant",
+            )),
+        }
+    }
 }
 
 impl fmt::Display for EntryType {
@@ -87,7 +125,7 @@ impl fmt::Display for EntryType {
     }
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DiffStatus {
     Added,
@@ -95,6 +133,19 @@ pub enum DiffStatus {
     Deleted,
     #[serde(other)]
     Unknown,
+}
+
+impl Serialize for DiffStatus {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            DiffStatus::Added => serializer.serialize_str("added"),
+            DiffStatus::Modified => serializer.serialize_str("modified"),
+            DiffStatus::Deleted => serializer.serialize_str("deleted"),
+            DiffStatus::Unknown => Err(serde::ser::Error::custom(
+                "cannot serialize unknown DiffStatus variant",
+            )),
+        }
+    }
 }
 
 impl fmt::Display for DiffStatus {
@@ -108,7 +159,7 @@ impl fmt::Display for DiffStatus {
     }
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CollaboratorRole {
     Owner,
@@ -117,6 +168,20 @@ pub enum CollaboratorRole {
     Read,
     #[serde(other)]
     Unknown,
+}
+
+impl Serialize for CollaboratorRole {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            CollaboratorRole::Owner => serializer.serialize_str("owner"),
+            CollaboratorRole::Admin => serializer.serialize_str("admin"),
+            CollaboratorRole::Write => serializer.serialize_str("write"),
+            CollaboratorRole::Read => serializer.serialize_str("read"),
+            CollaboratorRole::Unknown => Err(serde::ser::Error::custom(
+                "cannot serialize unknown CollaboratorRole variant",
+            )),
+        }
+    }
 }
 
 impl fmt::Display for CollaboratorRole {
@@ -230,6 +295,12 @@ pub struct FileResponse {
 #[derive(Deserialize, Debug)]
 pub struct FileHistoryResponse {
     pub commits: Vec<FileVersionEntry>,
+    #[serde(default)]
+    pub total: u32,
+    #[serde(default)]
+    pub limit: u32,
+    #[serde(default)]
+    pub offset: u32,
 }
 
 #[derive(Deserialize, Debug)]
@@ -383,9 +454,9 @@ async fn handle_response<T: serde::de::DeserializeOwned>(
 ) -> Result<T, CliError> {
     let response = check_error_response(response).await?;
     let status = response.status().as_u16();
-    response.json::<T>().await.map_err(|_| CliError::Api {
+    response.json::<T>().await.map_err(|e| CliError::Api {
         status,
-        error: "invalid response body".to_string(),
+        error: format!("invalid response body: {e}"),
     })
 }
 
@@ -394,18 +465,10 @@ async fn handle_empty_response(response: reqwest::Response) -> Result<(), CliErr
     Ok(())
 }
 
-/// Check whether `url` starts with `http://localhost` followed by end-of-string,
-/// `/`, or `:` (port). This prevents bypass via e.g. `http://localhost.evil.com`.
-fn is_localhost_url(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("http://localhost") else {
-        return false;
-    };
-    rest.is_empty() || rest.starts_with('/') || rest.starts_with(':')
-}
-
 impl SynsClient {
     pub fn new(server_url: &str) -> Result<SynsClient, CliError> {
-        if !server_url.starts_with("https://") && !is_localhost_url(server_url) {
+        let server_url = server_url.trim_end_matches('/');
+        if !server_url.starts_with("https://") && !crate::config::is_localhost_url(server_url) {
             return Err(CliError::Config {
                 message: "server URL must use HTTPS (or http://localhost for development)"
                     .to_string(),
@@ -823,5 +886,91 @@ impl SynsClient {
             .send()
             .await?;
         handle_response(response).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_new_rejects_plain_http() {
+        let result = SynsClient::new("http://example.com");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn client_new_allows_https() {
+        let client = SynsClient::new("https://syns.dev").unwrap();
+        assert_eq!(client.base_url, "https://syns.dev");
+    }
+
+    #[test]
+    fn client_new_allows_localhost_http() {
+        let client = SynsClient::new("http://localhost:3000").unwrap();
+        assert_eq!(client.base_url, "http://localhost:3000");
+    }
+
+    #[test]
+    fn client_new_strips_trailing_slash() {
+        let client = SynsClient::new("https://syns.dev/").unwrap();
+        assert_eq!(client.base_url, "https://syns.dev");
+    }
+
+    #[test]
+    fn encode_file_path_simple() {
+        assert_eq!(encode_file_path("foo/bar.txt"), "foo/bar.txt");
+    }
+
+    #[test]
+    fn encode_file_path_encodes_segments() {
+        assert_eq!(encode_file_path("my dir/my file.txt"), "my%20dir/my%20file.txt");
+    }
+
+    #[test]
+    fn encode_file_path_preserves_slashes() {
+        assert_eq!(encode_file_path("a/b/c"), "a/b/c");
+    }
+
+    #[test]
+    fn serialize_unknown_repo_status_fails() {
+        let result = serde_json::to_string(&RepoStatus::Unknown);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn serialize_known_repo_status_works() {
+        let result = serde_json::to_string(&RepoStatus::Active).unwrap();
+        assert_eq!(result, "\"active\"");
+    }
+
+    #[test]
+    fn deserialize_unknown_repo_status() {
+        let status: RepoStatus = serde_json::from_str("\"archived\"").unwrap();
+        assert_eq!(status, RepoStatus::Unknown);
+    }
+
+    #[test]
+    fn serialize_unknown_visibility_fails() {
+        let result = serde_json::to_string(&Visibility::Unknown);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn serialize_unknown_entry_type_fails() {
+        let result = serde_json::to_string(&EntryType::Unknown);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn serialize_unknown_diff_status_fails() {
+        let result = serde_json::to_string(&DiffStatus::Unknown);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn serialize_unknown_collaborator_role_fails() {
+        let result = serde_json::to_string(&CollaboratorRole::Unknown);
+        assert!(result.is_err());
     }
 }

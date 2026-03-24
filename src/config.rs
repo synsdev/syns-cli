@@ -7,6 +7,20 @@ const DEFAULT_SERVER_URL: &str = "https://syns.dev";
 const CONFIG_SUBDIR: &str = "syns";
 const CACHE_SUBDIR: &str = "syns";
 
+/// Check whether `url` starts with `http://localhost` followed by end-of-string,
+/// `/`, or `:` (port). This prevents bypass via e.g. `http://localhost.evil.com`.
+pub(crate) fn is_localhost_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://localhost") else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with('/') || rest.starts_with(':')
+}
+
+/// Validate that a URL is safe to open in a browser (must be https:// or http://localhost).
+pub(crate) fn is_safe_to_open(url: &str) -> bool {
+    url.starts_with("https://") || is_localhost_url(url)
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     server_url: String,
@@ -25,6 +39,13 @@ impl Config {
             },
         };
         let server_url = server_url.trim_end_matches('/').to_string();
+
+        if !server_url.starts_with("https://") && !is_localhost_url(&server_url) {
+            return Err(CliError::Config {
+                message: "server URL must use HTTPS (or http://localhost for development)"
+                    .to_string(),
+            });
+        }
 
         // Config directory resolution
         let config_dir = match env::var("SYNS_CONFIG_DIR") {
@@ -74,18 +95,18 @@ mod tests {
     #[test]
     #[serial]
     fn config_server_flag_wins_over_env() {
-        unsafe { env::set_var("SYNS_URL", "http://env.example.com") };
-        let config = Config::new(Some("http://flag.example.com")).unwrap();
-        assert_eq!(config.server_url(), "http://flag.example.com");
+        unsafe { env::set_var("SYNS_URL", "https://env.example.com") };
+        let config = Config::new(Some("https://flag.example.com")).unwrap();
+        assert_eq!(config.server_url(), "https://flag.example.com");
         unsafe { env::remove_var("SYNS_URL") };
     }
 
     #[test]
     #[serial]
     fn config_env_wins_over_default() {
-        unsafe { env::set_var("SYNS_URL", "http://env.example.com") };
+        unsafe { env::set_var("SYNS_URL", "https://env.example.com") };
         let config = Config::new(None).unwrap();
-        assert_eq!(config.server_url(), "http://env.example.com");
+        assert_eq!(config.server_url(), "https://env.example.com");
         unsafe { env::remove_var("SYNS_URL") };
     }
 
@@ -99,8 +120,8 @@ mod tests {
 
     #[test]
     fn config_trailing_slash_stripped() {
-        let config = Config::new(Some("http://example.com/")).unwrap();
-        assert_eq!(config.server_url(), "http://example.com");
+        let config = Config::new(Some("https://example.com/")).unwrap();
+        assert_eq!(config.server_url(), "https://example.com");
     }
 
     #[test]
@@ -118,5 +139,62 @@ mod tests {
         assert!(cred_path.ends_with("credentials.json"));
         let parent = cred_path.parent().unwrap();
         assert!(parent.to_string_lossy().contains("syns"));
+    }
+
+    #[test]
+    fn config_rejects_http_url() {
+        let result = Config::new(Some("http://example.com"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_allows_localhost_http() {
+        let config = Config::new(Some("http://localhost:3000")).unwrap();
+        assert_eq!(config.server_url(), "http://localhost:3000");
+    }
+
+    #[test]
+    fn is_localhost_url_bare() {
+        assert!(is_localhost_url("http://localhost"));
+    }
+
+    #[test]
+    fn is_localhost_url_with_port() {
+        assert!(is_localhost_url("http://localhost:3000"));
+    }
+
+    #[test]
+    fn is_localhost_url_with_path() {
+        assert!(is_localhost_url("http://localhost/api"));
+    }
+
+    #[test]
+    fn is_localhost_url_rejects_evil_subdomain() {
+        assert!(!is_localhost_url("http://localhost.evil.com"));
+    }
+
+    #[test]
+    fn is_localhost_url_rejects_https() {
+        assert!(!is_localhost_url("https://localhost"));
+    }
+
+    #[test]
+    fn is_safe_to_open_allows_https() {
+        assert!(is_safe_to_open("https://example.com"));
+    }
+
+    #[test]
+    fn is_safe_to_open_allows_localhost() {
+        assert!(is_safe_to_open("http://localhost:3000"));
+    }
+
+    #[test]
+    fn is_safe_to_open_rejects_javascript() {
+        assert!(!is_safe_to_open("javascript:alert(1)"));
+    }
+
+    #[test]
+    fn is_safe_to_open_rejects_file() {
+        assert!(!is_safe_to_open("file:///etc/passwd"));
     }
 }

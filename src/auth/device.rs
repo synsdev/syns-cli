@@ -3,12 +3,14 @@ use std::time::{Duration, Instant};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+use crate::config::{is_localhost_url, is_safe_to_open};
 use crate::errors::CliError;
 
 const DEVICE_CODE_PATH: &str = "/api/auth/device/code";
 const DEVICE_TOKEN_PATH: &str = "/api/auth/device/token";
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
 const SLOW_DOWN_INCREMENT_SECS: u64 = 5;
+const MAX_EXPIRES_IN_SECS: u64 = 3600;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,20 +37,6 @@ struct TokenSuccessResponse {
 #[derive(Deserialize)]
 struct TokenErrorResponse {
     error: String,
-}
-
-/// Check whether `url` starts with `http://localhost` followed by end-of-string,
-/// `/`, or `:` (port). This prevents bypass via e.g. `http://localhost.evil.com`.
-fn is_localhost_url(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("http://localhost") else {
-        return false;
-    };
-    rest.is_empty() || rest.starts_with('/') || rest.starts_with(':')
-}
-
-/// Validate that a URL is safe to open in a browser (must be https:// or http://localhost).
-fn is_safe_to_open(url: &str) -> bool {
-    url.starts_with("https://") || is_localhost_url(url)
 }
 
 pub struct DeviceAuthFlow;
@@ -124,7 +112,8 @@ impl DeviceAuthFlow {
             .interval
             .unwrap_or(DEFAULT_POLL_INTERVAL_SECS)
             .max(DEFAULT_POLL_INTERVAL_SECS);
-        let deadline = Instant::now() + Duration::from_secs(device_code_response.expires_in);
+        let expires_in = device_code_response.expires_in.min(MAX_EXPIRES_IN_SECS);
+        let deadline = Instant::now() + Duration::from_secs(expires_in);
         eprintln!("{}", console::style("Waiting for authorization...").dim());
 
         // Polling loop
