@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::time::Duration;
 
 use reqwest::redirect;
@@ -32,6 +33,20 @@ pub enum RepoStatus {
     Draft,
     Completed,
     Abandoned,
+    #[serde(other)]
+    Unknown,
+}
+
+impl fmt::Display for RepoStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RepoStatus::Active => write!(f, "active"),
+            RepoStatus::Draft => write!(f, "draft"),
+            RepoStatus::Completed => write!(f, "completed"),
+            RepoStatus::Abandoned => write!(f, "abandoned"),
+            RepoStatus::Unknown => write!(f, "unknown"),
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -39,6 +54,18 @@ pub enum RepoStatus {
 pub enum Visibility {
     Public,
     Private,
+    #[serde(other)]
+    Unknown,
+}
+
+impl fmt::Display for Visibility {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Visibility::Public => write!(f, "public"),
+            Visibility::Private => write!(f, "private"),
+            Visibility::Unknown => write!(f, "unknown"),
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -46,6 +73,18 @@ pub enum Visibility {
 pub enum EntryType {
     File,
     Dir,
+    #[serde(other)]
+    Unknown,
+}
+
+impl fmt::Display for EntryType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EntryType::File => write!(f, "file"),
+            EntryType::Dir => write!(f, "dir"),
+            EntryType::Unknown => write!(f, "unknown"),
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -54,6 +93,19 @@ pub enum DiffStatus {
     Added,
     Modified,
     Deleted,
+    #[serde(other)]
+    Unknown,
+}
+
+impl fmt::Display for DiffStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DiffStatus::Added => write!(f, "added"),
+            DiffStatus::Modified => write!(f, "modified"),
+            DiffStatus::Deleted => write!(f, "deleted"),
+            DiffStatus::Unknown => write!(f, "unknown"),
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -63,6 +115,20 @@ pub enum CollaboratorRole {
     Admin,
     Write,
     Read,
+    #[serde(other)]
+    Unknown,
+}
+
+impl fmt::Display for CollaboratorRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CollaboratorRole::Owner => write!(f, "owner"),
+            CollaboratorRole::Admin => write!(f, "admin"),
+            CollaboratorRole::Write => write!(f, "write"),
+            CollaboratorRole::Read => write!(f, "read"),
+            CollaboratorRole::Unknown => write!(f, "unknown"),
+        }
+    }
 }
 
 // --- Request types ---
@@ -328,16 +394,36 @@ async fn handle_empty_response(response: reqwest::Response) -> Result<(), CliErr
     Ok(())
 }
 
+/// Check whether `url` starts with `http://localhost` followed by end-of-string,
+/// `/`, or `:` (port). This prevents bypass via e.g. `http://localhost.evil.com`.
+fn is_localhost_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://localhost") else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with('/') || rest.starts_with(':')
+}
+
 impl SynsClient {
-    pub fn new(server_url: &str) -> SynsClient {
-        SynsClient {
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .redirect(redirect::Policy::none())
-                .build()
-                .expect("failed to build HTTP client"),
-            base_url: server_url.to_string(),
+    pub fn new(server_url: &str) -> Result<SynsClient, CliError> {
+        if !server_url.starts_with("https://") && !is_localhost_url(server_url) {
+            return Err(CliError::Config {
+                message: "server URL must use HTTPS (or http://localhost for development)"
+                    .to_string(),
+            });
         }
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .redirect(redirect::Policy::none())
+            .build()
+            .map_err(|e| CliError::Config {
+                message: format!("failed to build HTTP client: {e}"),
+            })?;
+
+        Ok(SynsClient {
+            client,
+            base_url: server_url.to_string(),
+        })
     }
 
     pub async fn push(
@@ -538,6 +624,8 @@ impl SynsClient {
         &self,
         repo_id: &str,
         token: &str,
+        limit: u32,
+        offset: u32,
     ) -> Result<CollaboratorListResponse, CliError> {
         let url = format!(
             "{}/api/v1/repos/{}/collaborators",
@@ -548,6 +636,7 @@ impl SynsClient {
             .client
             .get(&url)
             .bearer_auth(token)
+            .query(&[("limit", limit.to_string()), ("offset", offset.to_string())])
             .send()
             .await?;
         handle_response(response).await
@@ -622,7 +711,7 @@ impl SynsClient {
         &self,
         query: Option<&str>,
         tag: Option<&str>,
-        status: Option<&str>,
+        status: Option<&RepoStatus>,
         limit: u32,
         offset: u32,
     ) -> Result<ExploreResponse, CliError> {
@@ -636,7 +725,7 @@ impl SynsClient {
             req = req.query(&[("tag", t)]);
         }
         if let Some(s) = status {
-            req = req.query(&[("status", s)]);
+            req = req.query(&[("status", s.to_string())]);
         }
         let response = req.send().await?;
         handle_response(response).await

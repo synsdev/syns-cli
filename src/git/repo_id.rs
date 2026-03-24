@@ -6,7 +6,7 @@ const REPO_ID_LENGTH: usize = 16;
 
 pub fn derive_repo_id(remote_url: &str) -> Result<String, CliError> {
     let normalized = normalize_remote(remote_url);
-    if normalized.is_empty() {
+    if normalized.is_empty() || normalized == "https://" {
         return Err(CliError::Config {
             message: "cannot derive repo ID from empty remote URL".to_string(),
         });
@@ -46,6 +46,12 @@ mod tests {
     #[test]
     fn repo_id_empty_input_returns_error() {
         let result = derive_repo_id("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn repo_id_degenerate_https_returns_error() {
+        let result = derive_repo_id("https://");
         assert!(result.is_err());
     }
 }

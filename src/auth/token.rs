@@ -41,7 +41,8 @@ impl TokenStore {
     }
 
     pub fn write(&self, token: &str) -> Result<(), CliError> {
-        if token.trim().is_empty() {
+        let token = token.trim();
+        if token.is_empty() {
             return Err(CliError::Config {
                 message: "token must not be empty".to_string(),
             });
@@ -173,5 +174,15 @@ mod tests {
         let result = store.write("   ");
         assert!(result.is_err());
         assert!(std::fs::metadata(dir.path().join("credentials.json")).is_err());
+    }
+
+    #[test]
+    fn token_write_trims_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TokenStore::new(dir.path().join("credentials.json"));
+
+        store.write("  my-token  ").unwrap();
+        let result = store.read().unwrap();
+        assert_eq!(result, Some("my-token".to_string()));
     }
 }

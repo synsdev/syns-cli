@@ -37,13 +37,27 @@ struct TokenErrorResponse {
     error: String,
 }
 
+/// Check whether `url` starts with `http://localhost` followed by end-of-string,
+/// `/`, or `:` (port). This prevents bypass via e.g. `http://localhost.evil.com`.
+fn is_localhost_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://localhost") else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with('/') || rest.starts_with(':')
+}
+
+/// Validate that a URL is safe to open in a browser (must be https:// or http://localhost).
+fn is_safe_to_open(url: &str) -> bool {
+    url.starts_with("https://") || is_localhost_url(url)
+}
+
 pub struct DeviceAuthFlow;
 
 impl DeviceAuthFlow {
     pub async fn run(server_url: &str) -> Result<String, CliError> {
         // Strip trailing slash and validate URL scheme.
         let server_url = server_url.trim_end_matches('/');
-        if !server_url.starts_with("https://") && !server_url.starts_with("http://localhost") {
+        if !server_url.starts_with("https://") && !is_localhost_url(server_url) {
             return Err(CliError::Config {
                 message: "server URL must use HTTPS (or http://localhost for development)"
                     .to_string(),
@@ -100,8 +114,10 @@ impl DeviceAuthFlow {
                 .yellow()
         );
 
-        // Open browser (best-effort)
-        let _ = open::that(display_url);
+        // Open browser (best-effort), but only if the URL is safe
+        if is_safe_to_open(display_url) {
+            let _ = open::that(display_url);
+        }
 
         // Set up polling
         let mut poll_interval_secs = device_code_response

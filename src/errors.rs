@@ -38,6 +38,8 @@ impl fmt::Display for CliError {
     }
 }
 
+impl std::error::Error for CliError {}
+
 impl From<reqwest::Error> for CliError {
     fn from(error: reqwest::Error) -> Self {
         if error.is_connect() || error.is_timeout() {
