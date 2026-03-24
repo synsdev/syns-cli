@@ -13,7 +13,17 @@ pub(crate) fn is_localhost_url(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("http://localhost") else {
         return false;
     };
-    rest.is_empty() || rest.starts_with('/') || rest.starts_with(':')
+    if rest.is_empty() || rest.starts_with('/') {
+        return true;
+    }
+    if let Some(after_colon) = rest.strip_prefix(':') {
+        // After the colon, everything until next '/' or end must be all digits.
+        // This rejects userinfo bypass like http://localhost:80@evil.com
+        let port_end = after_colon.find('/').unwrap_or(after_colon.len());
+        let port = &after_colon[..port_end];
+        return !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit());
+    }
+    false
 }
 
 /// Validate that a URL is safe to open in a browser (must be https:// or http://localhost).
@@ -196,5 +206,45 @@ mod tests {
     #[test]
     fn is_safe_to_open_rejects_file() {
         assert!(!is_safe_to_open("file:///etc/passwd"));
+    }
+
+    #[test]
+    fn is_localhost_url_rejects_userinfo_bypass() {
+        assert!(!is_localhost_url("http://localhost:80@evil.com"));
+    }
+
+    #[test]
+    fn is_localhost_url_rejects_userinfo_bypass_with_path() {
+        assert!(!is_localhost_url("http://localhost:80@evil.com/callback"));
+    }
+
+    #[test]
+    fn is_localhost_url_with_port_and_path() {
+        assert!(is_localhost_url("http://localhost:3000/api/callback"));
+    }
+
+    #[test]
+    fn is_localhost_url_rejects_colon_no_digits() {
+        assert!(!is_localhost_url("http://localhost:abc"));
+    }
+
+    #[test]
+    fn is_localhost_url_rejects_empty_port() {
+        assert!(!is_localhost_url("http://localhost:"));
+    }
+
+    #[test]
+    fn is_safe_to_open_rejects_data_uri() {
+        assert!(!is_safe_to_open("data:text/html,<script>alert(1)</script>"));
+    }
+
+    #[test]
+    fn is_safe_to_open_rejects_plain_http() {
+        assert!(!is_safe_to_open("http://evil.com"));
+    }
+
+    #[test]
+    fn is_safe_to_open_rejects_localhost_userinfo_bypass() {
+        assert!(!is_safe_to_open("http://localhost:80@evil.com"));
     }
 }

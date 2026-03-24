@@ -44,9 +44,7 @@ impl Serialize for RepoStatus {
             RepoStatus::Draft => serializer.serialize_str("draft"),
             RepoStatus::Completed => serializer.serialize_str("completed"),
             RepoStatus::Abandoned => serializer.serialize_str("abandoned"),
-            RepoStatus::Unknown => Err(serde::ser::Error::custom(
-                "cannot serialize unknown RepoStatus variant",
-            )),
+            RepoStatus::Unknown => serializer.serialize_str("unknown"),
         }
     }
 }
@@ -77,9 +75,7 @@ impl Serialize for Visibility {
         match self {
             Visibility::Public => serializer.serialize_str("public"),
             Visibility::Private => serializer.serialize_str("private"),
-            Visibility::Unknown => Err(serde::ser::Error::custom(
-                "cannot serialize unknown Visibility variant",
-            )),
+            Visibility::Unknown => serializer.serialize_str("unknown"),
         }
     }
 }
@@ -108,9 +104,7 @@ impl Serialize for EntryType {
         match self {
             EntryType::File => serializer.serialize_str("file"),
             EntryType::Dir => serializer.serialize_str("dir"),
-            EntryType::Unknown => Err(serde::ser::Error::custom(
-                "cannot serialize unknown EntryType variant",
-            )),
+            EntryType::Unknown => serializer.serialize_str("unknown"),
         }
     }
 }
@@ -141,9 +135,7 @@ impl Serialize for DiffStatus {
             DiffStatus::Added => serializer.serialize_str("added"),
             DiffStatus::Modified => serializer.serialize_str("modified"),
             DiffStatus::Deleted => serializer.serialize_str("deleted"),
-            DiffStatus::Unknown => Err(serde::ser::Error::custom(
-                "cannot serialize unknown DiffStatus variant",
-            )),
+            DiffStatus::Unknown => serializer.serialize_str("unknown"),
         }
     }
 }
@@ -177,9 +169,7 @@ impl Serialize for CollaboratorRole {
             CollaboratorRole::Admin => serializer.serialize_str("admin"),
             CollaboratorRole::Write => serializer.serialize_str("write"),
             CollaboratorRole::Read => serializer.serialize_str("read"),
-            CollaboratorRole::Unknown => Err(serde::ser::Error::custom(
-                "cannot serialize unknown CollaboratorRole variant",
-            )),
+            CollaboratorRole::Unknown => serializer.serialize_str("unknown"),
         }
     }
 }
@@ -933,9 +923,9 @@ mod tests {
     }
 
     #[test]
-    fn serialize_unknown_repo_status_fails() {
-        let result = serde_json::to_string(&RepoStatus::Unknown);
-        assert!(result.is_err());
+    fn serialize_unknown_repo_status_returns_unknown() {
+        let result = serde_json::to_string(&RepoStatus::Unknown).unwrap();
+        assert_eq!(result, "\"unknown\"");
     }
 
     #[test]
@@ -951,26 +941,26 @@ mod tests {
     }
 
     #[test]
-    fn serialize_unknown_visibility_fails() {
-        let result = serde_json::to_string(&Visibility::Unknown);
-        assert!(result.is_err());
+    fn serialize_unknown_visibility_returns_unknown() {
+        let result = serde_json::to_string(&Visibility::Unknown).unwrap();
+        assert_eq!(result, "\"unknown\"");
     }
 
     #[test]
-    fn serialize_unknown_entry_type_fails() {
-        let result = serde_json::to_string(&EntryType::Unknown);
-        assert!(result.is_err());
+    fn serialize_unknown_entry_type_returns_unknown() {
+        let result = serde_json::to_string(&EntryType::Unknown).unwrap();
+        assert_eq!(result, "\"unknown\"");
     }
 
     #[test]
-    fn serialize_unknown_diff_status_fails() {
-        let result = serde_json::to_string(&DiffStatus::Unknown);
-        assert!(result.is_err());
+    fn serialize_unknown_diff_status_returns_unknown() {
+        let result = serde_json::to_string(&DiffStatus::Unknown).unwrap();
+        assert_eq!(result, "\"unknown\"");
     }
 
     #[test]
-    fn serialize_unknown_collaborator_role_fails() {
-        let result = serde_json::to_string(&CollaboratorRole::Unknown);
-        assert!(result.is_err());
+    fn serialize_unknown_collaborator_role_returns_unknown() {
+        let result = serde_json::to_string(&CollaboratorRole::Unknown).unwrap();
+        assert_eq!(result, "\"unknown\"");
     }
 }

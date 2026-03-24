@@ -61,8 +61,10 @@ impl TokenStore {
             message: format!("could not serialize credentials: {e}"),
         })?;
 
-        // On Unix, create file with restricted permissions from the start to
-        // avoid a TOCTOU race where the file is briefly world-readable.
+        // Write to a temp file first, then atomically rename over the target.
+        // This prevents partial writes from corrupting the credentials file.
+        let tmp_path = self.credentials_path.with_extension("tmp");
+
         #[cfg(unix)]
         {
             use std::io::Write as _;
@@ -71,7 +73,7 @@ impl TokenStore {
                 .create(true)
                 .truncate(true)
                 .mode(0o600)
-                .open(&self.credentials_path)
+                .open(&tmp_path)
                 .map_err(|err| CliError::Io {
                     message: format!("could not write credentials: {err}"),
                 })?;
@@ -82,10 +84,14 @@ impl TokenStore {
 
         #[cfg(not(unix))]
         {
-            std::fs::write(&self.credentials_path, &json).map_err(|err| CliError::Io {
+            std::fs::write(&tmp_path, &json).map_err(|err| CliError::Io {
                 message: format!("could not write credentials: {err}"),
             })?;
         }
+
+        std::fs::rename(&tmp_path, &self.credentials_path).map_err(|err| CliError::Io {
+            message: format!("could not write credentials: {err}"),
+        })?;
 
         Ok(())
     }

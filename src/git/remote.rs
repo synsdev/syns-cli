@@ -27,6 +27,7 @@ pub fn normalize_remote(url: &str) -> String {
                 // shorthand.
                 let is_port = match rest.find('/') {
                     Some(pos) if pos > 0 => rest[..pos].bytes().all(|b| b.is_ascii_digit()),
+                    None if !rest.is_empty() => rest.bytes().all(|b| b.is_ascii_digit()),
                     _ => false,
                 };
                 if is_port {
@@ -266,6 +267,15 @@ mod tests {
         assert_eq!(
             normalize_remote("git@gitlab.internal:2222/team/project"),
             "https://gitlab.internal:2222/team/project"
+        );
+    }
+
+    #[test]
+    fn normalize_ssh_shorthand_port_only_no_path() {
+        // MEDIUM 7: git@host:2222 with no path should treat 2222 as port
+        assert_eq!(
+            normalize_remote("git@gitlab.internal:2222"),
+            "https://gitlab.internal:2222"
         );
     }
 

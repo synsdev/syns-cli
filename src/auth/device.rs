@@ -3,14 +3,42 @@ use std::time::{Duration, Instant};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{is_localhost_url, is_safe_to_open};
+use crate::config::is_localhost_url;
 use crate::errors::CliError;
 
 const DEVICE_CODE_PATH: &str = "/api/auth/device/code";
 const DEVICE_TOKEN_PATH: &str = "/api/auth/device/token";
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
 const SLOW_DOWN_INCREMENT_SECS: u64 = 5;
-const MAX_EXPIRES_IN_SECS: u64 = 3600;
+const MAX_EXPIRES_IN_SECS: u64 = 60 * 60;
+const MAX_POLL_INTERVAL_SECS: u64 = 60;
+
+/// Extract the origin (scheme + host + port) from a URL for comparison.
+/// Returns None if the URL cannot be parsed.
+fn url_origin(url: &str) -> Option<String> {
+    let url = url::Url::parse(url).ok()?;
+    let host = url.host_str()?;
+    match url.port() {
+        Some(port) => Some(format!("{}://{}:{}", url.scheme(), host, port)),
+        None => Some(format!("{}://{}", url.scheme(), host)),
+    }
+}
+
+/// Check whether `verification_url` is safe to open in a browser.
+/// It must use https (or http://localhost) AND share the same origin as `server_url`.
+pub(crate) fn is_safe_verification_url(verification_url: &str, server_url: &str) -> bool {
+    use crate::config::is_safe_to_open;
+    if !is_safe_to_open(verification_url) {
+        return false;
+    }
+    let Some(ver_origin) = url_origin(verification_url) else {
+        return false;
+    };
+    let Some(srv_origin) = url_origin(server_url) else {
+        return false;
+    };
+    ver_origin.eq_ignore_ascii_case(&srv_origin)
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -37,6 +65,28 @@ struct TokenSuccessResponse {
 #[derive(Deserialize)]
 struct TokenErrorResponse {
     error: String,
+}
+
+/// Classify a token poll response for testability.
+#[derive(Debug, PartialEq)]
+pub(crate) enum PollResult {
+    Success(String),
+    Pending,
+    SlowDown,
+    Expired,
+    AccessDenied,
+    Error(String),
+}
+
+/// Classify a token poll response body (status 400 error field).
+pub(crate) fn classify_poll_error(error: &str) -> PollResult {
+    match error {
+        "authorization_pending" => PollResult::Pending,
+        "slow_down" => PollResult::SlowDown,
+        "expired_token" => PollResult::Expired,
+        "access_denied" => PollResult::AccessDenied,
+        other => PollResult::Error(format!("login failed: {other}")),
+    }
 }
 
 pub struct DeviceAuthFlow;
@@ -102,8 +152,8 @@ impl DeviceAuthFlow {
                 .yellow()
         );
 
-        // Open browser (best-effort), but only if the URL is safe
-        if is_safe_to_open(display_url) {
+        // Open browser (best-effort), but only if the URL shares the server origin
+        if is_safe_verification_url(display_url, server_url) {
             let _ = open::that(display_url);
         }
 
@@ -158,7 +208,9 @@ impl DeviceAuthFlow {
                 match error_resp.error.as_str() {
                     "authorization_pending" => continue,
                     "slow_down" => {
-                        poll_interval_secs += SLOW_DOWN_INCREMENT_SECS;
+                        poll_interval_secs = poll_interval_secs
+                            .saturating_add(SLOW_DOWN_INCREMENT_SECS)
+                            .min(MAX_POLL_INTERVAL_SECS);
                         continue;
                     }
                     "expired_token" => {
@@ -187,5 +239,152 @@ impl DeviceAuthFlow {
                 error: error_msg,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── classify_poll_error ────────────────────────────────────────────
+
+    #[test]
+    fn poll_pending() {
+        assert_eq!(
+            classify_poll_error("authorization_pending"),
+            PollResult::Pending
+        );
+    }
+
+    #[test]
+    fn poll_slow_down() {
+        assert_eq!(classify_poll_error("slow_down"), PollResult::SlowDown);
+    }
+
+    #[test]
+    fn poll_expired() {
+        assert_eq!(classify_poll_error("expired_token"), PollResult::Expired);
+    }
+
+    #[test]
+    fn poll_access_denied() {
+        assert_eq!(classify_poll_error("access_denied"), PollResult::AccessDenied);
+    }
+
+    #[test]
+    fn poll_unknown_error() {
+        assert_eq!(
+            classify_poll_error("server_error"),
+            PollResult::Error("login failed: server_error".to_string())
+        );
+    }
+
+    // ── is_safe_verification_url ───────────────────────────────────────
+
+    #[test]
+    fn verification_url_same_origin_allowed() {
+        assert!(is_safe_verification_url(
+            "https://syns.dev/auth/device?code=ABC",
+            "https://syns.dev"
+        ));
+    }
+
+    #[test]
+    fn verification_url_different_host_rejected() {
+        assert!(!is_safe_verification_url(
+            "https://evil.com/phish",
+            "https://syns.dev"
+        ));
+    }
+
+    #[test]
+    fn verification_url_different_port_rejected() {
+        assert!(!is_safe_verification_url(
+            "https://syns.dev:9999/auth",
+            "https://syns.dev"
+        ));
+    }
+
+    #[test]
+    fn verification_url_http_non_localhost_rejected() {
+        assert!(!is_safe_verification_url(
+            "http://syns.dev/auth",
+            "http://syns.dev"
+        ));
+    }
+
+    #[test]
+    fn verification_url_localhost_same_port() {
+        assert!(is_safe_verification_url(
+            "http://localhost:3000/auth/device?code=ABC",
+            "http://localhost:3000"
+        ));
+    }
+
+    #[test]
+    fn verification_url_localhost_different_port_rejected() {
+        assert!(!is_safe_verification_url(
+            "http://localhost:9999/auth",
+            "http://localhost:3000"
+        ));
+    }
+
+    #[test]
+    fn verification_url_javascript_rejected() {
+        assert!(!is_safe_verification_url(
+            "javascript:alert(1)",
+            "https://syns.dev"
+        ));
+    }
+
+    // ── HTTPS enforcement ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn device_auth_rejects_plain_http() {
+        let result = DeviceAuthFlow::run("http://example.com").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn device_auth_rejects_ftp() {
+        let result = DeviceAuthFlow::run("ftp://example.com").await;
+        assert!(result.is_err());
+    }
+
+    // ── poll interval cap ──────────────────────────────────────────────
+
+    #[test]
+    fn poll_interval_caps_at_max() {
+        let mut interval: u64 = 55;
+        // Simulate repeated slow_down
+        for _ in 0..5 {
+            interval = interval
+                .saturating_add(SLOW_DOWN_INCREMENT_SECS)
+                .min(MAX_POLL_INTERVAL_SECS);
+        }
+        assert_eq!(interval, MAX_POLL_INTERVAL_SECS);
+    }
+
+    // ── url_origin helper ──────────────────────────────────────────────
+
+    #[test]
+    fn url_origin_with_port() {
+        assert_eq!(
+            url_origin("https://syns.dev:8443/path"),
+            Some("https://syns.dev:8443".to_string())
+        );
+    }
+
+    #[test]
+    fn url_origin_without_port() {
+        assert_eq!(
+            url_origin("https://syns.dev/path"),
+            Some("https://syns.dev".to_string())
+        );
+    }
+
+    #[test]
+    fn url_origin_invalid() {
+        assert_eq!(url_origin("not-a-url"), None);
     }
 }
