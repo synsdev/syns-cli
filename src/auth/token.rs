@@ -38,6 +38,10 @@ impl TokenStore {
             }
         })?;
 
+        if credentials.token.trim().is_empty() {
+            return Ok(None);
+        }
+
         Ok(Some(credentials.token))
     }
 
@@ -49,9 +53,24 @@ impl TokenStore {
         }
 
         if let Some(parent) = self.credentials_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|err| CliError::Io {
-                message: format!("could not create config directory: {err}"),
-            })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .recursive(true)
+                    .create(parent)
+                    .map_err(|err| CliError::Io {
+                        message: format!("could not create config directory: {err}"),
+                    })?;
+            }
+
+            #[cfg(not(unix))]
+            {
+                std::fs::create_dir_all(parent).map_err(|err| CliError::Io {
+                    message: format!("could not create config directory: {err}"),
+                })?;
+            }
         }
 
         let json = serde_json::to_string_pretty(&Credentials {
@@ -62,26 +81,52 @@ impl TokenStore {
         #[cfg(unix)]
         {
             use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::fs::PermissionsExt;
+            use tempfile::NamedTempFile;
 
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(CREDENTIALS_FILE_MODE)
-                .open(&self.credentials_path)
+            let parent = self
+                .credentials_path
+                .parent()
+                .expect("credentials path should have a parent directory");
+
+            let mut tmp = NamedTempFile::new_in(parent).map_err(|err| CliError::Io {
+                message: format!("could not write credentials: {err}"),
+            })?;
+
+            tmp.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(CREDENTIALS_FILE_MODE))
                 .map_err(|err| CliError::Io {
                     message: format!("could not write credentials: {err}"),
                 })?;
 
-            file.write_all(json.as_bytes()).map_err(|err| CliError::Io {
+            tmp.write_all(json.as_bytes()).map_err(|err| CliError::Io {
+                message: format!("could not write credentials: {err}"),
+            })?;
+
+            tmp.persist(&self.credentials_path).map_err(|err| CliError::Io {
                 message: format!("could not write credentials: {err}"),
             })?;
         }
 
         #[cfg(not(unix))]
         {
-            std::fs::write(&self.credentials_path, json).map_err(|err| CliError::Io {
+            use std::io::Write;
+            use tempfile::NamedTempFile;
+
+            let parent = self
+                .credentials_path
+                .parent()
+                .expect("credentials path should have a parent directory");
+
+            let mut tmp = NamedTempFile::new_in(parent).map_err(|err| CliError::Io {
+                message: format!("could not write credentials: {err}"),
+            })?;
+
+            tmp.write_all(json.as_bytes()).map_err(|err| CliError::Io {
+                message: format!("could not write credentials: {err}"),
+            })?;
+
+            tmp.persist(&self.credentials_path).map_err(|err| CliError::Io {
                 message: format!("could not write credentials: {err}"),
             })?;
         }
@@ -183,5 +228,25 @@ mod tests {
         let store = TokenStore::new(path);
         let err = store.read().unwrap_err();
         assert!(matches!(err, CliError::Config { .. }));
+    }
+
+    #[test]
+    fn read_returns_none_for_empty_token_in_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        std::fs::write(&path, r#"{"token": ""}"#).unwrap();
+
+        let store = TokenStore::new(path);
+        assert_eq!(store.read().unwrap(), None);
+    }
+
+    #[test]
+    fn read_returns_none_for_whitespace_token_in_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        std::fs::write(&path, r#"{"token": "   "}"#).unwrap();
+
+        let store = TokenStore::new(path);
+        assert_eq!(store.read().unwrap(), None);
     }
 }

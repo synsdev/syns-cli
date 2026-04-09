@@ -36,6 +36,45 @@ struct TokenErrorResponse {
     error: String,
 }
 
+async fn extract_api_error(response: reqwest::Response, status_code: u16) -> CliError {
+    let error = match response.json::<TokenErrorResponse>().await {
+        Ok(body) => body.error,
+        Err(_) => format!("HTTP {status_code}"),
+    };
+    CliError::Api {
+        status: Some(status_code),
+        error,
+    }
+}
+
+#[derive(Debug)]
+enum PollAction {
+    Continue,
+    SlowDown(u64),
+    Error(CliError),
+}
+
+fn classify_poll_error(error: &str, current_interval: u64) -> PollAction {
+    match error {
+        "authorization_pending" => PollAction::Continue,
+        "slow_down" => {
+            let new_interval =
+                (current_interval + SLOW_DOWN_INCREMENT_SECS).min(MAX_POLL_INTERVAL_SECS);
+            PollAction::SlowDown(new_interval)
+        }
+        "expired_token" => PollAction::Error(CliError::Io {
+            message: "device code expired \u{2014} please run 'syns login' again".into(),
+        }),
+        "access_denied" => PollAction::Error(CliError::Io {
+            message: "authorization was denied".into(),
+        }),
+        other => PollAction::Error(CliError::Api {
+            status: Some(400),
+            error: format!("login failed: {other}"),
+        }),
+    }
+}
+
 pub struct DeviceAuthFlow;
 
 impl DeviceAuthFlow {
@@ -49,7 +88,10 @@ impl DeviceAuthFlow {
         }
 
         // 2. Create reqwest client
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("failed to build HTTP client");
 
         // 3. Request device code
         let code_url = format!("{server_url}{DEVICE_CODE_PATH}");
@@ -65,14 +107,7 @@ impl DeviceAuthFlow {
         // 4. Handle non-200
         if !response.status().is_success() {
             let code = response.status().as_u16();
-            let error = match response.json::<TokenErrorResponse>().await {
-                Ok(body) => body.error,
-                Err(_) => format!("HTTP {code}"),
-            };
-            return Err(CliError::Api {
-                status: Some(code),
-                error,
-            });
+            return Err(extract_api_error(response, code).await);
         }
 
         // 5. Deserialize response
@@ -150,43 +185,18 @@ impl DeviceAuthFlow {
                     response.json().await.map_err(|_| CliError::Io {
                         message: "unexpected response from token endpoint".into(),
                     })?;
-                match error_body.error.as_str() {
-                    "authorization_pending" => continue,
-                    "slow_down" => {
-                        poll_interval_secs = (poll_interval_secs + SLOW_DOWN_INCREMENT_SECS)
-                            .min(MAX_POLL_INTERVAL_SECS);
+                match classify_poll_error(&error_body.error, poll_interval_secs) {
+                    PollAction::Continue => continue,
+                    PollAction::SlowDown(new_interval) => {
+                        poll_interval_secs = new_interval;
                         continue;
                     }
-                    "expired_token" => {
-                        return Err(CliError::Io {
-                            message:
-                                "device code expired \u{2014} please run 'syns login' again"
-                                    .into(),
-                        });
-                    }
-                    "access_denied" => {
-                        return Err(CliError::Io {
-                            message: "authorization was denied".into(),
-                        });
-                    }
-                    other => {
-                        return Err(CliError::Api {
-                            status: Some(400),
-                            error: format!("login failed: {other}"),
-                        });
-                    }
+                    PollAction::Error(err) => return Err(err),
                 }
             }
 
             let code = status.as_u16();
-            let error = match response.json::<TokenErrorResponse>().await {
-                Ok(body) => body.error,
-                Err(_) => format!("HTTP {code}"),
-            };
-            return Err(CliError::Api {
-                status: Some(code),
-                error,
-            });
+            return Err(extract_api_error(response, code).await);
         }
     }
 }
@@ -214,6 +224,42 @@ mod tests {
         // It will be ServerUnreachable since no server is running.
         assert!(!matches!(result, Err(CliError::Config { .. })));
         assert!(matches!(result, Err(CliError::ServerUnreachable { .. })));
+    }
+
+    #[test]
+    fn classify_poll_error_authorization_pending() {
+        let action = classify_poll_error("authorization_pending", 5);
+        assert!(matches!(action, PollAction::Continue));
+    }
+
+    #[test]
+    fn classify_poll_error_slow_down_increments() {
+        let action = classify_poll_error("slow_down", 5);
+        assert!(matches!(action, PollAction::SlowDown(10)));
+    }
+
+    #[test]
+    fn classify_poll_error_slow_down_caps_at_max() {
+        let action = classify_poll_error("slow_down", 58);
+        assert!(matches!(action, PollAction::SlowDown(60)));
+    }
+
+    #[test]
+    fn classify_poll_error_expired_token() {
+        let action = classify_poll_error("expired_token", 5);
+        assert!(matches!(action, PollAction::Error(CliError::Io { .. })));
+    }
+
+    #[test]
+    fn classify_poll_error_access_denied() {
+        let action = classify_poll_error("access_denied", 5);
+        assert!(matches!(action, PollAction::Error(CliError::Io { .. })));
+    }
+
+    #[test]
+    fn classify_poll_error_unknown_error() {
+        let action = classify_poll_error("server_error", 5);
+        assert!(matches!(action, PollAction::Error(CliError::Api { status: Some(400), .. })));
     }
 
     #[test]
