@@ -40,7 +40,7 @@ impl Output {
     }
 
     pub(crate) fn format_json<T: Serialize>(&self, value: &T) -> String {
-        match serde_json::to_string_pretty(value) {
+        match serde_json::to_string(value) {
             Ok(json) => json,
             Err(_) => r#"{"error": "serialization_failed"}"#.to_string(),
         }
@@ -69,8 +69,10 @@ impl Output {
     }
 
     pub fn json<T: Serialize>(&self, value: &T) {
-        let text = self.format_json(value);
-        println!("{text}");
+        match serde_json::to_string(value) {
+            Ok(json) => println!("{json}"),
+            Err(_) => eprintln!(r#"{{"error": "serialization_failed"}}"#),
+        }
     }
 
     pub fn error(&self, error: &CliError) {

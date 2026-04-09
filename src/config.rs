@@ -34,7 +34,7 @@ impl Config {
 
         match parsed.scheme() {
             "https" => {}
-            "http" if is_localhost_url(&server_url) => {}
+            "http" if is_localhost(&parsed) => {}
             _ => {
                 return Err(CliError::Config {
                     message: "server URL must use HTTPS (except http://localhost for local development)".into(),
@@ -78,9 +78,13 @@ impl Config {
     }
 }
 
+fn is_localhost(parsed: &Url) -> bool {
+    matches!(parsed.host_str(), Some("localhost") | Some("127.0.0.1") | Some("::1") | Some("[::1]"))
+}
+
 pub fn is_localhost_url(url: &str) -> bool {
     match Url::parse(url) {
-        Ok(parsed) => matches!(parsed.host_str(), Some("localhost") | Some("127.0.0.1")),
+        Ok(parsed) => is_localhost(&parsed),
         Err(_) => false,
     }
 }
@@ -96,7 +100,7 @@ pub fn is_safe_to_open(verification_url: &str, server_url: &str) -> bool {
     // Check safe scheme
     let safe_scheme = match verification.scheme() {
         "https" => true,
-        "http" => is_localhost_url(verification_url),
+        "http" => is_localhost(&verification),
         _ => false,
     };
 
@@ -104,10 +108,17 @@ pub fn is_safe_to_open(verification_url: &str, server_url: &str) -> bool {
         return false;
     }
 
-    // Check same origin: scheme, host, port
-    verification.scheme() == server.scheme()
-        && verification.host_str() == server.host_str()
-        && verification.port() == server.port()
+    // Check same origin: scheme + host + port
+    // Treat all loopback addresses (localhost, 127.0.0.1, ::1) as equivalent
+    let same_scheme = verification.scheme() == server.scheme();
+    let same_port = verification.port() == server.port();
+    let same_host = if is_localhost(&verification) && is_localhost(&server) {
+        true // All loopback variants are equivalent
+    } else {
+        verification.host_str() == server.host_str()
+    };
+
+    same_scheme && same_host && same_port
 }
 
 #[cfg(test)]
@@ -136,7 +147,8 @@ mod tests {
     #[test]
     fn config_rejects_http() {
         let result = Config::new(Some("http://example.com"));
-        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, CliError::Config { ref message } if message.contains("HTTPS")));
     }
 
     #[test]
@@ -161,6 +173,7 @@ mod tests {
         assert!(!is_localhost_url("http://localhost.evil.com"));
         assert!(!is_localhost_url("http://example.com"));
         assert!(!is_localhost_url("not a url"));
+        assert!(!is_localhost_url("http://localhost:80@evil.com"));
     }
 
     #[test]
@@ -194,5 +207,51 @@ mod tests {
         let config = Config::new(Some("https://syns.dev")).unwrap();
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
         assert_eq!(config.credentials_path(), PathBuf::from("/tmp/syns-test-config/credentials.json"));
+    }
+
+    #[test]
+    fn config_empty_string_uses_default() {
+        let config = Config::new(Some("")).unwrap();
+        assert_eq!(config.server_url(), "https://syns.dev");
+    }
+
+    #[test]
+    fn config_malformed_url_returns_error() {
+        let result = Config::new(Some(":::bad"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_cache_dir_is_set() {
+        let config = Config::new(Some("https://syns.dev")).unwrap();
+        let cache = config.cache_dir();
+        assert!(!cache.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn is_safe_to_open_port_mismatch() {
+        assert!(!is_safe_to_open("https://syns.dev:8443/auth", "https://syns.dev"));
+    }
+
+    #[test]
+    fn is_localhost_url_ipv6() {
+        assert!(is_localhost_url("http://[::1]:3000"));
+        assert!(is_localhost_url("http://[::1]"));
+    }
+
+    #[test]
+    fn config_allows_ipv6_localhost_http() {
+        let config = Config::new(Some("http://[::1]:3000")).unwrap();
+        assert_eq!(config.server_url(), "http://[::1]:3000");
+    }
+
+    #[test]
+    fn is_safe_to_open_loopback_normalization() {
+        // localhost server with 127.0.0.1 verification URL should be accepted
+        assert!(is_safe_to_open("http://127.0.0.1:3000/auth/verify", "http://localhost:3000"));
+        // vice versa
+        assert!(is_safe_to_open("http://localhost:3000/auth/verify", "http://127.0.0.1:3000"));
+        // IPv6 loopback also equivalent
+        assert!(is_safe_to_open("http://[::1]:3000/auth/verify", "http://localhost:3000"));
     }
 }
