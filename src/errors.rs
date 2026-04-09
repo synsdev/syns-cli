@@ -35,6 +35,21 @@ impl std::fmt::Display for CliError {
 
 impl std::error::Error for CliError {}
 
+impl From<reqwest::Error> for CliError {
+    fn from(err: reqwest::Error) -> Self {
+        if err.is_connect() || err.is_timeout() {
+            CliError::ServerUnreachable {
+                url: err.url().map(|u| u.to_string()).unwrap_or_default(),
+            }
+        } else {
+            CliError::Api {
+                status: err.status().map(|s| s.as_u16()),
+                error: err.to_string(),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
