@@ -69,7 +69,7 @@ impl Output {
     }
 
     pub fn json<T: Serialize>(&self, value: &T) {
-        match serde_json::to_string(value) {
+        match serde_json::to_string_pretty(value) {
             Ok(json) => println!("{json}"),
             Err(_) => eprintln!(r#"{{"error": "serialization_failed"}}"#),
         }
