@@ -35,6 +35,8 @@ impl std::fmt::Display for CliError {
 
 impl std::error::Error for CliError {}
 
+// Note: This impl has branching logic (connect/timeout vs other) that cannot be unit-tested
+// locally because reqwest::Error constructors are private. Covered by integration tests (U59).
 impl From<reqwest::Error> for CliError {
     fn from(err: reqwest::Error) -> Self {
         if err.is_connect() || err.is_timeout() {

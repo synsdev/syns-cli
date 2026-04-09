@@ -20,6 +20,18 @@ pub enum RepoStatus {
     Unknown,
 }
 
+impl RepoStatus {
+    pub fn as_query_str(&self) -> &str {
+        match self {
+            RepoStatus::Active => "active",
+            RepoStatus::Draft => "draft",
+            RepoStatus::Completed => "completed",
+            RepoStatus::Abandoned => "abandoned",
+            RepoStatus::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Visibility {
@@ -303,14 +315,13 @@ struct ApiErrorBody {
 
 fn encode_path_segments(path: &str) -> String {
     path.split('/')
+        .filter(|segment| !segment.is_empty())
         .map(|segment| urlencoding::encode(segment))
         .collect::<Vec<_>>()
         .join("/")
 }
 
-async fn process_response<T: serde::de::DeserializeOwned>(
-    response: reqwest::Response,
-) -> Result<T, CliError> {
+async fn check_response(response: reqwest::Response) -> Result<reqwest::Response, CliError> {
     let status = response.status();
     if status == reqwest::StatusCode::UNAUTHORIZED {
         return Err(CliError::AuthRequired);
@@ -323,6 +334,20 @@ async fn process_response<T: serde::de::DeserializeOwned>(
         };
         return Err(CliError::Api { status: Some(code), error });
     }
+    if !status.is_success() {
+        return Err(CliError::Api {
+            status: Some(status.as_u16()),
+            error: format!("unexpected status {}", status.as_u16()),
+        });
+    }
+    Ok(response)
+}
+
+async fn process_response<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T, CliError> {
+    let response = check_response(response).await?;
+    let status = response.status();
     response.json::<T>().await.map_err(|e| CliError::Api {
         status: Some(status.as_u16()),
         error: format!("invalid response body: {e}"),
@@ -330,18 +355,7 @@ async fn process_response<T: serde::de::DeserializeOwned>(
 }
 
 async fn process_empty_response(response: reqwest::Response) -> Result<(), CliError> {
-    let status = response.status();
-    if status == reqwest::StatusCode::UNAUTHORIZED {
-        return Err(CliError::AuthRequired);
-    }
-    if status.is_client_error() || status.is_server_error() {
-        let code = status.as_u16();
-        let error = match response.json::<ApiErrorBody>().await {
-            Ok(body) => body.error,
-            Err(_) => "unknown error".to_string(),
-        };
-        return Err(CliError::Api { status: Some(code), error });
-    }
+    check_response(response).await?;
     Ok(())
 }
 
@@ -355,7 +369,7 @@ pub struct SynsClient {
 
 impl SynsClient {
     pub fn new(server_url: &str) -> Result<SynsClient, CliError> {
-        if !server_url.starts_with("https://") && !server_url.starts_with("http://localhost") {
+        if !server_url.starts_with("https://") && !crate::config::is_localhost_url(server_url) {
             return Err(CliError::Config {
                 message: "HTTPS required for server URL (http://localhost permitted for development)".to_string(),
             });
@@ -466,13 +480,13 @@ impl SynsClient {
     }
 
     pub async fn remove_collaborator(&self, repo_id: &str, token: &str, user_id: &str) -> Result<(), CliError> {
-        let url = format!("{}/api/v1/repos/{}/collaborators/{}", self.base_url, repo_id, user_id);
+        let url = format!("{}/api/v1/repos/{}/collaborators/{}", self.base_url, repo_id, urlencoding::encode(user_id));
         let response = self.client.delete(&url).bearer_auth(token).send().await?;
         process_empty_response(response).await
     }
 
     pub async fn update_collaborator_role(&self, repo_id: &str, token: &str, user_id: &str, request: &UpdateCollaboratorRoleRequest) -> Result<(), CliError> {
-        let url = format!("{}/api/v1/repos/{}/collaborators/{}", self.base_url, repo_id, user_id);
+        let url = format!("{}/api/v1/repos/{}/collaborators/{}", self.base_url, repo_id, urlencoding::encode(user_id));
         let response = self.client.patch(&url).bearer_auth(token).json(request).send().await?;
         process_empty_response(response).await
     }
@@ -484,11 +498,7 @@ impl SynsClient {
         if let Some(q) = query { req = req.query(&[("search", q)]); }
         if let Some(t) = tag { req = req.query(&[("tag", t)]); }
         if let Some(s) = status {
-            let s_str = serde_json::to_value(s)
-                .ok()
-                .and_then(|v| v.as_str().map(String::from))
-                .unwrap_or_else(|| "unknown".to_string());
-            req = req.query(&[("status", &s_str)]);
+            req = req.query(&[("status", s.as_query_str())]);
         }
         let response = req.send().await?;
         process_response(response).await
@@ -509,18 +519,7 @@ impl SynsClient {
     pub async fn get_session(&self, token: &str) -> Result<SessionResponse, CliError> {
         let url = format!("{}/api/auth/get-session", self.base_url);
         let response = self.client.get(&url).bearer_auth(token).send().await?;
-        let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(CliError::AuthRequired);
-        }
-        if status.is_client_error() || status.is_server_error() {
-            let code = status.as_u16();
-            let error = match response.json::<ApiErrorBody>().await {
-                Ok(body) => body.error,
-                Err(_) => "unknown error".to_string(),
-            };
-            return Err(CliError::Api { status: Some(code), error });
-        }
+        let response = check_response(response).await?;
         // Special handling: better-auth returns 200 with null when token is invalid
         response.json::<SessionResponse>().await.map_err(|_| CliError::AuthRequired)
     }
@@ -557,7 +556,13 @@ mod tests {
     #[test]
     fn new_rejects_plain_http() {
         let err = SynsClient::new("http://example.com").unwrap_err();
-        assert!(matches!(err, CliError::Config { .. }));
+        assert!(matches!(err, CliError::Config { ref message } if message.contains("HTTPS")));
+    }
+
+    #[test]
+    fn new_rejects_localhost_prefix_attack() {
+        assert!(SynsClient::new("http://localhost.evil.com").is_err());
+        assert!(SynsClient::new("http://localhostevil").is_err());
     }
 
     #[test]
@@ -589,18 +594,44 @@ mod tests {
     #[test]
     fn repo_status_serializes() {
         assert_eq!(serde_json::to_string(&RepoStatus::Active).unwrap(), "\"active\"");
+        assert_eq!(serde_json::to_string(&RepoStatus::Draft).unwrap(), "\"draft\"");
+        assert_eq!(serde_json::to_string(&RepoStatus::Completed).unwrap(), "\"completed\"");
+        assert_eq!(serde_json::to_string(&RepoStatus::Abandoned).unwrap(), "\"abandoned\"");
         assert_eq!(serde_json::to_string(&RepoStatus::Unknown).unwrap(), "\"unknown\"");
+    }
+
+    #[test]
+    fn visibility_serializes() {
+        assert_eq!(serde_json::to_string(&Visibility::Public).unwrap(), "\"public\"");
+        assert_eq!(serde_json::to_string(&Visibility::Private).unwrap(), "\"private\"");
+        assert_eq!(serde_json::to_string(&Visibility::Unknown).unwrap(), "\"unknown\"");
     }
 
     #[test]
     fn other_enums_roundtrip() {
         assert_eq!(serde_json::from_str::<Visibility>("\"public\"").unwrap(), Visibility::Public);
+        assert_eq!(serde_json::from_str::<Visibility>("\"private\"").unwrap(), Visibility::Private);
         assert_eq!(serde_json::from_str::<Visibility>("\"future\"").unwrap(), Visibility::Unknown);
         assert_eq!(serde_json::from_str::<EntryType>("\"file\"").unwrap(), EntryType::File);
         assert_eq!(serde_json::from_str::<EntryType>("\"dir\"").unwrap(), EntryType::Dir);
+        assert_eq!(serde_json::from_str::<EntryType>("\"unknown_type\"").unwrap(), EntryType::Unknown);
         assert_eq!(serde_json::from_str::<DiffStatus>("\"added\"").unwrap(), DiffStatus::Added);
+        assert_eq!(serde_json::from_str::<DiffStatus>("\"modified\"").unwrap(), DiffStatus::Modified);
+        assert_eq!(serde_json::from_str::<DiffStatus>("\"deleted\"").unwrap(), DiffStatus::Deleted);
+        assert_eq!(serde_json::from_str::<CollaboratorRole>("\"owner\"").unwrap(), CollaboratorRole::Owner);
         assert_eq!(serde_json::from_str::<CollaboratorRole>("\"admin\"").unwrap(), CollaboratorRole::Admin);
+        assert_eq!(serde_json::from_str::<CollaboratorRole>("\"write\"").unwrap(), CollaboratorRole::Write);
+        assert_eq!(serde_json::from_str::<CollaboratorRole>("\"read\"").unwrap(), CollaboratorRole::Read);
         assert_eq!(serde_json::from_str::<CollaboratorRole>("\"superadmin\"").unwrap(), CollaboratorRole::Unknown);
+    }
+
+    #[test]
+    fn repo_status_as_query_str() {
+        assert_eq!(RepoStatus::Active.as_query_str(), "active");
+        assert_eq!(RepoStatus::Draft.as_query_str(), "draft");
+        assert_eq!(RepoStatus::Completed.as_query_str(), "completed");
+        assert_eq!(RepoStatus::Abandoned.as_query_str(), "abandoned");
+        assert_eq!(RepoStatus::Unknown.as_query_str(), "unknown");
     }
 
     #[test]
@@ -608,5 +639,12 @@ mod tests {
         assert_eq!(encode_path_segments("src/main.rs"), "src/main.rs");
         assert_eq!(encode_path_segments("src/my file.rs"), "src/my%20file.rs");
         assert_eq!(encode_path_segments("dir/sub dir/file #2.txt"), "dir/sub%20dir/file%20%232.txt");
+    }
+
+    #[test]
+    fn encode_path_filters_empty_segments() {
+        assert_eq!(encode_path_segments("/src/main.rs"), "src/main.rs");
+        assert_eq!(encode_path_segments("src//main.rs"), "src/main.rs");
+        assert_eq!(encode_path_segments("src/main.rs/"), "src/main.rs");
     }
 }
