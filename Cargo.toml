@@ -20,6 +20,8 @@ console = "0.16"
 dirs = "6"
 url = "2"
 urlencoding = "2"
+open = "5"
 
 [dev-dependencies]
 serial_test = "3"
+tempfile = "3"
