@@ -55,7 +55,14 @@ pub fn collect_files(
             None => continue,
         };
 
-        if !file_type.is_file() {
+        if file_type.is_dir() {
+            continue;
+        }
+        // DirEntry::file_type() uses lstat semantics (follow_links is false),
+        // so symlinks report is_file()=false regardless of target. We stat the
+        // target via entry.path().is_file() to distinguish symlink-to-file
+        // (collect) from symlink-to-directory or broken symlink (skip).
+        if file_type.is_symlink() && !entry.path().is_file() {
             continue;
         }
 
@@ -180,6 +187,21 @@ mod tests {
         assert!(files.contains_key("keep.txt"));
         assert!(files.contains_key("real_dir/inner.txt"));
         assert!(!files.contains_key("link_dir"));
+        assert!(!files.contains_key("link_dir/inner.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collects_symlink_to_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("real.txt"), "target content").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real.txt"), dir.path().join("link.txt"))
+            .unwrap();
+
+        let files = collect_files(dir.path(), &[]).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files.get("real.txt").unwrap(), b"target content");
+        assert_eq!(files.get("link.txt").unwrap(), b"target content");
     }
 
     #[test]
