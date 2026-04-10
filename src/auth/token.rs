@@ -1,5 +1,3 @@
-#![allow(dead_code)] // Used by downstream command units (U22)
-
 use std::path::PathBuf;
 
 use crate::errors::CliError;

@@ -1,5 +1,3 @@
-#![allow(dead_code)] // Used by downstream command units (U22)
-
 use crate::errors::CliError;
 
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;

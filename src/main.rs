@@ -81,7 +81,7 @@ async fn main() {
     }
 }
 
-async fn run(command: Commands, _config: &config::Config, output: &output::Output) -> Result<(), errors::CliError> {
+async fn run(command: Commands, config: &config::Config, output: &output::Output) -> Result<(), errors::CliError> {
     match command {
         Commands::Push {} => output.success("push: not yet implemented"),
         Commands::Pull {} => output.success("pull: not yet implemented"),
@@ -96,9 +96,9 @@ async fn run(command: Commands, _config: &config::Config, output: &output::Outpu
         Commands::Delete {} => output.success("delete: not yet implemented"),
         Commands::Explore {} => output.success("explore: not yet implemented"),
         Commands::Fork {} => output.success("fork: not yet implemented"),
-        Commands::Login {} => output.success("login: not yet implemented"),
-        Commands::Logout {} => output.success("logout: not yet implemented"),
-        Commands::Whoami {} => output.success("whoami: not yet implemented"),
+        Commands::Login {} => commands::login::cmd_login(config, output).await?,
+        Commands::Logout {} => commands::logout::cmd_logout(config, output).await?,
+        Commands::Whoami {} => commands::whoami::cmd_whoami(config, output).await?,
     }
     Ok(())
 }
