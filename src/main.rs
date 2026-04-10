@@ -9,6 +9,7 @@ mod commands;
 
 use clap::{Parser, Subcommand};
 use crate::commands::collaborators::CollaboratorsAction;
+use crate::commands::repo::{CliRepoStatus, CliVisibility};
 
 #[derive(Parser)]
 #[command(name = "syns", about = "Push, pull, and manage versioned file repositories")]
@@ -80,12 +81,12 @@ enum Commands {
         /// Update repository description
         #[arg(long)]
         description: Option<String>,
-        /// Update repository status (active, draft, completed, abandoned)
+        /// Update repository status
         #[arg(long)]
-        status: Option<String>,
-        /// Update repository visibility (public, private)
+        status: Option<CliRepoStatus>,
+        /// Update repository visibility
         #[arg(long)]
-        visibility: Option<String>,
+        visibility: Option<CliVisibility>,
         /// Set repository tags (replaces existing)
         #[arg(long)]
         tag: Vec<String>,
@@ -144,9 +145,9 @@ async fn run(command: Commands, config: &config::Config, output: &output::Output
         Commands::History { file, limit } => commands::history::cmd_history(config, output, file, limit).await?,
         Commands::Diff { from, to } => commands::diff::cmd_diff(config, output, from, to).await?,
         Commands::Revert { path, to, message } => commands::revert::cmd_revert(config, output, path, to, message).await?,
-        Commands::Repo { description, status, visibility, tag } => commands::repo::cmd_repo(&config, &output, description, status, visibility, tag).await?,
-        Commands::Collaborators { action } => commands::collaborators::cmd_collaborators(&config, &output, action).await?,
-        Commands::Delete { yes } => commands::delete::cmd_delete(&config, &output, yes).await?,
+        Commands::Repo { description, status, visibility, tag } => commands::repo::cmd_repo(config, output, description, status, visibility, tag).await?,
+        Commands::Collaborators { action } => commands::collaborators::cmd_collaborators(config, output, action).await?,
+        Commands::Delete { yes } => commands::delete::cmd_delete(config, output, yes).await?,
         Commands::Explore {} => output.success("explore: not yet implemented"),
         Commands::Fork {} => output.success("fork: not yet implemented"),
         Commands::Login {} => commands::login::cmd_login(config, output).await?,

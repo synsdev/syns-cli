@@ -5,25 +5,37 @@ use crate::errors::CliError;
 use crate::output::Output;
 use crate::repo::resolve::resolve_repo_identity;
 
-fn parse_status(s: &str) -> Result<RepoStatus, CliError> {
-    match s {
-        "active" => Ok(RepoStatus::Active),
-        "draft" => Ok(RepoStatus::Draft),
-        "completed" => Ok(RepoStatus::Completed),
-        "abandoned" => Ok(RepoStatus::Abandoned),
-        _ => Err(CliError::Config {
-            message: format!("invalid status '{}' — must be one of: active, draft, completed, abandoned", s),
-        }),
+#[derive(clap::ValueEnum, Debug, Clone)]
+pub enum CliRepoStatus {
+    Active,
+    Draft,
+    Completed,
+    Abandoned,
+}
+
+impl From<CliRepoStatus> for RepoStatus {
+    fn from(s: CliRepoStatus) -> Self {
+        match s {
+            CliRepoStatus::Active => RepoStatus::Active,
+            CliRepoStatus::Draft => RepoStatus::Draft,
+            CliRepoStatus::Completed => RepoStatus::Completed,
+            CliRepoStatus::Abandoned => RepoStatus::Abandoned,
+        }
     }
 }
 
-fn parse_visibility(v: &str) -> Result<Visibility, CliError> {
-    match v {
-        "public" => Ok(Visibility::Public),
-        "private" => Ok(Visibility::Private),
-        _ => Err(CliError::Config {
-            message: format!("invalid visibility '{}' — must be one of: public, private", v),
-        }),
+#[derive(clap::ValueEnum, Debug, Clone)]
+pub enum CliVisibility {
+    Public,
+    Private,
+}
+
+impl From<CliVisibility> for Visibility {
+    fn from(v: CliVisibility) -> Self {
+        match v {
+            CliVisibility::Public => Visibility::Public,
+            CliVisibility::Private => Visibility::Private,
+        }
     }
 }
 
@@ -50,8 +62,8 @@ pub async fn cmd_repo(
     config: &Config,
     output: &Output,
     description: Option<String>,
-    status: Option<String>,
-    visibility: Option<String>,
+    status: Option<CliRepoStatus>,
+    visibility: Option<CliVisibility>,
     tags: Vec<String>,
 ) -> Result<(), CliError> {
     let is_update = description.is_some() || status.is_some() || visibility.is_some() || !tags.is_empty();
@@ -67,12 +79,10 @@ pub async fn cmd_repo(
         let token = TokenStore::new(config.credentials_path())
             .read()?
             .ok_or(CliError::AuthRequired)?;
-        let parsed_status = status.map(|s| parse_status(&s)).transpose()?;
-        let parsed_visibility = visibility.map(|v| parse_visibility(&v)).transpose()?;
         let update = RepoUpdate {
             description,
-            status: parsed_status,
-            visibility: parsed_visibility,
+            status: status.map(|s| s.into()),
+            visibility: visibility.map(|v| v.into()),
             tags: if tags.is_empty() { None } else { Some(tags) },
         };
         let response = client.update_repo(&repo_id, &token, &update).await?;
@@ -174,7 +184,7 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_repo(&config, &output, None, None, Some("public".to_string()), vec![]).await;
+        let result = cmd_repo(&config, &output, None, None, Some(CliVisibility::Public), vec![]).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());

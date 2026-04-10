@@ -464,12 +464,12 @@ impl SynsClient {
         process_response(response).await
     }
 
-    pub async fn list_collaborators(&self, repo_id: &str, token: &str, limit: u32, offset: u32) -> Result<CollaboratorListResponse, CliError> {
+    pub async fn list_collaborators(&self, repo_id: &str, token: Option<&str>, limit: u32, offset: u32) -> Result<CollaboratorListResponse, CliError> {
         let url = format!("{}/api/v1/repos/{}/collaborators", self.base_url, repo_id);
-        let response = self.client.get(&url)
-            .bearer_auth(token)
-            .query(&[("limit", limit.to_string()), ("offset", offset.to_string())])
-            .send().await?;
+        let mut req = self.client.get(&url)
+            .query(&[("limit", limit.to_string()), ("offset", offset.to_string())]);
+        if let Some(t) = token { req = req.bearer_auth(t); }
+        let response = req.send().await?;
         process_response(response).await
     }
 

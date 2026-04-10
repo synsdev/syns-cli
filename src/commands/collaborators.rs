@@ -8,6 +8,33 @@ use clap::Subcommand;
 use serde_json::json;
 use std::io::Write;
 
+#[derive(clap::ValueEnum, Debug, Clone)]
+pub enum AssignableRole {
+    Admin,
+    Write,
+    Read,
+}
+
+impl AssignableRole {
+    fn as_str(&self) -> &str {
+        match self {
+            AssignableRole::Admin => "admin",
+            AssignableRole::Write => "write",
+            AssignableRole::Read => "read",
+        }
+    }
+}
+
+impl From<AssignableRole> for CollaboratorRole {
+    fn from(r: AssignableRole) -> Self {
+        match r {
+            AssignableRole::Admin => CollaboratorRole::Admin,
+            AssignableRole::Write => CollaboratorRole::Write,
+            AssignableRole::Read => CollaboratorRole::Read,
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 pub enum CollaboratorsAction {
     /// Add a collaborator to the repository
@@ -15,9 +42,9 @@ pub enum CollaboratorsAction {
         /// User ID of the collaborator to add
         #[arg()]
         user_id: String,
-        /// Role to assign (admin, write, read)
+        /// Role to assign
         #[arg(long)]
-        role: String,
+        role: AssignableRole,
     },
     /// Remove a collaborator from the repository
     Remove {
@@ -31,17 +58,6 @@ pub enum CollaboratorsAction {
 }
 
 const DEFAULT_COLLABORATOR_LIMIT: u32 = 100;
-
-fn parse_collaborator_role(role: &str) -> Result<CollaboratorRole, CliError> {
-    match role {
-        "admin" => Ok(CollaboratorRole::Admin),
-        "write" => Ok(CollaboratorRole::Write),
-        "read" => Ok(CollaboratorRole::Read),
-        _ => Err(CliError::Config {
-            message: format!("invalid role '{}' — must be one of: admin, write, read", role),
-        }),
-    }
-}
 
 fn confirm_remove(user_id: &str, repo_id: &str) -> Result<bool, CliError> {
     eprint!("Remove collaborator '{}' from '{}'? [y/N]: ", user_id, repo_id);
@@ -66,14 +82,12 @@ pub async fn cmd_collaborators(
     let identity = resolve_repo_identity(None, &current_dir)?;
     let owner = identity.owner.ok_or(CliError::RepoIdentityUnknown)?;
     let repo_id = format!("{}/{}", owner, identity.name);
-    let token = TokenStore::new(config.credentials_path())
-        .read()?
-        .ok_or(CliError::AuthRequired)?;
     let client = SynsClient::new(config.server_url())?;
 
     match action {
         None => {
-            let response = client.list_collaborators(&repo_id, &token, DEFAULT_COLLABORATOR_LIMIT, 0).await?;
+            let token = TokenStore::new(config.credentials_path()).read().ok().flatten();
+            let response = client.list_collaborators(&repo_id, token.as_deref(), DEFAULT_COLLABORATOR_LIMIT, 0).await?;
             if output.is_json() {
                 output.json(&json!({
                     "collaborators": response.collaborators.iter().map(|c| json!({
@@ -94,19 +108,28 @@ pub async fn cmd_collaborators(
                     ]
                 }).collect();
                 output.table(&["User ID", "Name", "Email", "Role"], rows);
+                if response.total as usize > response.collaborators.len() {
+                    eprintln!("Showing {} of {} collaborators.", response.collaborators.len(), response.total);
+                }
             }
         }
         Some(CollaboratorsAction::Add { user_id, role }) => {
-            let parsed_role = parse_collaborator_role(&role)?;
-            let request = AddCollaboratorRequest { user_id: user_id.clone(), role: parsed_role };
+            let token = TokenStore::new(config.credentials_path())
+                .read()?
+                .ok_or(CliError::AuthRequired)?;
+            let role_str = role.as_str().to_string();
+            let request = AddCollaboratorRequest { user_id: user_id.clone(), role: role.into() };
             client.add_collaborator(&repo_id, &token, &request).await?;
             if output.is_json() {
-                output.json(&json!({"added": true, "user_id": user_id, "role": role}));
+                output.json(&json!({"added": true, "user_id": user_id, "role": role_str}));
             } else {
-                output.success(&format!("Added '{}' as {} collaborator.", user_id, role));
+                output.success(&format!("Added '{}' as {} collaborator.", user_id, role_str));
             }
         }
         Some(CollaboratorsAction::Remove { user_id, yes }) => {
+            let token = TokenStore::new(config.credentials_path())
+                .read()?
+                .ok_or(CliError::AuthRequired)?;
             if !yes && !confirm_remove(&user_id, &repo_id)? {
                 eprintln!("Aborted.");
                 return Ok(());
@@ -160,7 +183,7 @@ mod tests {
             &output,
             Some(CollaboratorsAction::Add {
                 user_id: "bob-123".to_string(),
-                role: "write".to_string(),
+                role: AssignableRole::Write,
             }),
         ).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
