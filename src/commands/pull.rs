@@ -9,7 +9,31 @@ use crate::repo::syns_yaml::write_syns_yaml;
 use console::style;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+fn validate_entry_path(path: &str) -> Result<(), CliError> {
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.contains('\0')
+        || path.split('/').any(|seg| seg == ".." || seg == ".git")
+    {
+        return Err(CliError::Io {
+            message: format!("refusing path outside target directory: {path}"),
+        });
+    }
+    Ok(())
+}
+
+fn safe_join(target_dir: &Path, entry_path: &str) -> Result<PathBuf, CliError> {
+    validate_entry_path(entry_path)?;
+    let joined = target_dir.join(entry_path);
+    if !joined.starts_with(target_dir) {
+        return Err(CliError::Io {
+            message: format!("refusing path outside target directory: {entry_path}"),
+        });
+    }
+    Ok(joined)
+}
 
 pub async fn cmd_pull(
     config: &Config,
@@ -90,7 +114,7 @@ pub async fn cmd_pull(
 
     for entry in &to_download {
         let response = client.get_file(&repo_id, token.as_deref(), &entry.path, version.as_deref()).await?;
-        let file_path = target_dir.join(&entry.path);
+        let file_path = safe_join(&target_dir, &entry.path)?;
         if let Some(parent) = file_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| CliError::Io {
                 message: format!("could not write file {}: {e}", entry.path),
@@ -105,7 +129,7 @@ pub async fn cmd_pull(
     }
 
     for path in &to_delete {
-        let file_path = target_dir.join(path);
+        let file_path = safe_join(&target_dir, path)?;
         match std::fs::remove_file(&file_path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -150,4 +174,76 @@ pub async fn cmd_pull(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_entry_path_accepts_normal_paths() {
+        assert!(validate_entry_path("README.md").is_ok());
+        assert!(validate_entry_path("src/main.rs").is_ok());
+        assert!(validate_entry_path("a/b/c/d.txt").is_ok());
+        assert!(validate_entry_path(".hidden").is_ok());
+        assert!(validate_entry_path("dir/.hidden/file").is_ok());
+    }
+
+    #[test]
+    fn validate_entry_path_rejects_dot_dot() {
+        assert!(validate_entry_path("..").is_err());
+        assert!(validate_entry_path("../etc/passwd").is_err());
+        assert!(validate_entry_path("foo/../../etc/passwd").is_err());
+        assert!(validate_entry_path("foo/..").is_err());
+    }
+
+    #[test]
+    fn validate_entry_path_rejects_absolute_paths() {
+        assert!(validate_entry_path("/etc/passwd").is_err());
+        assert!(validate_entry_path("/tmp/file").is_err());
+    }
+
+    #[test]
+    fn validate_entry_path_rejects_null_bytes() {
+        assert!(validate_entry_path("file\0.txt").is_err());
+        assert!(validate_entry_path("\0").is_err());
+    }
+
+    #[test]
+    fn validate_entry_path_rejects_dot_git() {
+        assert!(validate_entry_path(".git").is_err());
+        assert!(validate_entry_path(".git/config").is_err());
+        assert!(validate_entry_path("foo/.git/hooks").is_err());
+    }
+
+    #[test]
+    fn validate_entry_path_rejects_empty() {
+        assert!(validate_entry_path("").is_err());
+    }
+
+    #[test]
+    fn safe_join_produces_correct_path() {
+        let dir = std::env::temp_dir();
+        let result = safe_join(&dir, "src/main.rs").unwrap();
+        assert_eq!(result, dir.join("src/main.rs"));
+    }
+
+    #[test]
+    fn safe_join_rejects_traversal() {
+        let dir = std::env::temp_dir();
+        assert!(safe_join(&dir, "../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn safe_join_rejects_absolute() {
+        let dir = std::env::temp_dir();
+        assert!(safe_join(&dir, "/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn validate_entry_path_allows_dot_segments_that_are_not_dot_dot() {
+        assert!(validate_entry_path(".gitignore").is_ok());
+        assert!(validate_entry_path("src/.gitkeep").is_ok());
+        assert!(validate_entry_path("...").is_ok());
+    }
 }
