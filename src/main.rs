@@ -110,9 +110,9 @@ enum Commands {
         /// Filter by tag (repeatable)
         #[arg(long)]
         tag: Vec<String>,
-        /// Filter by status (active, draft, completed, abandoned)
+        /// Filter by status
         #[arg(long)]
-        status: Option<String>,
+        status: Option<CliRepoStatus>,
         /// Maximum number of results
         #[arg(long, default_value = "20")]
         limit: u32,
