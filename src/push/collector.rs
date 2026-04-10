@@ -55,7 +55,7 @@ pub fn collect_files(
             None => continue,
         };
 
-        if file_type.is_dir() {
+        if !file_type.is_file() {
             continue;
         }
 
@@ -149,6 +149,37 @@ mod tests {
         assert!(files.contains_key("main.rs"));
         assert!(files.contains_key("test.rs"));
         assert!(!files.contains_key("data.csv"));
+    }
+
+    #[test]
+    fn excludes_git_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("keep.txt"), "keep").unwrap();
+        std::fs::create_dir_all(dir.path().join(".git/objects")).unwrap();
+        std::fs::write(dir.path().join(".git/config"), "[core]").unwrap();
+        std::fs::write(dir.path().join(".git/objects/abc"), "blob").unwrap();
+
+        let files = collect_files(dir.path(), &[]).unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files.contains_key("keep.txt"));
+        assert!(!files.contains_key(".git/config"));
+        assert!(!files.contains_key(".git/objects/abc"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skips_symlink_to_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("keep.txt"), "keep").unwrap();
+        std::fs::create_dir_all(dir.path().join("real_dir")).unwrap();
+        std::fs::write(dir.path().join("real_dir/inner.txt"), "inner").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real_dir"), dir.path().join("link_dir"))
+            .unwrap();
+
+        let files = collect_files(dir.path(), &[]).unwrap();
+        assert!(files.contains_key("keep.txt"));
+        assert!(files.contains_key("real_dir/inner.txt"));
+        assert!(!files.contains_key("link_dir"));
     }
 
     #[test]
