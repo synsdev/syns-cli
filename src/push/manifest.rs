@@ -41,6 +41,10 @@ impl Manifest {
     pub fn commit_sha(&self) -> Option<&str> {
         self.commit_sha.as_deref()
     }
+
+    pub fn file_paths(&self) -> impl Iterator<Item = &str> {
+        self.files.keys().map(|s| s.as_str())
+    }
 }
 
 #[cfg(test)]
@@ -99,6 +103,21 @@ mod tests {
         assert_eq!(manifest.commit_sha(), Some("sha2"));
         assert_eq!(manifest.file_sha("b.txt"), Some("bbb"));
         assert_eq!(manifest.file_sha("a.txt"), None);
+    }
+
+    #[test]
+    fn file_paths_returns_all_keys() {
+        let mut manifest = Manifest::default();
+        manifest.update(
+            "sha1".to_string(),
+            HashMap::from([
+                ("a.txt".to_string(), "aaa".to_string()),
+                ("b.txt".to_string(), "bbb".to_string()),
+            ]),
+        );
+        let mut paths: Vec<&str> = manifest.file_paths().collect();
+        paths.sort();
+        assert_eq!(paths, vec!["a.txt", "b.txt"]);
     }
 
     #[test]
