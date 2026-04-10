@@ -15,6 +15,7 @@ pub async fn cmd_logout(config: &Config, output: &Output) -> Result<(), CliError
     if let Some(token) = &token
         && let Ok(client) = reqwest::Client::builder()
             .timeout(Duration::from_secs(SIGN_OUT_TIMEOUT_SECS))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
     {
         let url = format!("{}{SIGN_OUT_PATH}", config.server_url());

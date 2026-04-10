@@ -8,6 +8,8 @@ const CREDENTIALS_FILE_MODE: u32 = 0o600;
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Credentials {
     token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
 }
 
 pub struct TokenStore {
@@ -43,7 +45,35 @@ impl TokenStore {
         Ok(Some(credentials.token))
     }
 
+    pub fn read_username(&self) -> Result<Option<String>, CliError> {
+        let contents = match std::fs::read_to_string(&self.credentials_path) {
+            Ok(c) => c,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(CliError::Io {
+                    message: format!("could not read credentials: {err}"),
+                });
+            }
+        };
+
+        let credentials: Credentials = serde_json::from_str(&contents).map_err(|err| {
+            CliError::Config {
+                message: format!("invalid credentials file: {err}"),
+            }
+        })?;
+
+        Ok(credentials.username)
+    }
+
     pub fn write(&self, token: &str) -> Result<(), CliError> {
+        self.write_with_username(token, None)
+    }
+
+    pub fn write_with_username(
+        &self,
+        token: &str,
+        username: Option<&str>,
+    ) -> Result<(), CliError> {
         if token.trim().is_empty() {
             return Err(CliError::Config {
                 message: "token must not be empty".into(),
@@ -73,6 +103,7 @@ impl TokenStore {
 
         let json = serde_json::to_string_pretty(&Credentials {
             token: token.to_string(),
+            username: username.map(String::from),
         })
         .expect("Credentials serialization should never fail");
 
@@ -246,5 +277,58 @@ mod tests {
 
         let store = TokenStore::new(path);
         assert_eq!(store.read().unwrap(), None);
+    }
+
+    #[test]
+    fn write_with_username_stores_both_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let store = TokenStore::new(path.clone());
+
+        store.write_with_username("my-token", Some("alice")).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let creds: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(creds["token"], "my-token");
+        assert_eq!(creds["username"], "alice");
+
+        assert_eq!(store.read().unwrap(), Some("my-token".to_string()));
+        assert_eq!(store.read_username().unwrap(), Some("alice".to_string()));
+    }
+
+    #[test]
+    fn write_with_username_none_omits_username_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let store = TokenStore::new(path.clone());
+
+        store.write_with_username("my-token", None).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let creds: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(creds["token"], "my-token");
+        assert!(creds.get("username").is_none());
+
+        assert_eq!(store.read_username().unwrap(), None);
+    }
+
+    #[test]
+    fn read_username_returns_none_when_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent").join("credentials.json");
+        let store = TokenStore::new(path);
+
+        assert_eq!(store.read_username().unwrap(), None);
+    }
+
+    #[test]
+    fn read_username_returns_none_for_legacy_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        // Legacy format: only token, no username field
+        std::fs::write(&path, r#"{"token": "old-token"}"#).unwrap();
+
+        let store = TokenStore::new(path);
+        assert_eq!(store.read_username().unwrap(), None);
     }
 }

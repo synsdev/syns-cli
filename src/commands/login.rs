@@ -16,6 +16,8 @@ pub async fn cmd_login(config: &Config, output: &Output) -> Result<(), CliError>
     match client.get_session(&token).await {
         Ok(session) => {
             let username = &session.user.username;
+            // Re-write credentials with username for downstream identity resolution (U11)
+            let _ = store.write_with_username(&token, Some(username));
             if output.is_json() {
                 output.json(&json!({"username": username}));
             } else {
@@ -89,7 +91,11 @@ mod tests {
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
-        let stored = TokenStore::new(config.credentials_path()).read().unwrap();
-        assert_eq!(stored, Some("test-bearer-token".to_string()));
+        let store = TokenStore::new(config.credentials_path());
+        assert_eq!(store.read().unwrap(), Some("test-bearer-token".to_string()));
+        assert_eq!(
+            store.read_username().unwrap(),
+            Some("testuser".to_string())
+        );
     }
 }
