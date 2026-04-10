@@ -103,9 +103,32 @@ enum Commands {
         yes: bool,
     },
     /// Browse public repositories
-    Explore {},
+    Explore {
+        /// Search repositories by name or description
+        #[arg(long, short = 'q')]
+        query: Option<String>,
+        /// Filter by tag (repeatable)
+        #[arg(long)]
+        tag: Vec<String>,
+        /// Filter by status (active, draft, completed, abandoned)
+        #[arg(long)]
+        status: Option<String>,
+        /// Maximum number of results
+        #[arg(long, default_value = "20")]
+        limit: u32,
+        /// Number of results to skip
+        #[arg(long, default_value = "0")]
+        offset: u32,
+    },
     /// Fork a repository
-    Fork {},
+    Fork {
+        /// Source repository in owner/name format
+        #[arg(value_name = "REPO")]
+        repo: String,
+        /// Custom name for the forked repository
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// Authenticate with the server
     Login {},
     /// Clear stored credentials
@@ -148,8 +171,12 @@ async fn run(command: Commands, config: &config::Config, output: &output::Output
         Commands::Repo { description, status, visibility, tag } => commands::repo::cmd_repo(config, output, description, status, visibility, tag).await?,
         Commands::Collaborators { action } => commands::collaborators::cmd_collaborators(config, output, action).await?,
         Commands::Delete { yes } => commands::delete::cmd_delete(config, output, yes).await?,
-        Commands::Explore {} => output.success("explore: not yet implemented"),
-        Commands::Fork {} => output.success("fork: not yet implemented"),
+        Commands::Explore { query, tag, status, limit, offset } => {
+            commands::explore::cmd_explore(config, output, query, tag, status, limit, offset).await?
+        }
+        Commands::Fork { repo, name } => {
+            commands::fork::cmd_fork(config, output, repo, name).await?
+        }
         Commands::Login {} => commands::login::cmd_login(config, output).await?,
         Commands::Logout {} => commands::logout::cmd_logout(config, output).await?,
         Commands::Whoami {} => commands::whoami::cmd_whoami(config, output).await?,
