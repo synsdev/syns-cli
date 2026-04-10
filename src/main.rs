@@ -45,11 +45,35 @@ enum Commands {
     /// Show repository status
     Status {},
     /// View version history
-    History {},
+    History {
+        /// Filter to a specific file path
+        #[arg(long)]
+        file: Option<String>,
+        /// Maximum number of entries to show
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
     /// Show changes between versions
-    Diff {},
+    Diff {
+        /// Starting version (number or SHA)
+        #[arg(long)]
+        from: Option<String>,
+        /// Ending version (number or SHA)
+        #[arg(long)]
+        to: Option<String>,
+    },
     /// Revert a file to a previous version
-    Revert {},
+    Revert {
+        /// File path to revert
+        #[arg()]
+        path: String,
+        /// Target version (number or SHA) to restore
+        #[arg(long)]
+        to: String,
+        /// Custom commit message
+        #[arg(long)]
+        message: Option<String>,
+    },
     /// Repository management
     Repo {},
     /// Manage repository collaborators
@@ -96,9 +120,9 @@ async fn run(command: Commands, config: &config::Config, output: &output::Output
         Commands::Ls { path } => commands::ls::cmd_ls(config, output, path).await?,
         Commands::Cat { path } => commands::cat::cmd_cat(config, output, path).await?,
         Commands::Status {} => commands::status::cmd_status(config, output).await?,
-        Commands::History {} => output.success("history: not yet implemented"),
-        Commands::Diff {} => output.success("diff: not yet implemented"),
-        Commands::Revert {} => output.success("revert: not yet implemented"),
+        Commands::History { file, limit } => commands::history::cmd_history(config, output, file, limit).await?,
+        Commands::Diff { from, to } => commands::diff::cmd_diff(config, output, from, to).await?,
+        Commands::Revert { path, to, message } => commands::revert::cmd_revert(config, output, path, to, message).await?,
         Commands::Repo {} => output.success("repo: not yet implemented"),
         Commands::Collaborators {} => output.success("collaborators: not yet implemented"),
         Commands::Delete {} => output.success("delete: not yet implemented"),
