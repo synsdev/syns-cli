@@ -31,7 +31,17 @@ enum Commands {
     /// Push files to a repository
     Push {},
     /// Pull files from a repository
-    Pull {},
+    Pull {
+        /// Repository in OWNER/NAME format
+        #[arg()]
+        repo: Option<String>,
+        /// Target directory (defaults to current directory)
+        #[arg()]
+        path: Option<String>,
+        /// Pull files at a specific version (number or SHA)
+        #[arg(long)]
+        version: Option<String>,
+    },
     /// List files in a repository
     Ls {
         /// Subdirectory path to list
@@ -161,7 +171,7 @@ async fn main() {
 async fn run(command: Commands, config: &config::Config, output: &output::Output) -> Result<(), errors::CliError> {
     match command {
         Commands::Push {} => output.success("push: not yet implemented"),
-        Commands::Pull {} => output.success("pull: not yet implemented"),
+        Commands::Pull { repo, path, version } => commands::pull::cmd_pull(config, output, repo, path, version).await?,
         Commands::Ls { path } => commands::ls::cmd_ls(config, output, path).await?,
         Commands::Cat { path } => commands::cat::cmd_cat(config, output, path).await?,
         Commands::Status {} => commands::status::cmd_status(config, output).await?,

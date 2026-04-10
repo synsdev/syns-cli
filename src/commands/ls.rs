@@ -15,7 +15,7 @@ pub async fn cmd_ls(config: &Config, output: &Output, path: Option<String>) -> R
     let token = TokenStore::new(config.credentials_path()).read().ok().flatten();
     let client = SynsClient::new(config.server_url())?;
 
-    let mut response = client.get_tree(&repo_id, token.as_deref(), path.as_deref(), false).await?;
+    let mut response = client.get_tree(&repo_id, token.as_deref(), path.as_deref(), false, None).await?;
 
     response.entries.sort_by(|a, b| {
         let type_order = |t: &EntryType| match t {

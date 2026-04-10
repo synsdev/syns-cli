@@ -418,13 +418,14 @@ impl SynsClient {
         process_response(response).await
     }
 
-    pub async fn get_tree(&self, repo_id: &str, token: Option<&str>, path: Option<&str>, recursive: bool) -> Result<TreeResponse, CliError> {
+    pub async fn get_tree(&self, repo_id: &str, token: Option<&str>, path: Option<&str>, recursive: bool, version_ref: Option<&str>) -> Result<TreeResponse, CliError> {
         let url = match path {
             Some(p) => format!("{}/api/v1/repos/{}/tree/{}", self.base_url, repo_id, encode_path_segments(p)),
             None => format!("{}/api/v1/repos/{}/tree", self.base_url, repo_id),
         };
         let mut req = self.client.get(&url);
         if recursive { req = req.query(&[("recursive", "true")]); }
+        if let Some(r) = version_ref { req = req.query(&[("ref", r)]); }
         if let Some(t) = token { req = req.bearer_auth(t); }
         let response = req.send().await?;
         process_response(response).await
