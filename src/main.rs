@@ -31,9 +31,17 @@ enum Commands {
     /// Pull files from a repository
     Pull {},
     /// List files in a repository
-    Ls {},
+    Ls {
+        /// Subdirectory path to list
+        #[arg()]
+        path: Option<String>,
+    },
     /// View a file's content
-    Cat {},
+    Cat {
+        /// File path to display
+        #[arg()]
+        path: String,
+    },
     /// Show repository status
     Status {},
     /// View version history
@@ -85,9 +93,9 @@ async fn run(command: Commands, config: &config::Config, output: &output::Output
     match command {
         Commands::Push {} => output.success("push: not yet implemented"),
         Commands::Pull {} => output.success("pull: not yet implemented"),
-        Commands::Ls {} => output.success("ls: not yet implemented"),
-        Commands::Cat {} => output.success("cat: not yet implemented"),
-        Commands::Status {} => output.success("status: not yet implemented"),
+        Commands::Ls { path } => commands::ls::cmd_ls(config, output, path).await?,
+        Commands::Cat { path } => commands::cat::cmd_cat(config, output, path).await?,
+        Commands::Status {} => commands::status::cmd_status(config, output).await?,
         Commands::History {} => output.success("history: not yet implemented"),
         Commands::Diff {} => output.success("diff: not yet implemented"),
         Commands::Revert {} => output.success("revert: not yet implemented"),
