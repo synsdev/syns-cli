@@ -23,7 +23,9 @@ impl Manifest {
                 message: format!("could not create manifest directory: {err}"),
             })?;
         }
-        let json = serde_json::to_string_pretty(self).unwrap();
+        let json = serde_json::to_string_pretty(self).map_err(|e| CliError::Io {
+            message: format!("could not serialize manifest: {e}"),
+        })?;
         std::fs::write(&path, json).map_err(|err| CliError::Io {
             message: format!("could not save manifest: {err}"),
         })

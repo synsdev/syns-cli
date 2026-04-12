@@ -101,7 +101,7 @@ pub struct PushEntry {
 #[derive(Serialize)]
 pub struct ForkRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_name: Option<String>,
+    pub name: Option<String>,
 }
 
 #[derive(Serialize)]

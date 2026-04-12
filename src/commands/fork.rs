@@ -40,7 +40,7 @@ pub async fn cmd_fork(
 
     let client = SynsClient::new(config.server_url())?;
 
-    let request = ForkRequest { target_name: name };
+    let request = ForkRequest { name };
 
     let response = client.fork(&repo, &token, &request).await?;
 

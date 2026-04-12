@@ -188,7 +188,9 @@ pub async fn smart_push(
     // Phase 4 — Manifest save
     let mut manifest = Manifest::default();
     manifest.update(response.commit_sha.clone(), local_shas);
-    let _ = manifest.save(&opts.cache_dir, owner, name);
+    if let Err(e) = manifest.save(&opts.cache_dir, owner, name) {
+        eprintln!("warning: could not save manifest (next push will re-upload all files): {e}");
+    }
 
     Ok(response)
 }
