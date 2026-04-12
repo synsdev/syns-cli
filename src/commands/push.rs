@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use clap::Args;
 
 use crate::auth::token::TokenStore;
-use crate::client::{PushResponse, RepoStatus, SynsClient, Visibility};
+use crate::client::{PushResponse, SynsClient};
+use crate::commands::repo::{CliRepoStatus, CliVisibility};
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
@@ -40,34 +41,16 @@ pub struct PushArgs {
     pub tag: Vec<String>,
 
     /// Set repository status
-    #[arg(long, value_parser = ["active", "draft", "completed", "abandoned"])]
-    pub status: Option<String>,
+    #[arg(long)]
+    pub status: Option<CliRepoStatus>,
 
     /// Set repository visibility
-    #[arg(long, value_parser = ["public", "private"])]
-    pub visibility: Option<String>,
+    #[arg(long)]
+    pub visibility: Option<CliVisibility>,
 
     /// Directory to push (defaults to current directory)
     #[arg(value_name = "PATH")]
     pub path: Option<PathBuf>,
-}
-
-fn parse_status(s: &str) -> RepoStatus {
-    match s {
-        "active" => RepoStatus::Active,
-        "draft" => RepoStatus::Draft,
-        "completed" => RepoStatus::Completed,
-        "abandoned" => RepoStatus::Abandoned,
-        _ => unreachable!("clap validates status values"),
-    }
-}
-
-fn parse_visibility(s: &str) -> Visibility {
-    match s {
-        "public" => Visibility::Public,
-        "private" => Visibility::Private,
-        _ => unreachable!("clap validates visibility values"),
-    }
 }
 
 async fn resolve_owner(
@@ -109,8 +92,8 @@ pub async fn cmd_push(
 
     let repo_id = format!("{owner}/{}", identity.name);
 
-    let status = args.status.as_deref().map(parse_status);
-    let visibility = args.visibility.as_deref().map(parse_visibility);
+    let status = args.status.clone().map(Into::into);
+    let visibility = args.visibility.clone().map(Into::into);
 
     let message = args
         .message
@@ -163,7 +146,7 @@ fn format_response(output: &Output, response: &PushResponse, repo_id: &str) {
             vec![
                 vec![
                     "commit".into(),
-                    response.commit_sha[..SHORT_SHA_LENGTH].into(),
+                    response.commit_sha[..response.commit_sha.len().min(SHORT_SHA_LENGTH)].into(),
                 ],
                 vec!["added".into(), response.added.to_string()],
                 vec!["updated".into(), response.updated.to_string()],
@@ -336,8 +319,8 @@ mod tests {
         let args = PushArgs {
             description: Some("My project description".into()),
             tag: vec!["rust".into(), "cli".into()],
-            status: Some("active".into()),
-            visibility: Some("public".into()),
+            status: Some(CliRepoStatus::Active),
+            visibility: Some(CliVisibility::Public),
             path: Some(temp_dir.path().into()),
             ..default_push_args()
         };
