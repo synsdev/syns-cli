@@ -9,6 +9,7 @@ mod commands;
 
 use clap::{Parser, Subcommand};
 use crate::commands::collaborators::CollaboratorsAction;
+use crate::commands::push::PushArgs;
 use crate::commands::repo::{CliRepoStatus, CliVisibility};
 
 #[derive(Parser)]
@@ -29,7 +30,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Push files to a repository
-    Push {},
+    Push(PushArgs),
     /// Pull files from a repository
     Pull {
         /// Repository in OWNER/NAME format
@@ -170,7 +171,7 @@ async fn main() {
 
 async fn run(command: Commands, config: &config::Config, output: &output::Output) -> Result<(), errors::CliError> {
     match command {
-        Commands::Push {} => output.success("push: not yet implemented"),
+        Commands::Push(args) => commands::push::cmd_push(config, output, &args).await?,
         Commands::Pull { repo, path, version } => commands::pull::cmd_pull(config, output, repo, path, version).await?,
         Commands::Ls { path } => commands::ls::cmd_ls(config, output, path).await?,
         Commands::Cat { path } => commands::cat::cmd_cat(config, output, path).await?,
