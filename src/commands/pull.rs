@@ -158,7 +158,7 @@ pub async fn cmd_pull(
     if output.is_json() {
         let mut summary = json!({
             "repo": repo_id,
-            "commit_sha": tree_response.commit_sha,
+            "commitSha": tree_response.commit_sha,
             "downloaded": downloaded,
             "unchanged": unchanged_count,
             "deleted": deleted,
