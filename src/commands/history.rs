@@ -20,27 +20,27 @@ pub async fn cmd_history(config: &Config, output: &Output, file: Option<String>,
 
         if output.is_json() {
             output.json(&json!({
-                "commits": response.commits.iter().map(|c| json!({
+                "data": response.data.iter().map(|c| json!({
+                    "version": c.version,
                     "sha": c.sha,
+                    "blob_sha": c.blob_sha,
                     "message": c.message,
                     "author": c.author,
-                    "timestamp": c.timestamp,
-                    "files_changed": c.files_changed,
-                    "file_content": c.file_content,
-                    "file_sha": c.file_sha,
-                    "file_diff": c.file_diff,
+                    "created_at": c.created_at,
+                    "content": c.content,
+                    "diff": c.diff,
                 })).collect::<Vec<_>>(),
                 "total": response.total,
                 "limit": response.limit,
                 "offset": response.offset,
             }));
         } else {
-            let rows = response.commits.iter().map(|entry| {
+            let rows = response.data.iter().map(|entry| {
                 vec![
                     entry.sha[..entry.sha.len().min(8)].to_string(),
                     entry.message.clone(),
                     entry.author.clone(),
-                    entry.timestamp.clone(),
+                    entry.created_at.clone(),
                 ]
             }).collect();
             output.table(&["SHA", "Message", "Author", "Date"], rows);
@@ -55,7 +55,7 @@ pub async fn cmd_history(config: &Config, output: &Output, file: Option<String>,
                     "sha": v.sha,
                     "message": v.message,
                     "author": v.author,
-                    "timestamp": v.timestamp,
+                    "created_at": v.created_at,
                     "files_changed": v.files_changed,
                 })).collect::<Vec<_>>(),
                 "total": response.total,
@@ -70,7 +70,7 @@ pub async fn cmd_history(config: &Config, output: &Output, file: Option<String>,
                     entry.sha[..entry.sha.len().min(8)].to_string(),
                     entry.message.clone(),
                     entry.author.clone(),
-                    entry.timestamp.clone(),
+                    entry.created_at.clone(),
                     if n == 1 { "1 file".to_string() } else { format!("{n} files") },
                 ]
             }).collect();
@@ -112,24 +112,24 @@ mod tests {
                         "sha": "ccc33333ccc33333",
                         "message": "third commit",
                         "author": "alice",
-                        "timestamp": "2025-01-03T00:00:00Z",
-                        "files_changed": ["a.ts", "b.ts"]
+                        "createdAt": "2025-01-03T00:00:00Z",
+                        "filesChanged": ["a.ts", "b.ts"]
                     },
                     {
                         "version": 2,
                         "sha": "bbb22222bbb22222",
                         "message": "second commit",
                         "author": "alice",
-                        "timestamp": "2025-01-02T00:00:00Z",
-                        "files_changed": ["a.ts", "c.ts"]
+                        "createdAt": "2025-01-02T00:00:00Z",
+                        "filesChanged": ["a.ts", "c.ts"]
                     },
                     {
                         "version": 1,
                         "sha": "aaa11111aaa11111",
                         "message": "first commit",
                         "author": "alice",
-                        "timestamp": "2025-01-01T00:00:00Z",
-                        "files_changed": ["a.ts"]
+                        "createdAt": "2025-01-01T00:00:00Z",
+                        "filesChanged": ["a.ts"]
                     }
                 ],
                 "total": 3,
@@ -165,26 +165,26 @@ mod tests {
             .and(path("/api/v1/repos/alice/my-project/files/src/main.ts/history"))
             .and(query_param("limit", "50"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "commits": [
+                "data": [
                     {
+                        "version": 3,
                         "sha": "ccc33333ccc33333",
+                        "blobSha": "blob3",
                         "message": "update main",
                         "author": "alice",
-                        "timestamp": "2025-01-03T00:00:00Z",
-                        "files_changed": ["src/main.ts"],
-                        "file_content": "console.log('v3');",
-                        "file_sha": "sha3",
-                        "file_diff": "--- a\n+++ b\n@@ -1 +1 @@\n-v2\n+v3"
+                        "createdAt": "2025-01-03T00:00:00Z",
+                        "content": "console.log('v3');",
+                        "diff": "--- a\n+++ b\n@@ -1 +1 @@\n-v2\n+v3"
                     },
                     {
+                        "version": 1,
                         "sha": "aaa11111aaa11111",
+                        "blobSha": "blob1",
                         "message": "add main",
                         "author": "alice",
-                        "timestamp": "2025-01-01T00:00:00Z",
-                        "files_changed": ["src/main.ts"],
-                        "file_content": "console.log('v1');",
-                        "file_sha": "sha1",
-                        "file_diff": null
+                        "createdAt": "2025-01-01T00:00:00Z",
+                        "content": "console.log('v1');",
+                        "diff": null
                     }
                 ],
                 "total": 2,

@@ -44,19 +44,20 @@ pub async fn cmd_fork(
 
     let response = client.fork(&repo, &token, &request).await?;
 
-    let fork_identity = parse_fork_identity(&response.id);
+    let fork_id = format!("{}/{}", response.owner, response.name);
+    let fork_identity = parse_fork_identity(&fork_id);
 
     if output.is_json() {
         output.json(&json!({
-            "id": response.id,
-            "commit_sha": response.commit_sha,
-            "file_count": response.file_count,
-            "commit_count": response.commit_count,
+            "owner": response.owner,
+            "name": response.name,
+            "commitSha": response.commit_sha,
+            "fileCount": response.file_count,
         }));
     } else {
-        output.success(&format!("Forked {} → {}", repo, response.id));
+        output.success(&format!("Forked {} → {}", repo, fork_id));
         eprintln!("{}", style(format!(
-            "{} files, {} commits", response.file_count, response.commit_count
+            "{} files", response.file_count
         )).dim());
     }
 
@@ -105,10 +106,18 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/v1/repos/alice/my-project/fork"))
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
-                "id": "bob/my-project",
-                "commit_sha": "abc123",
-                "file_count": 5,
-                "commit_count": 3
+                "owner": "bob",
+                "name": "my-project",
+                "description": null,
+                "commitSha": "abc123",
+                "status": "active",
+                "visibility": "public",
+                "tags": [],
+                "fileCount": 5,
+                "forkCount": 0,
+                "forkedFrom": { "owner": "alice", "name": "my-project" },
+                "createdAt": "2025-01-01T00:00:00Z",
+                "updatedAt": "2025-01-01T00:00:00Z"
             })))
             .mount(&mock_server)
             .await;

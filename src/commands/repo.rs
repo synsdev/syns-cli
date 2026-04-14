@@ -44,7 +44,7 @@ fn display_repo(output: &Output, response: &RepoResponse) {
         output.json(&response);
     } else {
         let rows = vec![
-            vec!["Repository".into(), response.id.clone()],
+            vec!["Repository".into(), format!("{}/{}", response.owner, response.name)],
             vec!["Description".into(), response.description.as_deref().unwrap_or("(none)").to_string()],
             vec!["Status".into(), format!("{:?}", response.status).to_lowercase()],
             vec!["Visibility".into(), format!("{:?}", response.visibility).to_lowercase()],
@@ -83,6 +83,7 @@ pub async fn cmd_repo(
             description,
             status: status.map(|s| s.into()),
             visibility: visibility.map(|v| v.into()),
+            author: None,
             tags: if tags.is_empty() { None } else { Some(tags) },
         };
         let response = client.update_repo(&repo_id, &token, &update).await?;
@@ -119,19 +120,18 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/v1/repos/alice/my-project"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "alice/my-project",
+                "owner": "alice",
                 "name": "my-project",
                 "description": "Test repo",
-                "owner_id": "user1",
                 "status": "active",
                 "visibility": "public",
                 "tags": ["api", "v2"],
-                "commit_sha": "abc12345def67890",
-                "file_count": 42,
-                "fork_count": 0,
-                "forked_from": null,
-                "created_at": "2025-01-01T00:00:00Z",
-                "updated_at": "2025-06-01T00:00:00Z"
+                "commitSha": "abc12345def67890",
+                "fileCount": 42,
+                "forkCount": 0,
+                "forkedFrom": null,
+                "createdAt": "2025-01-01T00:00:00Z",
+                "updatedAt": "2025-06-01T00:00:00Z"
             })))
             .mount(&mock_server)
             .await;
@@ -164,19 +164,18 @@ mod tests {
         Mock::given(method("PATCH"))
             .and(path("/api/v1/repos/alice/my-project"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "alice/my-project",
+                "owner": "alice",
                 "name": "my-project",
                 "description": "Test repo",
-                "owner_id": "user1",
                 "status": "active",
                 "visibility": "public",
                 "tags": [],
-                "commit_sha": "abc12345def67890",
-                "file_count": 42,
-                "fork_count": 0,
-                "forked_from": null,
-                "created_at": "2025-01-01T00:00:00Z",
-                "updated_at": "2025-06-01T00:00:00Z"
+                "commitSha": "abc12345def67890",
+                "fileCount": 42,
+                "forkCount": 0,
+                "forkedFrom": null,
+                "createdAt": "2025-01-01T00:00:00Z",
+                "updatedAt": "2025-06-01T00:00:00Z"
             })))
             .mount(&mock_server)
             .await;

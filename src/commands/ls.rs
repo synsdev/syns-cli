@@ -41,7 +41,7 @@ pub async fn cmd_ls(config: &Config, output: &Output, path: Option<String>) -> R
                 "sha": e.sha,
             })
         }).collect();
-        output.json(&json!({ "entries": entries, "commit_sha": response.commit_sha }));
+        output.json(&json!({ "entries": entries, "commitSha": response.commit_sha }));
     } else {
         let rows: Vec<Vec<String>> = response.entries.iter().map(|e| {
             vec![
@@ -90,7 +90,8 @@ mod tests {
                     { "name": "README.md", "path": "README.md", "type": "file", "size": 256, "sha": "abc123" },
                     { "name": "src", "path": "src", "type": "dir", "size": null, "sha": null }
                 ],
-                "commit_sha": "def456"
+                "commitSha": "def456",
+                "truncated": false
             })))
             .mount(&mock_server)
             .await;
@@ -124,7 +125,8 @@ mod tests {
                     { "name": "README.md", "path": "README.md", "type": "file", "size": 256, "sha": "abc123" },
                     { "name": "src", "path": "src", "type": "dir", "size": null, "sha": null }
                 ],
-                "commit_sha": "def456"
+                "commitSha": "def456",
+                "truncated": false
             })))
             .mount(&mock_server)
             .await;

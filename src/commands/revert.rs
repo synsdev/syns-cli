@@ -22,11 +22,13 @@ pub async fn cmd_revert(config: &Config, output: &Output, path: String, to: Stri
 
     if output.is_json() {
         output.json(&json!({
-            "commit_sha": response.commit_sha,
-            "changed": response.changed,
+            "commitSha": response.commit_sha,
+            "version": response.version,
+            "filesChanged": response.files_changed,
+            "created": response.created,
             "path": path,
         }));
-    } else if response.changed {
+    } else if response.files_changed > 0 {
         output.success(&format!(
             "Reverted {} to {} (commit {})",
             path, to, &response.commit_sha[..response.commit_sha.len().min(8)]
@@ -67,8 +69,10 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/v1/repos/alice/my-project/files/src/config.ts/revert"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "commit_sha": "ddd44444ddd44444",
-                "changed": true
+                "commitSha": "ddd44444ddd44444",
+                "version": 4,
+                "filesChanged": 1,
+                "created": false
             })))
             .mount(&mock_server)
             .await;

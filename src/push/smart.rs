@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::client::{
-    EntryType, PushEntry, PushRequest, PushResponse, RepoStatus, SynsClient, TreeResponse,
-    Visibility,
+    EntryType, PushDeleteEntry, PushFileEntry, PushRequest, PushResponse, RepoStatus, SynsClient,
+    TreeResponse, Visibility,
 };
 use crate::errors::CliError;
 use crate::push::collector::collect_files;
@@ -43,8 +43,8 @@ fn build_push_entries(
     local_shas: &HashMap<String, String>,
     reference_shas: &HashMap<String, String>,
     force: bool,
-) -> Result<(HashMap<String, PushEntry>, Vec<String>), CliError> {
-    let mut entries = HashMap::new();
+) -> Result<(Vec<PushFileEntry>, Vec<PushDeleteEntry>), CliError> {
+    let mut entries = Vec::new();
     let mut deletes = Vec::new();
 
     for (path, sha) in local_shas {
@@ -58,13 +58,13 @@ fn build_push_entries(
         } else {
             None
         };
-        entries.insert(path.clone(), PushEntry { sha: sha.clone(), content });
+        entries.push(PushFileEntry { path: path.clone(), sha: sha.clone(), content });
     }
 
     if !force {
         for path in reference_shas.keys() {
             if !local_shas.contains_key(path) {
-                deletes.push(path.clone());
+                deletes.push(PushDeleteEntry { path: path.clone() });
             }
         }
     }
@@ -73,31 +73,27 @@ fn build_push_entries(
 }
 
 fn upgrade_to_full(
-    entries: &HashMap<String, PushEntry>,
+    entries: &[PushFileEntry],
     local_files: &HashMap<String, Vec<u8>>,
-) -> Result<HashMap<String, PushEntry>, CliError> {
-    let mut upgraded = HashMap::new();
-    for (path, entry) in entries {
+) -> Result<Vec<PushFileEntry>, CliError> {
+    let mut upgraded = Vec::new();
+    for entry in entries {
         if entry.content.is_some() {
-            upgraded.insert(
-                path.clone(),
-                PushEntry {
-                    sha: entry.sha.clone(),
-                    content: entry.content.clone(),
-                },
-            );
+            upgraded.push(PushFileEntry {
+                path: entry.path.clone(),
+                sha: entry.sha.clone(),
+                content: entry.content.clone(),
+            });
         } else {
-            let bytes = &local_files[path];
+            let bytes = &local_files[&entry.path];
             let utf8 = String::from_utf8(bytes.clone()).map_err(|_| CliError::Io {
-                message: format!("file is not valid UTF-8: {path}"),
+                message: format!("file is not valid UTF-8: {}", entry.path),
             })?;
-            upgraded.insert(
-                path.clone(),
-                PushEntry {
-                    sha: entry.sha.clone(),
-                    content: Some(utf8),
-                },
-            );
+            upgraded.push(PushFileEntry {
+                path: entry.path.clone(),
+                sha: entry.sha.clone(),
+                content: Some(utf8),
+            });
         }
     }
     Ok(upgraded)
@@ -153,9 +149,11 @@ pub async fn smart_push(
     // Phase 3 — Build and send
     let (entries, deletes) = build_push_entries(&local_files, &local_shas, &reference_shas, opts.force)?;
 
+    let deletions = if deletes.is_empty() { None } else { Some(deletes) };
+
     let request = PushRequest {
         files: entries,
-        delete: deletes,
+        deletions,
         message: opts.message.clone(),
         author: opts.author.clone(),
         parent_sha,
@@ -171,7 +169,7 @@ pub async fn smart_push(
             let retry_entries = upgrade_to_full(&request.files, &local_files)?;
             let retry_request = PushRequest {
                 files: retry_entries,
-                delete: request.delete.clone(),
+                deletions: request.deletions.clone(),
                 message: request.message.clone(),
                 author: request.author.clone(),
                 parent_sha: request.parent_sha.clone(),
@@ -217,12 +215,10 @@ mod tests {
         Mock::given(method("PUT"))
             .and(path("/api/v1/repos/alice/new-repo/push"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "commit_sha": "abc123",
-                "added": 2,
-                "updated": 0,
-                "deleted": 0,
-                "file_count": 2,
-                "changed": true
+                "commitSha": "abc123",
+                "version": 1,
+                "filesChanged": 2,
+                "created": true
             })))
             .mount(&mock_server)
             .await;
@@ -271,11 +267,13 @@ mod tests {
         let put_request = requests.iter().find(|r| r.method == reqwest::Method::PUT).unwrap();
         let body: serde_json::Value = serde_json::from_slice(&put_request.body).unwrap();
 
-        let files = body["files"].as_object().unwrap();
-        assert!(files["main.txt"]["content"].is_string());
-        assert!(files["sub/other.txt"]["content"].is_string());
-        assert!(body["parent_sha"].is_null());
-        assert!(body["delete"].as_array().unwrap().is_empty());
+        let files = body["files"].as_array().unwrap();
+        let has_main = files.iter().any(|f| f["path"] == "main.txt" && f["content"].is_string());
+        let has_other = files.iter().any(|f| f["path"] == "sub/other.txt" && f["content"].is_string());
+        assert!(has_main);
+        assert!(has_other);
+        assert!(body["parentSha"].is_null());
+        assert!(body.get("deletions").is_none() || body["deletions"].is_null());
     }
 
     #[tokio::test]
@@ -285,12 +283,10 @@ mod tests {
         Mock::given(method("PUT"))
             .and(path("/api/v1/repos/bob/my-repo/push"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "commit_sha": "def456",
-                "added": 0,
-                "updated": 1,
-                "deleted": 0,
-                "file_count": 2,
-                "changed": true
+                "commitSha": "def456",
+                "version": 2,
+                "filesChanged": 1,
+                "created": false
             })))
             .mount(&mock_server)
             .await;
@@ -343,11 +339,13 @@ mod tests {
         let put_request = requests.iter().find(|r| r.method == reqwest::Method::PUT).unwrap();
         let body: serde_json::Value = serde_json::from_slice(&put_request.body).unwrap();
 
-        let files = body["files"].as_object().unwrap();
-        assert!(files["a.txt"]["content"].is_null(), "unchanged file should be sha-only");
-        assert_eq!(files["b.txt"]["content"].as_str(), Some("modified"));
-        assert_eq!(body["parent_sha"].as_str(), Some("old-sha"));
-        assert!(body["delete"].as_array().unwrap().is_empty());
+        let files = body["files"].as_array().unwrap();
+        let a_entry = files.iter().find(|f| f["path"] == "a.txt").unwrap();
+        assert!(a_entry["content"].is_null(), "unchanged file should be sha-only");
+        let b_entry = files.iter().find(|f| f["path"] == "b.txt").unwrap();
+        assert_eq!(b_entry["content"].as_str(), Some("modified"));
+        assert_eq!(body["parentSha"].as_str(), Some("old-sha"));
+        assert!(body.get("deletions").is_none() || body["deletions"].is_null());
     }
 
     #[tokio::test]
@@ -357,12 +355,10 @@ mod tests {
         Mock::given(method("PUT"))
             .and(path("/api/v1/repos/owner/repo/push"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "commit_sha": "del123",
-                "added": 0,
-                "updated": 0,
-                "deleted": 1,
-                "file_count": 1,
-                "changed": true
+                "commitSha": "del123",
+                "version": 3,
+                "filesChanged": 1,
+                "created": false
             })))
             .mount(&mock_server)
             .await;
@@ -414,16 +410,17 @@ mod tests {
         let put_request = requests.iter().find(|r| r.method == reqwest::Method::PUT).unwrap();
         let body: serde_json::Value = serde_json::from_slice(&put_request.body).unwrap();
 
-        let deletes: Vec<&str> = body["delete"]
+        let deletes: Vec<&str> = body["deletions"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|v| v.as_str().unwrap())
+            .map(|v| v["path"].as_str().unwrap())
             .collect();
         assert_eq!(deletes, vec!["removed.txt"]);
 
-        let files = body["files"].as_object().unwrap();
-        assert!(files["keep.txt"]["content"].is_null(), "unchanged file should be sha-only");
+        let files = body["files"].as_array().unwrap();
+        let keep_entry = files.iter().find(|f| f["path"] == "keep.txt").unwrap();
+        assert!(keep_entry["content"].is_null(), "unchanged file should be sha-only");
     }
 
     #[tokio::test]
@@ -434,12 +431,10 @@ mod tests {
         Mock::given(method("PUT"))
             .and(path("/api/v1/repos/owner/repo/push"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "commit_sha": "retry123",
-                "added": 1,
-                "updated": 1,
-                "deleted": 0,
-                "file_count": 2,
-                "changed": true
+                "commitSha": "retry123",
+                "version": 4,
+                "filesChanged": 2,
+                "created": false
             })))
             .with_priority(2)
             .mount(&mock_server)
@@ -510,11 +505,13 @@ mod tests {
 
         // First request: b.txt should be sha-only (unchanged per manifest)
         let body1: serde_json::Value = serde_json::from_slice(&put_requests[0].body).unwrap();
-        assert!(body1["files"]["b.txt"]["content"].is_null());
+        let b_entry1 = body1["files"].as_array().unwrap().iter().find(|f| f["path"] == "b.txt").unwrap().clone();
+        assert!(b_entry1["content"].is_null());
 
         // Second request (retry): b.txt should have content (upgraded)
         let body2: serde_json::Value = serde_json::from_slice(&put_requests[1].body).unwrap();
-        assert_eq!(body2["files"]["b.txt"]["content"].as_str(), Some("old-b"));
+        let b_entry2 = body2["files"].as_array().unwrap().iter().find(|f| f["path"] == "b.txt").unwrap().clone();
+        assert_eq!(b_entry2["content"].as_str(), Some("old-b"));
     }
 
     #[tokio::test]
@@ -524,12 +521,10 @@ mod tests {
         Mock::given(method("PUT"))
             .and(path("/api/v1/repos/owner/repo/push"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "commit_sha": "force123",
-                "added": 0,
-                "updated": 2,
-                "deleted": 0,
-                "file_count": 2,
-                "changed": true
+                "commitSha": "force123",
+                "version": 5,
+                "filesChanged": 2,
+                "created": false
             })))
             .mount(&mock_server)
             .await;
@@ -584,11 +579,13 @@ mod tests {
         assert_eq!(requests[0].method, reqwest::Method::PUT);
 
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        let files = body["files"].as_object().unwrap();
-        assert!(files["a.txt"]["content"].is_string(), "force should send all content");
-        assert!(files["b.txt"]["content"].is_string(), "force should send all content");
-        assert!(body["parent_sha"].is_null(), "force defaults parent_sha to None");
-        assert!(body["delete"].as_array().unwrap().is_empty());
+        let files = body["files"].as_array().unwrap();
+        let a_entry = files.iter().find(|f| f["path"] == "a.txt").unwrap();
+        assert!(a_entry["content"].is_string(), "force should send all content");
+        let b_entry = files.iter().find(|f| f["path"] == "b.txt").unwrap();
+        assert!(b_entry["content"].is_string(), "force should send all content");
+        assert!(body["parentSha"].is_null(), "force defaults parent_sha to None");
+        assert!(body.get("deletions").is_none() || body["deletions"].is_null());
 
         // Manifest was still saved
         assert!(cache_dir.path().join("owner").join("repo.json").exists());

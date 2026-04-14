@@ -34,7 +34,7 @@ pub async fn cmd_explore(
     } else {
         let rows: Vec<Vec<String>> = response.data.iter().map(|repo| {
             vec![
-                repo.id.clone(),
+                format!("{}/{}", repo.owner, repo.name),
                 repo.description.as_deref().unwrap_or("-").to_string(),
                 repo.status.as_query_str().to_string(),
                 repo.fork_count.to_string(),
@@ -73,34 +73,32 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": [
                     {
-                        "id": "alice/project-a",
+                        "owner": "alice",
                         "name": "project-a",
                         "description": "First project",
-                        "owner_id": "u1",
                         "status": "active",
                         "visibility": "public",
                         "tags": ["api"],
-                        "commit_sha": "abc123",
-                        "file_count": 10,
-                        "fork_count": 2,
-                        "forked_from": null,
-                        "created_at": "2025-01-01T00:00:00Z",
-                        "updated_at": "2025-06-01T00:00:00Z"
+                        "commitSha": "abc123",
+                        "fileCount": 10,
+                        "forkCount": 2,
+                        "forkedFrom": null,
+                        "createdAt": "2025-01-01T00:00:00Z",
+                        "updatedAt": "2025-06-01T00:00:00Z"
                     },
                     {
-                        "id": "bob/project-b",
+                        "owner": "bob",
                         "name": "project-b",
                         "description": null,
-                        "owner_id": "u2",
                         "status": "draft",
                         "visibility": "public",
                         "tags": [],
-                        "commit_sha": null,
-                        "file_count": 0,
-                        "fork_count": 0,
-                        "forked_from": null,
-                        "created_at": "2025-02-01T00:00:00Z",
-                        "updated_at": "2025-06-02T00:00:00Z"
+                        "commitSha": null,
+                        "fileCount": 0,
+                        "forkCount": 0,
+                        "forkedFrom": null,
+                        "createdAt": "2025-02-01T00:00:00Z",
+                        "updatedAt": "2025-06-02T00:00:00Z"
                     }
                 ],
                 "total": 3,

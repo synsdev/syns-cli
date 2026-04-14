@@ -91,7 +91,7 @@ pub struct PushRequest {
     pub visibility: Option<Visibility>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct PushFileEntry {
     pub path: String,
     pub sha: String,
@@ -99,7 +99,7 @@ pub struct PushFileEntry {
     pub content: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct PushDeleteEntry {
     pub path: String,
 }

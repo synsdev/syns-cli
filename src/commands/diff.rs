@@ -55,23 +55,25 @@ pub async fn cmd_diff(config: &Config, output: &Output, from: Option<String>, to
 
     if output.is_json() {
         output.json(&json!({
-            "from_sha": response.from_sha,
-            "to_sha": response.to_sha,
-            "entries": response.entries.iter().map(|e| json!({
+            "from": { "version": response.from.version, "sha": response.from.sha },
+            "to": { "version": response.to.version, "sha": response.to.sha },
+            "files": response.files.iter().map(|e| json!({
                 "path": e.path,
                 "status": status_str(&e.status),
                 "diff": e.diff,
             })).collect::<Vec<_>>(),
         }));
     } else {
-        if response.entries.is_empty() {
+        if response.files.is_empty() {
             output.success("No differences found.");
             return Ok(());
         }
-        for (i, entry) in response.entries.iter().enumerate() {
+        for (i, entry) in response.files.iter().enumerate() {
             eprintln!("{}  {}", style_status(&entry.status), entry.path);
-            println!("{}", entry.diff);
-            if i < response.entries.len() - 1 {
+            if let Some(ref diff) = entry.diff {
+                println!("{}", diff);
+            }
+            if i < response.files.len() - 1 {
                 println!();
             }
         }
@@ -105,9 +107,9 @@ mod tests {
             .and(query_param("from", "1"))
             .and(query_param("to", "3"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "from_sha": "aaa11111",
-                "to_sha": "ccc33333",
-                "entries": [
+                "from": { "version": 1, "sha": "aaa11111" },
+                "to": { "version": 3, "sha": "ccc33333" },
+                "files": [
                     {
                         "path": "src/config.ts",
                         "status": "modified",
@@ -156,16 +158,16 @@ mod tests {
                         "sha": "eee55555",
                         "message": "fifth",
                         "author": "alice",
-                        "timestamp": "2025-01-05T00:00:00Z",
-                        "files_changed": ["a.ts"]
+                        "createdAt": "2025-01-05T00:00:00Z",
+                        "filesChanged": ["a.ts"]
                     },
                     {
                         "version": 4,
                         "sha": "ddd44444",
                         "message": "fourth",
                         "author": "alice",
-                        "timestamp": "2025-01-04T00:00:00Z",
-                        "files_changed": ["b.ts"]
+                        "createdAt": "2025-01-04T00:00:00Z",
+                        "filesChanged": ["b.ts"]
                     }
                 ],
                 "total": 5,
@@ -180,9 +182,9 @@ mod tests {
             .and(query_param("from", "4"))
             .and(query_param("to", "5"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "from_sha": "ddd44444",
-                "to_sha": "eee55555",
-                "entries": [
+                "from": { "version": 4, "sha": "ddd44444" },
+                "to": { "version": 5, "sha": "eee55555" },
+                "files": [
                     {
                         "path": "a.ts",
                         "status": "modified",

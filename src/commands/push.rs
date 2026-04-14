@@ -132,14 +132,12 @@ pub async fn cmd_push(
 fn format_response(output: &Output, response: &PushResponse, repo_id: &str) {
     if output.is_json() {
         output.json(&serde_json::json!({
-            "commit_sha": response.commit_sha,
-            "added": response.added,
-            "updated": response.updated,
-            "deleted": response.deleted,
-            "file_count": response.file_count,
-            "changed": response.changed,
+            "commitSha": response.commit_sha,
+            "version": response.version,
+            "filesChanged": response.files_changed,
+            "created": response.created,
         }));
-    } else if response.changed {
+    } else if response.files_changed > 0 || response.created {
         output.success(&format!("Pushed to {repo_id}"));
         output.table(
             &["", ""],
@@ -148,10 +146,8 @@ fn format_response(output: &Output, response: &PushResponse, repo_id: &str) {
                     "commit".into(),
                     response.commit_sha[..response.commit_sha.len().min(SHORT_SHA_LENGTH)].into(),
                 ],
-                vec!["added".into(), response.added.to_string()],
-                vec!["updated".into(), response.updated.to_string()],
-                vec!["deleted".into(), response.deleted.to_string()],
-                vec!["total files".into(), response.file_count.to_string()],
+                vec!["version".into(), response.version.to_string()],
+                vec!["files changed".into(), response.files_changed.to_string()],
             ],
         );
     } else {
@@ -197,12 +193,10 @@ mod tests {
         Mock::given(method("PUT"))
             .and(path("/api/v1/repos/alice/new-repo/push"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "commit_sha": "abc12345def67890",
-                "added": 1,
-                "updated": 0,
-                "deleted": 0,
-                "file_count": 1,
-                "changed": true
+                "commitSha": "abc12345def67890",
+                "version": 1,
+                "filesChanged": 1,
+                "created": true
             })))
             .expect(1)
             .mount(&mock_server)
@@ -240,12 +234,10 @@ mod tests {
         Mock::given(method("PUT"))
             .and(path("/api/v1/repos/carol/repo/push"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "commit_sha": "def45678abc12345",
-                "added": 0,
-                "updated": 1,
-                "deleted": 0,
-                "file_count": 1,
-                "changed": false
+                "commitSha": "def45678abc12345",
+                "version": 2,
+                "filesChanged": 0,
+                "created": false
             })))
             .expect(1)
             .mount(&mock_server)
@@ -288,12 +280,10 @@ mod tests {
         Mock::given(method("PUT"))
             .and(path("/api/v1/repos/dave/project/push"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "commit_sha": "meta1234abcd5678",
-                "added": 1,
-                "updated": 0,
-                "deleted": 0,
-                "file_count": 1,
-                "changed": true
+                "commitSha": "meta1234abcd5678",
+                "version": 1,
+                "filesChanged": 1,
+                "created": true
             })))
             .expect(1)
             .mount(&mock_server)
@@ -377,12 +367,10 @@ mod tests {
         Mock::given(method("PUT"))
             .and(path("/api/v1/repos/eve/repo/push"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "commit_sha": "same1234same5678",
-                "added": 0,
-                "updated": 0,
-                "deleted": 0,
-                "file_count": 1,
-                "changed": false
+                "commitSha": "same1234same5678",
+                "version": 1,
+                "filesChanged": 0,
+                "created": false
             })))
             .mount(&mock_server)
             .await;

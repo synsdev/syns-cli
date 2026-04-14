@@ -90,26 +90,26 @@ pub async fn cmd_collaborators(
             let response = client.list_collaborators(&repo_id, token.as_deref(), DEFAULT_COLLABORATOR_LIMIT, 0).await?;
             if output.is_json() {
                 output.json(&json!({
-                    "collaborators": response.collaborators.iter().map(|c| json!({
-                        "user_id": c.user_id,
-                        "name": c.name,
-                        "email": c.email,
+                    "data": response.data.iter().map(|c| json!({
+                        "user_id": c.user.id,
+                        "name": c.user.name,
+                        "email": c.user.email,
                         "role": format!("{:?}", c.role).to_lowercase(),
                     })).collect::<Vec<_>>(),
                     "total": response.total,
                 }));
             } else {
-                let rows = response.collaborators.iter().map(|c| {
+                let rows = response.data.iter().map(|c| {
                     vec![
-                        c.user_id.clone(),
-                        c.name.clone(),
-                        c.email.clone(),
+                        c.user.id.clone(),
+                        c.user.name.clone(),
+                        c.user.email.clone(),
                         format!("{:?}", c.role).to_lowercase(),
                     ]
                 }).collect();
                 output.table(&["User ID", "Name", "Email", "Role"], rows);
-                if response.total as usize > response.collaborators.len() {
-                    eprintln!("Showing {} of {} collaborators.", response.collaborators.len(), response.total);
+                if response.total as usize > response.data.len() {
+                    eprintln!("Showing {} of {} collaborators.", response.data.len(), response.total);
                 }
             }
         }
