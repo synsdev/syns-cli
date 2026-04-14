@@ -23,10 +23,10 @@ pub async fn cmd_history(config: &Config, output: &Output, file: Option<String>,
                 "data": response.data.iter().map(|c| json!({
                     "version": c.version,
                     "sha": c.sha,
-                    "blob_sha": c.blob_sha,
+                    "blobSha": c.blob_sha,
                     "message": c.message,
                     "author": c.author,
-                    "created_at": c.created_at,
+                    "createdAt": c.created_at,
                     "content": c.content,
                     "diff": c.diff,
                 })).collect::<Vec<_>>(),
@@ -50,13 +50,13 @@ pub async fn cmd_history(config: &Config, output: &Output, file: Option<String>,
 
         if output.is_json() {
             output.json(&json!({
-                "versions": response.data.iter().map(|v| json!({
+                "data": response.data.iter().map(|v| json!({
                     "version": v.version,
                     "sha": v.sha,
                     "message": v.message,
                     "author": v.author,
-                    "created_at": v.created_at,
-                    "files_changed": v.files_changed,
+                    "createdAt": v.created_at,
+                    "filesChanged": v.files_changed,
                 })).collect::<Vec<_>>(),
                 "total": response.total,
                 "limit": response.limit,

@@ -4,6 +4,7 @@ const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
 const SLOW_DOWN_INCREMENT_SECS: u64 = 5;
 const MAX_POLL_INTERVAL_SECS: u64 = 60;
 const MAX_EXPIRES_IN_SECS: u64 = 3600;
+const CLIENT_ID: &str = "syns-cli";
 const DEVICE_CODE_PATH: &str = "/api/auth/device/code";
 const DEVICE_TOKEN_PATH: &str = "/api/auth/device/token";
 
@@ -94,7 +95,7 @@ impl DeviceAuthFlow {
         let code_url = format!("{server_url}{DEVICE_CODE_PATH}");
         let response = client
             .post(&code_url)
-            .json(&serde_json::json!({"client_id": "syns-cli"}))
+            .json(&serde_json::json!({"client_id": CLIENT_ID}))
             .send()
             .await
             .map_err(|_| CliError::ServerUnreachable {
@@ -161,7 +162,7 @@ impl DeviceAuthFlow {
                 .post(&token_url)
                 .json(&TokenPollRequest {
                     device_code: device_code_response.device_code.clone(),
-                    client_id: "syns-cli".to_string(),
+                    client_id: CLIENT_ID.to_string(),
                 })
                 .send()
                 .await

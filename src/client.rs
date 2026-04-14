@@ -77,8 +77,10 @@ pub struct PushRequest {
     pub files: Vec<PushFileEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deletions: Option<Vec<PushDeleteEntry>>,
-    pub message: String,
-    pub author: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_sha: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -92,6 +94,7 @@ pub struct PushRequest {
 }
 
 #[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct PushFileEntry {
     pub path: String,
     pub sha: String,
@@ -100,6 +103,7 @@ pub struct PushFileEntry {
 }
 
 #[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct PushDeleteEntry {
     pub path: String,
 }
@@ -289,6 +293,7 @@ pub struct DiffEntry {
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct CollaboratorUser {
     pub id: String,
     pub name: String,

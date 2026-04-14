@@ -16,6 +16,11 @@ pub fn resolve_repo_identity(name_flag: Option<&str>, path: &Path) -> Result<Rep
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
             if let Some((owner, name)) = trimmed.split_once('/') {
+                if owner.is_empty() || name.is_empty() || name.contains('/') {
+                    return Err(CliError::Config {
+                        message: "invalid repository name: must be 'owner/name' format".into(),
+                    });
+                }
                 return Ok(RepoIdentity {
                     owner: Some(owner.to_lowercase()),
                     name: name.to_lowercase(),

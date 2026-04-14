@@ -154,8 +154,8 @@ pub async fn smart_push(
     let request = PushRequest {
         files: entries,
         deletions,
-        message: opts.message.clone(),
-        author: opts.author.clone(),
+        message: Some(opts.message.clone()),
+        author: Some(opts.author.clone()),
         parent_sha,
         description: opts.description.clone(),
         tags: opts.tags.clone(),

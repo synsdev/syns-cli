@@ -51,10 +51,10 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/auth/device/code"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "deviceCode": "test-device-code",
-                "userCode": "TEST-1234",
-                "verificationUri": format!("{}/verify", mock_server.uri()),
-                "expiresIn": 30,
+                "device_code": "test-device-code",
+                "user_code": "TEST-1234",
+                "verification_uri": format!("{}/verify", mock_server.uri()),
+                "expires_in": 30,
                 "interval": 5
             })))
             .mount(&mock_server)

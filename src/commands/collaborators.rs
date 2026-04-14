@@ -91,7 +91,7 @@ pub async fn cmd_collaborators(
             if output.is_json() {
                 output.json(&json!({
                     "data": response.data.iter().map(|c| json!({
-                        "user_id": c.user.id,
+                        "userId": c.user.id,
                         "name": c.user.name,
                         "email": c.user.email,
                         "role": format!("{:?}", c.role).to_lowercase(),
@@ -121,7 +121,7 @@ pub async fn cmd_collaborators(
             let request = AddCollaboratorRequest { user_id: user_id.clone(), role: role.into() };
             client.add_collaborator(&repo_id, &token, &request).await?;
             if output.is_json() {
-                output.json(&json!({"added": true, "user_id": user_id, "role": role_str}));
+                output.json(&json!({"added": true, "userId": user_id, "role": role_str}));
             } else {
                 output.success(&format!("Added '{}' as {} collaborator.", user_id, role_str));
             }
@@ -136,7 +136,7 @@ pub async fn cmd_collaborators(
             }
             client.remove_collaborator(&repo_id, &token, &user_id).await?;
             if output.is_json() {
-                output.json(&json!({"removed": true, "user_id": user_id}));
+                output.json(&json!({"removed": true, "userId": user_id}));
             } else {
                 output.success(&format!("Removed collaborator '{}'.", user_id));
             }
