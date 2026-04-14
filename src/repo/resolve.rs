@@ -15,6 +15,12 @@ pub fn resolve_repo_identity(name_flag: Option<&str>, path: &Path) -> Result<Rep
     if let Some(raw) = name_flag {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
+            if let Some((owner, name)) = trimmed.split_once('/') {
+                return Ok(RepoIdentity {
+                    owner: Some(owner.to_lowercase()),
+                    name: name.to_lowercase(),
+                });
+            }
             return Ok(RepoIdentity {
                 owner: None,
                 name: trimmed.to_lowercase(),

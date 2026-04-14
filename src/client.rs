@@ -1,7 +1,5 @@
 #![allow(dead_code)] // Types and methods used by downstream units (U10, U11, U21+)
 
-use std::collections::HashMap;
-
 use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
 
@@ -74,9 +72,11 @@ pub enum CollaboratorRole {
 // --- Request Types ---
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PushRequest {
-    pub files: HashMap<String, PushEntry>,
-    pub delete: Vec<String>,
+    pub files: Vec<PushFileEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deletions: Option<Vec<PushDeleteEntry>>,
     pub message: String,
     pub author: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -92,19 +92,27 @@ pub struct PushRequest {
 }
 
 #[derive(Serialize)]
-pub struct PushEntry {
+pub struct PushFileEntry {
+    pub path: String,
     pub sha: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
 }
 
 #[derive(Serialize)]
+pub struct PushDeleteEntry {
+    pub path: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ForkRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RepoUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -113,21 +121,26 @@ pub struct RepoUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub visibility: Option<Visibility>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AddCollaboratorRequest {
     pub user_id: String,
     pub role: CollaboratorRole,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdateCollaboratorRoleRequest {
     pub role: CollaboratorRole,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RevertFileRequest {
     pub to: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -137,19 +150,20 @@ pub struct RevertFileRequest {
 // --- Response Types ---
 
 #[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct PushResponse {
     pub commit_sha: String,
-    pub added: u32,
-    pub updated: u32,
-    pub deleted: u32,
-    pub file_count: u32,
-    pub changed: bool,
+    pub version: u32,
+    pub files_changed: u32,
+    pub created: bool,
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct TreeResponse {
     pub entries: Vec<TreeEntry>,
     pub commit_sha: String,
+    pub truncated: bool,
 }
 
 pub type PullResponse = TreeResponse;
@@ -172,8 +186,9 @@ pub struct FileResponse {
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct FileHistoryResponse {
-    pub commits: Vec<FileVersionEntry>,
+    pub data: Vec<FileVersionEntry>,
     #[serde(default)]
     pub total: u32,
     #[serde(default)]
@@ -183,35 +198,46 @@ pub struct FileHistoryResponse {
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct FileVersionEntry {
+    pub version: u32,
     pub sha: String,
+    pub blob_sha: String,
     pub message: String,
     pub author: String,
-    pub timestamp: String,
-    pub files_changed: Vec<String>,
-    pub file_content: String,
-    pub file_sha: String,
-    pub file_diff: Option<String>,
+    pub created_at: String,
+    pub content: String,
+    pub diff: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkedFrom {
+    pub owner: String,
+    pub name: String,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct RepoResponse {
-    pub id: String,
+    pub owner: String,
     pub name: String,
     pub description: Option<String>,
-    pub owner_id: String,
-    pub status: RepoStatus,
-    pub visibility: Visibility,
-    pub tags: Vec<String>,
     pub commit_sha: Option<String>,
-    pub file_count: u32,
+    pub status: RepoStatus,
+    pub author: Option<String>,
+    pub tags: Vec<String>,
+    pub visibility: Visibility,
+    pub forked_from: Option<ForkedFrom>,
     pub fork_count: u32,
-    pub forked_from: Option<String>,
+    pub file_count: u32,
+    pub role: Option<CollaboratorRole>,
     pub created_at: String,
     pub updated_at: String,
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct RepoListResponse {
     pub data: Vec<RepoResponse>,
     pub total: u32,
@@ -220,6 +246,7 @@ pub struct RepoListResponse {
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct VersionListResponse {
     pub data: Vec<VersionEntry>,
     pub total: u32,
@@ -228,32 +255,51 @@ pub struct VersionListResponse {
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct VersionEntry {
     pub version: u32,
     pub sha: String,
     pub message: String,
     pub author: String,
-    pub timestamp: String,
+    pub created_at: String,
     pub files_changed: Vec<String>,
 }
 
 #[derive(Deserialize, Debug)]
-pub struct DiffResponse {
-    pub from_sha: String,
-    pub to_sha: String,
-    pub entries: Vec<DiffEntry>,
+#[serde(rename_all = "camelCase")]
+pub struct DiffEndpoint {
+    pub version: u32,
+    pub sha: String,
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffResponse {
+    pub from: DiffEndpoint,
+    pub to: DiffEndpoint,
+    pub files: Vec<DiffEntry>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct DiffEntry {
     pub path: String,
     pub status: DiffStatus,
-    pub diff: String,
+    pub diff: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
+pub struct CollaboratorUser {
+    pub id: String,
+    pub name: String,
+    pub username: String,
+    pub email: String,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct CollaboratorListResponse {
-    pub collaborators: Vec<Collaborator>,
+    pub data: Vec<Collaborator>,
     #[serde(default)]
     pub total: u32,
     #[serde(default)]
@@ -263,14 +309,16 @@ pub struct CollaboratorListResponse {
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct Collaborator {
-    pub user_id: String,
-    pub name: String,
-    pub email: String,
+    pub user: CollaboratorUser,
     pub role: CollaboratorRole,
+    pub added_by: Option<String>,
+    pub created_at: String,
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct ExploreResponse {
     pub data: Vec<RepoResponse>,
     pub total: u32,
@@ -278,13 +326,8 @@ pub struct ExploreResponse {
     pub offset: u32,
 }
 
-#[derive(Deserialize, Debug)]
-pub struct ForkResponse {
-    pub id: String,
-    pub commit_sha: String,
-    pub file_count: u32,
-    pub commit_count: u32,
-}
+/// Fork response is the full Repository object.
+pub type ForkResponse = RepoResponse;
 
 #[derive(Deserialize, Debug)]
 pub struct SessionResponse {
@@ -301,9 +344,12 @@ pub struct SessionUser {
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct RevertResponse {
     pub commit_sha: String,
-    pub changed: bool,
+    pub version: u32,
+    pub files_changed: u32,
+    pub created: bool,
 }
 
 // --- Private Helpers ---
