@@ -86,17 +86,15 @@ pub async fn cmd_pull(
     let mut unchanged_count: usize = 0;
 
     for entry in &server_files {
-        if version.is_none() {
-            if let Some(server_sha) = &entry.sha {
-                if let Some(local_sha) = manifest.file_sha(&entry.path) {
-                    if server_sha == local_sha {
-                        let file_path = safe_join(&target_dir, &entry.path)?;
-                        if file_path.exists() {
-                            unchanged_count += 1;
-                            continue;
-                        }
-                    }
-                }
+        if version.is_none()
+            && let Some(server_sha) = &entry.sha
+            && let Some(local_sha) = manifest.file_sha(&entry.path)
+            && server_sha == local_sha
+        {
+            let file_path = safe_join(&target_dir, &entry.path)?;
+            if file_path.exists() {
+                unchanged_count += 1;
+                continue;
             }
         }
         to_download.push(*entry);
