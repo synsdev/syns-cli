@@ -8,7 +8,7 @@ use serde_json::json;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn logout_clears_credentials() {
     let ctx = setup().await;
@@ -20,6 +20,7 @@ async fn logout_clears_credentials() {
     Mock::given(method("POST"))
         .and(path("/api/auth/sign-out"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
         .mount(&ctx.mock_server)
         .await;
 
@@ -28,7 +29,7 @@ async fn logout_clears_credentials() {
     assert_eq!(store.read().unwrap(), None);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn whoami_shows_current_user() {
     let ctx = setup().await;
@@ -62,7 +63,7 @@ async fn whoami_shows_current_user() {
     assert!(result.is_ok());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn whoami_returns_auth_error_when_not_logged_in() {
     let ctx = setup().await;

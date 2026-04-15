@@ -10,7 +10,7 @@ use std::fs;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn push_creates_repo_and_sends_files() {
     let ctx = setup().await;
@@ -56,7 +56,7 @@ async fn push_creates_repo_and_sends_files() {
     assert!(result.is_ok());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn push_sends_only_changed_files() {
     let ctx = setup().await;
@@ -115,11 +115,11 @@ async fn push_sends_only_changed_files() {
     assert!(!b_entry["content"].is_null(), "b.txt should have content (file changed)");
 
     let a_entry = files.iter().find(|f| f["path"] == "a.txt").expect("a.txt not in files");
-    assert!(a_entry["content"].is_null() || a_entry.get("content").is_none(),
-        "a.txt should not have content (file unchanged)");
+    assert!(a_entry.get("content").is_none(),
+        "a.txt should not have content key (file unchanged)");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn pull_downloads_tree() {
     let ctx = setup().await;

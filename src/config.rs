@@ -53,9 +53,12 @@ impl Config {
         };
 
         // Cache directory resolution
-        let cache_dir = match dirs::cache_dir() {
-            Some(path) => path.join(CACHE_SUBDIR),
-            None => config_dir.join("cache"),
+        let cache_dir = match std::env::var("SYNS_CACHE_DIR") {
+            Ok(val) if !val.is_empty() => PathBuf::from(val),
+            _ => match dirs::cache_dir() {
+                Some(path) => path.join(CACHE_SUBDIR),
+                None => config_dir.join("cache"),
+            },
         };
 
         Ok(Config {
@@ -207,6 +210,15 @@ mod tests {
         let config = Config::new(Some("https://syns.dev")).unwrap();
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
         assert_eq!(config.credentials_path(), PathBuf::from("/tmp/syns-test-config/credentials.json"));
+    }
+
+    #[test]
+    #[serial]
+    fn config_uses_syns_cache_dir_env() {
+        unsafe { std::env::set_var("SYNS_CACHE_DIR", "/tmp/syns-test-cache") };
+        let config = Config::new(Some("https://syns.dev")).unwrap();
+        unsafe { std::env::remove_var("SYNS_CACHE_DIR") };
+        assert_eq!(config.cache_dir(), Path::new("/tmp/syns-test-cache"));
     }
 
     #[test]

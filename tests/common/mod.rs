@@ -10,11 +10,13 @@ pub struct TestContext {
     pub output: Output,
     pub project_dir: TempDir,
     _config_dir: TempDir,
+    _cache_dir: TempDir,
 }
 
 impl Drop for TestContext {
     fn drop(&mut self) {
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+        unsafe { std::env::remove_var("SYNS_CACHE_DIR") };
     }
 }
 
@@ -22,8 +24,10 @@ pub async fn setup() -> TestContext {
     let mock_server = MockServer::start().await;
     let project_dir = tempfile::tempdir().unwrap();
     let config_dir = tempfile::tempdir().unwrap();
+    let cache_dir = tempfile::tempdir().unwrap();
 
     unsafe { std::env::set_var("SYNS_CONFIG_DIR", config_dir.path()) };
+    unsafe { std::env::set_var("SYNS_CACHE_DIR", cache_dir.path()) };
     let config = Config::new(Some(&mock_server.uri())).unwrap();
     let output = Output::new(false);
 
@@ -33,6 +37,7 @@ pub async fn setup() -> TestContext {
         output,
         project_dir,
         _config_dir: config_dir,
+        _cache_dir: cache_dir,
     }
 }
 
