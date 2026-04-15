@@ -63,7 +63,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/auth/device/token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "token": "test-bearer-token"
+                "access_token": "test-bearer-token"
             })))
             .mount(&mock_server)
             .await;

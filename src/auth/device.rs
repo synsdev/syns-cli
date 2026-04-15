@@ -22,11 +22,12 @@ struct DeviceCodeResponse {
 struct TokenPollRequest {
     device_code: String,
     client_id: String,
+    grant_type: String,
 }
 
 #[derive(serde::Deserialize)]
 struct TokenSuccessResponse {
-    token: String,
+    access_token: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -163,6 +164,7 @@ impl DeviceAuthFlow {
                 .json(&TokenPollRequest {
                     device_code: device_code_response.device_code.clone(),
                     client_id: CLIENT_ID.to_string(),
+                    grant_type: "urn:ietf:params:oauth:grant-type:device_code".to_string(),
                 })
                 .send()
                 .await
@@ -176,7 +178,7 @@ impl DeviceAuthFlow {
                     response.json().await.map_err(|_| CliError::Io {
                         message: "unexpected response from token endpoint".into(),
                     })?;
-                return Ok(success.token);
+                return Ok(success.access_token);
             }
 
             if status == reqwest::StatusCode::BAD_REQUEST {
