@@ -8,6 +8,19 @@ use std::path::Path;
 
 const BINARY_CHECK_SIZE: usize = 8192;
 
+const DEFAULT_EXCLUDE_DIRS: &[&str] = &[
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    ".tox",
+    "target",
+    ".next",
+    ".nuxt",
+    "dist",
+    "build",
+    ".cache",
+];
+
 fn to_forward_slash_path(path: &Path) -> Option<String> {
     let parts: Option<Vec<&str>> = path.components().map(|c| c.as_os_str().to_str()).collect();
     parts.map(|p| p.join("/"))
@@ -40,7 +53,18 @@ pub fn collect_files(
         .parents(true)
         .add_custom_ignore_filename(".synsignore")
         .overrides(overrides)
-        .filter_entry(|entry| entry.file_name() != OsStr::new(".git"))
+        .filter_entry(|entry| {
+            let name = entry.file_name();
+            if name == OsStr::new(".git") {
+                return false;
+            }
+            if entry.file_type().is_some_and(|ft| ft.is_dir())
+                && DEFAULT_EXCLUDE_DIRS.iter().any(|d| name == OsStr::new(d))
+            {
+                return false;
+            }
+            true
+        })
         .build();
 
     let mut file_map = HashMap::new();
@@ -214,5 +238,59 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files.get("text.txt").unwrap(), b"hello");
         assert!(!files.contains_key("binary.bin"));
+    }
+
+    #[test]
+    fn excludes_common_dependency_and_build_directories() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Files that should be collected
+        std::fs::write(dir.path().join("keep.txt"), "keep").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
+
+        // Directories that should be excluded
+        std::fs::create_dir_all(dir.path().join("node_modules/leftpad")).unwrap();
+        std::fs::write(dir.path().join("node_modules/leftpad/index.js"), "module.exports = {};").unwrap();
+        std::fs::create_dir_all(dir.path().join("__pycache__")).unwrap();
+        std::fs::write(dir.path().join("__pycache__/mod.cpython.pyc"), "cache").unwrap();
+        std::fs::create_dir_all(dir.path().join(".venv/lib")).unwrap();
+        std::fs::write(dir.path().join(".venv/lib/site.py"), "site").unwrap();
+        std::fs::create_dir_all(dir.path().join("target/debug")).unwrap();
+        std::fs::write(dir.path().join("target/debug/binary"), "elf").unwrap();
+        std::fs::create_dir_all(dir.path().join(".next/static")).unwrap();
+        std::fs::write(dir.path().join(".next/static/chunk.js"), "chunk").unwrap();
+        std::fs::create_dir_all(dir.path().join("build")).unwrap();
+        std::fs::write(dir.path().join("build/output.js"), "built").unwrap();
+        std::fs::create_dir_all(dir.path().join(".cache")).unwrap();
+        std::fs::write(dir.path().join(".cache/data"), "cached").unwrap();
+
+        let files = collect_files(dir.path(), &[]).unwrap();
+
+        assert_eq!(files.len(), 2);
+        assert!(files.contains_key("keep.txt"));
+        assert!(files.contains_key("src/main.rs"));
+
+        // Verify excluded directories are not present
+        assert!(!files.keys().any(|k| k.starts_with("node_modules/")));
+        assert!(!files.keys().any(|k| k.starts_with("__pycache__/")));
+        assert!(!files.keys().any(|k| k.starts_with(".venv/")));
+        assert!(!files.keys().any(|k| k.starts_with("target/")));
+        assert!(!files.keys().any(|k| k.starts_with(".next/")));
+        assert!(!files.keys().any(|k| k.starts_with("build/")));
+        assert!(!files.keys().any(|k| k.starts_with(".cache/")));
+    }
+
+    #[test]
+    fn excludes_directories_not_files_with_same_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("node_modules"), "I am a file").unwrap();
+        std::fs::write(dir.path().join("keep.txt"), "keep").unwrap();
+
+        let files = collect_files(dir.path(), &[]).unwrap();
+
+        assert_eq!(files.len(), 2);
+        assert!(files.contains_key("node_modules"));
+        assert!(files.contains_key("keep.txt"));
     }
 }

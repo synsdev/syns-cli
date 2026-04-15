@@ -90,8 +90,11 @@ pub async fn cmd_pull(
             if let Some(server_sha) = &entry.sha {
                 if let Some(local_sha) = manifest.file_sha(&entry.path) {
                     if server_sha == local_sha {
-                        unchanged_count += 1;
-                        continue;
+                        let file_path = safe_join(&target_dir, &entry.path)?;
+                        if file_path.exists() {
+                            unchanged_count += 1;
+                            continue;
+                        }
                     }
                 }
             }
@@ -245,5 +248,86 @@ mod tests {
         assert!(validate_entry_path(".gitignore").is_ok());
         assert!(validate_entry_path("src/.gitkeep").is_ok());
         assert!(validate_entry_path("...").is_ok());
+    }
+
+    #[test]
+    fn pull_downloads_files_missing_from_disk_despite_manifest_match() {
+        let dir = tempfile::tempdir().unwrap();
+        // Target directory is empty — no files on disk
+
+        let mut manifest = Manifest::default();
+        let files_map: HashMap<String, String> = [
+            ("src/main.rs".to_string(), "abc123".to_string()),
+            ("README.md".to_string(), "def456".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        manifest.update("commit1".to_string(), files_map);
+
+        // Simulated server entries with matching SHAs
+        let server_entries: Vec<(&str, &str)> = vec![
+            ("src/main.rs", "abc123"),
+            ("README.md", "def456"),
+        ];
+
+        let mut to_download = Vec::new();
+        let mut unchanged_count: usize = 0;
+
+        for (path, server_sha) in &server_entries {
+            if let Some(local_sha) = manifest.file_sha(path) {
+                if server_sha == &local_sha {
+                    let file_path = safe_join(dir.path(), path).unwrap();
+                    if file_path.exists() {
+                        unchanged_count += 1;
+                        continue;
+                    }
+                }
+            }
+            to_download.push(*path);
+        }
+
+        // All files should be in to_download because none exist on disk
+        assert_eq!(to_download.len(), 2);
+        assert_eq!(unchanged_count, 0);
+        assert!(to_download.contains(&"src/main.rs"));
+        assert!(to_download.contains(&"README.md"));
+    }
+
+    #[test]
+    fn pull_skips_files_present_on_disk_with_matching_sha() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create the file on disk
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
+
+        let mut manifest = Manifest::default();
+        let files_map: HashMap<String, String> =
+            [("src/main.rs".to_string(), "abc123".to_string())]
+                .into_iter()
+                .collect();
+        manifest.update("commit1".to_string(), files_map);
+
+        // Simulated server entry with matching SHA
+        let server_entries: Vec<(&str, &str)> = vec![("src/main.rs", "abc123")];
+
+        let mut to_download: Vec<&str> = Vec::new();
+        let mut unchanged_count: usize = 0;
+
+        for (path, server_sha) in &server_entries {
+            if let Some(local_sha) = manifest.file_sha(path) {
+                if server_sha == &local_sha {
+                    let file_path = safe_join(dir.path(), path).unwrap();
+                    if file_path.exists() {
+                        unchanged_count += 1;
+                        continue;
+                    }
+                }
+            }
+            to_download.push(path);
+        }
+
+        // File exists and SHA matches — should be unchanged
+        assert_eq!(unchanged_count, 1);
+        assert!(to_download.is_empty());
     }
 }
