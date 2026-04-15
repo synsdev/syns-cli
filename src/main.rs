@@ -1,16 +1,9 @@
-mod config;
-mod client;
-mod output;
-mod errors;
-mod auth;
-mod repo;
-mod push;
-mod commands;
+use syns_cli::{commands, config, errors, output};
 
 use clap::{Parser, Subcommand};
-use crate::commands::collaborators::CollaboratorsAction;
-use crate::commands::push::PushArgs;
-use crate::commands::repo::{CliRepoStatus, CliVisibility};
+use syns_cli::commands::collaborators::CollaboratorsAction;
+use syns_cli::commands::push::PushArgs;
+use syns_cli::commands::repo::{CliRepoStatus, CliVisibility};
 
 #[derive(Parser)]
 #[command(name = "syns", about = "Push, pull, and manage versioned file repositories")]
