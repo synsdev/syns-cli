@@ -145,7 +145,7 @@ fn parse_repo_access_role(role: &str) -> Result<CollaboratorRole, CliError> {
 
 fn parse_repo_string(repo: &str) -> Result<(&str, &str), CliError> {
     match repo.split_once('/') {
-        Some((owner, name)) if !owner.is_empty() && !name.is_empty() => Ok((owner, name)),
+        Some((owner, name)) if !owner.is_empty() && !name.is_empty() && !name.contains('/') => Ok((owner, name)),
         _ => Err(CliError::Config {
             message: format!("invalid repository '{}' \u{2014} must be in owner/name format", repo),
         }),
@@ -485,7 +485,7 @@ pub async fn cmd_teams(
         Some(TeamsAction::Decline { invitation_id }) => {
             client.decline_invitation(&token, &invitation_id).await?;
             if output.is_json() {
-                output.json(&json!({"declined": true, "invitation_id": invitation_id}));
+                output.json(&json!({"declined": true, "invitationId": invitation_id}));
             } else {
                 output.success(&format!("Declined invitation '{}'.", invitation_id));
             }
@@ -516,7 +516,7 @@ pub async fn cmd_teams(
             }
             client.remove_member(&token, &team_id, &user_id).await?;
             if output.is_json() {
-                output.json(&json!({"removed": true, "user_id": user_id}));
+                output.json(&json!({"removed": true, "userId": user_id}));
             } else {
                 output.success(&format!("Removed member '{}' from team '{}'.", user_id, name));
             }
@@ -554,6 +554,7 @@ pub async fn cmd_teams(
             }
         }
         Some(TeamsAction::RemoveRepo { name, repo, yes }) => {
+            let (repo_owner, repo_name) = parse_repo_string(&repo)?;
             let team_id = resolve_team_id(&client, &token, &name, output).await?;
             if !yes {
                 eprint!("Remove repository access for '{}' from team '{}'? [y/N]: ", repo, name);
@@ -570,7 +571,6 @@ pub async fn cmd_teams(
                     return Ok(());
                 }
             }
-            let (repo_owner, repo_name) = parse_repo_string(&repo)?;
             client.remove_team_repo(&token, &team_id, repo_owner, repo_name).await?;
             if output.is_json() {
                 output.json(&json!({"removed": true, "team": name, "repo": repo}));
