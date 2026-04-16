@@ -11,6 +11,7 @@ pub mod collaborators;
 pub mod delete;
 pub mod explore;
 pub mod fork;
+pub mod teams;
 pub mod login;
 pub mod logout;
 pub mod whoami;

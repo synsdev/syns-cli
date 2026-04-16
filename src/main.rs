@@ -2,6 +2,7 @@ use syns_cli::{commands, config, errors, output};
 
 use clap::{Parser, Subcommand};
 use syns_cli::commands::collaborators::CollaboratorsAction;
+use syns_cli::commands::teams::TeamsAction;
 use syns_cli::commands::push::PushArgs;
 use syns_cli::commands::repo::{CliRepoStatus, CliVisibility};
 
@@ -133,6 +134,11 @@ enum Commands {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Manage teams
+    Teams {
+        #[command(subcommand)]
+        action: Option<TeamsAction>,
+    },
     /// Authenticate with the server
     Login {},
     /// Clear stored credentials
@@ -181,6 +187,7 @@ async fn run(command: Commands, config: &config::Config, output: &output::Output
         Commands::Fork { repo, name } => {
             commands::fork::cmd_fork(config, output, repo, name).await?
         }
+        Commands::Teams { action } => commands::teams::cmd_teams(config, output, action).await?,
         Commands::Login {} => commands::login::cmd_login(config, output).await?,
         Commands::Logout {} => commands::logout::cmd_logout(config, output).await?,
         Commands::Whoami {} => commands::whoami::cmd_whoami(config, output).await?,
