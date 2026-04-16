@@ -818,14 +818,14 @@ impl SynsClient {
 
     // Team-repo access
 
-    pub async fn add_team_repo(&self, token: &str, team_id: &str, repo_id: &str, request: &TeamRepoAccessRequest) -> Result<TeamRepoResponse, CliError> {
-        let url = format!("{}/api/v1/teams/{}/repos/{}", self.base_url, team_id, repo_id);
+    pub async fn add_team_repo(&self, token: &str, team_id: &str, owner: &str, name: &str, request: &TeamRepoAccessRequest) -> Result<TeamRepoResponse, CliError> {
+        let url = format!("{}/api/v1/teams/{}/repos/{}/{}", self.base_url, team_id, owner, name);
         let response = self.client.put(&url).bearer_auth(token).json(request).send().await?;
         process_response(response).await
     }
 
-    pub async fn remove_team_repo(&self, token: &str, team_id: &str, repo_id: &str) -> Result<(), CliError> {
-        let url = format!("{}/api/v1/teams/{}/repos/{}", self.base_url, team_id, repo_id);
+    pub async fn remove_team_repo(&self, token: &str, team_id: &str, owner: &str, name: &str) -> Result<(), CliError> {
+        let url = format!("{}/api/v1/teams/{}/repos/{}/{}", self.base_url, team_id, owner, name);
         let response = self.client.delete(&url).bearer_auth(token).send().await?;
         process_empty_response(response).await
     }
