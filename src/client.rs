@@ -69,6 +69,26 @@ pub enum CollaboratorRole {
     Unknown,
 }
 
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum TeamRole {
+    Owner,
+    Admin,
+    Member,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum InvitationStatus {
+    Pending,
+    Accepted,
+    Declined,
+    #[serde(other)]
+    Unknown,
+}
+
 // --- Request Types ---
 
 #[derive(Serialize)]
@@ -334,6 +354,132 @@ pub struct ExploreResponse {
 /// Fork response is the full Repository object.
 pub type ForkResponse = RepoResponse;
 
+// --- Team Helper Structs ---
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct UserSummary {
+    pub id: String,
+    pub username: String,
+    pub name: String,
+    pub email: Option<String>,
+    pub image: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamSummary {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+// --- Team Response Types ---
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamResponse {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub owner: UserSummary,
+    pub member_count: u32,
+    pub role: TeamRole,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct TeamListResponse {
+    pub data: Vec<TeamResponse>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamMemberResponse {
+    pub user: UserSummary,
+    pub role: TeamRole,
+    pub joined_at: String,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct TeamMembersResponse {
+    pub data: Vec<TeamMemberResponse>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct InvitationResponse {
+    pub id: String,
+    pub team: TeamSummary,
+    pub email: String,
+    pub role: TeamRole,
+    pub invited_by: Option<UserSummary>,
+    pub status: InvitationStatus,
+    pub expires_at: String,
+    pub created_at: String,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct InvitationListResponse {
+    pub data: Vec<InvitationResponse>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamRepoResponse {
+    pub owner: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub visibility: Visibility,
+    pub role: CollaboratorRole,
+    pub added_by: Option<UserSummary>,
+    pub added_at: String,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct TeamReposResponse {
+    pub data: Vec<TeamRepoResponse>,
+}
+
+// --- Team Request Types ---
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateTeamRequest {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateTeamRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<Option<String>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InviteRequest {
+    pub email: String,
+    pub role: TeamRole,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeRoleRequest {
+    pub role: TeamRole,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamRepoAccessRequest {
+    pub role: CollaboratorRole,
+}
+
 #[derive(Deserialize, Debug)]
 pub struct SessionResponse {
     pub user: SessionUser,
@@ -589,6 +735,108 @@ impl SynsClient {
     }
 }
 
+// --- Team Methods ---
+
+impl SynsClient {
+    // Team CRUD
+
+    pub async fn create_team(&self, token: &str, request: &CreateTeamRequest) -> Result<TeamResponse, CliError> {
+        let url = format!("{}/api/v1/teams", self.base_url);
+        let response = self.client.post(&url).bearer_auth(token).json(request).send().await?;
+        process_response(response).await
+    }
+
+    pub async fn list_teams(&self, token: &str) -> Result<TeamListResponse, CliError> {
+        let url = format!("{}/api/v1/teams", self.base_url);
+        let response = self.client.get(&url).bearer_auth(token).send().await?;
+        process_response(response).await
+    }
+
+    pub async fn get_team(&self, token: &str, team_id: &str) -> Result<TeamResponse, CliError> {
+        let url = format!("{}/api/v1/teams/{}", self.base_url, team_id);
+        let response = self.client.get(&url).bearer_auth(token).send().await?;
+        process_response(response).await
+    }
+
+    pub async fn update_team(&self, token: &str, team_id: &str, request: &UpdateTeamRequest) -> Result<TeamResponse, CliError> {
+        let url = format!("{}/api/v1/teams/{}", self.base_url, team_id);
+        let response = self.client.patch(&url).bearer_auth(token).json(request).send().await?;
+        process_response(response).await
+    }
+
+    pub async fn delete_team(&self, token: &str, team_id: &str) -> Result<(), CliError> {
+        let url = format!("{}/api/v1/teams/{}", self.base_url, team_id);
+        let response = self.client.delete(&url).bearer_auth(token).send().await?;
+        process_empty_response(response).await
+    }
+
+    // Member management
+
+    pub async fn list_members(&self, token: &str, team_id: &str) -> Result<TeamMembersResponse, CliError> {
+        let url = format!("{}/api/v1/teams/{}/members", self.base_url, team_id);
+        let response = self.client.get(&url).bearer_auth(token).send().await?;
+        process_response(response).await
+    }
+
+    pub async fn invite_member(&self, token: &str, team_id: &str, request: &InviteRequest) -> Result<InvitationResponse, CliError> {
+        let url = format!("{}/api/v1/teams/{}/invite", self.base_url, team_id);
+        let response = self.client.post(&url).bearer_auth(token).json(request).send().await?;
+        process_response(response).await
+    }
+
+    pub async fn change_role(&self, token: &str, team_id: &str, user_id: &str, request: &ChangeRoleRequest) -> Result<TeamMemberResponse, CliError> {
+        let url = format!("{}/api/v1/teams/{}/members/{}/role", self.base_url, team_id, user_id);
+        let response = self.client.post(&url).bearer_auth(token).json(request).send().await?;
+        process_response(response).await
+    }
+
+    pub async fn remove_member(&self, token: &str, team_id: &str, user_id: &str) -> Result<(), CliError> {
+        let url = format!("{}/api/v1/teams/{}/members/{}", self.base_url, team_id, user_id);
+        let response = self.client.delete(&url).bearer_auth(token).send().await?;
+        process_empty_response(response).await
+    }
+
+    // Invitation flow
+
+    pub async fn list_my_invitations(&self, token: &str) -> Result<InvitationListResponse, CliError> {
+        let url = format!("{}/api/v1/teams/invitations", self.base_url);
+        let response = self.client.get(&url).bearer_auth(token).send().await?;
+        process_response(response).await
+    }
+
+    pub async fn accept_invitation(&self, token: &str, invitation_id: &str) -> Result<TeamMemberResponse, CliError> {
+        let url = format!("{}/api/v1/teams/invitations/{}/accept", self.base_url, invitation_id);
+        let response = self.client.post(&url).bearer_auth(token).send().await?;
+        process_response(response).await
+    }
+
+    pub async fn decline_invitation(&self, token: &str, invitation_id: &str) -> Result<(), CliError> {
+        let url = format!("{}/api/v1/teams/invitations/{}/decline", self.base_url, invitation_id);
+        let response = self.client.post(&url).bearer_auth(token).send().await?;
+        process_empty_response(response).await
+    }
+
+    // Team-repo access
+
+    pub async fn add_team_repo(&self, token: &str, team_id: &str, repo_id: &str, request: &TeamRepoAccessRequest) -> Result<TeamRepoResponse, CliError> {
+        let url = format!("{}/api/v1/teams/{}/repos/{}", self.base_url, team_id, repo_id);
+        let response = self.client.put(&url).bearer_auth(token).json(request).send().await?;
+        process_response(response).await
+    }
+
+    pub async fn remove_team_repo(&self, token: &str, team_id: &str, repo_id: &str) -> Result<(), CliError> {
+        let url = format!("{}/api/v1/teams/{}/repos/{}", self.base_url, team_id, repo_id);
+        let response = self.client.delete(&url).bearer_auth(token).send().await?;
+        process_empty_response(response).await
+    }
+
+    pub async fn list_team_repos(&self, token: &str, team_id: &str) -> Result<TeamReposResponse, CliError> {
+        let url = format!("{}/api/v1/teams/{}/repos", self.base_url, team_id);
+        let response = self.client.get(&url).bearer_auth(token).send().await?;
+        process_response(response).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,5 +946,77 @@ mod tests {
         assert_eq!(encode_path_segments("/src/main.rs"), "src/main.rs");
         assert_eq!(encode_path_segments("src//main.rs"), "src/main.rs");
         assert_eq!(encode_path_segments("src/main.rs/"), "src/main.rs");
+    }
+
+    #[test]
+    fn team_response_deserializes_nested_owner() {
+        let json = r#"{
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "name": "backend-team",
+            "description": null,
+            "owner": {
+                "id": "user-123",
+                "username": "alice",
+                "name": "Alice Smith",
+                "image": null
+            },
+            "memberCount": 5,
+            "role": "owner",
+            "createdAt": "2026-03-18T10:00:00.000Z",
+            "updatedAt": "2026-03-18T12:00:00.000Z"
+        }"#;
+
+        let response: TeamResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.id, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(response.name, "backend-team");
+        assert!(response.description.is_none());
+        assert_eq!(response.owner.id, "user-123");
+        assert_eq!(response.owner.username, "alice");
+        assert_eq!(response.owner.name, "Alice Smith");
+        assert!(response.owner.email.is_none());
+        assert!(response.owner.image.is_none());
+        assert_eq!(response.member_count, 5);
+        assert_eq!(response.role, TeamRole::Owner);
+        assert_eq!(response.created_at, "2026-03-18T10:00:00.000Z");
+        assert_eq!(response.updated_at, "2026-03-18T12:00:00.000Z");
+    }
+
+    #[test]
+    fn team_request_structs_serialize_to_camel_case() {
+        // CreateTeamRequest
+        let create = CreateTeamRequest {
+            name: "test-team".to_string(),
+            description: Some("A test team".to_string()),
+        };
+        let create_json = serde_json::to_value(&create).unwrap();
+        assert_eq!(create_json["name"], "test-team");
+        assert_eq!(create_json["description"], "A test team");
+
+        // CreateTeamRequest with no description — field omitted
+        let create_no_desc = CreateTeamRequest {
+            name: "minimal".to_string(),
+            description: None,
+        };
+        let create_no_desc_json = serde_json::to_value(&create_no_desc).unwrap();
+        assert_eq!(create_no_desc_json["name"], "minimal");
+        assert!(create_no_desc_json.get("description").is_none());
+
+        // UpdateTeamRequest with name change and description cleared
+        let update = UpdateTeamRequest {
+            name: Some("renamed".to_string()),
+            description: Some(None),
+        };
+        let update_json = serde_json::to_value(&update).unwrap();
+        assert_eq!(update_json["name"], "renamed");
+        assert!(update_json["description"].is_null());
+
+        // UpdateTeamRequest with both omitted
+        let update_empty = UpdateTeamRequest {
+            name: None,
+            description: None,
+        };
+        let update_empty_json = serde_json::to_value(&update_empty).unwrap();
+        assert!(update_empty_json.get("name").is_none());
+        assert!(update_empty_json.get("description").is_none());
     }
 }
