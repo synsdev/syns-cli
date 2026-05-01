@@ -37,9 +37,8 @@ pub fn resolve_repo_identity(
     }
 
     // 2-4. Try .syns.yaml — propagate errors (malformed yaml is a hard error).
-    match read_syns_yaml(path)? {
-        Some(identity) => return Ok(identity),
-        None => {}
+    if let Some(identity) = read_syns_yaml(path)? {
+        return Ok(identity);
     }
 
     // 5-7. Fall through to git remote extraction.

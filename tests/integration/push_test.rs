@@ -175,5 +175,5 @@ async fn pull_downloads_tree() {
         response.commit_sha,
         "3333333333333333333333333333333333333333"
     );
-    assert_eq!(response.truncated, false);
+    assert!(!response.truncated);
 }

@@ -36,10 +36,10 @@ fn parse_origin_url(config_content: &str) -> Option<String> {
             if trimmed.starts_with('[') {
                 return None;
             }
-            if let Some((key, value)) = trimmed.split_once('=') {
-                if key.trim() == "url" {
-                    return Some(value.trim().to_string());
-                }
+            if let Some((key, value)) = trimmed.split_once('=')
+                && key.trim() == "url"
+            {
+                return Some(value.trim().to_string());
             }
         }
     }

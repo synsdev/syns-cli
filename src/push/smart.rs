@@ -48,10 +48,7 @@ fn build_push_entries(
     let mut deletes = Vec::new();
 
     for (path, sha) in local_shas {
-        let changed = force
-            || reference_shas
-                .get(path)
-                .map_or(true, |ref_sha| ref_sha != sha);
+        let changed = force || (reference_shas.get(path) != Some(sha));
         let content = if changed {
             let bytes = &local_files[path];
             let utf8 = String::from_utf8(bytes.clone()).map_err(|_| CliError::Io {

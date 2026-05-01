@@ -284,13 +284,13 @@ mod tests {
         let mut unchanged_count: usize = 0;
 
         for (path, server_sha) in &server_entries {
-            if let Some(local_sha) = manifest.file_sha(path) {
-                if server_sha == &local_sha {
-                    let file_path = safe_join(dir.path(), path).unwrap();
-                    if file_path.exists() {
-                        unchanged_count += 1;
-                        continue;
-                    }
+            if let Some(local_sha) = manifest.file_sha(path)
+                && server_sha == &local_sha
+            {
+                let file_path = safe_join(dir.path(), path).unwrap();
+                if file_path.exists() {
+                    unchanged_count += 1;
+                    continue;
                 }
             }
             to_download.push(*path);
@@ -324,13 +324,13 @@ mod tests {
         let mut unchanged_count: usize = 0;
 
         for (path, server_sha) in &server_entries {
-            if let Some(local_sha) = manifest.file_sha(path) {
-                if server_sha == &local_sha {
-                    let file_path = safe_join(dir.path(), path).unwrap();
-                    if file_path.exists() {
-                        unchanged_count += 1;
-                        continue;
-                    }
+            if let Some(local_sha) = manifest.file_sha(path)
+                && server_sha == &local_sha
+            {
+                let file_path = safe_join(dir.path(), path).unwrap();
+                if file_path.exists() {
+                    unchanged_count += 1;
+                    continue;
                 }
             }
             to_download.push(path);
