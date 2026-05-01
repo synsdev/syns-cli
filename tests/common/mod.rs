@@ -1,6 +1,6 @@
+use syns_cli::auth::token::TokenStore;
 use syns_cli::config::Config;
 use syns_cli::output::Output;
-use syns_cli::auth::token::TokenStore;
 use tempfile::TempDir;
 use wiremock::MockServer;
 

@@ -1,5 +1,5 @@
 use crate::errors::CliError;
-use comfy_table::{presets, Attribute, Cell, Table};
+use comfy_table::{Attribute, Cell, Table, presets};
 use console::style;
 use serde::Serialize;
 
@@ -120,10 +120,7 @@ mod tests {
     #[test]
     fn format_table_json_mode_is_noop() {
         let output = Output::new(true);
-        let result = output.format_table(
-            &["Name"],
-            vec![vec!["value".into()]],
-        );
+        let result = output.format_table(&["Name"], vec![vec!["value".into()]]);
         assert!(result.is_none());
     }
 
@@ -155,7 +152,9 @@ mod tests {
     #[test]
     fn format_error_normal_mode() {
         let output = Output::new(false);
-        let err = CliError::Config { message: "test error".into() };
+        let err = CliError::Config {
+            message: "test error".into(),
+        };
         let text = output.format_error(&err);
         assert!(text.contains("error:"));
         assert!(text.contains("configuration error: test error"));
@@ -164,7 +163,9 @@ mod tests {
     #[test]
     fn format_error_json_mode() {
         let output = Output::new(true);
-        let err = CliError::Config { message: "test error".into() };
+        let err = CliError::Config {
+            message: "test error".into(),
+        };
         let text = output.format_error(&err);
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(parsed["error"], "configuration error: test error");

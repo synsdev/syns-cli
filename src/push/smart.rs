@@ -48,7 +48,10 @@ fn build_push_entries(
     let mut deletes = Vec::new();
 
     for (path, sha) in local_shas {
-        let changed = force || reference_shas.get(path).map_or(true, |ref_sha| ref_sha != sha);
+        let changed = force
+            || reference_shas
+                .get(path)
+                .map_or(true, |ref_sha| ref_sha != sha);
         let content = if changed {
             let bytes = &local_files[path];
             let utf8 = String::from_utf8(bytes.clone()).map_err(|_| CliError::Io {
@@ -58,7 +61,11 @@ fn build_push_entries(
         } else {
             None
         };
-        entries.push(PushFileEntry { path: path.clone(), sha: sha.clone(), content });
+        entries.push(PushFileEntry {
+            path: path.clone(),
+            sha: sha.clone(),
+            content,
+        });
     }
 
     if !force {
@@ -125,7 +132,11 @@ pub async fn smart_push(
     } else if let Some(manifest) = Manifest::load(&opts.cache_dir, owner, name) {
         let ref_shas: HashMap<String, String> = manifest
             .file_paths()
-            .filter_map(|p| manifest.file_sha(p).map(|sha| (p.to_string(), sha.to_string())))
+            .filter_map(|p| {
+                manifest
+                    .file_sha(p)
+                    .map(|sha| (p.to_string(), sha.to_string()))
+            })
             .collect();
         let parent = manifest.commit_sha().map(String::from);
         (ref_shas, parent)
@@ -135,7 +146,9 @@ pub async fn smart_push(
                 let parent = Some(tree.commit_sha.clone());
                 (tree_to_sha_map(&tree), parent)
             }
-            Err(CliError::Api { status: Some(404), .. }) => (HashMap::new(), None),
+            Err(CliError::Api {
+                status: Some(404), ..
+            }) => (HashMap::new(), None),
             Err(e) => return Err(e),
         }
     };
@@ -147,9 +160,14 @@ pub async fn smart_push(
     };
 
     // Phase 3 — Build and send
-    let (entries, deletes) = build_push_entries(&local_files, &local_shas, &reference_shas, opts.force)?;
+    let (entries, deletes) =
+        build_push_entries(&local_files, &local_shas, &reference_shas, opts.force)?;
 
-    let deletions = if deletes.is_empty() { None } else { Some(deletes) };
+    let deletions = if deletes.is_empty() {
+        None
+    } else {
+        Some(deletes)
+    };
 
     let request = PushRequest {
         files: entries,
@@ -165,7 +183,10 @@ pub async fn smart_push(
 
     let response = match client.push(repo_id, token, &request).await {
         Ok(response) => response,
-        Err(CliError::Api { status: Some(409), ref error }) if error == "missing_blobs" => {
+        Err(CliError::Api {
+            status: Some(409),
+            ref error,
+        }) if error == "missing_blobs" => {
             let retry_entries = upgrade_to_full(&request.files, &local_files)?;
             let retry_request = PushRequest {
                 files: retry_entries,
@@ -260,16 +281,29 @@ mod tests {
         assert_eq!(syns_yaml, "owner: alice\nname: new-repo\n");
 
         // Manifest was saved
-        assert!(cache_dir.path().join("alice").join("new-repo.json").exists());
+        assert!(
+            cache_dir
+                .path()
+                .join("alice")
+                .join("new-repo.json")
+                .exists()
+        );
 
         // Verify request body
         let requests = mock_server.received_requests().await.unwrap();
-        let put_request = requests.iter().find(|r| r.method == reqwest::Method::PUT).unwrap();
+        let put_request = requests
+            .iter()
+            .find(|r| r.method == reqwest::Method::PUT)
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&put_request.body).unwrap();
 
         let files = body["files"].as_array().unwrap();
-        let has_main = files.iter().any(|f| f["path"] == "main.txt" && f["content"].is_string());
-        let has_other = files.iter().any(|f| f["path"] == "sub/other.txt" && f["content"].is_string());
+        let has_main = files
+            .iter()
+            .any(|f| f["path"] == "main.txt" && f["content"].is_string());
+        let has_other = files
+            .iter()
+            .any(|f| f["path"] == "sub/other.txt" && f["content"].is_string());
         assert!(has_main);
         assert!(has_other);
         assert!(body["parentSha"].is_null());
@@ -336,12 +370,18 @@ mod tests {
         assert!(result.is_ok());
 
         let requests = mock_server.received_requests().await.unwrap();
-        let put_request = requests.iter().find(|r| r.method == reqwest::Method::PUT).unwrap();
+        let put_request = requests
+            .iter()
+            .find(|r| r.method == reqwest::Method::PUT)
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&put_request.body).unwrap();
 
         let files = body["files"].as_array().unwrap();
         let a_entry = files.iter().find(|f| f["path"] == "a.txt").unwrap();
-        assert!(a_entry["content"].is_null(), "unchanged file should be sha-only");
+        assert!(
+            a_entry["content"].is_null(),
+            "unchanged file should be sha-only"
+        );
         let b_entry = files.iter().find(|f| f["path"] == "b.txt").unwrap();
         assert_eq!(b_entry["content"].as_str(), Some("modified"));
         assert_eq!(body["parentSha"].as_str(), Some("old-sha"));
@@ -407,7 +447,10 @@ mod tests {
         assert!(result.is_ok());
 
         let requests = mock_server.received_requests().await.unwrap();
-        let put_request = requests.iter().find(|r| r.method == reqwest::Method::PUT).unwrap();
+        let put_request = requests
+            .iter()
+            .find(|r| r.method == reqwest::Method::PUT)
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&put_request.body).unwrap();
 
         let deletes: Vec<&str> = body["deletions"]
@@ -420,7 +463,10 @@ mod tests {
 
         let files = body["files"].as_array().unwrap();
         let keep_entry = files.iter().find(|f| f["path"] == "keep.txt").unwrap();
-        assert!(keep_entry["content"].is_null(), "unchanged file should be sha-only");
+        assert!(
+            keep_entry["content"].is_null(),
+            "unchanged file should be sha-only"
+        );
     }
 
     #[tokio::test]
@@ -505,12 +551,24 @@ mod tests {
 
         // First request: b.txt should be sha-only (unchanged per manifest)
         let body1: serde_json::Value = serde_json::from_slice(&put_requests[0].body).unwrap();
-        let b_entry1 = body1["files"].as_array().unwrap().iter().find(|f| f["path"] == "b.txt").unwrap().clone();
+        let b_entry1 = body1["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["path"] == "b.txt")
+            .unwrap()
+            .clone();
         assert!(b_entry1["content"].is_null());
 
         // Second request (retry): b.txt should have content (upgraded)
         let body2: serde_json::Value = serde_json::from_slice(&put_requests[1].body).unwrap();
-        let b_entry2 = body2["files"].as_array().unwrap().iter().find(|f| f["path"] == "b.txt").unwrap().clone();
+        let b_entry2 = body2["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["path"] == "b.txt")
+            .unwrap()
+            .clone();
         assert_eq!(b_entry2["content"].as_str(), Some("old-b"));
     }
 
@@ -581,10 +639,19 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         let files = body["files"].as_array().unwrap();
         let a_entry = files.iter().find(|f| f["path"] == "a.txt").unwrap();
-        assert!(a_entry["content"].is_string(), "force should send all content");
+        assert!(
+            a_entry["content"].is_string(),
+            "force should send all content"
+        );
         let b_entry = files.iter().find(|f| f["path"] == "b.txt").unwrap();
-        assert!(b_entry["content"].is_string(), "force should send all content");
-        assert!(body["parentSha"].is_null(), "force defaults parent_sha to None");
+        assert!(
+            b_entry["content"].is_string(),
+            "force should send all content"
+        );
+        assert!(
+            body["parentSha"].is_null(),
+            "force defaults parent_sha to None"
+        );
         assert!(body.get("deletions").is_none() || body["deletions"].is_null());
 
         // Manifest was still saved

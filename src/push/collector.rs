@@ -1,6 +1,6 @@
 use crate::errors::CliError;
-use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
+use ignore::overrides::OverrideBuilder;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::Read;
@@ -39,9 +39,11 @@ pub fn collect_files(
 ) -> Result<HashMap<String, Vec<u8>>, CliError> {
     let mut overrides = OverrideBuilder::new(path);
     for pattern in excludes {
-        overrides.add(&format!("!{pattern}")).map_err(|err| CliError::Io {
-            message: format!("invalid exclude pattern '{pattern}': {err}"),
-        })?;
+        overrides
+            .add(&format!("!{pattern}"))
+            .map_err(|err| CliError::Io {
+                message: format!("invalid exclude pattern '{pattern}': {err}"),
+            })?;
     }
     let overrides = overrides.build().map_err(|err| CliError::Io {
         message: format!("invalid exclude pattern: {err}"),
@@ -251,7 +253,11 @@ mod tests {
 
         // Directories that should be excluded
         std::fs::create_dir_all(dir.path().join("node_modules/leftpad")).unwrap();
-        std::fs::write(dir.path().join("node_modules/leftpad/index.js"), "module.exports = {};").unwrap();
+        std::fs::write(
+            dir.path().join("node_modules/leftpad/index.js"),
+            "module.exports = {};",
+        )
+        .unwrap();
         std::fs::create_dir_all(dir.path().join("__pycache__")).unwrap();
         std::fs::write(dir.path().join("__pycache__/mod.cpython.pyc"), "cache").unwrap();
         std::fs::create_dir_all(dir.path().join(".venv/lib")).unwrap();

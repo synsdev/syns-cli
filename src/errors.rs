@@ -22,10 +22,21 @@ impl CliError {
 impl std::fmt::Display for CliError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CliError::Api { status: Some(s), error } => write!(f, "server error ({s}): {error}"),
-            CliError::Api { status: None, error } => write!(f, "network error: {error}"),
-            CliError::AuthRequired => write!(f, "authentication required \u{2014} run 'syns login' first"),
-            CliError::RepoIdentityUnknown => write!(f, "cannot determine repo identity \u{2014} provide --name or create .syns.yaml"),
+            CliError::Api {
+                status: Some(s),
+                error,
+            } => write!(f, "server error ({s}): {error}"),
+            CliError::Api {
+                status: None,
+                error,
+            } => write!(f, "network error: {error}"),
+            CliError::AuthRequired => {
+                write!(f, "authentication required \u{2014} run 'syns login' first")
+            }
+            CliError::RepoIdentityUnknown => write!(
+                f,
+                "cannot determine repo identity \u{2014} provide --name or create .syns.yaml"
+            ),
             CliError::ServerUnreachable { url } => write!(f, "could not reach server at {url}"),
             CliError::Io { message } => write!(f, "{message}"),
             CliError::Config { message } => write!(f, "configuration error: {message}"),
@@ -59,19 +70,47 @@ mod tests {
     #[test]
     fn exit_codes() {
         assert_eq!(CliError::RepoIdentityUnknown.exit_code(), 2);
-        assert_eq!(CliError::ServerUnreachable { url: "x".into() }.exit_code(), 3);
+        assert_eq!(
+            CliError::ServerUnreachable { url: "x".into() }.exit_code(),
+            3
+        );
         assert_eq!(CliError::AuthRequired.exit_code(), 1);
-        assert_eq!((CliError::Config { message: "x".into() }).exit_code(), 1);
-        assert_eq!((CliError::Api { status: Some(500), error: "x".into() }).exit_code(), 1);
-        assert_eq!((CliError::Io { message: "x".into() }).exit_code(), 1);
+        assert_eq!(
+            (CliError::Config {
+                message: "x".into()
+            })
+            .exit_code(),
+            1
+        );
+        assert_eq!(
+            (CliError::Api {
+                status: Some(500),
+                error: "x".into()
+            })
+            .exit_code(),
+            1
+        );
+        assert_eq!(
+            (CliError::Io {
+                message: "x".into()
+            })
+            .exit_code(),
+            1
+        );
     }
 
     #[test]
     fn display_messages() {
-        let api_with = CliError::Api { status: Some(404), error: "not_found".into() };
+        let api_with = CliError::Api {
+            status: Some(404),
+            error: "not_found".into(),
+        };
         assert_eq!(api_with.to_string(), "server error (404): not_found");
 
-        let api_without = CliError::Api { status: None, error: "timeout".into() };
+        let api_without = CliError::Api {
+            status: None,
+            error: "timeout".into(),
+        };
         assert_eq!(api_without.to_string(), "network error: timeout");
 
         assert_eq!(
@@ -85,17 +124,26 @@ mod tests {
         );
 
         assert_eq!(
-            CliError::ServerUnreachable { url: "https://example.com".into() }.to_string(),
+            CliError::ServerUnreachable {
+                url: "https://example.com".into()
+            }
+            .to_string(),
             "could not reach server at https://example.com"
         );
 
         assert_eq!(
-            CliError::Io { message: "file not found".into() }.to_string(),
+            CliError::Io {
+                message: "file not found".into()
+            }
+            .to_string(),
             "file not found"
         );
 
         assert_eq!(
-            CliError::Config { message: "bad url".into() }.to_string(),
+            CliError::Config {
+                message: "bad url".into()
+            }
+            .to_string(),
             "configuration error: bad url"
         );
     }

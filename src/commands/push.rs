@@ -8,7 +8,7 @@ use crate::commands::repo::{CliRepoStatus, CliVisibility};
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
-use crate::push::smart::{smart_push, SmartPushOptions};
+use crate::push::smart::{SmartPushOptions, smart_push};
 use crate::repo::resolve::resolve_repo_identity;
 
 const DEFAULT_COMMIT_MESSAGE: &str = "push";
@@ -65,11 +65,7 @@ async fn resolve_owner(
     Ok(session.user.username)
 }
 
-pub async fn cmd_push(
-    config: &Config,
-    output: &Output,
-    args: &PushArgs,
-) -> Result<(), CliError> {
+pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Result<(), CliError> {
     let push_path = match &args.path {
         Some(p) => p.clone(),
         None => std::env::current_dir().map_err(|e| CliError::Io {
@@ -184,8 +180,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/v1/repos/alice/new-repo/tree"))
             .respond_with(
-                ResponseTemplate::new(404)
-                    .set_body_json(serde_json::json!({"error": "not_found"})),
+                ResponseTemplate::new(404).set_body_json(serde_json::json!({"error": "not_found"})),
             )
             .mount(&mock_server)
             .await;
@@ -327,14 +322,8 @@ mod tests {
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&put_request.body).unwrap();
 
-        assert_eq!(
-            body["description"].as_str(),
-            Some("My project description")
-        );
-        assert_eq!(
-            body["tags"],
-            serde_json::json!(["rust", "cli"])
-        );
+        assert_eq!(body["description"].as_str(), Some("My project description"));
+        assert_eq!(body["tags"], serde_json::json!(["rust", "cli"]));
         assert_eq!(body["status"].as_str(), Some("active"));
         assert_eq!(body["visibility"].as_str(), Some("public"));
     }

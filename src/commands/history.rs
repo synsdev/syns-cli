@@ -6,17 +6,28 @@ use crate::output::Output;
 use crate::repo::resolve::resolve_repo_identity;
 use serde_json::json;
 
-pub async fn cmd_history(config: &Config, output: &Output, file: Option<String>, limit: u32) -> Result<(), CliError> {
-    let current_dir = std::env::current_dir()
-        .map_err(|e| CliError::Io { message: format!("could not determine current directory: {e}") })?;
+pub async fn cmd_history(
+    config: &Config,
+    output: &Output,
+    file: Option<String>,
+    limit: u32,
+) -> Result<(), CliError> {
+    let current_dir = std::env::current_dir().map_err(|e| CliError::Io {
+        message: format!("could not determine current directory: {e}"),
+    })?;
     let identity = resolve_repo_identity(None, &current_dir)?;
     let owner = identity.owner.ok_or(CliError::RepoIdentityUnknown)?;
     let repo_id = format!("{}/{}", owner, identity.name);
-    let token = TokenStore::new(config.credentials_path()).read().ok().flatten();
+    let token = TokenStore::new(config.credentials_path())
+        .read()
+        .ok()
+        .flatten();
     let client = SynsClient::new(config.server_url())?;
 
     if let Some(path) = file {
-        let response = client.get_file_history(&repo_id, token.as_deref(), &path, limit).await?;
+        let response = client
+            .get_file_history(&repo_id, token.as_deref(), &path, limit)
+            .await?;
 
         if output.is_json() {
             output.json(&json!({
@@ -35,18 +46,24 @@ pub async fn cmd_history(config: &Config, output: &Output, file: Option<String>,
                 "offset": response.offset,
             }));
         } else {
-            let rows = response.data.iter().map(|entry| {
-                vec![
-                    entry.sha[..entry.sha.len().min(8)].to_string(),
-                    entry.message.clone(),
-                    entry.author.clone(),
-                    entry.created_at.clone(),
-                ]
-            }).collect();
+            let rows = response
+                .data
+                .iter()
+                .map(|entry| {
+                    vec![
+                        entry.sha[..entry.sha.len().min(8)].to_string(),
+                        entry.message.clone(),
+                        entry.author.clone(),
+                        entry.created_at.clone(),
+                    ]
+                })
+                .collect();
             output.table(&["SHA", "Message", "Author", "Date"], rows);
         }
     } else {
-        let response = client.list_versions(&repo_id, token.as_deref(), limit, 0).await?;
+        let response = client
+            .list_versions(&repo_id, token.as_deref(), limit, 0)
+            .await?;
 
         if output.is_json() {
             output.json(&json!({
@@ -63,18 +80,29 @@ pub async fn cmd_history(config: &Config, output: &Output, file: Option<String>,
                 "offset": response.offset,
             }));
         } else {
-            let rows = response.data.iter().map(|entry| {
-                let n = entry.files_changed.len();
-                vec![
-                    entry.version.to_string(),
-                    entry.sha[..entry.sha.len().min(8)].to_string(),
-                    entry.message.clone(),
-                    entry.author.clone(),
-                    entry.created_at.clone(),
-                    if n == 1 { "1 file".to_string() } else { format!("{n} files") },
-                ]
-            }).collect();
-            output.table(&["Version", "SHA", "Message", "Author", "Date", "Files"], rows);
+            let rows = response
+                .data
+                .iter()
+                .map(|entry| {
+                    let n = entry.files_changed.len();
+                    vec![
+                        entry.version.to_string(),
+                        entry.sha[..entry.sha.len().min(8)].to_string(),
+                        entry.message.clone(),
+                        entry.author.clone(),
+                        entry.created_at.clone(),
+                        if n == 1 {
+                            "1 file".to_string()
+                        } else {
+                            format!("{n} files")
+                        },
+                    ]
+                })
+                .collect();
+            output.table(
+                &["Version", "SHA", "Message", "Author", "Date", "Files"],
+                rows,
+            );
         }
     }
 
@@ -95,7 +123,8 @@ mod tests {
         std::fs::write(
             dir.path().join(".syns.yaml"),
             "owner: alice\nname: my-project\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
 
@@ -155,14 +184,17 @@ mod tests {
         std::fs::write(
             dir.path().join(".syns.yaml"),
             "owner: alice\nname: my-project\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
 
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/api/v1/repos/alice/my-project/files/src/main.ts/history"))
+            .and(path(
+                "/api/v1/repos/alice/my-project/files/src/main.ts/history",
+            ))
             .and(query_param("limit", "50"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": [

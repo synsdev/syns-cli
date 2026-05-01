@@ -1,10 +1,10 @@
-use crate::common::{setup, seed_credentials};
+use crate::common::{seed_credentials, setup};
+use serde_json::json;
+use serial_test::serial;
 use syns_cli::auth::token::TokenStore;
 use syns_cli::commands::logout::cmd_logout;
 use syns_cli::commands::whoami::cmd_whoami;
 use syns_cli::errors::CliError;
-use serial_test::serial;
-use serde_json::json;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, ResponseTemplate};
 

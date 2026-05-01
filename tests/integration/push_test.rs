@@ -1,12 +1,12 @@
-use crate::common::{setup, seed_credentials};
-use syns_cli::commands::push::{cmd_push, PushArgs};
-use syns_cli::client::SynsClient;
-use syns_cli::push::hash::blob_sha1;
-use syns_cli::push::manifest::Manifest;
-use serial_test::serial;
+use crate::common::{seed_credentials, setup};
 use serde_json::json;
+use serial_test::serial;
 use std::collections::HashMap;
 use std::fs;
+use syns_cli::client::SynsClient;
+use syns_cli::commands::push::{PushArgs, cmd_push};
+use syns_cli::push::hash::blob_sha1;
+use syns_cli::push::manifest::Manifest;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
 
@@ -17,7 +17,11 @@ async fn push_creates_repo_and_sends_files() {
     seed_credentials(&ctx, "test-token-abc", "alice");
 
     fs::write(ctx.project_dir.path().join("hello.txt"), "hello world").unwrap();
-    fs::write(ctx.project_dir.path().join(".syns.yaml"), "owner: alice\nname: new-repo\n").unwrap();
+    fs::write(
+        ctx.project_dir.path().join(".syns.yaml"),
+        "owner: alice\nname: new-repo\n",
+    )
+    .unwrap();
 
     Mock::given(method("GET"))
         .and(path("/api/v1/repos/alice/new-repo/tree"))
@@ -64,7 +68,11 @@ async fn push_sends_only_changed_files() {
 
     fs::write(ctx.project_dir.path().join("a.txt"), "unchanged").unwrap();
     fs::write(ctx.project_dir.path().join("b.txt"), "modified").unwrap();
-    fs::write(ctx.project_dir.path().join(".syns.yaml"), "owner: bob\nname: my-repo\n").unwrap();
+    fs::write(
+        ctx.project_dir.path().join(".syns.yaml"),
+        "owner: bob\nname: my-repo\n",
+    )
+    .unwrap();
 
     let mut manifest = Manifest::default();
     manifest.update(
@@ -74,7 +82,9 @@ async fn push_sends_only_changed_files() {
             ("b.txt".to_string(), blob_sha1(b"original")),
         ]),
     );
-    manifest.save(ctx.config.cache_dir(), "bob", "my-repo").unwrap();
+    manifest
+        .save(ctx.config.cache_dir(), "bob", "my-repo")
+        .unwrap();
 
     Mock::given(method("PUT"))
         .and(path("/api/v1/repos/bob/my-repo/push"))
@@ -103,20 +113,35 @@ async fn push_sends_only_changed_files() {
     assert!(result.is_ok());
 
     let requests = ctx.mock_server.received_requests().await.unwrap();
-    let push_request = requests.iter()
+    let push_request = requests
+        .iter()
         .find(|r| r.url.path() == "/api/v1/repos/bob/my-repo/push")
         .expect("push request not found");
     let body: serde_json::Value = serde_json::from_slice(&push_request.body).unwrap();
 
-    assert_eq!(body["parentSha"], "1111111111111111111111111111111111111111");
+    assert_eq!(
+        body["parentSha"],
+        "1111111111111111111111111111111111111111"
+    );
 
     let files = body["files"].as_array().unwrap();
-    let b_entry = files.iter().find(|f| f["path"] == "b.txt").expect("b.txt not in files");
-    assert!(!b_entry["content"].is_null(), "b.txt should have content (file changed)");
+    let b_entry = files
+        .iter()
+        .find(|f| f["path"] == "b.txt")
+        .expect("b.txt not in files");
+    assert!(
+        !b_entry["content"].is_null(),
+        "b.txt should have content (file changed)"
+    );
 
-    let a_entry = files.iter().find(|f| f["path"] == "a.txt").expect("a.txt not in files");
-    assert!(a_entry.get("content").is_none(),
-        "a.txt should not have content key (file unchanged)");
+    let a_entry = files
+        .iter()
+        .find(|f| f["path"] == "a.txt")
+        .expect("a.txt not in files");
+    assert!(
+        a_entry.get("content").is_none(),
+        "a.txt should not have content key (file unchanged)"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -146,6 +171,9 @@ async fn pull_downloads_tree() {
 
     let response = response.unwrap();
     assert_eq!(response.entries.len(), 3);
-    assert_eq!(response.commit_sha, "3333333333333333333333333333333333333333");
+    assert_eq!(
+        response.commit_sha,
+        "3333333333333333333333333333333333333333"
+    );
     assert_eq!(response.truncated, false);
 }

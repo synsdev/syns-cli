@@ -7,15 +7,21 @@ use crate::repo::resolve::resolve_repo_identity;
 use serde_json::json;
 
 pub async fn cmd_cat(config: &Config, output: &Output, path: String) -> Result<(), CliError> {
-    let current_dir = std::env::current_dir()
-        .map_err(|e| CliError::Io { message: format!("could not determine current directory: {e}") })?;
+    let current_dir = std::env::current_dir().map_err(|e| CliError::Io {
+        message: format!("could not determine current directory: {e}"),
+    })?;
     let identity = resolve_repo_identity(None, &current_dir)?;
     let owner = identity.owner.ok_or(CliError::RepoIdentityUnknown)?;
     let repo_id = format!("{}/{}", owner, identity.name);
-    let token = TokenStore::new(config.credentials_path()).read().ok().flatten();
+    let token = TokenStore::new(config.credentials_path())
+        .read()
+        .ok()
+        .flatten();
     let client = SynsClient::new(config.server_url())?;
 
-    let response = client.get_file(&repo_id, token.as_deref(), &path, None).await?;
+    let response = client
+        .get_file(&repo_id, token.as_deref(), &path, None)
+        .await?;
 
     if output.is_json() {
         output.json(&json!({
@@ -44,7 +50,8 @@ mod tests {
         std::fs::write(
             dir.path().join(".syns.yaml"),
             "owner: alice\nname: my-project\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
 
@@ -76,7 +83,8 @@ mod tests {
         std::fs::write(
             dir.path().join(".syns.yaml"),
             "owner: alice\nname: my-project\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
 

@@ -44,8 +44,9 @@ pub async fn cmd_pull(
 ) -> Result<(), CliError> {
     let target_dir = match &path_arg {
         Some(p) => PathBuf::from(p),
-        None => std::env::current_dir()
-            .map_err(|e| CliError::Io { message: format!("could not determine current directory: {e}") })?,
+        None => std::env::current_dir().map_err(|e| CliError::Io {
+            message: format!("could not determine current directory: {e}"),
+        })?,
     };
 
     let (owner, name) = if let Some(ref arg) = repo_arg {
@@ -65,21 +66,27 @@ pub async fn cmd_pull(
     };
 
     let repo_id = format!("{owner}/{name}");
-    let token = TokenStore::new(config.credentials_path()).read().ok().flatten();
+    let token = TokenStore::new(config.credentials_path())
+        .read()
+        .ok()
+        .flatten();
     let client = SynsClient::new(config.server_url())?;
 
     let tree_response = if version.is_some() {
-        client.get_tree(&repo_id, token.as_deref(), None, true, version.as_deref()).await?
+        client
+            .get_tree(&repo_id, token.as_deref(), None, true, version.as_deref())
+            .await?
     } else {
         client.pull(&repo_id, token.as_deref()).await?
     };
 
-    let server_files: Vec<_> = tree_response.entries.iter()
+    let server_files: Vec<_> = tree_response
+        .entries
+        .iter()
         .filter(|e| e.entry_type == EntryType::File)
         .collect();
 
-    let mut manifest = Manifest::load(config.cache_dir(), &owner, &name)
-        .unwrap_or_default();
+    let mut manifest = Manifest::load(config.cache_dir(), &owner, &name).unwrap_or_default();
 
     let server_paths: HashSet<String> = server_files.iter().map(|e| e.path.clone()).collect();
     let mut to_download = Vec::new();
@@ -101,7 +108,8 @@ pub async fn cmd_pull(
     }
 
     let to_delete: Vec<String> = if version.is_none() {
-        manifest.file_paths()
+        manifest
+            .file_paths()
             .filter(|p| !server_paths.contains(*p))
             .map(|p| p.to_string())
             .collect()
@@ -114,7 +122,9 @@ pub async fn cmd_pull(
     })?;
 
     for entry in &to_download {
-        let response = client.get_file(&repo_id, token.as_deref(), &entry.path, version.as_deref()).await?;
+        let response = client
+            .get_file(&repo_id, token.as_deref(), &entry.path, version.as_deref())
+            .await?;
         let file_path = safe_join(&target_dir, &entry.path)?;
         if let Some(parent) = file_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| CliError::Io {
@@ -146,7 +156,8 @@ pub async fn cmd_pull(
     }
 
     if version.is_none() {
-        let files_map: HashMap<String, String> = server_files.iter()
+        let files_map: HashMap<String, String> = server_files
+            .iter()
             .map(|e| (e.path.clone(), e.sha.clone().unwrap_or_default()))
             .collect();
         manifest.update(tree_response.commit_sha.clone(), files_map);
@@ -165,7 +176,10 @@ pub async fn cmd_pull(
             "deleted": deleted,
         });
         if let Some(ref v) = version {
-            summary.as_object_mut().unwrap().insert("version".into(), json!(v));
+            summary
+                .as_object_mut()
+                .unwrap()
+                .insert("version".into(), json!(v));
         }
         output.json(&summary);
     } else {
@@ -263,10 +277,8 @@ mod tests {
         manifest.update("commit1".to_string(), files_map);
 
         // Simulated server entries with matching SHAs
-        let server_entries: Vec<(&str, &str)> = vec![
-            ("src/main.rs", "abc123"),
-            ("README.md", "def456"),
-        ];
+        let server_entries: Vec<(&str, &str)> =
+            vec![("src/main.rs", "abc123"), ("README.md", "def456")];
 
         let mut to_download = Vec::new();
         let mut unchanged_count: usize = 0;

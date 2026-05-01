@@ -83,7 +83,10 @@ fn is_valid_reponame(name: &str) -> bool {
     if len == 0 || len > REPONAME_MAX_LENGTH {
         return false;
     }
-    if !name.chars().all(|c| matches!(c, 'a'..='z' | '0'..='9' | '.' | '_' | '-')) {
+    if !name
+        .chars()
+        .all(|c| matches!(c, 'a'..='z' | '0'..='9' | '.' | '_' | '-'))
+    {
         return false;
     }
     let first = name.as_bytes()[0];
@@ -124,7 +127,10 @@ mod tests {
         );
         assert_eq!(
             extract_from_git_remote(tmp.path()),
-            Some(RepoIdentity { owner: None, name: "my-project".into() })
+            Some(RepoIdentity {
+                owner: None,
+                name: "my-project".into()
+            })
         );
     }
 
@@ -137,7 +143,10 @@ mod tests {
         );
         assert_eq!(
             extract_from_git_remote(tmp.path()),
-            Some(RepoIdentity { owner: None, name: "ssh-project".into() })
+            Some(RepoIdentity {
+                owner: None,
+                name: "ssh-project".into()
+            })
         );
     }
 
@@ -150,7 +159,10 @@ mod tests {
         );
         assert_eq!(
             extract_from_git_remote(tmp.path()),
-            Some(RepoIdentity { owner: None, name: "my-project".into() })
+            Some(RepoIdentity {
+                owner: None,
+                name: "my-project".into()
+            })
         );
     }
 
@@ -163,7 +175,10 @@ mod tests {
         );
         assert_eq!(
             extract_from_git_remote(tmp.path()),
-            Some(RepoIdentity { owner: None, name: "my-project".into() })
+            Some(RepoIdentity {
+                owner: None,
+                name: "my-project".into()
+            })
         );
     }
 
@@ -176,7 +191,10 @@ mod tests {
         );
         assert_eq!(
             extract_from_git_remote(tmp.path()),
-            Some(RepoIdentity { owner: None, name: "my-project".into() })
+            Some(RepoIdentity {
+                owner: None,
+                name: "my-project".into()
+            })
         );
     }
 
@@ -217,7 +235,10 @@ mod tests {
         fs::create_dir_all(&sub).unwrap();
         assert_eq!(
             extract_from_git_remote(&sub),
-            Some(RepoIdentity { owner: None, name: "parent-repo".into() })
+            Some(RepoIdentity {
+                owner: None,
+                name: "parent-repo".into()
+            })
         );
     }
 

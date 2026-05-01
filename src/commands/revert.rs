@@ -6,9 +6,16 @@ use crate::output::Output;
 use crate::repo::resolve::resolve_repo_identity;
 use serde_json::json;
 
-pub async fn cmd_revert(config: &Config, output: &Output, path: String, to: String, message: Option<String>) -> Result<(), CliError> {
-    let current_dir = std::env::current_dir()
-        .map_err(|e| CliError::Io { message: format!("could not determine current directory: {e}") })?;
+pub async fn cmd_revert(
+    config: &Config,
+    output: &Output,
+    path: String,
+    to: String,
+    message: Option<String>,
+) -> Result<(), CliError> {
+    let current_dir = std::env::current_dir().map_err(|e| CliError::Io {
+        message: format!("could not determine current directory: {e}"),
+    })?;
     let identity = resolve_repo_identity(None, &current_dir)?;
     let owner = identity.owner.ok_or(CliError::RepoIdentityUnknown)?;
     let repo_id = format!("{}/{}", owner, identity.name);
@@ -17,8 +24,13 @@ pub async fn cmd_revert(config: &Config, output: &Output, path: String, to: Stri
         .ok_or(CliError::AuthRequired)?;
     let client = SynsClient::new(config.server_url())?;
 
-    let request = RevertFileRequest { to: to.clone(), message: message.clone() };
-    let response = client.revert_file(&repo_id, &token, &path, &request).await?;
+    let request = RevertFileRequest {
+        to: to.clone(),
+        message: message.clone(),
+    };
+    let response = client
+        .revert_file(&repo_id, &token, &path, &request)
+        .await?;
 
     if output.is_json() {
         output.json(&json!({
@@ -31,7 +43,9 @@ pub async fn cmd_revert(config: &Config, output: &Output, path: String, to: Stri
     } else if response.files_changed > 0 {
         output.success(&format!(
             "Reverted {} to {} (commit {})",
-            path, to, &response.commit_sha[..response.commit_sha.len().min(8)]
+            path,
+            to,
+            &response.commit_sha[..response.commit_sha.len().min(8)]
         ));
     } else {
         output.success(&format!(
@@ -57,7 +71,8 @@ mod tests {
         std::fs::write(
             dir.path().join(".syns.yaml"),
             "owner: alice\nname: my-project\n",
-        ).unwrap();
+        )
+        .unwrap();
         TokenStore::new(dir.path().join("credentials.json"))
             .write("test-token")
             .unwrap();
@@ -67,7 +82,9 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/api/v1/repos/alice/my-project/files/src/config.ts/revert"))
+            .and(path(
+                "/api/v1/repos/alice/my-project/files/src/config.ts/revert",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "commitSha": "ddd44444ddd44444",
                 "version": 4,
@@ -80,7 +97,14 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_revert(&config, &output, "src/config.ts".to_string(), "3".to_string(), None).await;
+        let result = cmd_revert(
+            &config,
+            &output,
+            "src/config.ts".to_string(),
+            "3".to_string(),
+            None,
+        )
+        .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
@@ -93,7 +117,8 @@ mod tests {
         std::fs::write(
             dir.path().join(".syns.yaml"),
             "owner: alice\nname: my-project\n",
-        ).unwrap();
+        )
+        .unwrap();
         // Do NOT write a credentials file
         std::env::set_current_dir(dir.path()).unwrap();
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };

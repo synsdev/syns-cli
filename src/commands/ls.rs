@@ -6,16 +6,26 @@ use crate::output::Output;
 use crate::repo::resolve::resolve_repo_identity;
 use serde_json::json;
 
-pub async fn cmd_ls(config: &Config, output: &Output, path: Option<String>) -> Result<(), CliError> {
-    let current_dir = std::env::current_dir()
-        .map_err(|e| CliError::Io { message: format!("could not determine current directory: {e}") })?;
+pub async fn cmd_ls(
+    config: &Config,
+    output: &Output,
+    path: Option<String>,
+) -> Result<(), CliError> {
+    let current_dir = std::env::current_dir().map_err(|e| CliError::Io {
+        message: format!("could not determine current directory: {e}"),
+    })?;
     let identity = resolve_repo_identity(None, &current_dir)?;
     let owner = identity.owner.ok_or(CliError::RepoIdentityUnknown)?;
     let repo_id = format!("{}/{}", owner, identity.name);
-    let token = TokenStore::new(config.credentials_path()).read().ok().flatten();
+    let token = TokenStore::new(config.credentials_path())
+        .read()
+        .ok()
+        .flatten();
     let client = SynsClient::new(config.server_url())?;
 
-    let mut response = client.get_tree(&repo_id, token.as_deref(), path.as_deref(), false, None).await?;
+    let mut response = client
+        .get_tree(&repo_id, token.as_deref(), path.as_deref(), false, None)
+        .await?;
 
     response.entries.sort_by(|a, b| {
         let type_order = |t: &EntryType| match t {
@@ -23,40 +33,50 @@ pub async fn cmd_ls(config: &Config, output: &Output, path: Option<String>) -> R
             EntryType::File => 1,
             EntryType::Unknown => 2,
         };
-        type_order(&a.entry_type).cmp(&type_order(&b.entry_type))
+        type_order(&a.entry_type)
+            .cmp(&type_order(&b.entry_type))
             .then_with(|| a.name.cmp(&b.name))
     });
 
     if output.is_json() {
-        let entries: Vec<_> = response.entries.iter().map(|e| {
-            json!({
-                "name": e.name,
-                "path": e.path,
-                "type": match e.entry_type {
-                    EntryType::File => "file",
-                    EntryType::Dir => "dir",
-                    EntryType::Unknown => "unknown",
-                },
-                "size": e.size,
-                "sha": e.sha,
+        let entries: Vec<_> = response
+            .entries
+            .iter()
+            .map(|e| {
+                json!({
+                    "name": e.name,
+                    "path": e.path,
+                    "type": match e.entry_type {
+                        EntryType::File => "file",
+                        EntryType::Dir => "dir",
+                        EntryType::Unknown => "unknown",
+                    },
+                    "size": e.size,
+                    "sha": e.sha,
+                })
             })
-        }).collect();
+            .collect();
         output.json(&json!({ "entries": entries, "commitSha": response.commit_sha }));
     } else {
-        let rows: Vec<Vec<String>> = response.entries.iter().map(|e| {
-            vec![
-                e.name.clone(),
-                match e.entry_type {
-                    EntryType::File => "file",
-                    EntryType::Dir => "dir",
-                    EntryType::Unknown => "unknown",
-                }.to_string(),
-                match e.size {
-                    Some(n) => n.to_string(),
-                    None => "-".to_string(),
-                },
-            ]
-        }).collect();
+        let rows: Vec<Vec<String>> = response
+            .entries
+            .iter()
+            .map(|e| {
+                vec![
+                    e.name.clone(),
+                    match e.entry_type {
+                        EntryType::File => "file",
+                        EntryType::Dir => "dir",
+                        EntryType::Unknown => "unknown",
+                    }
+                    .to_string(),
+                    match e.size {
+                        Some(n) => n.to_string(),
+                        None => "-".to_string(),
+                    },
+                ]
+            })
+            .collect();
         output.table(&["Name", "Type", "Size"], rows);
     }
 
@@ -77,7 +97,8 @@ mod tests {
         std::fs::write(
             dir.path().join(".syns.yaml"),
             "owner: alice\nname: my-project\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
 
@@ -112,7 +133,8 @@ mod tests {
         std::fs::write(
             dir.path().join(".syns.yaml"),
             "owner: alice\nname: my-project\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
 

@@ -35,10 +35,9 @@ pub fn read_syns_yaml(path: &Path) -> Result<Option<RepoIdentity>, CliError> {
         message: format!("could not read .syns.yaml: {err}"),
     })?;
 
-    let yaml: SynsYaml =
-        serde_yaml::from_str(&contents).map_err(|err| CliError::Io {
-            message: format!("invalid .syns.yaml: {err}"),
-        })?;
+    let yaml: SynsYaml = serde_yaml::from_str(&contents).map_err(|err| CliError::Io {
+        message: format!("invalid .syns.yaml: {err}"),
+    })?;
 
     Ok(Some(RepoIdentity {
         owner: Some(yaml.owner),

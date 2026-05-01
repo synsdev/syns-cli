@@ -5,14 +5,11 @@ pub fn blob_sha1(content: &[u8]) -> String {
     let mut hasher = Sha1::new();
     hasher.update(header.as_bytes());
     hasher.update(content);
-    hasher
-        .finalize()
-        .iter()
-        .fold(String::new(), |mut acc, b| {
-            use std::fmt::Write;
-            write!(acc, "{b:02x}").unwrap();
-            acc
-        })
+    hasher.finalize().iter().fold(String::new(), |mut acc, b| {
+        use std::fmt::Write;
+        write!(acc, "{b:02x}").unwrap();
+        acc
+    })
 }
 
 #[cfg(test)]

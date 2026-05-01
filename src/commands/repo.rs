@@ -44,13 +44,43 @@ fn display_repo(output: &Output, response: &RepoResponse) {
         output.json(&response);
     } else {
         let rows = vec![
-            vec!["Repository".into(), format!("{}/{}", response.owner, response.name)],
-            vec!["Description".into(), response.description.as_deref().unwrap_or("(none)").to_string()],
-            vec!["Status".into(), format!("{:?}", response.status).to_lowercase()],
-            vec!["Visibility".into(), format!("{:?}", response.visibility).to_lowercase()],
-            vec!["Tags".into(), if response.tags.is_empty() { "(none)".to_string() } else { response.tags.join(", ") }],
+            vec![
+                "Repository".into(),
+                format!("{}/{}", response.owner, response.name),
+            ],
+            vec![
+                "Description".into(),
+                response
+                    .description
+                    .as_deref()
+                    .unwrap_or("(none)")
+                    .to_string(),
+            ],
+            vec![
+                "Status".into(),
+                format!("{:?}", response.status).to_lowercase(),
+            ],
+            vec![
+                "Visibility".into(),
+                format!("{:?}", response.visibility).to_lowercase(),
+            ],
+            vec![
+                "Tags".into(),
+                if response.tags.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    response.tags.join(", ")
+                },
+            ],
             vec!["Files".into(), response.file_count.to_string()],
-            vec!["Commit".into(), response.commit_sha.as_deref().unwrap_or("(no commits)").to_string()],
+            vec![
+                "Commit".into(),
+                response
+                    .commit_sha
+                    .as_deref()
+                    .unwrap_or("(no commits)")
+                    .to_string(),
+            ],
             vec!["Created".into(), response.created_at.clone()],
             vec!["Updated".into(), response.updated_at.clone()],
         ];
@@ -66,10 +96,12 @@ pub async fn cmd_repo(
     visibility: Option<CliVisibility>,
     tags: Vec<String>,
 ) -> Result<(), CliError> {
-    let is_update = description.is_some() || status.is_some() || visibility.is_some() || !tags.is_empty();
+    let is_update =
+        description.is_some() || status.is_some() || visibility.is_some() || !tags.is_empty();
 
-    let current_dir = std::env::current_dir()
-        .map_err(|e| CliError::Io { message: format!("could not determine current directory: {e}") })?;
+    let current_dir = std::env::current_dir().map_err(|e| CliError::Io {
+        message: format!("could not determine current directory: {e}"),
+    })?;
     let identity = resolve_repo_identity(None, &current_dir)?;
     let owner = identity.owner.ok_or(CliError::RepoIdentityUnknown)?;
     let repo_id = format!("{}/{}", owner, identity.name);
@@ -89,7 +121,10 @@ pub async fn cmd_repo(
         let response = client.update_repo(&repo_id, &token, &update).await?;
         display_repo(output, &response);
     } else {
-        let token = TokenStore::new(config.credentials_path()).read().ok().flatten();
+        let token = TokenStore::new(config.credentials_path())
+            .read()
+            .ok()
+            .flatten();
         let response = client.get_repo(&repo_id, token.as_deref()).await?;
         display_repo(output, &response);
     }
@@ -111,7 +146,8 @@ mod tests {
         std::fs::write(
             dir.path().join(".syns.yaml"),
             "owner: alice\nname: my-project\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
 
@@ -152,7 +188,8 @@ mod tests {
         std::fs::write(
             dir.path().join(".syns.yaml"),
             "owner: alice\nname: my-project\n",
-        ).unwrap();
+        )
+        .unwrap();
         TokenStore::new(dir.path().join("credentials.json"))
             .write("test-token")
             .unwrap();
@@ -183,7 +220,15 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_repo(&config, &output, None, None, Some(CliVisibility::Public), vec![]).await;
+        let result = cmd_repo(
+            &config,
+            &output,
+            None,
+            None,
+            Some(CliVisibility::Public),
+            vec![],
+        )
+        .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());

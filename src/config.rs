@@ -37,7 +37,9 @@ impl Config {
             "http" if is_localhost(&parsed) => {}
             _ => {
                 return Err(CliError::Config {
-                    message: "server URL must use HTTPS (except http://localhost for local development)".into(),
+                    message:
+                        "server URL must use HTTPS (except http://localhost for local development)"
+                            .into(),
                 });
             }
         }
@@ -82,7 +84,10 @@ impl Config {
 }
 
 fn is_localhost(parsed: &Url) -> bool {
-    matches!(parsed.host_str(), Some("localhost") | Some("127.0.0.1") | Some("::1") | Some("[::1]"))
+    matches!(
+        parsed.host_str(),
+        Some("localhost") | Some("127.0.0.1") | Some("::1") | Some("[::1]")
+    )
 }
 
 pub fn is_localhost_url(url: &str) -> bool {
@@ -182,17 +187,29 @@ mod tests {
     #[test]
     fn is_safe_to_open_cases() {
         // Same origin, HTTPS
-        assert!(is_safe_to_open("https://syns.dev/auth/verify", "https://syns.dev"));
+        assert!(is_safe_to_open(
+            "https://syns.dev/auth/verify",
+            "https://syns.dev"
+        ));
         // Same origin, localhost HTTP
-        assert!(is_safe_to_open("http://localhost:3000/auth/verify", "http://localhost:3000"));
+        assert!(is_safe_to_open(
+            "http://localhost:3000/auth/verify",
+            "http://localhost:3000"
+        ));
         // Different host
-        assert!(!is_safe_to_open("https://evil.com/phish", "https://syns.dev"));
+        assert!(!is_safe_to_open(
+            "https://evil.com/phish",
+            "https://syns.dev"
+        ));
         // Different scheme
         assert!(!is_safe_to_open("http://syns.dev/auth", "https://syns.dev"));
         // javascript: scheme
         assert!(!is_safe_to_open("javascript:alert(1)", "https://syns.dev"));
         // data: scheme
-        assert!(!is_safe_to_open("data:text/html,<h1>phish</h1>", "https://syns.dev"));
+        assert!(!is_safe_to_open(
+            "data:text/html,<h1>phish</h1>",
+            "https://syns.dev"
+        ));
     }
 
     #[test]
@@ -209,7 +226,10 @@ mod tests {
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", "/tmp/syns-test-config") };
         let config = Config::new(Some("https://syns.dev")).unwrap();
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
-        assert_eq!(config.credentials_path(), PathBuf::from("/tmp/syns-test-config/credentials.json"));
+        assert_eq!(
+            config.credentials_path(),
+            PathBuf::from("/tmp/syns-test-config/credentials.json")
+        );
     }
 
     #[test]
@@ -242,7 +262,10 @@ mod tests {
 
     #[test]
     fn is_safe_to_open_port_mismatch() {
-        assert!(!is_safe_to_open("https://syns.dev:8443/auth", "https://syns.dev"));
+        assert!(!is_safe_to_open(
+            "https://syns.dev:8443/auth",
+            "https://syns.dev"
+        ));
     }
 
     #[test]
@@ -260,10 +283,19 @@ mod tests {
     #[test]
     fn is_safe_to_open_loopback_normalization() {
         // localhost server with 127.0.0.1 verification URL should be accepted
-        assert!(is_safe_to_open("http://127.0.0.1:3000/auth/verify", "http://localhost:3000"));
+        assert!(is_safe_to_open(
+            "http://127.0.0.1:3000/auth/verify",
+            "http://localhost:3000"
+        ));
         // vice versa
-        assert!(is_safe_to_open("http://localhost:3000/auth/verify", "http://127.0.0.1:3000"));
+        assert!(is_safe_to_open(
+            "http://localhost:3000/auth/verify",
+            "http://127.0.0.1:3000"
+        ));
         // IPv6 loopback also equivalent
-        assert!(is_safe_to_open("http://[::1]:3000/auth/verify", "http://localhost:3000"));
+        assert!(is_safe_to_open(
+            "http://[::1]:3000/auth/verify",
+            "http://localhost:3000"
+        ));
     }
 }

@@ -81,8 +81,9 @@ impl DeviceAuthFlow {
         // 1. HTTPS enforcement
         if !server_url.starts_with("https://") && !crate::config::is_localhost_url(server_url) {
             return Err(CliError::Config {
-                message: "server URL must use HTTPS (except http://localhost for local development)"
-                    .into(),
+                message:
+                    "server URL must use HTTPS (except http://localhost for local development)"
+                        .into(),
             });
         }
 
@@ -260,7 +261,13 @@ mod tests {
     #[test]
     fn classify_poll_error_unknown_error() {
         let action = classify_poll_error("server_error", 5);
-        assert!(matches!(action, PollAction::Error(CliError::Api { status: Some(400), .. })));
+        assert!(matches!(
+            action,
+            PollAction::Error(CliError::Api {
+                status: Some(400),
+                ..
+            })
+        ));
     }
 
     #[test]

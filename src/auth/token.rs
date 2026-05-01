@@ -32,11 +32,10 @@ impl TokenStore {
             }
         };
 
-        let credentials: Credentials = serde_json::from_str(&contents).map_err(|err| {
-            CliError::Config {
+        let credentials: Credentials =
+            serde_json::from_str(&contents).map_err(|err| CliError::Config {
                 message: format!("invalid credentials file: {err}"),
-            }
-        })?;
+            })?;
 
         if credentials.token.trim().is_empty() {
             return Ok(None);
@@ -56,11 +55,10 @@ impl TokenStore {
             }
         };
 
-        let credentials: Credentials = serde_json::from_str(&contents).map_err(|err| {
-            CliError::Config {
+        let credentials: Credentials =
+            serde_json::from_str(&contents).map_err(|err| CliError::Config {
                 message: format!("invalid credentials file: {err}"),
-            }
-        })?;
+            })?;
 
         Ok(credentials.username)
     }
@@ -69,11 +67,7 @@ impl TokenStore {
         self.write_with_username(token, None)
     }
 
-    pub fn write_with_username(
-        &self,
-        token: &str,
-        username: Option<&str>,
-    ) -> Result<(), CliError> {
+    pub fn write_with_username(&self, token: &str, username: Option<&str>) -> Result<(), CliError> {
         if token.trim().is_empty() {
             return Err(CliError::Config {
                 message: "token must not be empty".into(),
@@ -132,9 +126,10 @@ impl TokenStore {
                 message: format!("could not write credentials: {err}"),
             })?;
 
-            tmp.persist(&self.credentials_path).map_err(|err| CliError::Io {
-                message: format!("could not write credentials: {err}"),
-            })?;
+            tmp.persist(&self.credentials_path)
+                .map_err(|err| CliError::Io {
+                    message: format!("could not write credentials: {err}"),
+                })?;
         }
 
         #[cfg(not(unix))]
@@ -155,9 +150,10 @@ impl TokenStore {
                 message: format!("could not write credentials: {err}"),
             })?;
 
-            tmp.persist(&self.credentials_path).map_err(|err| CliError::Io {
-                message: format!("could not write credentials: {err}"),
-            })?;
+            tmp.persist(&self.credentials_path)
+                .map_err(|err| CliError::Io {
+                    message: format!("could not write credentials: {err}"),
+                })?;
         }
 
         Ok(())
@@ -285,7 +281,9 @@ mod tests {
         let path = dir.path().join("credentials.json");
         let store = TokenStore::new(path.clone());
 
-        store.write_with_username("my-token", Some("alice")).unwrap();
+        store
+            .write_with_username("my-token", Some("alice"))
+            .unwrap();
 
         let raw = std::fs::read_to_string(&path).unwrap();
         let creds: serde_json::Value = serde_json::from_str(&raw).unwrap();

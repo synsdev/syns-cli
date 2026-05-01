@@ -11,7 +11,8 @@ fn validate_repo_id(repo: &str) -> Result<(), CliError> {
     let parts: Vec<&str> = repo.split('/').collect();
     if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
         return Err(CliError::Config {
-            message: "invalid repository: must be in owner/name format (e.g., alice/my-project)".into(),
+            message: "invalid repository: must be in owner/name format (e.g., alice/my-project)"
+                .into(),
         });
     }
     Ok(())
@@ -56,9 +57,7 @@ pub async fn cmd_fork(
         }));
     } else {
         output.success(&format!("Forked {} → {}", repo, fork_id));
-        eprintln!("{}", style(format!(
-            "{} files", response.file_count
-        )).dim());
+        eprintln!("{}", style(format!("{} files", response.file_count)).dim());
     }
 
     let cwd = match std::env::current_dir() {
@@ -75,9 +74,10 @@ pub async fn cmd_fork(
             return Ok(());
         }
         if !output.is_json() {
-            eprintln!("{}", style(format!(
-                "Updated .syns.yaml → {}/{}", fork_owner, fork_name
-            )).dim());
+            eprintln!(
+                "{}",
+                style(format!("Updated .syns.yaml → {}/{}", fork_owner, fork_name)).dim()
+            );
         }
     }
 

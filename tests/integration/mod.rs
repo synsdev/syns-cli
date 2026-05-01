@@ -1,2 +1,2 @@
-mod push_test;
 mod auth_test;
+mod push_test;

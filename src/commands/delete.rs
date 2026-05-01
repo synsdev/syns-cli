@@ -9,28 +9,33 @@ use serde_json::json;
 use std::io::Write;
 
 fn confirm_delete(repo_id: &str) -> Result<bool, CliError> {
-    eprintln!("{}", style(format!(
-        "WARNING: This will permanently delete repository '{}' and all its contents.", repo_id
-    )).red().bold());
+    eprintln!(
+        "{}",
+        style(format!(
+            "WARNING: This will permanently delete repository '{}' and all its contents.",
+            repo_id
+        ))
+        .red()
+        .bold()
+    );
     eprintln!("This action cannot be undone.");
     eprint!("Type the repository name to confirm ('{}'): ", repo_id);
     std::io::stderr().flush().map_err(|e| CliError::Io {
         message: format!("could not read confirmation input: {e}"),
     })?;
     let mut input = String::new();
-    std::io::stdin().read_line(&mut input).map_err(|e| CliError::Io {
-        message: format!("could not read confirmation input: {e}"),
-    })?;
+    std::io::stdin()
+        .read_line(&mut input)
+        .map_err(|e| CliError::Io {
+            message: format!("could not read confirmation input: {e}"),
+        })?;
     Ok(input.trim() == repo_id)
 }
 
-pub async fn cmd_delete(
-    config: &Config,
-    output: &Output,
-    yes: bool,
-) -> Result<(), CliError> {
-    let current_dir = std::env::current_dir()
-        .map_err(|e| CliError::Io { message: format!("could not determine current directory: {e}") })?;
+pub async fn cmd_delete(config: &Config, output: &Output, yes: bool) -> Result<(), CliError> {
+    let current_dir = std::env::current_dir().map_err(|e| CliError::Io {
+        message: format!("could not determine current directory: {e}"),
+    })?;
     let identity = resolve_repo_identity(None, &current_dir)?;
     let owner = identity.owner.ok_or(CliError::RepoIdentityUnknown)?;
     let repo_id = format!("{}/{}", owner, identity.name);
@@ -69,7 +74,8 @@ mod tests {
         std::fs::write(
             dir.path().join(".syns.yaml"),
             "owner: alice\nname: my-project\n",
-        ).unwrap();
+        )
+        .unwrap();
         TokenStore::new(dir.path().join("credentials.json"))
             .write("test-token")
             .unwrap();

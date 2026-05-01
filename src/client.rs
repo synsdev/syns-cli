@@ -529,7 +529,10 @@ async fn check_response(response: reqwest::Response) -> Result<reqwest::Response
             Ok(body) => body.error,
             Err(_) => "unknown error".to_string(),
         };
-        return Err(CliError::Api { status: Some(code), error });
+        return Err(CliError::Api {
+            status: Some(code),
+            error,
+        });
     }
     if !status.is_success() {
         return Err(CliError::Api {
@@ -568,7 +571,9 @@ impl SynsClient {
     pub fn new(server_url: &str) -> Result<SynsClient, CliError> {
         if !server_url.starts_with("https://") && !crate::config::is_localhost_url(server_url) {
             return Err(CliError::Config {
-                message: "HTTPS required for server URL (http://localhost permitted for development)".to_string(),
+                message:
+                    "HTTPS required for server URL (http://localhost permitted for development)"
+                        .to_string(),
             });
         }
 
@@ -578,123 +583,281 @@ impl SynsClient {
             .timeout(std::time::Duration::from_secs(30))
             .redirect(Policy::none())
             .build()
-            .map_err(|e| CliError::Config { message: e.to_string() })?;
+            .map_err(|e| CliError::Config {
+                message: e.to_string(),
+            })?;
 
         Ok(SynsClient { client, base_url })
     }
 
-    pub async fn push(&self, repo_id: &str, token: &str, request: &PushRequest) -> Result<PushResponse, CliError> {
+    pub async fn push(
+        &self,
+        repo_id: &str,
+        token: &str,
+        request: &PushRequest,
+    ) -> Result<PushResponse, CliError> {
         let url = format!("{}/api/v1/repos/{}/push", self.base_url, repo_id);
-        let response = self.client.put(&url).bearer_auth(token).json(request).send().await?;
+        let response = self
+            .client
+            .put(&url)
+            .bearer_auth(token)
+            .json(request)
+            .send()
+            .await?;
         process_response(response).await
     }
 
     pub async fn pull(&self, repo_id: &str, token: Option<&str>) -> Result<PullResponse, CliError> {
         let url = format!("{}/api/v1/repos/{}/tree", self.base_url, repo_id);
         let mut req = self.client.get(&url).query(&[("recursive", "true")]);
-        if let Some(t) = token { req = req.bearer_auth(t); }
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
         let response = req.send().await?;
         process_response(response).await
     }
 
-    pub async fn list_repos(&self, token: Option<&str>, search: Option<&str>, limit: u32, offset: u32) -> Result<RepoListResponse, CliError> {
+    pub async fn list_repos(
+        &self,
+        token: Option<&str>,
+        search: Option<&str>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<RepoListResponse, CliError> {
         let url = format!("{}/api/v1/repos", self.base_url);
-        let mut req = self.client.get(&url)
+        let mut req = self
+            .client
+            .get(&url)
             .query(&[("limit", limit.to_string()), ("offset", offset.to_string())]);
-        if let Some(q) = search { req = req.query(&[("search", q)]); }
-        if let Some(t) = token { req = req.bearer_auth(t); }
+        if let Some(q) = search {
+            req = req.query(&[("search", q)]);
+        }
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
         let response = req.send().await?;
         process_response(response).await
     }
 
-    pub async fn get_repo(&self, repo_id: &str, token: Option<&str>) -> Result<RepoResponse, CliError> {
+    pub async fn get_repo(
+        &self,
+        repo_id: &str,
+        token: Option<&str>,
+    ) -> Result<RepoResponse, CliError> {
         let url = format!("{}/api/v1/repos/{}", self.base_url, repo_id);
         let mut req = self.client.get(&url);
-        if let Some(t) = token { req = req.bearer_auth(t); }
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
         let response = req.send().await?;
         process_response(response).await
     }
 
-    pub async fn get_tree(&self, repo_id: &str, token: Option<&str>, path: Option<&str>, recursive: bool, version_ref: Option<&str>) -> Result<TreeResponse, CliError> {
+    pub async fn get_tree(
+        &self,
+        repo_id: &str,
+        token: Option<&str>,
+        path: Option<&str>,
+        recursive: bool,
+        version_ref: Option<&str>,
+    ) -> Result<TreeResponse, CliError> {
         let url = match path {
-            Some(p) => format!("{}/api/v1/repos/{}/tree/{}", self.base_url, repo_id, encode_path_segments(p)),
+            Some(p) => format!(
+                "{}/api/v1/repos/{}/tree/{}",
+                self.base_url,
+                repo_id,
+                encode_path_segments(p)
+            ),
             None => format!("{}/api/v1/repos/{}/tree", self.base_url, repo_id),
         };
         let mut req = self.client.get(&url);
-        if recursive { req = req.query(&[("recursive", "true")]); }
-        if let Some(r) = version_ref { req = req.query(&[("ref", r)]); }
-        if let Some(t) = token { req = req.bearer_auth(t); }
+        if recursive {
+            req = req.query(&[("recursive", "true")]);
+        }
+        if let Some(r) = version_ref {
+            req = req.query(&[("ref", r)]);
+        }
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
         let response = req.send().await?;
         process_response(response).await
     }
 
-    pub async fn get_file(&self, repo_id: &str, token: Option<&str>, path: &str, version_ref: Option<&str>) -> Result<FileResponse, CliError> {
-        let url = format!("{}/api/v1/repos/{}/files/{}", self.base_url, repo_id, encode_path_segments(path));
+    pub async fn get_file(
+        &self,
+        repo_id: &str,
+        token: Option<&str>,
+        path: &str,
+        version_ref: Option<&str>,
+    ) -> Result<FileResponse, CliError> {
+        let url = format!(
+            "{}/api/v1/repos/{}/files/{}",
+            self.base_url,
+            repo_id,
+            encode_path_segments(path)
+        );
         let mut req = self.client.get(&url);
-        if let Some(r) = version_ref { req = req.query(&[("ref", r)]); }
-        if let Some(t) = token { req = req.bearer_auth(t); }
+        if let Some(r) = version_ref {
+            req = req.query(&[("ref", r)]);
+        }
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
         let response = req.send().await?;
         process_response(response).await
     }
 
-    pub async fn get_file_history(&self, repo_id: &str, token: Option<&str>, path: &str, limit: u32) -> Result<FileHistoryResponse, CliError> {
-        let url = format!("{}/api/v1/repos/{}/files/{}/history", self.base_url, repo_id, encode_path_segments(path));
+    pub async fn get_file_history(
+        &self,
+        repo_id: &str,
+        token: Option<&str>,
+        path: &str,
+        limit: u32,
+    ) -> Result<FileHistoryResponse, CliError> {
+        let url = format!(
+            "{}/api/v1/repos/{}/files/{}/history",
+            self.base_url,
+            repo_id,
+            encode_path_segments(path)
+        );
         let mut req = self.client.get(&url).query(&[("limit", limit.to_string())]);
-        if let Some(t) = token { req = req.bearer_auth(t); }
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
         let response = req.send().await?;
         process_response(response).await
     }
 
-    pub async fn list_versions(&self, repo_id: &str, token: Option<&str>, limit: u32, offset: u32) -> Result<VersionListResponse, CliError> {
+    pub async fn list_versions(
+        &self,
+        repo_id: &str,
+        token: Option<&str>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<VersionListResponse, CliError> {
         let url = format!("{}/api/v1/repos/{}/versions", self.base_url, repo_id);
-        let mut req = self.client.get(&url)
+        let mut req = self
+            .client
+            .get(&url)
             .query(&[("limit", limit.to_string()), ("offset", offset.to_string())]);
-        if let Some(t) = token { req = req.bearer_auth(t); }
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
         let response = req.send().await?;
         process_response(response).await
     }
 
-    pub async fn get_diff(&self, repo_id: &str, token: Option<&str>, from: &str, to: &str) -> Result<DiffResponse, CliError> {
+    pub async fn get_diff(
+        &self,
+        repo_id: &str,
+        token: Option<&str>,
+        from: &str,
+        to: &str,
+    ) -> Result<DiffResponse, CliError> {
         let url = format!("{}/api/v1/repos/{}/diff", self.base_url, repo_id);
         let mut req = self.client.get(&url).query(&[("from", from), ("to", to)]);
-        if let Some(t) = token { req = req.bearer_auth(t); }
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
         let response = req.send().await?;
         process_response(response).await
     }
 
-    pub async fn list_collaborators(&self, repo_id: &str, token: Option<&str>, limit: u32, offset: u32) -> Result<CollaboratorListResponse, CliError> {
+    pub async fn list_collaborators(
+        &self,
+        repo_id: &str,
+        token: Option<&str>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<CollaboratorListResponse, CliError> {
         let url = format!("{}/api/v1/repos/{}/collaborators", self.base_url, repo_id);
-        let mut req = self.client.get(&url)
+        let mut req = self
+            .client
+            .get(&url)
             .query(&[("limit", limit.to_string()), ("offset", offset.to_string())]);
-        if let Some(t) = token { req = req.bearer_auth(t); }
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
         let response = req.send().await?;
         process_response(response).await
     }
 
-    pub async fn add_collaborator(&self, repo_id: &str, token: &str, request: &AddCollaboratorRequest) -> Result<(), CliError> {
+    pub async fn add_collaborator(
+        &self,
+        repo_id: &str,
+        token: &str,
+        request: &AddCollaboratorRequest,
+    ) -> Result<(), CliError> {
         let url = format!("{}/api/v1/repos/{}/collaborators", self.base_url, repo_id);
-        let response = self.client.post(&url).bearer_auth(token).json(request).send().await?;
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(token)
+            .json(request)
+            .send()
+            .await?;
         process_empty_response(response).await
     }
 
-    pub async fn remove_collaborator(&self, repo_id: &str, token: &str, user_id: &str) -> Result<(), CliError> {
-        let url = format!("{}/api/v1/repos/{}/collaborators/{}", self.base_url, repo_id, urlencoding::encode(user_id));
+    pub async fn remove_collaborator(
+        &self,
+        repo_id: &str,
+        token: &str,
+        user_id: &str,
+    ) -> Result<(), CliError> {
+        let url = format!(
+            "{}/api/v1/repos/{}/collaborators/{}",
+            self.base_url,
+            repo_id,
+            urlencoding::encode(user_id)
+        );
         let response = self.client.delete(&url).bearer_auth(token).send().await?;
         process_empty_response(response).await
     }
 
-    pub async fn update_collaborator_role(&self, repo_id: &str, token: &str, user_id: &str, request: &UpdateCollaboratorRoleRequest) -> Result<(), CliError> {
-        let url = format!("{}/api/v1/repos/{}/collaborators/{}", self.base_url, repo_id, urlencoding::encode(user_id));
-        let response = self.client.patch(&url).bearer_auth(token).json(request).send().await?;
+    pub async fn update_collaborator_role(
+        &self,
+        repo_id: &str,
+        token: &str,
+        user_id: &str,
+        request: &UpdateCollaboratorRoleRequest,
+    ) -> Result<(), CliError> {
+        let url = format!(
+            "{}/api/v1/repos/{}/collaborators/{}",
+            self.base_url,
+            repo_id,
+            urlencoding::encode(user_id)
+        );
+        let response = self
+            .client
+            .patch(&url)
+            .bearer_auth(token)
+            .json(request)
+            .send()
+            .await?;
         process_empty_response(response).await
     }
 
-    pub async fn explore(&self, query: Option<&str>, tag: Option<&str>, status: Option<&RepoStatus>, limit: u32, offset: u32) -> Result<ExploreResponse, CliError> {
+    pub async fn explore(
+        &self,
+        query: Option<&str>,
+        tag: Option<&str>,
+        status: Option<&RepoStatus>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<ExploreResponse, CliError> {
         let url = format!("{}/api/v1/explore", self.base_url);
-        let mut req = self.client.get(&url)
+        let mut req = self
+            .client
+            .get(&url)
             .query(&[("limit", limit.to_string()), ("offset", offset.to_string())]);
-        if let Some(q) = query { req = req.query(&[("search", q)]); }
-        if let Some(t) = tag { req = req.query(&[("tag", t)]); }
+        if let Some(q) = query {
+            req = req.query(&[("search", q)]);
+        }
+        if let Some(t) = tag {
+            req = req.query(&[("tag", t)]);
+        }
         if let Some(s) = status {
             req = req.query(&[("status", s.as_query_str())]);
         }
@@ -702,9 +865,20 @@ impl SynsClient {
         process_response(response).await
     }
 
-    pub async fn fork(&self, repo_id: &str, token: &str, request: &ForkRequest) -> Result<ForkResponse, CliError> {
+    pub async fn fork(
+        &self,
+        repo_id: &str,
+        token: &str,
+        request: &ForkRequest,
+    ) -> Result<ForkResponse, CliError> {
         let url = format!("{}/api/v1/repos/{}/fork", self.base_url, repo_id);
-        let response = self.client.post(&url).bearer_auth(token).json(request).send().await?;
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(token)
+            .json(request)
+            .send()
+            .await?;
         process_response(response).await
     }
 
@@ -719,18 +893,49 @@ impl SynsClient {
         let response = self.client.get(&url).bearer_auth(token).send().await?;
         let response = check_response(response).await?;
         // Special handling: better-auth returns 200 with null when token is invalid
-        response.json::<SessionResponse>().await.map_err(|_| CliError::AuthRequired)
+        response
+            .json::<SessionResponse>()
+            .await
+            .map_err(|_| CliError::AuthRequired)
     }
 
-    pub async fn update_repo(&self, repo_id: &str, token: &str, update: &RepoUpdate) -> Result<RepoResponse, CliError> {
+    pub async fn update_repo(
+        &self,
+        repo_id: &str,
+        token: &str,
+        update: &RepoUpdate,
+    ) -> Result<RepoResponse, CliError> {
         let url = format!("{}/api/v1/repos/{}", self.base_url, repo_id);
-        let response = self.client.patch(&url).bearer_auth(token).json(update).send().await?;
+        let response = self
+            .client
+            .patch(&url)
+            .bearer_auth(token)
+            .json(update)
+            .send()
+            .await?;
         process_response(response).await
     }
 
-    pub async fn revert_file(&self, repo_id: &str, token: &str, path: &str, request: &RevertFileRequest) -> Result<RevertResponse, CliError> {
-        let url = format!("{}/api/v1/repos/{}/files/{}/revert", self.base_url, repo_id, encode_path_segments(path));
-        let response = self.client.post(&url).bearer_auth(token).json(request).send().await?;
+    pub async fn revert_file(
+        &self,
+        repo_id: &str,
+        token: &str,
+        path: &str,
+        request: &RevertFileRequest,
+    ) -> Result<RevertResponse, CliError> {
+        let url = format!(
+            "{}/api/v1/repos/{}/files/{}/revert",
+            self.base_url,
+            repo_id,
+            encode_path_segments(path)
+        );
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(token)
+            .json(request)
+            .send()
+            .await?;
         process_response(response).await
     }
 }
@@ -740,9 +945,19 @@ impl SynsClient {
 impl SynsClient {
     // Team CRUD
 
-    pub async fn create_team(&self, token: &str, request: &CreateTeamRequest) -> Result<TeamResponse, CliError> {
+    pub async fn create_team(
+        &self,
+        token: &str,
+        request: &CreateTeamRequest,
+    ) -> Result<TeamResponse, CliError> {
         let url = format!("{}/api/v1/teams", self.base_url);
-        let response = self.client.post(&url).bearer_auth(token).json(request).send().await?;
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(token)
+            .json(request)
+            .send()
+            .await?;
         process_response(response).await
     }
 
@@ -758,9 +973,20 @@ impl SynsClient {
         process_response(response).await
     }
 
-    pub async fn update_team(&self, token: &str, team_id: &str, request: &UpdateTeamRequest) -> Result<TeamResponse, CliError> {
+    pub async fn update_team(
+        &self,
+        token: &str,
+        team_id: &str,
+        request: &UpdateTeamRequest,
+    ) -> Result<TeamResponse, CliError> {
         let url = format!("{}/api/v1/teams/{}", self.base_url, team_id);
-        let response = self.client.patch(&url).bearer_auth(token).json(request).send().await?;
+        let response = self
+            .client
+            .patch(&url)
+            .bearer_auth(token)
+            .json(request)
+            .send()
+            .await?;
         process_response(response).await
     }
 
@@ -772,65 +998,149 @@ impl SynsClient {
 
     // Member management
 
-    pub async fn list_members(&self, token: &str, team_id: &str) -> Result<TeamMembersResponse, CliError> {
+    pub async fn list_members(
+        &self,
+        token: &str,
+        team_id: &str,
+    ) -> Result<TeamMembersResponse, CliError> {
         let url = format!("{}/api/v1/teams/{}/members", self.base_url, team_id);
         let response = self.client.get(&url).bearer_auth(token).send().await?;
         process_response(response).await
     }
 
-    pub async fn invite_member(&self, token: &str, team_id: &str, request: &InviteRequest) -> Result<InvitationResponse, CliError> {
+    pub async fn invite_member(
+        &self,
+        token: &str,
+        team_id: &str,
+        request: &InviteRequest,
+    ) -> Result<InvitationResponse, CliError> {
         let url = format!("{}/api/v1/teams/{}/invite", self.base_url, team_id);
-        let response = self.client.post(&url).bearer_auth(token).json(request).send().await?;
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(token)
+            .json(request)
+            .send()
+            .await?;
         process_response(response).await
     }
 
-    pub async fn change_role(&self, token: &str, team_id: &str, user_id: &str, request: &ChangeRoleRequest) -> Result<TeamMemberResponse, CliError> {
-        let url = format!("{}/api/v1/teams/{}/members/{}/role", self.base_url, team_id, user_id);
-        let response = self.client.post(&url).bearer_auth(token).json(request).send().await?;
+    pub async fn change_role(
+        &self,
+        token: &str,
+        team_id: &str,
+        user_id: &str,
+        request: &ChangeRoleRequest,
+    ) -> Result<TeamMemberResponse, CliError> {
+        let url = format!(
+            "{}/api/v1/teams/{}/members/{}/role",
+            self.base_url, team_id, user_id
+        );
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(token)
+            .json(request)
+            .send()
+            .await?;
         process_response(response).await
     }
 
-    pub async fn remove_member(&self, token: &str, team_id: &str, user_id: &str) -> Result<(), CliError> {
-        let url = format!("{}/api/v1/teams/{}/members/{}", self.base_url, team_id, user_id);
+    pub async fn remove_member(
+        &self,
+        token: &str,
+        team_id: &str,
+        user_id: &str,
+    ) -> Result<(), CliError> {
+        let url = format!(
+            "{}/api/v1/teams/{}/members/{}",
+            self.base_url, team_id, user_id
+        );
         let response = self.client.delete(&url).bearer_auth(token).send().await?;
         process_empty_response(response).await
     }
 
     // Invitation flow
 
-    pub async fn list_my_invitations(&self, token: &str) -> Result<InvitationListResponse, CliError> {
+    pub async fn list_my_invitations(
+        &self,
+        token: &str,
+    ) -> Result<InvitationListResponse, CliError> {
         let url = format!("{}/api/v1/teams/invitations", self.base_url);
         let response = self.client.get(&url).bearer_auth(token).send().await?;
         process_response(response).await
     }
 
-    pub async fn accept_invitation(&self, token: &str, invitation_id: &str) -> Result<TeamMemberResponse, CliError> {
-        let url = format!("{}/api/v1/teams/invitations/{}/accept", self.base_url, invitation_id);
+    pub async fn accept_invitation(
+        &self,
+        token: &str,
+        invitation_id: &str,
+    ) -> Result<TeamMemberResponse, CliError> {
+        let url = format!(
+            "{}/api/v1/teams/invitations/{}/accept",
+            self.base_url, invitation_id
+        );
         let response = self.client.post(&url).bearer_auth(token).send().await?;
         process_response(response).await
     }
 
-    pub async fn decline_invitation(&self, token: &str, invitation_id: &str) -> Result<(), CliError> {
-        let url = format!("{}/api/v1/teams/invitations/{}/decline", self.base_url, invitation_id);
+    pub async fn decline_invitation(
+        &self,
+        token: &str,
+        invitation_id: &str,
+    ) -> Result<(), CliError> {
+        let url = format!(
+            "{}/api/v1/teams/invitations/{}/decline",
+            self.base_url, invitation_id
+        );
         let response = self.client.post(&url).bearer_auth(token).send().await?;
         process_empty_response(response).await
     }
 
     // Team-repo access
 
-    pub async fn add_team_repo(&self, token: &str, team_id: &str, owner: &str, name: &str, request: &TeamRepoAccessRequest) -> Result<TeamRepoResponse, CliError> {
-        let url = format!("{}/api/v1/teams/{}/repos/{}/{}", self.base_url, team_id, owner, name);
-        let response = self.client.put(&url).bearer_auth(token).json(request).send().await?;
+    pub async fn add_team_repo(
+        &self,
+        token: &str,
+        team_id: &str,
+        owner: &str,
+        name: &str,
+        request: &TeamRepoAccessRequest,
+    ) -> Result<TeamRepoResponse, CliError> {
+        let url = format!(
+            "{}/api/v1/teams/{}/repos/{}/{}",
+            self.base_url, team_id, owner, name
+        );
+        let response = self
+            .client
+            .put(&url)
+            .bearer_auth(token)
+            .json(request)
+            .send()
+            .await?;
         process_response(response).await
     }
 
-    pub async fn remove_team_repo(&self, token: &str, team_id: &str, owner: &str, name: &str) -> Result<(), CliError> {
-        let url = format!("{}/api/v1/teams/{}/repos/{}/{}", self.base_url, team_id, owner, name);
+    pub async fn remove_team_repo(
+        &self,
+        token: &str,
+        team_id: &str,
+        owner: &str,
+        name: &str,
+    ) -> Result<(), CliError> {
+        let url = format!(
+            "{}/api/v1/teams/{}/repos/{}/{}",
+            self.base_url, team_id, owner, name
+        );
         let response = self.client.delete(&url).bearer_auth(token).send().await?;
         process_empty_response(response).await
     }
 
-    pub async fn list_team_repos(&self, token: &str, team_id: &str) -> Result<TeamReposResponse, CliError> {
+    pub async fn list_team_repos(
+        &self,
+        token: &str,
+        team_id: &str,
+    ) -> Result<TeamReposResponse, CliError> {
         let url = format!("{}/api/v1/teams/{}/repos", self.base_url, team_id);
         let response = self.client.get(&url).bearer_auth(token).send().await?;
         process_response(response).await
@@ -879,50 +1189,134 @@ mod tests {
 
     #[test]
     fn repo_status_deserializes_known() {
-        assert_eq!(serde_json::from_str::<RepoStatus>("\"active\"").unwrap(), RepoStatus::Active);
-        assert_eq!(serde_json::from_str::<RepoStatus>("\"draft\"").unwrap(), RepoStatus::Draft);
-        assert_eq!(serde_json::from_str::<RepoStatus>("\"completed\"").unwrap(), RepoStatus::Completed);
-        assert_eq!(serde_json::from_str::<RepoStatus>("\"abandoned\"").unwrap(), RepoStatus::Abandoned);
+        assert_eq!(
+            serde_json::from_str::<RepoStatus>("\"active\"").unwrap(),
+            RepoStatus::Active
+        );
+        assert_eq!(
+            serde_json::from_str::<RepoStatus>("\"draft\"").unwrap(),
+            RepoStatus::Draft
+        );
+        assert_eq!(
+            serde_json::from_str::<RepoStatus>("\"completed\"").unwrap(),
+            RepoStatus::Completed
+        );
+        assert_eq!(
+            serde_json::from_str::<RepoStatus>("\"abandoned\"").unwrap(),
+            RepoStatus::Abandoned
+        );
     }
 
     #[test]
     fn repo_status_deserializes_unknown_to_unknown() {
-        assert_eq!(serde_json::from_str::<RepoStatus>("\"archived\"").unwrap(), RepoStatus::Unknown);
-        assert_eq!(serde_json::from_str::<RepoStatus>("\"some_future_status\"").unwrap(), RepoStatus::Unknown);
+        assert_eq!(
+            serde_json::from_str::<RepoStatus>("\"archived\"").unwrap(),
+            RepoStatus::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<RepoStatus>("\"some_future_status\"").unwrap(),
+            RepoStatus::Unknown
+        );
     }
 
     #[test]
     fn repo_status_serializes() {
-        assert_eq!(serde_json::to_string(&RepoStatus::Active).unwrap(), "\"active\"");
-        assert_eq!(serde_json::to_string(&RepoStatus::Draft).unwrap(), "\"draft\"");
-        assert_eq!(serde_json::to_string(&RepoStatus::Completed).unwrap(), "\"completed\"");
-        assert_eq!(serde_json::to_string(&RepoStatus::Abandoned).unwrap(), "\"abandoned\"");
-        assert_eq!(serde_json::to_string(&RepoStatus::Unknown).unwrap(), "\"unknown\"");
+        assert_eq!(
+            serde_json::to_string(&RepoStatus::Active).unwrap(),
+            "\"active\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RepoStatus::Draft).unwrap(),
+            "\"draft\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RepoStatus::Completed).unwrap(),
+            "\"completed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RepoStatus::Abandoned).unwrap(),
+            "\"abandoned\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RepoStatus::Unknown).unwrap(),
+            "\"unknown\""
+        );
     }
 
     #[test]
     fn visibility_serializes() {
-        assert_eq!(serde_json::to_string(&Visibility::Public).unwrap(), "\"public\"");
-        assert_eq!(serde_json::to_string(&Visibility::Private).unwrap(), "\"private\"");
-        assert_eq!(serde_json::to_string(&Visibility::Unknown).unwrap(), "\"unknown\"");
+        assert_eq!(
+            serde_json::to_string(&Visibility::Public).unwrap(),
+            "\"public\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Visibility::Private).unwrap(),
+            "\"private\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Visibility::Unknown).unwrap(),
+            "\"unknown\""
+        );
     }
 
     #[test]
     fn other_enums_roundtrip() {
-        assert_eq!(serde_json::from_str::<Visibility>("\"public\"").unwrap(), Visibility::Public);
-        assert_eq!(serde_json::from_str::<Visibility>("\"private\"").unwrap(), Visibility::Private);
-        assert_eq!(serde_json::from_str::<Visibility>("\"future\"").unwrap(), Visibility::Unknown);
-        assert_eq!(serde_json::from_str::<EntryType>("\"file\"").unwrap(), EntryType::File);
-        assert_eq!(serde_json::from_str::<EntryType>("\"dir\"").unwrap(), EntryType::Dir);
-        assert_eq!(serde_json::from_str::<EntryType>("\"unknown_type\"").unwrap(), EntryType::Unknown);
-        assert_eq!(serde_json::from_str::<DiffStatus>("\"added\"").unwrap(), DiffStatus::Added);
-        assert_eq!(serde_json::from_str::<DiffStatus>("\"modified\"").unwrap(), DiffStatus::Modified);
-        assert_eq!(serde_json::from_str::<DiffStatus>("\"deleted\"").unwrap(), DiffStatus::Deleted);
-        assert_eq!(serde_json::from_str::<CollaboratorRole>("\"owner\"").unwrap(), CollaboratorRole::Owner);
-        assert_eq!(serde_json::from_str::<CollaboratorRole>("\"admin\"").unwrap(), CollaboratorRole::Admin);
-        assert_eq!(serde_json::from_str::<CollaboratorRole>("\"write\"").unwrap(), CollaboratorRole::Write);
-        assert_eq!(serde_json::from_str::<CollaboratorRole>("\"read\"").unwrap(), CollaboratorRole::Read);
-        assert_eq!(serde_json::from_str::<CollaboratorRole>("\"superadmin\"").unwrap(), CollaboratorRole::Unknown);
+        assert_eq!(
+            serde_json::from_str::<Visibility>("\"public\"").unwrap(),
+            Visibility::Public
+        );
+        assert_eq!(
+            serde_json::from_str::<Visibility>("\"private\"").unwrap(),
+            Visibility::Private
+        );
+        assert_eq!(
+            serde_json::from_str::<Visibility>("\"future\"").unwrap(),
+            Visibility::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<EntryType>("\"file\"").unwrap(),
+            EntryType::File
+        );
+        assert_eq!(
+            serde_json::from_str::<EntryType>("\"dir\"").unwrap(),
+            EntryType::Dir
+        );
+        assert_eq!(
+            serde_json::from_str::<EntryType>("\"unknown_type\"").unwrap(),
+            EntryType::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<DiffStatus>("\"added\"").unwrap(),
+            DiffStatus::Added
+        );
+        assert_eq!(
+            serde_json::from_str::<DiffStatus>("\"modified\"").unwrap(),
+            DiffStatus::Modified
+        );
+        assert_eq!(
+            serde_json::from_str::<DiffStatus>("\"deleted\"").unwrap(),
+            DiffStatus::Deleted
+        );
+        assert_eq!(
+            serde_json::from_str::<CollaboratorRole>("\"owner\"").unwrap(),
+            CollaboratorRole::Owner
+        );
+        assert_eq!(
+            serde_json::from_str::<CollaboratorRole>("\"admin\"").unwrap(),
+            CollaboratorRole::Admin
+        );
+        assert_eq!(
+            serde_json::from_str::<CollaboratorRole>("\"write\"").unwrap(),
+            CollaboratorRole::Write
+        );
+        assert_eq!(
+            serde_json::from_str::<CollaboratorRole>("\"read\"").unwrap(),
+            CollaboratorRole::Read
+        );
+        assert_eq!(
+            serde_json::from_str::<CollaboratorRole>("\"superadmin\"").unwrap(),
+            CollaboratorRole::Unknown
+        );
     }
 
     #[test]
@@ -938,7 +1332,10 @@ mod tests {
     fn encode_path_preserves_slashes() {
         assert_eq!(encode_path_segments("src/main.rs"), "src/main.rs");
         assert_eq!(encode_path_segments("src/my file.rs"), "src/my%20file.rs");
-        assert_eq!(encode_path_segments("dir/sub dir/file #2.txt"), "dir/sub%20dir/file%20%232.txt");
+        assert_eq!(
+            encode_path_segments("dir/sub dir/file #2.txt"),
+            "dir/sub%20dir/file%20%232.txt"
+        );
     }
 
     #[test]

@@ -1,8 +1,8 @@
 use std::path::Path;
 
-use crate::errors::CliError;
 use super::remote::extract_from_git_remote;
 use super::syns_yaml::read_syns_yaml;
+use crate::errors::CliError;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RepoIdentity {
@@ -10,7 +10,10 @@ pub struct RepoIdentity {
     pub name: String,
 }
 
-pub fn resolve_repo_identity(name_flag: Option<&str>, path: &Path) -> Result<RepoIdentity, CliError> {
+pub fn resolve_repo_identity(
+    name_flag: Option<&str>,
+    path: &Path,
+) -> Result<RepoIdentity, CliError> {
     // 1. If name_flag is present and non-empty after trimming, use it directly.
     if let Some(raw) = name_flag {
         let trimmed = raw.trim();
@@ -49,8 +52,8 @@ pub fn resolve_repo_identity(name_flag: Option<&str>, path: &Path) -> Result<Rep
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use crate::errors::CliError;
+    use std::fs;
 
     #[test]
     fn name_flag_takes_precedence_over_syns_yaml() {
@@ -164,11 +167,7 @@ mod tests {
     #[test]
     fn malformed_syns_yaml_is_hard_error() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join(".syns.yaml"),
-            "not: valid: yaml: [[",
-        )
-        .unwrap();
+        fs::write(dir.path().join(".syns.yaml"), "not: valid: yaml: [[").unwrap();
 
         let result = resolve_repo_identity(None, dir.path());
         assert!(matches!(result, Err(CliError::Io { .. })));

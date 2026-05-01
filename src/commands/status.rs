@@ -6,12 +6,16 @@ use crate::output::Output;
 use crate::repo::resolve::resolve_repo_identity;
 
 pub async fn cmd_status(config: &Config, output: &Output) -> Result<(), CliError> {
-    let current_dir = std::env::current_dir()
-        .map_err(|e| CliError::Io { message: format!("could not determine current directory: {e}") })?;
+    let current_dir = std::env::current_dir().map_err(|e| CliError::Io {
+        message: format!("could not determine current directory: {e}"),
+    })?;
     let identity = resolve_repo_identity(None, &current_dir)?;
     let owner = identity.owner.ok_or(CliError::RepoIdentityUnknown)?;
     let repo_id = format!("{}/{}", owner, identity.name);
-    let token = TokenStore::new(config.credentials_path()).read().ok().flatten();
+    let token = TokenStore::new(config.credentials_path())
+        .read()
+        .ok()
+        .flatten();
     let client = SynsClient::new(config.server_url())?;
 
     let response = client.get_repo(&repo_id, token.as_deref()).await?;
@@ -20,13 +24,43 @@ pub async fn cmd_status(config: &Config, output: &Output) -> Result<(), CliError
         output.json(&response);
     } else {
         let rows = vec![
-            vec!["Repository".into(), format!("{}/{}", response.owner, response.name)],
-            vec!["Description".into(), response.description.as_deref().unwrap_or("(none)").to_string()],
-            vec!["Status".into(), format!("{:?}", response.status).to_lowercase()],
-            vec!["Visibility".into(), format!("{:?}", response.visibility).to_lowercase()],
-            vec!["Tags".into(), if response.tags.is_empty() { "(none)".to_string() } else { response.tags.join(", ") }],
+            vec![
+                "Repository".into(),
+                format!("{}/{}", response.owner, response.name),
+            ],
+            vec![
+                "Description".into(),
+                response
+                    .description
+                    .as_deref()
+                    .unwrap_or("(none)")
+                    .to_string(),
+            ],
+            vec![
+                "Status".into(),
+                format!("{:?}", response.status).to_lowercase(),
+            ],
+            vec![
+                "Visibility".into(),
+                format!("{:?}", response.visibility).to_lowercase(),
+            ],
+            vec![
+                "Tags".into(),
+                if response.tags.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    response.tags.join(", ")
+                },
+            ],
             vec!["Files".into(), response.file_count.to_string()],
-            vec!["Commit".into(), response.commit_sha.as_deref().unwrap_or("(no commits)").to_string()],
+            vec![
+                "Commit".into(),
+                response
+                    .commit_sha
+                    .as_deref()
+                    .unwrap_or("(no commits)")
+                    .to_string(),
+            ],
             vec!["Created".into(), response.created_at],
             vec!["Updated".into(), response.updated_at],
         ];
@@ -50,7 +84,8 @@ mod tests {
         std::fs::write(
             dir.path().join(".syns.yaml"),
             "owner: alice\nname: my-project\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
 
@@ -91,7 +126,8 @@ mod tests {
         std::fs::write(
             dir.path().join(".syns.yaml"),
             "owner: alice\nname: my-project\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
 

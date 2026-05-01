@@ -93,9 +93,6 @@ mod tests {
         assert!(result.is_ok());
         let store = TokenStore::new(config.credentials_path());
         assert_eq!(store.read().unwrap(), Some("test-bearer-token".to_string()));
-        assert_eq!(
-            store.read_username().unwrap(),
-            Some("testuser".to_string())
-        );
+        assert_eq!(store.read_username().unwrap(), Some("testuser".to_string()));
     }
 }

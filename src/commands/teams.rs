@@ -127,7 +127,10 @@ fn parse_team_role(role: &str) -> Result<TeamRole, CliError> {
         "admin" => Ok(TeamRole::Admin),
         "member" => Ok(TeamRole::Member),
         _ => Err(CliError::Config {
-            message: format!("invalid role '{}' \u{2014} must be one of: admin, member", role),
+            message: format!(
+                "invalid role '{}' \u{2014} must be one of: admin, member",
+                role
+            ),
         }),
     }
 }
@@ -138,16 +141,24 @@ fn parse_repo_access_role(role: &str) -> Result<CollaboratorRole, CliError> {
         "write" => Ok(CollaboratorRole::Write),
         "read" => Ok(CollaboratorRole::Read),
         _ => Err(CliError::Config {
-            message: format!("invalid role '{}' \u{2014} must be one of: admin, write, read", role),
+            message: format!(
+                "invalid role '{}' \u{2014} must be one of: admin, write, read",
+                role
+            ),
         }),
     }
 }
 
 fn parse_repo_string(repo: &str) -> Result<(&str, &str), CliError> {
     match repo.split_once('/') {
-        Some((owner, name)) if !owner.is_empty() && !name.is_empty() && !name.contains('/') => Ok((owner, name)),
+        Some((owner, name)) if !owner.is_empty() && !name.is_empty() && !name.contains('/') => {
+            Ok((owner, name))
+        }
         _ => Err(CliError::Config {
-            message: format!("invalid repository '{}' \u{2014} must be in owner/name format", repo),
+            message: format!(
+                "invalid repository '{}' \u{2014} must be in owner/name format",
+                repo
+            ),
         }),
     }
 }
@@ -161,11 +172,15 @@ async fn resolve_team_id(
     let response = client.list_teams(token).await?;
 
     let matches: Vec<_> = if let Some((owner_part, team_part)) = name.split_once('/') {
-        response.data.into_iter()
+        response
+            .data
+            .into_iter()
             .filter(|t| t.owner.username == owner_part && t.name == team_part)
             .collect()
     } else {
-        response.data.into_iter()
+        response
+            .data
+            .into_iter()
             .filter(|t| t.name == name)
             .collect()
     };
@@ -182,7 +197,11 @@ async fn resolve_team_id(
             message: format!(
                 "multiple teams named '{}' \u{2014} specify as 'owner/team-name' to disambiguate: {}",
                 name,
-                matches.iter().map(|t| format!("{}/{}", t.owner.username, name)).collect::<Vec<_>>().join(", ")
+                matches
+                    .iter()
+                    .map(|t| format!("{}/{}", t.owner.username, name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         }),
         _ => {
@@ -195,9 +214,11 @@ async fn resolve_team_id(
                 message: format!("could not read selection input: {e}"),
             })?;
             let mut input = String::new();
-            std::io::stdin().read_line(&mut input).map_err(|e| CliError::Io {
-                message: format!("could not read selection input: {e}"),
-            })?;
+            std::io::stdin()
+                .read_line(&mut input)
+                .map_err(|e| CliError::Io {
+                    message: format!("could not read selection input: {e}"),
+                })?;
             let selection: usize = input.trim().parse().map_err(|_| CliError::Config {
                 message: "invalid selection".to_string(),
             })?;
@@ -231,10 +252,16 @@ fn display_team(output: &Output, team: &crate::client::TeamResponse) {
     } else {
         let rows = vec![
             vec!["Name".to_string(), team.name.clone()],
-            vec!["Description".to_string(), team.description.as_deref().unwrap_or("(none)").to_string()],
+            vec![
+                "Description".to_string(),
+                team.description.as_deref().unwrap_or("(none)").to_string(),
+            ],
             vec!["Owner".to_string(), team.owner.username.clone()],
             vec!["Members".to_string(), team.member_count.to_string()],
-            vec!["Role".to_string(), format!("{:?}", team.role).to_lowercase()],
+            vec![
+                "Role".to_string(),
+                format!("{:?}", team.role).to_lowercase(),
+            ],
             vec!["Created".to_string(), team.created_at.clone()],
             vec!["Updated".to_string(), team.updated_at.clone()],
         ];
@@ -259,8 +286,14 @@ fn display_member(output: &Output, member: &crate::client::TeamMemberResponse) {
         let rows = vec![
             vec!["Username".to_string(), member.user.username.clone()],
             vec!["Name".to_string(), member.user.name.clone()],
-            vec!["Email".to_string(), member.user.email.as_deref().unwrap_or("(none)").to_string()],
-            vec!["Role".to_string(), format!("{:?}", member.role).to_lowercase()],
+            vec![
+                "Email".to_string(),
+                member.user.email.as_deref().unwrap_or("(none)").to_string(),
+            ],
+            vec![
+                "Role".to_string(),
+                format!("{:?}", member.role).to_lowercase(),
+            ],
             vec!["Joined".to_string(), member.joined_at.clone()],
         ];
         output.table(&["Property", "Value"], rows);
@@ -293,9 +326,22 @@ fn display_invitation(output: &Output, invitation: &crate::client::InvitationRes
             vec!["ID".to_string(), invitation.id.clone()],
             vec!["Team".to_string(), invitation.team.name.clone()],
             vec!["Email".to_string(), invitation.email.clone()],
-            vec!["Role".to_string(), format!("{:?}", invitation.role).to_lowercase()],
-            vec!["Invited By".to_string(), invitation.invited_by.as_ref().map(|u| u.username.clone()).unwrap_or("(deleted)".to_string())],
-            vec!["Status".to_string(), format!("{:?}", invitation.status).to_lowercase()],
+            vec![
+                "Role".to_string(),
+                format!("{:?}", invitation.role).to_lowercase(),
+            ],
+            vec![
+                "Invited By".to_string(),
+                invitation
+                    .invited_by
+                    .as_ref()
+                    .map(|u| u.username.clone())
+                    .unwrap_or("(deleted)".to_string()),
+            ],
+            vec![
+                "Status".to_string(),
+                format!("{:?}", invitation.status).to_lowercase(),
+            ],
             vec!["Expires".to_string(), invitation.expires_at.clone()],
         ];
         output.table(&["Property", "Value"], rows);
@@ -334,15 +380,19 @@ pub async fn cmd_teams(
                     })).collect::<Vec<_>>(),
                 }));
             } else {
-                let rows = response.data.iter().map(|t| {
-                    vec![
-                        t.name.clone(),
-                        t.owner.username.clone(),
-                        t.member_count.to_string(),
-                        format!("{:?}", t.role).to_lowercase(),
-                        t.updated_at.clone(),
-                    ]
-                }).collect();
+                let rows = response
+                    .data
+                    .iter()
+                    .map(|t| {
+                        vec![
+                            t.name.clone(),
+                            t.owner.username.clone(),
+                            t.member_count.to_string(),
+                            format!("{:?}", t.role).to_lowercase(),
+                            t.updated_at.clone(),
+                        ]
+                    })
+                    .collect();
                 output.table(&["Name", "Owner", "Members", "Role", "Updated"], rows);
             }
         }
@@ -356,7 +406,12 @@ pub async fn cmd_teams(
             let response = client.get_team(&token, &team_id).await?;
             display_team(output, &response);
         }
-        Some(TeamsAction::Update { name, rename, description, clear_description }) => {
+        Some(TeamsAction::Update {
+            name,
+            rename,
+            description,
+            clear_description,
+        }) => {
             if rename.is_none() && description.is_none() && !clear_description {
                 return Err(CliError::Config {
                     message: "no update flags provided \u{2014} use --rename, --description, or --clear-description".to_string(),
@@ -364,7 +419,8 @@ pub async fn cmd_teams(
             }
             if description.is_some() && clear_description {
                 return Err(CliError::Config {
-                    message: "cannot use --description and --clear-description together".to_string(),
+                    message: "cannot use --description and --clear-description together"
+                        .to_string(),
                 });
             }
             let team_id = resolve_team_id(&client, &token, &name, output).await?;
@@ -373,7 +429,10 @@ pub async fn cmd_teams(
             } else {
                 description.map(Some)
             };
-            let request = UpdateTeamRequest { name: rename, description: desc };
+            let request = UpdateTeamRequest {
+                name: rename,
+                description: desc,
+            };
             let response = client.update_team(&token, &team_id, &request).await?;
             display_team(output, &response);
         }
@@ -389,9 +448,11 @@ pub async fn cmd_teams(
                     message: format!("could not read confirmation input: {e}"),
                 })?;
                 let mut input = String::new();
-                std::io::stdin().read_line(&mut input).map_err(|e| CliError::Io {
-                    message: format!("could not read confirmation input: {e}"),
-                })?;
+                std::io::stdin()
+                    .read_line(&mut input)
+                    .map_err(|e| CliError::Io {
+                        message: format!("could not read confirmation input: {e}"),
+                    })?;
                 if input.trim() != name {
                     eprintln!("Aborted \u{2014} input did not match team name.");
                     return Ok(());
@@ -422,22 +483,29 @@ pub async fn cmd_teams(
                     })).collect::<Vec<_>>(),
                 }));
             } else {
-                let rows = response.data.iter().map(|m| {
-                    vec![
-                        m.user.username.clone(),
-                        m.user.name.clone(),
-                        m.user.email.as_deref().unwrap_or("(none)").to_string(),
-                        format!("{:?}", m.role).to_lowercase(),
-                        m.joined_at.clone(),
-                    ]
-                }).collect();
+                let rows = response
+                    .data
+                    .iter()
+                    .map(|m| {
+                        vec![
+                            m.user.username.clone(),
+                            m.user.name.clone(),
+                            m.user.email.as_deref().unwrap_or("(none)").to_string(),
+                            format!("{:?}", m.role).to_lowercase(),
+                            m.joined_at.clone(),
+                        ]
+                    })
+                    .collect();
                 output.table(&["Username", "Name", "Email", "Role", "Joined"], rows);
             }
         }
         Some(TeamsAction::Invite { name, email, role }) => {
             let parsed_role = parse_team_role(&role)?;
             let team_id = resolve_team_id(&client, &token, &name, output).await?;
-            let request = InviteRequest { email, role: parsed_role };
+            let request = InviteRequest {
+                email,
+                role: parsed_role,
+            };
             let response = client.invite_member(&token, &team_id, &request).await?;
             display_invitation(output, &response);
         }
@@ -466,15 +534,22 @@ pub async fn cmd_teams(
                     })).collect::<Vec<_>>(),
                 }));
             } else {
-                let rows = response.data.iter().map(|inv| {
-                    vec![
-                        inv.id.clone(),
-                        inv.team.name.clone(),
-                        format!("{:?}", inv.role).to_lowercase(),
-                        inv.invited_by.as_ref().map(|u| u.username.clone()).unwrap_or("(deleted)".to_string()),
-                        inv.expires_at.clone(),
-                    ]
-                }).collect();
+                let rows = response
+                    .data
+                    .iter()
+                    .map(|inv| {
+                        vec![
+                            inv.id.clone(),
+                            inv.team.name.clone(),
+                            format!("{:?}", inv.role).to_lowercase(),
+                            inv.invited_by
+                                .as_ref()
+                                .map(|u| u.username.clone())
+                                .unwrap_or("(deleted)".to_string()),
+                            inv.expires_at.clone(),
+                        ]
+                    })
+                    .collect();
                 output.table(&["ID", "Team", "Role", "Invited By", "Expires"], rows);
             }
         }
@@ -490,11 +565,17 @@ pub async fn cmd_teams(
                 output.success(&format!("Declined invitation '{}'.", invitation_id));
             }
         }
-        Some(TeamsAction::Role { name, user_id, role }) => {
+        Some(TeamsAction::Role {
+            name,
+            user_id,
+            role,
+        }) => {
             let parsed_role = parse_team_role(&role)?;
             let team_id = resolve_team_id(&client, &token, &name, output).await?;
             let request = ChangeRoleRequest { role: parsed_role };
-            let response = client.change_role(&token, &team_id, &user_id, &request).await?;
+            let response = client
+                .change_role(&token, &team_id, &user_id, &request)
+                .await?;
             display_member(output, &response);
         }
         Some(TeamsAction::Remove { name, user_id, yes }) => {
@@ -505,9 +586,11 @@ pub async fn cmd_teams(
                     message: format!("could not read confirmation input: {e}"),
                 })?;
                 let mut input = String::new();
-                std::io::stdin().read_line(&mut input).map_err(|e| CliError::Io {
-                    message: format!("could not read confirmation input: {e}"),
-                })?;
+                std::io::stdin()
+                    .read_line(&mut input)
+                    .map_err(|e| CliError::Io {
+                        message: format!("could not read confirmation input: {e}"),
+                    })?;
                 let trimmed = input.trim().to_lowercase();
                 if trimmed != "y" && trimmed != "yes" {
                     eprintln!("Aborted.");
@@ -518,7 +601,10 @@ pub async fn cmd_teams(
             if output.is_json() {
                 output.json(&json!({"removed": true, "userId": user_id}));
             } else {
-                output.success(&format!("Removed member '{}' from team '{}'.", user_id, name));
+                output.success(&format!(
+                    "Removed member '{}' from team '{}'.",
+                    user_id, name
+                ));
             }
         }
         Some(TeamsAction::AddRepo { name, repo, role }) => {
@@ -526,7 +612,9 @@ pub async fn cmd_teams(
             let team_id = resolve_team_id(&client, &token, &name, output).await?;
             let (repo_owner, repo_name) = parse_repo_string(&repo)?;
             let request = TeamRepoAccessRequest { role: parsed_role };
-            let response = client.add_team_repo(&token, &team_id, repo_owner, repo_name, &request).await?;
+            let response = client
+                .add_team_repo(&token, &team_id, repo_owner, repo_name, &request)
+                .await?;
             if output.is_json() {
                 output.json(&json!({
                     "owner": response.owner,
@@ -544,10 +632,26 @@ pub async fn cmd_teams(
                 }));
             } else {
                 let rows = vec![
-                    vec!["Repository".to_string(), format!("{}/{}", response.owner, response.name)],
-                    vec!["Visibility".to_string(), format!("{:?}", response.visibility).to_lowercase()],
-                    vec!["Role".to_string(), format!("{:?}", response.role).to_lowercase()],
-                    vec!["Added By".to_string(), response.added_by.as_ref().map(|u| u.username.clone()).unwrap_or("(deleted)".to_string())],
+                    vec![
+                        "Repository".to_string(),
+                        format!("{}/{}", response.owner, response.name),
+                    ],
+                    vec![
+                        "Visibility".to_string(),
+                        format!("{:?}", response.visibility).to_lowercase(),
+                    ],
+                    vec![
+                        "Role".to_string(),
+                        format!("{:?}", response.role).to_lowercase(),
+                    ],
+                    vec![
+                        "Added By".to_string(),
+                        response
+                            .added_by
+                            .as_ref()
+                            .map(|u| u.username.clone())
+                            .unwrap_or("(deleted)".to_string()),
+                    ],
                     vec!["Added".to_string(), response.added_at.clone()],
                 ];
                 output.table(&["Property", "Value"], rows);
@@ -557,25 +661,35 @@ pub async fn cmd_teams(
             let (repo_owner, repo_name) = parse_repo_string(&repo)?;
             let team_id = resolve_team_id(&client, &token, &name, output).await?;
             if !yes {
-                eprint!("Remove repository access for '{}' from team '{}'? [y/N]: ", repo, name);
+                eprint!(
+                    "Remove repository access for '{}' from team '{}'? [y/N]: ",
+                    repo, name
+                );
                 std::io::stderr().flush().map_err(|e| CliError::Io {
                     message: format!("could not read confirmation input: {e}"),
                 })?;
                 let mut input = String::new();
-                std::io::stdin().read_line(&mut input).map_err(|e| CliError::Io {
-                    message: format!("could not read confirmation input: {e}"),
-                })?;
+                std::io::stdin()
+                    .read_line(&mut input)
+                    .map_err(|e| CliError::Io {
+                        message: format!("could not read confirmation input: {e}"),
+                    })?;
                 let trimmed = input.trim().to_lowercase();
                 if trimmed != "y" && trimmed != "yes" {
                     eprintln!("Aborted.");
                     return Ok(());
                 }
             }
-            client.remove_team_repo(&token, &team_id, repo_owner, repo_name).await?;
+            client
+                .remove_team_repo(&token, &team_id, repo_owner, repo_name)
+                .await?;
             if output.is_json() {
                 output.json(&json!({"removed": true, "team": name, "repo": repo}));
             } else {
-                output.success(&format!("Removed repository access for '{}' from team '{}'.", repo, name));
+                output.success(&format!(
+                    "Removed repository access for '{}' from team '{}'.",
+                    repo, name
+                ));
             }
         }
         Some(TeamsAction::Repos { name }) => {
@@ -599,16 +713,26 @@ pub async fn cmd_teams(
                     })).collect::<Vec<_>>(),
                 }));
             } else {
-                let rows = response.data.iter().map(|r| {
-                    vec![
-                        format!("{}/{}", r.owner, r.name),
-                        format!("{:?}", r.visibility).to_lowercase(),
-                        format!("{:?}", r.role).to_lowercase(),
-                        r.added_by.as_ref().map(|u| u.username.clone()).unwrap_or("(deleted)".to_string()),
-                        r.added_at.clone(),
-                    ]
-                }).collect();
-                output.table(&["Repository", "Visibility", "Role", "Added By", "Added"], rows);
+                let rows = response
+                    .data
+                    .iter()
+                    .map(|r| {
+                        vec![
+                            format!("{}/{}", r.owner, r.name),
+                            format!("{:?}", r.visibility).to_lowercase(),
+                            format!("{:?}", r.role).to_lowercase(),
+                            r.added_by
+                                .as_ref()
+                                .map(|u| u.username.clone())
+                                .unwrap_or("(deleted)".to_string()),
+                            r.added_at.clone(),
+                        ]
+                    })
+                    .collect();
+                output.table(
+                    &["Repository", "Visibility", "Role", "Added By", "Added"],
+                    rows,
+                );
             }
         }
     }
@@ -730,8 +854,12 @@ mod tests {
         let result = cmd_teams(
             &config,
             &output,
-            Some(TeamsAction::Create { name: "my-team".to_string(), description: None }),
-        ).await;
+            Some(TeamsAction::Create {
+                name: "my-team".to_string(),
+                description: None,
+            }),
+        )
+        .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());

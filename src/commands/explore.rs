@@ -17,9 +17,21 @@ pub async fn cmd_explore(
 ) -> Result<(), CliError> {
     let client = SynsClient::new(config.server_url())?;
     let status_enum = status.map(RepoStatus::from);
-    let tag_str = if tags.is_empty() { None } else { Some(tags.join(",")) };
+    let tag_str = if tags.is_empty() {
+        None
+    } else {
+        Some(tags.join(","))
+    };
 
-    let response = client.explore(query.as_deref(), tag_str.as_deref(), status_enum.as_ref(), limit, offset).await?;
+    let response = client
+        .explore(
+            query.as_deref(),
+            tag_str.as_deref(),
+            status_enum.as_ref(),
+            limit,
+            offset,
+        )
+        .await?;
 
     if output.is_json() {
         let repos = to_value(&response.data).map_err(|e| CliError::Io {
@@ -32,20 +44,30 @@ pub async fn cmd_explore(
             "offset": response.offset,
         }));
     } else {
-        let rows: Vec<Vec<String>> = response.data.iter().map(|repo| {
-            vec![
-                format!("{}/{}", repo.owner, repo.name),
-                repo.description.as_deref().unwrap_or("-").to_string(),
-                repo.status.as_query_str().to_string(),
-                repo.fork_count.to_string(),
-            ]
-        }).collect();
+        let rows: Vec<Vec<String>> = response
+            .data
+            .iter()
+            .map(|repo| {
+                vec![
+                    format!("{}/{}", repo.owner, repo.name),
+                    repo.description.as_deref().unwrap_or("-").to_string(),
+                    repo.status.as_query_str().to_string(),
+                    repo.fork_count.to_string(),
+                ]
+            })
+            .collect();
         output.table(&["Name", "Description", "Status", "Forks"], rows);
 
         if response.total > response.data.len() as u32 {
-            eprintln!("{}", style(format!(
-                "Showing {} of {} repositories", response.data.len(), response.total
-            )).dim());
+            eprintln!(
+                "{}",
+                style(format!(
+                    "Showing {} of {} repositories",
+                    response.data.len(),
+                    response.total
+                ))
+                .dim()
+            );
         }
     }
 
@@ -139,7 +161,16 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(true);
 
-        let result = cmd_explore(&config, &output, None, vec![], Some(CliRepoStatus::Active), 20, 0).await;
+        let result = cmd_explore(
+            &config,
+            &output,
+            None,
+            vec![],
+            Some(CliRepoStatus::Active),
+            20,
+            0,
+        )
+        .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());

@@ -25,33 +25,51 @@ fn style_status(status: &DiffStatus) -> console::StyledObject<&'static str> {
     }
 }
 
-pub async fn cmd_diff(config: &Config, output: &Output, from: Option<String>, to: Option<String>) -> Result<(), CliError> {
-    let current_dir = std::env::current_dir()
-        .map_err(|e| CliError::Io { message: format!("could not determine current directory: {e}") })?;
+pub async fn cmd_diff(
+    config: &Config,
+    output: &Output,
+    from: Option<String>,
+    to: Option<String>,
+) -> Result<(), CliError> {
+    let current_dir = std::env::current_dir().map_err(|e| CliError::Io {
+        message: format!("could not determine current directory: {e}"),
+    })?;
     let identity = resolve_repo_identity(None, &current_dir)?;
     let owner = identity.owner.ok_or(CliError::RepoIdentityUnknown)?;
     let repo_id = format!("{}/{}", owner, identity.name);
-    let token = TokenStore::new(config.credentials_path()).read().ok().flatten();
+    let token = TokenStore::new(config.credentials_path())
+        .read()
+        .ok()
+        .flatten();
     let client = SynsClient::new(config.server_url())?;
 
     let (from_val, to_val) = match (from, to) {
         (Some(f), Some(t)) => (f, t),
         (None, None) => {
-            let response = client.list_versions(&repo_id, token.as_deref(), 2, 0).await?;
+            let response = client
+                .list_versions(&repo_id, token.as_deref(), 2, 0)
+                .await?;
             if response.data.len() < 2 {
                 return Err(CliError::Api {
                     status: None,
                     error: "repository has fewer than 2 versions — cannot diff".to_string(),
                 });
             }
-            (response.data[1].version.to_string(), response.data[0].version.to_string())
+            (
+                response.data[1].version.to_string(),
+                response.data[0].version.to_string(),
+            )
         }
-        _ => return Err(CliError::Config {
-            message: "both --from and --to must be specified, or neither".to_string(),
-        }),
+        _ => {
+            return Err(CliError::Config {
+                message: "both --from and --to must be specified, or neither".to_string(),
+            });
+        }
     };
 
-    let response = client.get_diff(&repo_id, token.as_deref(), &from_val, &to_val).await?;
+    let response = client
+        .get_diff(&repo_id, token.as_deref(), &from_val, &to_val)
+        .await?;
 
     if output.is_json() {
         output.json(&json!({
@@ -96,7 +114,8 @@ mod tests {
         std::fs::write(
             dir.path().join(".syns.yaml"),
             "owner: alice\nname: my-project\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
 
@@ -128,7 +147,13 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_diff(&config, &output, Some("1".to_string()), Some("3".to_string())).await;
+        let result = cmd_diff(
+            &config,
+            &output,
+            Some("1".to_string()),
+            Some("3".to_string()),
+        )
+        .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
@@ -141,7 +166,8 @@ mod tests {
         std::fs::write(
             dir.path().join(".syns.yaml"),
             "owner: alice\nname: my-project\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
 
@@ -211,7 +237,8 @@ mod tests {
         std::fs::write(
             dir.path().join(".syns.yaml"),
             "owner: alice\nname: my-project\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
 

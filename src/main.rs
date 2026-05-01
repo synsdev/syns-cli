@@ -2,12 +2,15 @@ use syns_cli::{commands, config, errors, output};
 
 use clap::{Parser, Subcommand};
 use syns_cli::commands::collaborators::CollaboratorsAction;
-use syns_cli::commands::teams::TeamsAction;
 use syns_cli::commands::push::PushArgs;
 use syns_cli::commands::repo::{CliRepoStatus, CliVisibility};
+use syns_cli::commands::teams::TeamsAction;
 
 #[derive(Parser)]
-#[command(name = "syns", about = "Push, pull, and manage versioned file repositories")]
+#[command(
+    name = "syns",
+    about = "Push, pull, and manage versioned file repositories"
+)]
 struct Cli {
     /// Override server URL
     #[arg(long, global = true, env = "SYNS_URL")]
@@ -168,21 +171,47 @@ async fn main() {
     }
 }
 
-async fn run(command: Commands, config: &config::Config, output: &output::Output) -> Result<(), errors::CliError> {
+async fn run(
+    command: Commands,
+    config: &config::Config,
+    output: &output::Output,
+) -> Result<(), errors::CliError> {
     match command {
         Commands::Push(args) => commands::push::cmd_push(config, output, &args).await?,
-        Commands::Pull { repo, path, version } => commands::pull::cmd_pull(config, output, repo, path, version).await?,
+        Commands::Pull {
+            repo,
+            path,
+            version,
+        } => commands::pull::cmd_pull(config, output, repo, path, version).await?,
         Commands::Ls { path } => commands::ls::cmd_ls(config, output, path).await?,
         Commands::Cat { path } => commands::cat::cmd_cat(config, output, path).await?,
         Commands::Status {} => commands::status::cmd_status(config, output).await?,
-        Commands::History { file, limit } => commands::history::cmd_history(config, output, file, limit).await?,
+        Commands::History { file, limit } => {
+            commands::history::cmd_history(config, output, file, limit).await?
+        }
         Commands::Diff { from, to } => commands::diff::cmd_diff(config, output, from, to).await?,
-        Commands::Revert { path, to, message } => commands::revert::cmd_revert(config, output, path, to, message).await?,
-        Commands::Repo { description, status, visibility, tag } => commands::repo::cmd_repo(config, output, description, status, visibility, tag).await?,
-        Commands::Collaborators { action } => commands::collaborators::cmd_collaborators(config, output, action).await?,
+        Commands::Revert { path, to, message } => {
+            commands::revert::cmd_revert(config, output, path, to, message).await?
+        }
+        Commands::Repo {
+            description,
+            status,
+            visibility,
+            tag,
+        } => commands::repo::cmd_repo(config, output, description, status, visibility, tag).await?,
+        Commands::Collaborators { action } => {
+            commands::collaborators::cmd_collaborators(config, output, action).await?
+        }
         Commands::Delete { yes } => commands::delete::cmd_delete(config, output, yes).await?,
-        Commands::Explore { query, tag, status, limit, offset } => {
-            commands::explore::cmd_explore(config, output, query, tag, status, limit, offset).await?
+        Commands::Explore {
+            query,
+            tag,
+            status,
+            limit,
+            offset,
+        } => {
+            commands::explore::cmd_explore(config, output, query, tag, status, limit, offset)
+                .await?
         }
         Commands::Fork { repo, name } => {
             commands::fork::cmd_fork(config, output, repo, name).await?
