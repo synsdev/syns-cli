@@ -3,10 +3,10 @@ use crate::client::{AddCollaboratorRequest, CollaboratorRole, SynsClient};
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
+use crate::prompts::{ConfirmOutcome, confirm_or_yes};
 use crate::repo::resolve::resolve_repo_identity;
 use clap::Subcommand;
 use serde_json::json;
-use std::io::Write;
 
 #[derive(clap::ValueEnum, Debug, Clone)]
 pub enum AssignableRole {
@@ -59,22 +59,18 @@ pub enum CollaboratorsAction {
 
 const DEFAULT_COLLABORATOR_LIMIT: u32 = 100;
 
-fn confirm_remove(user_id: &str, repo_id: &str) -> Result<bool, CliError> {
-    eprint!(
+fn confirm_remove(user_id: &str, repo_id: &str, yes: bool) -> Result<bool, CliError> {
+    let prompt = format!(
         "Remove collaborator '{}' from '{}'? [y/N]: ",
         user_id, repo_id
     );
-    std::io::stderr().flush().map_err(|e| CliError::Io {
-        message: format!("could not read confirmation input: {e}"),
-    })?;
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .map_err(|e| CliError::Io {
-            message: format!("could not read confirmation input: {e}"),
-        })?;
-    let trimmed = input.trim().to_lowercase();
-    Ok(trimmed == "y" || trimmed == "yes")
+    match confirm_or_yes(yes, &prompt)? {
+        ConfirmOutcome::SkipPrompt => Ok(true),
+        ConfirmOutcome::Input(input) => {
+            let trimmed = input.trim().to_lowercase();
+            Ok(trimmed == "y" || trimmed == "yes")
+        }
+    }
 }
 
 pub async fn cmd_collaborators(
@@ -155,7 +151,7 @@ pub async fn cmd_collaborators(
             let token = TokenStore::new(config.credentials_path())
                 .read()?
                 .ok_or(CliError::AuthRequired)?;
-            if !yes && !confirm_remove(&user_id, &repo_id)? {
+            if !confirm_remove(&user_id, &repo_id, yes)? {
                 eprintln!("Aborted.");
                 return Ok(());
             }

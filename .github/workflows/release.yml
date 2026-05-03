@@ -1,0 +1,166 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  test:
+    name: Pre-build gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo install --locked cargo-audit
+      - run: cargo audit
+      - run: cargo test --workspace --locked
+
+  release:
+    name: Build (production matrix)
+    needs: test
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+            use_cross: true
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            archive: tar.gz
+            use_cross: false
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            archive: tar.gz
+            use_cross: false
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+            use_cross: false
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build (cross)
+        if: matrix.use_cross
+        uses: houseabsolute/actions-rust-cross@fe6ede73c7f0a50412ec05994e2aa5a7bf635eac  # v1.0.7
+        with:
+          target: ${{ matrix.target }}
+          args: '--release'
+      - name: Build (native)
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Strip and archive (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          strip target/${{ matrix.target }}/release/syns
+          mkdir -p dist
+          tar -czvf dist/syns-${{ github.ref_name }}-${{ matrix.target }}.tar.gz \
+            -C target/${{ matrix.target }}/release syns
+      - name: Archive (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          mkdir dist
+          Compress-Archive -Path target/${{ matrix.target }}/release/syns.exe -DestinationPath dist/syns-${{ github.ref_name }}-${{ matrix.target }}.zip
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: syns-${{ matrix.target }}
+          path: dist/*
+
+  release-staging:
+    name: Build (staging matrix)
+    needs: test
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+            use_cross: true
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            archive: tar.gz
+            use_cross: false
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            archive: tar.gz
+            use_cross: false
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+            use_cross: false
+    runs-on: ${{ matrix.runner }}
+    env:
+      SYNS_CLI_DEFAULT_SERVER_URL: https://staging.syns.dev
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Validate staging URL
+        shell: bash
+        run: |
+          if ! [[ "$SYNS_CLI_DEFAULT_SERVER_URL" =~ ^https://[a-zA-Z0-9.-]+(:[0-9]+)?(/.*)?$ ]]; then
+            echo "ERROR: invalid SYNS_CLI_DEFAULT_SERVER_URL: $SYNS_CLI_DEFAULT_SERVER_URL"
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          key: ${{ matrix.target }}-staging
+      - name: Build (cross)
+        if: matrix.use_cross
+        uses: houseabsolute/actions-rust-cross@fe6ede73c7f0a50412ec05994e2aa5a7bf635eac  # v1.0.7
+        with:
+          target: ${{ matrix.target }}
+          args: '--release'
+      - name: Build (native)
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Strip and archive (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          strip target/${{ matrix.target }}/release/syns
+          mkdir -p dist
+          tar -czvf dist/syns-${{ github.ref_name }}-${{ matrix.target }}-staging.tar.gz \
+            -C target/${{ matrix.target }}/release syns
+      - name: Archive (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          mkdir dist
+          Compress-Archive -Path target/${{ matrix.target }}/release/syns.exe -DestinationPath dist/syns-${{ github.ref_name }}-${{ matrix.target }}-staging.zip
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: syns-${{ matrix.target }}-staging
+          path: dist/*
+
+  publish:
+    name: Publish GitHub Release
+    needs: [release, release-staging]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          path: artifacts
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
+        with:
+          files: artifacts/**/*
+          draft: false
+          prerelease: false

@@ -4,7 +4,10 @@ use crate::errors::CliError;
 use std::path::{Path, PathBuf};
 use url::Url;
 
-const DEFAULT_SERVER_URL: &str = "https://syns.dev";
+const DEFAULT_SERVER_URL: &str = match option_env!("SYNS_CLI_DEFAULT_SERVER_URL") {
+    Some(url) => url,
+    None => "https://syns.dev",
+};
 const CONFIG_SUBDIR: &str = "syns";
 const CACHE_SUBDIR: &str = "syns";
 

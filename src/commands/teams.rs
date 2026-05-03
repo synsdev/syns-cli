@@ -6,10 +6,11 @@ use crate::client::{
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
+use crate::prompts::{ConfirmOutcome, confirm_or_yes};
 use clap::Subcommand;
 use console::style;
 use serde_json::json;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 
 #[derive(Subcommand, Debug)]
 pub enum TeamsAction {
@@ -193,18 +194,22 @@ async fn resolve_team_id(
         _ if name.contains('/') => Err(CliError::Config {
             message: format!("no team named '{}' found", name),
         }),
-        _ if output.is_json() => Err(CliError::Config {
-            message: format!(
-                "multiple teams named '{}' \u{2014} specify as 'owner/team-name' to disambiguate: {}",
-                name,
-                matches
+        _ => {
+            // CLI_IA.md line 822: in non-TTY or --json mode, do NOT prompt;
+            // emit the list of matches and exit 1 with a single uniform error.
+            if !std::io::stdin().is_terminal() || output.is_json() {
+                let listed = matches
                     .iter()
                     .map(|t| format!("{}/{}", t.owner.username, name))
                     .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        }),
-        _ => {
+                    .join(", ");
+                return Err(CliError::Config {
+                    message: format!(
+                        "ambiguous team name '{}'; matched: {}; pass 'owner/team-name' instead to disambiguate",
+                        name, listed
+                    ),
+                });
+            }
             eprintln!("Multiple teams named '{}':", name);
             for (i, team) in matches.iter().enumerate() {
                 eprintln!("  {}. {} (owner: {})", i + 1, name, team.owner.username);
@@ -438,24 +443,18 @@ pub async fn cmd_teams(
         }
         Some(TeamsAction::Delete { name, yes }) => {
             let team_id = resolve_team_id(&client, &token, &name, output).await?;
-            if !yes {
-                eprintln!("{}", style(format!(
-                    "WARNING: This will permanently delete team '{}' and all its memberships, invitations, and repository access entries.", name
-                )).red().bold());
-                eprintln!("This action cannot be undone.");
-                eprint!("Type the team name to confirm ('{}'): ", name);
-                std::io::stderr().flush().map_err(|e| CliError::Io {
-                    message: format!("could not read confirmation input: {e}"),
-                })?;
-                let mut input = String::new();
-                std::io::stdin()
-                    .read_line(&mut input)
-                    .map_err(|e| CliError::Io {
-                        message: format!("could not read confirmation input: {e}"),
-                    })?;
-                if input.trim() != name {
-                    eprintln!("Aborted \u{2014} input did not match team name.");
-                    return Ok(());
+            eprintln!("{}", style(format!(
+                "WARNING: This will permanently delete team '{}' and all its memberships, invitations, and repository access entries.", name
+            )).red().bold());
+            eprintln!("This action cannot be undone.");
+            let prompt = format!("Type the team name to confirm ('{}'): ", name);
+            match confirm_or_yes(yes, &prompt)? {
+                ConfirmOutcome::SkipPrompt => { /* proceed */ }
+                ConfirmOutcome::Input(input) => {
+                    if input.trim() != name {
+                        eprintln!("Aborted \u{2014} input did not match team name.");
+                        return Ok(());
+                    }
                 }
             }
             client.delete_team(&token, &team_id).await?;
@@ -580,21 +579,15 @@ pub async fn cmd_teams(
         }
         Some(TeamsAction::Remove { name, user_id, yes }) => {
             let team_id = resolve_team_id(&client, &token, &name, output).await?;
-            if !yes {
-                eprint!("Remove member '{}' from team '{}'? [y/N]: ", user_id, name);
-                std::io::stderr().flush().map_err(|e| CliError::Io {
-                    message: format!("could not read confirmation input: {e}"),
-                })?;
-                let mut input = String::new();
-                std::io::stdin()
-                    .read_line(&mut input)
-                    .map_err(|e| CliError::Io {
-                        message: format!("could not read confirmation input: {e}"),
-                    })?;
-                let trimmed = input.trim().to_lowercase();
-                if trimmed != "y" && trimmed != "yes" {
-                    eprintln!("Aborted.");
-                    return Ok(());
+            let prompt = format!("Remove member '{}' from team '{}'? [y/N]: ", user_id, name);
+            match confirm_or_yes(yes, &prompt)? {
+                ConfirmOutcome::SkipPrompt => { /* proceed */ }
+                ConfirmOutcome::Input(input) => {
+                    let trimmed = input.trim().to_lowercase();
+                    if trimmed != "y" && trimmed != "yes" {
+                        eprintln!("Aborted.");
+                        return Ok(());
+                    }
                 }
             }
             client.remove_member(&token, &team_id, &user_id).await?;
@@ -660,24 +653,18 @@ pub async fn cmd_teams(
         Some(TeamsAction::RemoveRepo { name, repo, yes }) => {
             let (repo_owner, repo_name) = parse_repo_string(&repo)?;
             let team_id = resolve_team_id(&client, &token, &name, output).await?;
-            if !yes {
-                eprint!(
-                    "Remove repository access for '{}' from team '{}'? [y/N]: ",
-                    repo, name
-                );
-                std::io::stderr().flush().map_err(|e| CliError::Io {
-                    message: format!("could not read confirmation input: {e}"),
-                })?;
-                let mut input = String::new();
-                std::io::stdin()
-                    .read_line(&mut input)
-                    .map_err(|e| CliError::Io {
-                        message: format!("could not read confirmation input: {e}"),
-                    })?;
-                let trimmed = input.trim().to_lowercase();
-                if trimmed != "y" && trimmed != "yes" {
-                    eprintln!("Aborted.");
-                    return Ok(());
+            let prompt = format!(
+                "Remove repository access for '{}' from team '{}'? [y/N]: ",
+                repo, name
+            );
+            match confirm_or_yes(yes, &prompt)? {
+                ConfirmOutcome::SkipPrompt => { /* proceed */ }
+                ConfirmOutcome::Input(input) => {
+                    let trimmed = input.trim().to_lowercase();
+                    if trimmed != "y" && trimmed != "yes" {
+                        eprintln!("Aborted.");
+                        return Ok(());
+                    }
                 }
             }
             client
@@ -786,6 +773,97 @@ mod tests {
 
         let result = resolve_team_id(&client, "test-token", "alpha", &output).await;
         assert_eq!(result.unwrap(), "uuid-alpha".to_string());
+    }
+
+    #[tokio::test]
+    async fn disambiguation_returns_ambiguous_error_in_json_mode_with_multiple_matches() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/teams"))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {
+                        "id": "uuid-alice-core",
+                        "name": "core",
+                        "description": null,
+                        "owner": { "id": "u1", "username": "alice", "name": "Alice", "image": null },
+                        "memberCount": 3,
+                        "role": "owner",
+                        "createdAt": "2026-01-01T00:00:00Z",
+                        "updatedAt": "2026-02-01T00:00:00Z"
+                    },
+                    {
+                        "id": "uuid-bob-core",
+                        "name": "core",
+                        "description": null,
+                        "owner": { "id": "u2", "username": "bob", "name": "Bob", "image": null },
+                        "memberCount": 1,
+                        "role": "member",
+                        "createdAt": "2026-01-15T00:00:00Z",
+                        "updatedAt": "2026-01-15T00:00:00Z"
+                    }
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        // JSON mode triggers the combined non-interactive predicate even if
+        // stdin happens to be a TTY at test time.
+        let output = Output::new(true);
+
+        let result = resolve_team_id(&client, "test-token", "core", &output).await;
+        let err = result.unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("ambiguous team name 'core'"),
+            "expected ambiguous-team error, got: {message}"
+        );
+        assert!(
+            message.contains("alice/core"),
+            "expected alice/core in matches, got: {message}"
+        );
+        assert!(
+            message.contains("bob/core"),
+            "expected bob/core in matches, got: {message}"
+        );
+        assert!(
+            message.contains("pass 'owner/team-name' instead to disambiguate"),
+            "expected disambiguation hint, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn disambiguation_with_single_match_returns_match_unchanged_in_json_mode() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/teams"))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {
+                        "id": "uuid-only",
+                        "name": "core",
+                        "description": null,
+                        "owner": { "id": "u1", "username": "alice", "name": "Alice", "image": null },
+                        "memberCount": 3,
+                        "role": "owner",
+                        "createdAt": "2026-01-01T00:00:00Z",
+                        "updatedAt": "2026-02-01T00:00:00Z"
+                    }
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let output = Output::new(true);
+
+        let result = resolve_team_id(&client, "test-token", "core", &output).await;
+        assert_eq!(result.unwrap(), "uuid-only".to_string());
     }
 
     #[tokio::test]

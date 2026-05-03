@@ -3,12 +3,12 @@ use crate::client::SynsClient;
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
+use crate::prompts::{ConfirmOutcome, confirm_or_yes};
 use crate::repo::resolve::resolve_repo_identity;
 use console::style;
 use serde_json::json;
-use std::io::Write;
 
-fn confirm_delete(repo_id: &str) -> Result<bool, CliError> {
+fn confirm_delete(repo_id: &str, yes: bool) -> Result<bool, CliError> {
     eprintln!(
         "{}",
         style(format!(
@@ -19,17 +19,11 @@ fn confirm_delete(repo_id: &str) -> Result<bool, CliError> {
         .bold()
     );
     eprintln!("This action cannot be undone.");
-    eprint!("Type the repository name to confirm ('{}'): ", repo_id);
-    std::io::stderr().flush().map_err(|e| CliError::Io {
-        message: format!("could not read confirmation input: {e}"),
-    })?;
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .map_err(|e| CliError::Io {
-            message: format!("could not read confirmation input: {e}"),
-        })?;
-    Ok(input.trim() == repo_id)
+    let prompt = format!("Type the repository name to confirm ('{}'): ", repo_id);
+    match confirm_or_yes(yes, &prompt)? {
+        ConfirmOutcome::SkipPrompt => Ok(true),
+        ConfirmOutcome::Input(input) => Ok(input.trim() == repo_id),
+    }
 }
 
 pub async fn cmd_delete(config: &Config, output: &Output, yes: bool) -> Result<(), CliError> {
@@ -44,7 +38,7 @@ pub async fn cmd_delete(config: &Config, output: &Output, yes: bool) -> Result<(
         .ok_or(CliError::AuthRequired)?;
     let client = SynsClient::new(config.server_url())?;
 
-    if !yes && !confirm_delete(&repo_id)? {
+    if !confirm_delete(&repo_id, yes)? {
         eprintln!("Aborted — input did not match repository name.");
         return Ok(());
     }
