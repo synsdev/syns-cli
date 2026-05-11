@@ -25,36 +25,55 @@ on:
   workflow_run:
     workflows: ["Release"]
     types: [completed]
+  # DEVIATION #2 from SPEC § 9 / PLAN: workflow_dispatch added as a recovery
+  # path so the bumper can be re-fired manually for an already-tagged release
+  # when a prior workflow_run-driven attempt failed (e.g., during the first
+  # production run of u199 the SPEC's broken commits/<sha>/tags endpoint
+  # failed on v0.2.2, requiring `gh workflow run scoop-bump.yml --ref main
+  # -f tag=v0.2.2`). Without workflow_dispatch the only re-trigger path is
+  # `gh run rerun`, which replays the original YAML — not the fixed YAML —
+  # for workflow_run runs. Flagged for G8 RECONCILE.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to bump (e.g., v0.2.2)'
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: scoop-bump-${{ github.event.workflow_run.head_sha }}
+  group: scoop-bump-${{ github.event.workflow_run.head_sha || inputs.tag }}
   cancel-in-progress: false
 
 jobs:
   bump:
     if: >-
-      github.event.workflow_run.conclusion == 'success'
-      && github.event.workflow_run.event == 'push'
+      github.event_name == 'workflow_dispatch'
+      || (github.event.workflow_run.conclusion == 'success'
+          && github.event.workflow_run.event == 'push')
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - name: Derive TAG from upstream head_sha
+      - name: Derive TAG from upstream head_sha (or workflow_dispatch input)
         id: derive
         run: |
-          # DEVIATION from SPEC § 4.3 step 4 / PLAN scoop-bump.yml verbatim:
+          # DEVIATION #1 from SPEC § 4.3 step 4 / PLAN scoop-bump.yml verbatim:
           # The SPEC-specified endpoint `gh api repos/.../commits/<sha>/tags`
           # does NOT exist on GitHub's REST API (HTTP 422). The PROTOTYPE
           # never exercised it (only pushed a marker file). We preserve the
           # SPEC's head_sha → tag design intent (per D3 rationale) by listing
           # all tags and filtering by .commit.sha, which IS a real endpoint.
           # Flagged for G8 RECONCILE to update SPEC § 4.3 step 4.
-          TAG=$(gh api repos/${{ github.repository }}/tags --paginate --jq '.[] | select(.commit.sha == "${{ github.event.workflow_run.head_sha }}") | .name' | head -1)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG=$(gh api repos/${{ github.repository }}/tags --paginate --jq '.[] | select(.commit.sha == "${{ github.event.workflow_run.head_sha }}") | .name' | head -1)
+          fi
           if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
-            echo "no-tag at head_sha=${{ github.event.workflow_run.head_sha }}; exiting"
+            echo "no-tag; exiting"
             exit 0
           fi
           VERSION="${TAG#v}"
