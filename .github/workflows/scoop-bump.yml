@@ -159,14 +159,20 @@ jobs:
             }
           }' > bucket/syns.json
 
-          # Idempotency gate: if bucket/syns.json is byte-identical to what's
-          # already on disk (re-run for the same tag), exit cleanly with no
-          # empty commit (per u199 SPEC § 4.3 step 10).
-          if git diff --quiet -- bucket/syns.json; then
+          # DEVIATION #3 from SPEC § 4.3 step 10 / PLAN scoop-bump.yml verbatim:
+          # The SPEC's idempotency gate `git diff --quiet -- bucket/syns.json`
+          # returns 0 (no diff) even for an UNTRACKED file (first-creation
+          # case), causing the bucket bump to be silently skipped on the very
+          # first run when bucket/syns.json doesn't yet exist on the bucket
+          # repo's main branch. Fix: stage first, then compare against the
+          # index. `git diff --cached --quiet` correctly detects both
+          # first-creation and content-change cases.
+          # Flagged for G8 RECONCILE to update SPEC § 4.3 step 10.
+          git add bucket/syns.json
+          if git diff --cached --quiet -- bucket/syns.json; then
             echo "no-op: bucket/syns.json unchanged for $VERSION"
             exit 0
           fi
 
-          git add bucket/syns.json
           git commit -m "syns ${VERSION}"
           git push origin main
