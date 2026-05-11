@@ -1,9 +1,10 @@
 [package]
 name = "syns"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Command-line client for the Syns coordinated multi-agent development platform."
 license = "MIT"
+homepage = "https://github.com/synsdev/syns-cli"
 repository = "https://github.com/synsdev/syns-cli"
 readme = "README.md"
 keywords = ["syns", "cli", "git", "multi-agent", "version-control"]

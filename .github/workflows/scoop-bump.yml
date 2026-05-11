@@ -1,0 +1,55 @@
+# u199 prototype: minimal workflow_run gate exerciser + R-04 PAT push test.
+# This is a temporary echo-only workflow used to settle PROTOTYPE risks R-02
+# (does GitHub fire workflow_run for cargo-dist's release.yml?) and R-04
+# (does actions/checkout + fine-grained PAT + git push to a separate repo work?).
+# The real scoop-bump.yml (bucket-rendering logic) will replace this in the
+# next pipeline step after PROTOTYPE.md is regenerated with these findings.
+name: scoop-bump
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  echo-fire:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Echo workflow_run event fields
+        run: |
+          echo "workflow_run fired"
+          echo "conclusion=${{ github.event.workflow_run.conclusion }}"
+          echo "event=${{ github.event.workflow_run.event }}"
+          echo "head_branch=${{ github.event.workflow_run.head_branch }}"
+          echo "head_sha=${{ github.event.workflow_run.head_sha }}"
+
+      # R-04 PAT push test — gated on the R-02 success branch (must be a
+      # tag-triggered Release with conclusion: success).
+      - name: Checkout scoop-syns with PAT
+        if: >-
+          github.event.workflow_run.conclusion == 'success'
+          && github.event.workflow_run.event == 'push'
+          && startsWith(github.event.workflow_run.head_branch, 'v')
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: synsdev/scoop-syns
+          token: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          persist-credentials: true
+          path: scoop-bucket
+
+      - name: Push prototype marker commit
+        if: >-
+          github.event.workflow_run.conclusion == 'success'
+          && github.event.workflow_run.event == 'push'
+          && startsWith(github.event.workflow_run.head_branch, 'v')
+        run: |
+          cd scoop-bucket
+          git config user.name 'syns-release-bot'
+          git config user.email 'release-bot@syns.dev'
+          touch "bucket/.prototype-marker-${{ github.run_id }}"
+          git add bucket/
+          git commit -m 'r04 prototype: PAT push from u199 prototype run ${{ github.run_id }}'
+          git push origin main
