@@ -45,7 +45,14 @@ jobs:
       - name: Derive TAG from upstream head_sha
         id: derive
         run: |
-          TAG=$(gh api repos/${{ github.repository }}/commits/${{ github.event.workflow_run.head_sha }}/tags --jq '.[0].name')
+          # DEVIATION from SPEC § 4.3 step 4 / PLAN scoop-bump.yml verbatim:
+          # The SPEC-specified endpoint `gh api repos/.../commits/<sha>/tags`
+          # does NOT exist on GitHub's REST API (HTTP 422). The PROTOTYPE
+          # never exercised it (only pushed a marker file). We preserve the
+          # SPEC's head_sha → tag design intent (per D3 rationale) by listing
+          # all tags and filtering by .commit.sha, which IS a real endpoint.
+          # Flagged for G8 RECONCILE to update SPEC § 4.3 step 4.
+          TAG=$(gh api repos/${{ github.repository }}/tags --paginate --jq '.[] | select(.commit.sha == "${{ github.event.workflow_run.head_sha }}") | .name' | head -1)
           if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
             echo "no-tag at head_sha=${{ github.event.workflow_run.head_sha }}; exiting"
             exit 0
