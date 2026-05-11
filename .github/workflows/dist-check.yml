@@ -1,0 +1,21 @@
+name: dist-check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: dist-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: dist generate --check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Install cargo-dist 0.31.0
+        run: cargo install cargo-dist --version=0.31.0 --locked
+      - name: Verify generated workflow has no drift
+        run: dist generate --check

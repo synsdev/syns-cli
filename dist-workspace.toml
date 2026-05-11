@@ -1,0 +1,23 @@
+[workspace]
+members = ["cargo:."]
+
+[dist]
+cargo-dist-version = "0.31.0"
+ci = ["github"]
+installers = []
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+pr-run-mode = "plan"
+
+[dist.github-custom-runners]
+x86_64-apple-darwin = "macos-15-intel"
+
+[dist.github-action-commits]
+"actions/checkout" = "de0fac2e4500dabe0009e67214ff5f5447ce83dd"  # v6.0.2
+"actions/upload-artifact" = "b7c566a772e6b6bfb58ed0dc250532a479d7789f"  # v6.0.0
+"actions/download-artifact" = "37930b1c2abaa49bbe596cd826c3c89aef350131"  # v7.0.0
