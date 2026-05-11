@@ -1,9 +1,24 @@
-# u199 prototype: minimal workflow_run gate exerciser + R-04 PAT push test.
-# This is a temporary echo-only workflow used to settle PROTOTYPE risks R-02
-# (does GitHub fire workflow_run for cargo-dist's release.yml?) and R-04
-# (does actions/checkout + fine-grained PAT + git push to a separate repo work?).
-# The real scoop-bump.yml (bucket-rendering logic) will replace this in the
-# next pipeline step after PROTOTYPE.md is regenerated with these findings.
+# scoop-bump.yml — Scoop bucket auto-bump for synsdev/syns-cli
+#
+# Cross-file SHA-pin invariant (enforced by dist-check.yml's cross-pin-lint job;
+# do NOT bypass without lockstep update):
+#   The 'actions/checkout' SHA in this file MUST equal the SHA recorded in
+#   dist-workspace.toml [dist.github-action-commits] "actions/checkout".
+#   On rotation, update BOTH files in the same commit.
+#
+# Gate semantics (do NOT change without re-verification against a live release):
+#   The job-level if: gate filters on workflow_run.event == 'push' AND
+#   workflow_run.conclusion == 'success'. The release tag is derived from
+#   workflow_run.head_sha by querying the GitHub commits API (gh api
+#   repos/.../commits/<sha>/tags); workflow_run.head_branch is intentionally
+#   NOT consulted for tag derivation, for robustness against any future
+#   change in workflow_run field semantics (per SPEC § 3.7 / C-05).
+#
+# Empirical anchor: this workflow's gate + tag-derivation pattern was settled
+# against scoop-bump.yml runs 25695310140 (head_branch=v0.2.0, conclusion=
+# failure, gated-skipped) and 25695996351 (head_branch=v0.2.1, conclusion=
+# success, gate passed). See units/cli/u199/PROTOTYPE.md § 2 R-02.
+
 name: scoop-bump
 
 on:
@@ -14,42 +29,118 @@ on:
 permissions:
   contents: read
 
-jobs:
-  echo-fire:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Echo workflow_run event fields
-        run: |
-          echo "workflow_run fired"
-          echo "conclusion=${{ github.event.workflow_run.conclusion }}"
-          echo "event=${{ github.event.workflow_run.event }}"
-          echo "head_branch=${{ github.event.workflow_run.head_branch }}"
-          echo "head_sha=${{ github.event.workflow_run.head_sha }}"
+concurrency:
+  group: scoop-bump-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
 
-      # R-04 PAT push test — gated on the R-02 success branch (must be a
-      # tag-triggered Release with conclusion: success).
-      - name: Checkout scoop-syns with PAT
-        if: >-
-          github.event.workflow_run.conclusion == 'success'
-          && github.event.workflow_run.event == 'push'
-          && startsWith(github.event.workflow_run.head_branch, 'v')
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+jobs:
+  bump:
+    if: >-
+      github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Derive TAG from upstream head_sha
+        id: derive
+        run: |
+          TAG=$(gh api repos/${{ github.repository }}/commits/${{ github.event.workflow_run.head_sha }}/tags --jq '.[0].name')
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "no-tag at head_sha=${{ github.event.workflow_run.head_sha }}; exiting"
+            exit 0
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Derived TAG=$TAG VERSION=$VERSION"
+
+      - name: Skip prereleases
+        if: steps.derive.outputs.tag != ''
+        run: |
+          gh api repos/${{ github.repository }}/releases/tags/${{ steps.derive.outputs.tag }} > release.json
+          if ! jq -e '.prerelease == false' release.json > /dev/null; then
+            echo "release ${{ steps.derive.outputs.tag }} is a prerelease; skipping"
+            exit 0
+          fi
+
+      - name: Download Windows archive
+        if: steps.derive.outputs.tag != ''
+        run: |
+          gh release download ${{ steps.derive.outputs.tag }} \
+            -p 'syns-x86_64-pc-windows-msvc.zip' \
+            -R ${{ github.repository }}
+
+      - name: Compute SHA-256 of Windows archive
+        if: steps.derive.outputs.tag != ''
+        id: hash
+        run: |
+          HASH=$(shasum -a 256 syns-x86_64-pc-windows-msvc.zip | cut -d' ' -f1)
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+          echo "SHA-256 of syns-x86_64-pc-windows-msvc.zip = $HASH"
+
+      - name: Checkout synsdev/scoop-syns with PAT
+        if: steps.derive.outputs.tag != ''
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           repository: synsdev/scoop-syns
           token: ${{ secrets.SCOOP_BUCKET_TOKEN }}
           persist-credentials: true
           path: scoop-bucket
 
-      - name: Push prototype marker commit
-        if: >-
-          github.event.workflow_run.conclusion == 'success'
-          && github.event.workflow_run.event == 'push'
-          && startsWith(github.event.workflow_run.head_branch, 'v')
+      - name: Render bucket/syns.json and push
+        if: steps.derive.outputs.tag != ''
+        working-directory: scoop-bucket
+        env:
+          VERSION: ${{ steps.derive.outputs.version }}
+          HASH: ${{ steps.hash.outputs.hash }}
         run: |
-          cd scoop-bucket
           git config user.name 'syns-release-bot'
           git config user.email 'release-bot@syns.dev'
-          touch "bucket/.prototype-marker-${{ github.run_id }}"
-          git add bucket/
-          git commit -m 'r04 prototype: PAT push from u199 prototype run ${{ github.run_id }}'
+
+          # Scoop manifest schema omissions (intentional — preserve at lockstep):
+          #   - 'suggest.vcredist' is omitted: Rust binaries built against MSVC
+          #     with cargo-dist's [profile.dist] statically link the MSVC C
+          #     runtime; no VC++ redistributable is needed (per u199 SPEC C-03).
+          #     If a future C++ FFI dep is added, ADD this field in lockstep.
+          #   - 'architecture.64bit.extract_dir' is omitted: cargo-dist 0.31.0's
+          #     Windows zip lays out syns.exe, README.md, and LICENSE at depth 1
+          #     with no wrapper directory (per u196 § 1 / u199 SPEC C-04). If a
+          #     future cargo-dist version introduces wrappers, ADD this field
+          #     in lockstep.
+          # NOTE: the literal '$version' in autoupdate.architecture.64bit.url
+          # is Scoop's runtime placeholder, expanded by Scoop's update tooling
+          # at install time — NOT a jq/shell variable. Do NOT interpolate.
+          jq -n --arg v "$VERSION" --arg h "$HASH" '{
+            version: $v,
+            description: "Command-line client for the Syns coordinated multi-agent development platform.",
+            homepage: "https://github.com/synsdev/syns-cli",
+            license: "MIT",
+            architecture: {
+              "64bit": {
+                url: "https://github.com/synsdev/syns-cli/releases/download/v\($v)/syns-x86_64-pc-windows-msvc.zip",
+                hash: $h
+              }
+            },
+            bin: "syns.exe",
+            checkver: {github: "https://github.com/synsdev/syns-cli"},
+            autoupdate: {
+              architecture: {
+                "64bit": {
+                  url: "https://github.com/synsdev/syns-cli/releases/download/v$version/syns-x86_64-pc-windows-msvc.zip"
+                }
+              }
+            }
+          }' > bucket/syns.json
+
+          # Idempotency gate: if bucket/syns.json is byte-identical to what's
+          # already on disk (re-run for the same tag), exit cleanly with no
+          # empty commit (per u199 SPEC § 4.3 step 10).
+          if git diff --quiet -- bucket/syns.json; then
+            echo "no-op: bucket/syns.json unchanged for $VERSION"
+            exit 0
+          fi
+
+          git add bucket/syns.json
+          git commit -m "syns ${VERSION}"
           git push origin main
