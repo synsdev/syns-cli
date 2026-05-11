@@ -57,9 +57,28 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
+      # DEVIATION #5 from SPEC § 4.3 step 4: the SPEC interpolates
+      # `${{ inputs.tag }}` directly into bash. GitHub Actions expands
+      # `${{ ... }}` BEFORE bash parses the script, so an input value of
+      # `v0.2.2"; curl exfil; #` becomes literal bash (CWE-94). The sink
+      # reaches `SCOOP_BUCKET_TOKEN` in the same job, escalating a
+      # `syns-cli` workflow-write collaborator to effective write on
+      # `synsdev/scoop-syns`. Move every attacker-controlled or
+      # future-mutable context expression through `env:`, then validate
+      # the dispatch input against a strict version-tag regex BEFORE it
+      # touches the shell. After this gate, `steps.derive.outputs.tag` is
+      # sanitised, so downstream steps that reference it via
+      # `${{ steps.derive.outputs.tag }}` are safe.
+      # Flagged for G8 RECONCILE to update SPEC § 4.3 step 4.
       - name: Derive TAG from upstream head_sha (or workflow_dispatch input)
         id: derive
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          REPO: ${{ github.repository }}
         run: |
+          set -euo pipefail
           # DEVIATION #1 from SPEC § 4.3 step 4 / PLAN scoop-bump.yml verbatim:
           # The SPEC-specified endpoint `gh api repos/.../commits/<sha>/tags`
           # does NOT exist on GitHub's REST API (HTTP 422). The PROTOTYPE
@@ -67,10 +86,18 @@ jobs:
           # SPEC's head_sha → tag design intent (per D3 rationale) by listing
           # all tags and filtering by .commit.sha, which IS a real endpoint.
           # Flagged for G8 RECONCILE to update SPEC § 4.3 step 4.
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ inputs.tag }}"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            # H-3: validate the dispatch input BEFORE it touches bash.
+            # Allowed shape: v<major>.<minor>.<patch>[-<prerelease>] where
+            # the prerelease segment is alnum, '.', and '-'. Rejects any
+            # value that could embed shell metacharacters.
+            if ! printf '%s' "$INPUT_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$'; then
+              echo "ERROR: invalid tag format for workflow_dispatch input: $INPUT_TAG" >&2
+              exit 1
+            fi
+            TAG="$INPUT_TAG"
           else
-            TAG=$(gh api repos/${{ github.repository }}/tags --paginate --jq '.[] | select(.commit.sha == "${{ github.event.workflow_run.head_sha }}") | .name' | head -1)
+            TAG=$(gh api "repos/$REPO/tags" --paginate --jq ".[] | select(.commit.sha == \"$HEAD_SHA\") | .name" | head -1)
           fi
           if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
             echo "no-tag; exiting"
