@@ -1772,7 +1772,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "syns-cli"
+name = "syns"
 version = "0.1.0"
 dependencies = [
  "clap",
