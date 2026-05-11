@@ -81,24 +81,43 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Derived TAG=$TAG VERSION=$VERSION"
 
-      - name: Skip prereleases
+      # DEVIATION #4 from SPEC § 4.3 step 6 / § 9 step 4: the SPEC's
+      # `exit 0` shape (inside a `run:` block) only terminates the step,
+      # not the job — every gate-step below still has `if: ... tag != ''`
+      # as its sole guard, so a prerelease tag would proceed to download,
+      # hash, checkout, render, and push to the stable Scoop bucket.
+      # Today the `workflow_run` path is upstream-gated by cargo-dist's
+      # plan-job (prereleases reject), but the `workflow_dispatch`
+      # recovery valve (DEVIATION #2) bypasses that gate, so the prerelease
+      # filter MUST live on this side. Replace the `exit 0` with a step
+      # output (`skip=true|false`) and gate every downstream step on
+      # `steps.prerelease_check.outputs.skip != 'true'` in lockstep with
+      # the existing `tag != ''` discipline.
+      # Flagged for G8 RECONCILE to update SPEC § 4.3 step 6 + § 9 step 4.
+      - name: Check release prerelease flag
+        id: prerelease_check
         if: steps.derive.outputs.tag != ''
         run: |
-          gh api repos/${{ github.repository }}/releases/tags/${{ steps.derive.outputs.tag }} > release.json
-          if ! jq -e '.prerelease == false' release.json > /dev/null; then
-            echo "release ${{ steps.derive.outputs.tag }} is a prerelease; skipping"
-            exit 0
+          set -euo pipefail
+          gh api "repos/${{ github.repository }}/releases/tags/${{ steps.derive.outputs.tag }}" > release.json
+          IS_PRE=$(jq -r '.prerelease' release.json)
+          if [ "$IS_PRE" = "true" ]; then
+            echo "release ${{ steps.derive.outputs.tag }} is a prerelease; downstream steps will be skipped"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "release ${{ steps.derive.outputs.tag }} is a stable release; proceeding"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Download Windows archive
-        if: steps.derive.outputs.tag != ''
+        if: steps.derive.outputs.tag != '' && steps.prerelease_check.outputs.skip != 'true'
         run: |
           gh release download ${{ steps.derive.outputs.tag }} \
             -p 'syns-x86_64-pc-windows-msvc.zip' \
             -R ${{ github.repository }}
 
       - name: Compute SHA-256 of Windows archive
-        if: steps.derive.outputs.tag != ''
+        if: steps.derive.outputs.tag != '' && steps.prerelease_check.outputs.skip != 'true'
         id: hash
         run: |
           HASH=$(shasum -a 256 syns-x86_64-pc-windows-msvc.zip | cut -d' ' -f1)
@@ -106,7 +125,7 @@ jobs:
           echo "SHA-256 of syns-x86_64-pc-windows-msvc.zip = $HASH"
 
       - name: Checkout synsdev/scoop-syns with PAT
-        if: steps.derive.outputs.tag != ''
+        if: steps.derive.outputs.tag != '' && steps.prerelease_check.outputs.skip != 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           repository: synsdev/scoop-syns
@@ -115,7 +134,7 @@ jobs:
           path: scoop-bucket
 
       - name: Render bucket/syns.json and push
-        if: steps.derive.outputs.tag != ''
+        if: steps.derive.outputs.tag != '' && steps.prerelease_check.outputs.skip != 'true'
         working-directory: scoop-bucket
         env:
           VERSION: ${{ steps.derive.outputs.version }}
