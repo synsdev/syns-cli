@@ -36,3 +36,7 @@ tempfile = "3"
 [dev-dependencies]
 serial_test = "3"
 wiremock = "0.6"
+
+[profile.dist]
+inherits = "release"
+lto = "thin"
