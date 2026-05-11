@@ -19,3 +19,15 @@ jobs:
         run: cargo install cargo-dist --version=0.31.0 --locked
       - name: Verify generated workflow has no drift
         run: dist generate --check
+
+  cross-pin-lint:
+    name: cross-pin lint (scoop-bump.yml ↔ dist-workspace.toml)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Verify actions/checkout SHA pin is consistent
+        run: |
+          TOML_SHA=$(grep -E '^\s*"actions/checkout"\s*=' dist-workspace.toml | grep -oE '"[0-9a-f]{40}"' | tr -d '"')
+          YML_SHA=$(grep -oE 'actions/checkout@[0-9a-f]{40}' .github/workflows/scoop-bump.yml | head -1 | cut -d@ -f2)
+          test "$TOML_SHA" = "$YML_SHA" || { echo "actions/checkout SHA pin in scoop-bump.yml ($YML_SHA) does not match dist-workspace.toml ($TOML_SHA); rotate BOTH files in the same commit per scoop-bump.yml's top-of-file invariant comment"; exit 1; }
+          echo "OK actions/checkout SHA pin consistent: $YML_SHA"
