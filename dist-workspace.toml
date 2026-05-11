@@ -5,6 +5,8 @@ members = ["cargo:."]
 cargo-dist-version = "0.31.0"
 ci = ["github"]
 installers = []
+unix-archive = ".tar.gz"
+windows-archive = ".zip"
 targets = [
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
