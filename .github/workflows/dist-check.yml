@@ -29,5 +29,13 @@ jobs:
         run: |
           TOML_SHA=$(grep -E '^\s*"actions/checkout"\s*=' dist-workspace.toml | grep -oE '"[0-9a-f]{40}"' | tr -d '"')
           YML_SHA=$(grep -oE 'actions/checkout@[0-9a-f]{40}' .github/workflows/scoop-bump.yml | head -1 | cut -d@ -f2)
-          test "$TOML_SHA" = "$YML_SHA" || { echo "actions/checkout SHA pin in scoop-bump.yml ($YML_SHA) does not match dist-workspace.toml ($TOML_SHA); rotate BOTH files in the same commit per scoop-bump.yml's top-of-file invariant comment"; exit 1; }
+          # CF-06 hardening (per SPEC_REVIEW R2 § 3 CF-06): a `grep` that
+          # finds no match leaves its capture variable empty, and
+          # `test "" = ""` evaluates true — so the lint would silently pass
+          # on the most likely real-world drift (TOML entry removed or YAML
+          # `uses:` line refactored). Fail loudly on either-side empty
+          # BEFORE the equality check.
+          test -n "$TOML_SHA" || { echo "FAIL: could not extract actions/checkout SHA from dist-workspace.toml"; exit 1; }
+          test -n "$YML_SHA"  || { echo "FAIL: could not extract actions/checkout SHA from .github/workflows/scoop-bump.yml"; exit 1; }
+          test "$TOML_SHA" = "$YML_SHA" || { echo "FAIL: actions/checkout SHA pin in scoop-bump.yml ($YML_SHA) does not match dist-workspace.toml ($TOML_SHA); rotate BOTH files in the same commit per scoop-bump.yml's top-of-file invariant comment"; exit 1; }
           echo "OK actions/checkout SHA pin consistent: $YML_SHA"
