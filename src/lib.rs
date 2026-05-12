@@ -5,6 +5,7 @@ pub mod client;
 pub mod commands;
 pub mod config;
 pub mod errors;
+pub mod install_detect;
 pub mod output;
 pub mod prompts;
 pub mod push;
