@@ -112,9 +112,13 @@ pub struct UpgradeArgs {
 // Error catalog
 // =============================================================================
 
-/// All failure modes of the upgrade flow. Eight variants — seven `Err`
+/// All failure modes of the upgrade flow. Eleven variants — ten `Err`
 /// candidates plus one informational `PackageManagerManaged` that never flows
 /// through `Result::Err` (kept for grep consistency with the other wire forms).
+/// CR R2 fixes grew the catalog from 8 to 11: `IoError` + `ExtractFailed`
+/// (H-5: split BinaryLocked into accurate variants) and `OverrideUrlInvalid`
+/// (H-3: env-var hardening). All three additions are flagged for G8
+/// RECONCILE into SPEC § 3.3 / § 7.
 #[derive(Debug, Error)]
 pub enum UpgradeError {
     #[error("could not fetch release metadata from GitHub: {0}")]
