@@ -14,4 +14,5 @@ pub mod repo;
 pub mod revert;
 pub mod status;
 pub mod teams;
+pub mod upgrade;
 pub mod whoami;
