@@ -878,22 +878,51 @@ mod tests {
         }
     }
 
-    #[test]
-    fn exit_code_transient_variants_return_3() {
+    /// CR H-8: previously this test asserted only `GitHubApiFailed.exit_code() == 3`
+    /// and a misplaced `Sha256sumLineMissing.exit_code() == 1` (which is the
+    /// PERMANENT category, belonging in `exit_code_permanent_variants_return_1`).
+    /// The two real transient variants — `DownloadFailed` and
+    /// `Sha256sumDownloadFailed`, both wrapping `reqwest::Error` — were never
+    /// asserted. A future maintainer changing `exit_code()` to mis-classify
+    /// either of those as exit 1 would have had no failing test.
+    ///
+    /// Constructing a `reqwest::Error` from public API requires actually firing
+    /// a request and observing it fail; we use a connection-refused probe
+    /// against `http://127.0.0.1:1` which is unbound by convention and
+    /// reachable from any platform. `tokio::test(flavor = "current_thread")`
+    /// matches the rest of the upgrade-test runtime.
+    #[tokio::test(flavor = "current_thread")]
+    async fn exit_code_transient_variants_return_3() {
+        // GitHubApiFailed — the simple String-carrying transient.
         assert_eq!(UpgradeError::GitHubApiFailed("x".into()).exit_code(), 3);
-        // DownloadFailed / Sha256sumDownloadFailed need a reqwest::Error;
-        // build one by triggering a parse failure (the public-API-safe path).
-        let dummy = reqwest::Url::parse("not a url").unwrap_err();
-        assert_eq!(
-            UpgradeError::Sha256sumLineMissing {
-                filename: "x".into()
-            }
-            .exit_code(),
-            1
-        );
-        // The transient-vs-permanent split is exercised by these representative
-        // variants — we don't need to construct the reqwest::Error variants.
-        let _ = dummy; // suppress unused warning if reqwest's parse type ever changes
+
+        // Build a real reqwest::Error via a connection-refused probe.
+        let real_err: reqwest::Error = reqwest::Client::new()
+            .get("http://127.0.0.1:1")
+            .send()
+            .await
+            .expect_err("connection to 127.0.0.1:1 must refuse");
+
+        // DownloadFailed — transient (exit 3).
+        let downloaded_err: reqwest::Error = reqwest::Client::new()
+            .get("http://127.0.0.1:1")
+            .send()
+            .await
+            .expect_err("connection to 127.0.0.1:1 must refuse");
+        let download_failed = UpgradeError::DownloadFailed {
+            source: downloaded_err,
+            url: "http://127.0.0.1:1/syns-x86_64-unknown-linux-gnu.tar.gz".into(),
+        };
+        assert_eq!(download_failed.exit_code(), 3);
+        assert_eq!(download_failed.wire_form(), "upgrade_download_failed");
+
+        // Sha256sumDownloadFailed — transient (exit 3).
+        let sha_failed = UpgradeError::Sha256sumDownloadFailed {
+            source: real_err,
+            url: "http://127.0.0.1:1/sha256.sum".into(),
+        };
+        assert_eq!(sha_failed.exit_code(), 3);
+        assert_eq!(sha_failed.wire_form(), "upgrade_sha256sum_download_failed");
     }
 
     #[test]
