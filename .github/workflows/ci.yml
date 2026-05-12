@@ -20,3 +20,107 @@ jobs:
       - run: cargo install --locked cargo-audit
       - run: cargo audit
       - run: cargo test --workspace --locked
+
+  install-detect-smoke:
+    name: install-detect-smoke (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            expected_method: curl
+            install_dir_relative: .local/bin
+            target_triple: x86_64-unknown-linux-gnu
+          - os: macos-14
+            expected_method: curl
+            install_dir_relative: .local/bin
+            target_triple: aarch64-apple-darwin
+          - os: windows-latest
+            expected_method: curl
+            install_dir_relative: AppData/Local/Programs/syns/bin
+            target_triple: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Install binary at canonical prefix
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEST="${HOME}/${{ matrix.install_dir_relative }}"
+          mkdir -p "${DEST}"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp target/release/syns.exe "${DEST}/syns.exe"
+          else
+            cp target/release/syns "${DEST}/syns"
+            chmod +x "${DEST}/syns"
+          fi
+          echo "DEST=${DEST}" >> "${GITHUB_ENV}"
+
+      - name: Start fixture HTTP server
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Build the GitHub API fixture: /repos/synsdev/syns-cli/releases/latest
+          # is a literal file containing JSON the upgrade subcommand will parse.
+          mkdir -p fixture-server/repos/synsdev/syns-cli/releases
+          cat > fixture-server/repos/synsdev/syns-cli/releases/latest <<EOF
+          {
+            "tag_name": "v9.9.9",
+            "prerelease": false,
+            "assets": [
+              {
+                "name": "syns-${{ matrix.target_triple }}.tar.gz",
+                "browser_download_url": "http://127.0.0.1:18080/unused"
+              },
+              {
+                "name": "syns-${{ matrix.target_triple }}.zip",
+                "browser_download_url": "http://127.0.0.1:18080/unused"
+              }
+            ]
+          }
+          EOF
+          (cd fixture-server && python3 -m http.server 18080 >server.log 2>&1) &
+          # Give the server time to come up.
+          sleep 3
+          curl -fsS http://127.0.0.1:18080/repos/synsdev/syns-cli/releases/latest \
+            | head -c 200
+          echo
+
+      - name: Invoke `syns upgrade --check-only --json`
+        shell: bash
+        env:
+          _INTERNAL_GH_API_BASE: http://127.0.0.1:18080/repos/synsdev/syns-cli
+          _INTERNAL_GH_DOWNLOAD_BASE: http://127.0.0.1:18080/repos/synsdev/syns-cli/releases/download
+        run: |
+          set -euo pipefail
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            BIN="${DEST}/syns.exe"
+          else
+            BIN="${DEST}/syns"
+          fi
+          echo "Invoking: ${BIN} upgrade --check-only --json"
+          # Capture stdout (the JSON document) and stderr separately.
+          "${BIN}" upgrade --check-only --json > result.json 2> stderr.txt || EXIT_CODE=$?
+          EXIT_CODE=${EXIT_CODE:-0}
+          echo "exit=${EXIT_CODE}"
+          echo "--- stdout ---"
+          cat result.json
+          echo "--- stderr ---"
+          cat stderr.txt
+          if [ "${EXIT_CODE}" != "0" ]; then
+            echo "::error::syns upgrade --check-only --json exited ${EXIT_CODE}"
+            exit 1
+          fi
+          ACTUAL=$(python3 -c "import json,sys; print(json.load(open('result.json')).get('installMethod','MISSING'))")
+          echo "installMethod=${ACTUAL}"
+          if [ "${ACTUAL}" != "${{ matrix.expected_method }}" ]; then
+            echo "::error::expected installMethod=${{ matrix.expected_method }}, got installMethod=${ACTUAL}"
+            exit 1
+          fi
+          echo "installMethod=${ACTUAL} (matches expected)"
