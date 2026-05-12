@@ -39,6 +39,7 @@ tar = "0.4"
 zip = "8"
 sha2 = "0.10"
 self-replace = "1.5"
+thiserror = "2"
 
 [dev-dependencies]
 serial_test = "3"
