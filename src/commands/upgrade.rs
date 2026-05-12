@@ -403,15 +403,41 @@ pub async fn run_with(
         operation: "resolve-current-exe-dir",
         source: std::io::Error::other("current_exe has no parent directory"),
     })?;
-    let pid = std::process::id();
-    let archive_path = current_exe_dir.join(format!(
-        ".syns-upgrade-{}-{}.{}",
-        pid, metadata.tag_name, archive_ext
+    // CR H-2 fix: RAII staging directory. `TempDir::new_in(current_exe_dir)`
+    // keeps the staged archive + extracted binary on the same filesystem as
+    // the running binary (required by `self_replace` — POSIX `rename(2)`
+    // returns `EXDEV` across filesystems; see PROTOTYPE C-08), and `Drop`
+    // recursively removes the staging dir on EVERY return path — success
+    // path, verify-checksum failure, extract failure, AND self_replace
+    // failure. The R1 cleanup gap (no `fs::remove_file` after
+    // `self_replace` failure) closes structurally; the per-call-site
+    // `let _ = fs::remove_file(...)` lines are deleted.
+    let staging =
+        tempfile::TempDir::new_in(current_exe_dir).map_err(|e| UpgradeError::IoError {
+            path: current_exe_dir.to_path_buf(),
+            operation: "create-staging-tempdir",
+            source: e,
+        })?;
+    let archive_path = staging.path().join(format!(
+        "syns-upgrade-{}.{}",
+        metadata.tag_name, archive_ext
     ));
+    let extracted_path = staging.path().join("syns-extracted");
     let download_url = asset.browser_download_url.clone();
     download_archive(&client, &download_url, &archive_path).await?;
 
     let asset_name = format!("syns-{}.{}", TARGET_TRIPLE, archive_ext);
+
+    // CR H-4 fix: open the archive ONCE after download; share the FD with
+    // both the SHA-256 hash pass and the extract pass. The verified bytes
+    // are bound to the extracted bytes because no path re-open happens
+    // between them — an attacker swapping the archive on disk between the
+    // two operations cannot affect the data the extractor sees.
+    let mut archive_file = fs::File::open(&archive_path).map_err(|e| UpgradeError::IoError {
+        path: archive_path.clone(),
+        operation: "verify-extract-open-archive",
+        source: e,
+    })?;
 
     // State 7: verifying-checksum (skipped by --no-checksum).
     if !args.no_checksum {
@@ -420,32 +446,35 @@ pub async fn run_with(
             download_base.trim_end_matches('/'),
             metadata.tag_name
         );
-        if let Err(e) =
-            verify_checksum(&client, &archive_path, &asset_name, &release_base_url).await
-        {
-            let _ = fs::remove_file(&archive_path);
-            return Err(e);
-        }
+        verify_checksum(&client, &mut archive_file, &asset_name, &release_base_url).await?;
+        // Rewind the FD so the extract pass starts at offset 0 (the hash
+        // pass consumed the file forward). This explicit seek is the
+        // structural guarantee that the verified bytes equal the extracted
+        // bytes — re-opening by path would re-open the TOCTOU window.
+        use std::io::Seek;
+        archive_file
+            .seek(std::io::SeekFrom::Start(0))
+            .map_err(|e| UpgradeError::IoError {
+                path: archive_path.clone(),
+                operation: "rewind-archive-for-extract",
+                source: e,
+            })?;
     }
 
-    // Extract.
-    let extracted_path = current_exe_dir.join(format!(".syns-upgrade-{}-extracted", pid));
-    if let Err(e) = extract_binary(&archive_path, TARGET_TRIPLE, &extracted_path) {
-        let _ = fs::remove_file(&archive_path);
-        let _ = fs::remove_file(&extracted_path);
-        return Err(e);
-    }
+    // Extract — reads from the same FD that was hashed.
+    extract_binary(&mut archive_file, TARGET_TRIPLE, &extracted_path)?;
 
     // State 8: atomic-replace via self_replace (PROTOTYPE C-01 / C-02).
+    // If this fails, the RAII `staging` Drop removes both `archive_path`
+    // and `extracted_path` on the way out — no resource leak (CR H-2).
     self_replace::self_replace(&extracted_path).map_err(|e| UpgradeError::BinaryLocked {
         path: current_exe.clone(),
         source: e,
     })?;
 
-    // Best-effort cleanup. self_replace owns the *swap*'s tempfiles; the
-    // archive + extracted-binary tempfile belong to this function.
-    let _ = fs::remove_file(&extracted_path);
-    let _ = fs::remove_file(&archive_path);
+    // The TempDir's Drop runs at end-of-scope and reclaims the staging
+    // directory. self_replace owns the *swap*'s own tempfiles; we don't.
+    drop(staging);
 
     // State 9: complete.
     print_complete(output, &running_version, &latest_version);
@@ -606,26 +635,33 @@ async fn download_archive(client: &Client, url: &str, dest: &Path) -> Result<(),
 
 async fn verify_checksum(
     client: &Client,
-    archive_path: &Path,
+    archive_file: &mut fs::File,
     archive_filename: &str,
     release_base_url: &str,
 ) -> Result<(), UpgradeError> {
+    // CR H-4: hash the open file descriptor. After this returns, the caller
+    // MUST `Seek::seek(SeekFrom::Start(0))` before passing the same FD into
+    // `extract_binary` — without that, the extractor reads from EOF and
+    // surfaces an empty archive.
     let body = download_sha256sum(client, release_base_url).await?;
-    verify_archive_sha256(archive_path, archive_filename, &body).map_err(UpgradeError::from)
+    verify_archive_sha256(archive_file, archive_filename, &body).map_err(UpgradeError::from)
 }
+
+// CR H-4 (TOCTOU fix): `extract_binary` now reads from a `&mut File` shared
+// with `verify_archive_sha256`'s hash pass instead of re-opening the archive
+// by path. The caller seeks the file back to the start between the hash and
+// the extract so the same kernel file-table entry is consumed by both
+// passes, binding the verified bytes to the extracted bytes. Re-opening
+// `archive_path` inside this helper would re-open the TOCTOU window — do
+// NOT add a path-take overload.
 
 #[cfg(not(target_os = "windows"))]
 fn extract_binary(
-    archive_path: &Path,
+    archive_file: &mut fs::File,
     target_triple: &str,
     dest: &Path,
 ) -> Result<(), UpgradeError> {
-    let f = fs::File::open(archive_path).map_err(|e| UpgradeError::IoError {
-        path: archive_path.to_path_buf(),
-        operation: "extract-binary-open-archive",
-        source: e,
-    })?;
-    let gz = flate2::read::GzDecoder::new(f);
+    let gz = flate2::read::GzDecoder::new(archive_file);
     let mut archive = tar::Archive::new(gz);
     // u196 § 3.2 Unix layout: `syns-{TARGET_TRIPLE}/syns` inside the archive.
     let inner_path = format!("syns-{}/syns", target_triple);
@@ -672,18 +708,17 @@ fn extract_binary(
 
 #[cfg(target_os = "windows")]
 fn extract_binary(
-    archive_path: &Path,
+    archive_file: &mut fs::File,
     target_triple: &str,
     dest: &Path,
 ) -> Result<(), UpgradeError> {
-    let f = fs::File::open(archive_path).map_err(|e| UpgradeError::IoError {
-        path: archive_path.to_path_buf(),
-        operation: "extract-binary-open-archive",
-        source: e,
-    })?;
-    let mut archive = zip::ZipArchive::new(f).map_err(|e| UpgradeError::ExtractFailed {
-        message: format!("zip open: {e}"),
-    })?;
+    // zip requires `Read + Seek` — `&mut File` provides both. The shared FD
+    // semantics still hold: ZipArchive::new owns the read+seek operations
+    // against the existing file-table entry; no path-open happens here.
+    let mut archive =
+        zip::ZipArchive::new(archive_file).map_err(|e| UpgradeError::ExtractFailed {
+            message: format!("zip open: {e}"),
+        })?;
     // u196 § 3.2 Windows layout: `syns.exe` at depth 1 (no wrapper directory).
     for i in 0..archive.len() {
         let mut entry = archive
