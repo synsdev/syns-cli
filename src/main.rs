@@ -5,6 +5,7 @@ use syns_cli::commands::collaborators::CollaboratorsAction;
 use syns_cli::commands::push::PushArgs;
 use syns_cli::commands::repo::{CliRepoStatus, CliVisibility};
 use syns_cli::commands::teams::TeamsAction;
+use syns_cli::commands::upgrade::UpgradeArgs;
 
 #[derive(Parser)]
 #[command(
@@ -142,6 +143,8 @@ enum Commands {
         #[command(subcommand)]
         action: Option<TeamsAction>,
     },
+    /// Upgrade the syns CLI binary to the latest release
+    Upgrade(UpgradeArgs),
     /// Authenticate with the server
     Login {},
     /// Clear stored credentials
@@ -217,6 +220,7 @@ async fn run(
             commands::fork::cmd_fork(config, output, repo, name).await?
         }
         Commands::Teams { action } => commands::teams::cmd_teams(config, output, action).await?,
+        Commands::Upgrade(args) => commands::upgrade::run(args, output).await?,
         Commands::Login {} => commands::login::cmd_login(config, output).await?,
         Commands::Logout {} => commands::logout::cmd_logout(config, output).await?,
         Commands::Whoami {} => commands::whoami::cmd_whoami(config, output).await?,

@@ -7,6 +7,7 @@ pub enum CliError {
     ServerUnreachable { url: String },
     Io { message: String },
     Config { message: String },
+    Upgrade(crate::commands::upgrade::UpgradeError),
 }
 
 impl CliError {
@@ -14,6 +15,7 @@ impl CliError {
         match self {
             CliError::RepoIdentityUnknown => 2,
             CliError::ServerUnreachable { .. } => 3,
+            CliError::Upgrade(e) => e.exit_code(),
             _ => 1,
         }
     }
@@ -40,11 +42,18 @@ impl std::fmt::Display for CliError {
             CliError::ServerUnreachable { url } => write!(f, "could not reach server at {url}"),
             CliError::Io { message } => write!(f, "{message}"),
             CliError::Config { message } => write!(f, "configuration error: {message}"),
+            CliError::Upgrade(e) => write!(f, "{e}"),
         }
     }
 }
 
 impl std::error::Error for CliError {}
+
+impl From<crate::commands::upgrade::UpgradeError> for CliError {
+    fn from(e: crate::commands::upgrade::UpgradeError) -> Self {
+        CliError::Upgrade(e)
+    }
+}
 
 // Note: This impl has branching logic (connect/timeout vs other) that cannot be unit-tested
 // locally because reqwest::Error constructors are private. Covered by integration tests (U59).
@@ -93,6 +102,22 @@ mod tests {
         assert_eq!(
             (CliError::Io {
                 message: "x".into()
+            })
+            .exit_code(),
+            1
+        );
+
+        // PD-2: Upgrade variant delegates exit codes to inner UpgradeError.
+        use crate::commands::upgrade::UpgradeError;
+        assert_eq!(
+            CliError::Upgrade(UpgradeError::GitHubApiFailed("x".into())).exit_code(),
+            3
+        );
+        assert_eq!(
+            CliError::Upgrade(UpgradeError::ChecksumMismatch {
+                filename: "x".into(),
+                expected: "0".into(),
+                actual: "1".into(),
             })
             .exit_code(),
             1
