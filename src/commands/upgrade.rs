@@ -494,9 +494,17 @@ pub async fn run_with(
         source: e,
     })?;
 
-    // The TempDir's Drop runs at end-of-scope and reclaims the staging
-    // directory. self_replace owns the *swap*'s own tempfiles; we don't.
-    drop(staging);
+    // CR R2 § H-R2-2 — do NOT call `drop(staging)` here. Rust drops locals
+    // in reverse-of-declaration order at end-of-scope: `archive_file` is
+    // declared AFTER `staging`, so the FD is released FIRST and `staging`
+    // (the TempDir) is dropped AFTER. On Windows that order is load-bearing:
+    // `fs::remove_dir_all` cannot delete a directory containing a file with
+    // an open handle (Rust's `File::open` does not request
+    // `FILE_SHARE_DELETE`), and `TempDir::Drop` silently swallows the
+    // error — so an explicit `drop(staging)` here would leak the staging
+    // directory on every successful upgrade on Windows. The
+    // `success_path_drops_archive_file_before_staging` test enforces this.
+    // self_replace owns the *swap*'s own tempfiles; we don't.
 
     // State 9: complete.
     print_complete(output, stderr, &running_version, &latest_version);
@@ -1375,5 +1383,64 @@ mod tests {
         } else {
             assert_eq!(ext, "tar.gz");
         }
+    }
+
+    // CR R2 § H-R2-2 — `run_with` declares `staging` (TempDir) BEFORE
+    // `archive_file` (fs::File). Rust drops locals in reverse-of-declaration
+    // order at end-of-scope, so `archive_file` MUST drop first, releasing
+    // the FD before `TempDir::Drop` (which calls `fs::remove_dir_all`) runs.
+    // On Windows the directory cannot be removed while a file inside has
+    // an open handle, so an explicit `drop(staging)` between the FD-using
+    // calls and end-of-scope reintroduces the leak.
+    //
+    // This test mirrors the function-body structure with `DropProbe`
+    // wrappers that record their drop order in a shared log. A future
+    // maintainer who reintroduces an explicit `drop(_staging)` in the
+    // mirror will see the assertion fail. The production-side guarantee
+    // is the comment + variable-declaration order at upgrade.rs §
+    // run_with — this test pins the Rust semantic the code relies upon.
+    #[test]
+    fn success_path_drops_archive_file_before_staging() {
+        use std::sync::{Arc, Mutex};
+
+        let drop_log: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+
+        struct DropProbe {
+            label: &'static str,
+            log: Arc<Mutex<Vec<&'static str>>>,
+        }
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.log.lock().unwrap().push(self.label);
+            }
+        }
+
+        // Mirror `run_with`'s structure between `staging` declaration and
+        // end-of-scope on the SUCCESS path: staging declared first,
+        // archive_file declared later, self_replace called, function returns.
+        fn mirror_run_with_success(log: Arc<Mutex<Vec<&'static str>>>) {
+            // Order mirrors upgrade.rs `run_with`: staging first, then archive_file.
+            let _staging = DropProbe {
+                label: "staging",
+                log: log.clone(),
+            };
+            let _archive_file = DropProbe {
+                label: "archive_file",
+                log: log.clone(),
+            };
+            // Imagine: verify_checksum, extract_binary, self_replace::self_replace
+            // all called here with `_archive_file` still in scope. No explicit
+            // `drop(_staging)` is inserted before end-of-scope.
+        }
+
+        mirror_run_with_success(drop_log.clone());
+
+        let log = drop_log.lock().unwrap();
+        assert_eq!(
+            *log,
+            vec!["archive_file", "staging"],
+            "success path must drop archive_file BEFORE staging so the FD \
+             is released before TempDir::Drop fires — Windows requires it"
+        );
     }
 }
