@@ -271,7 +271,9 @@ pub async fn run_with(
 
     // State 4: comparing-version.
     let running_version = parse_semver(env!("CARGO_PKG_VERSION"))?;
-    let latest_version = parse_semver(metadata.tag_name.trim_start_matches('v'))?;
+    // `parse_semver` already strips the leading 'v'; do not double-strip
+    // (CR Low #3 — superfluous transformation deleted at the call site).
+    let latest_version = parse_semver(&metadata.tag_name)?;
     let asset = select_asset(&metadata.assets, TARGET_TRIPLE, &metadata.tag_name)?;
     let archive_ext = archive_extension();
 
@@ -289,18 +291,29 @@ pub async fn run_with(
     }
 
     // State 6: downloading.
-    let current_exe = std::env::current_exe().map_err(|e| UpgradeError::BinaryLocked {
-        path: PathBuf::from("(unknown)"),
-        source: e,
-    })?;
-    let current_exe_canonical = std::fs::canonicalize(&current_exe).unwrap_or(current_exe.clone());
-    let current_exe_dir =
-        current_exe_canonical
-            .parent()
-            .ok_or_else(|| UpgradeError::BinaryLocked {
-                path: current_exe_canonical.clone(),
-                source: std::io::Error::other("current_exe has no parent directory"),
+    //
+    // CR H-1 fix: route `current_exe` through the trait so the staging-path
+    // computation is consistent with the same Windows-verbatim-prefix-stripping
+    // shim used at install-method-detection time. The duplicate
+    // `std::fs::canonicalize` previously at this site is removed because
+    // `RealCurrentExecutable::current_executable_path` already canonicalizes and
+    // strips the `\\?\` prefix on Windows. (Note: `self_replace::self_replace`
+    // internally calls its own `std::env::current_exe()` — the trait routing
+    // governs staging paths, not the swap target itself; T10 spawns a
+    // subprocess so the swap mutates a tempdir-resident binary copy.)
+    let current_exe =
+        executable
+            .current_executable_path()
+            .map_err(|e| UpgradeError::BinaryLocked {
+                path: PathBuf::from("(unknown)"),
+                source: e,
             })?;
+    let current_exe_dir = current_exe
+        .parent()
+        .ok_or_else(|| UpgradeError::BinaryLocked {
+            path: current_exe.clone(),
+            source: std::io::Error::other("current_exe has no parent directory"),
+        })?;
     let pid = std::process::id();
     let archive_path = current_exe_dir.join(format!(
         ".syns-upgrade-{}-{}.{}",
@@ -336,7 +349,7 @@ pub async fn run_with(
 
     // State 8: atomic-replace via self_replace (PROTOTYPE C-01 / C-02).
     self_replace::self_replace(&extracted_path).map_err(|e| UpgradeError::BinaryLocked {
-        path: current_exe_canonical.clone(),
+        path: current_exe.clone(),
         source: e,
     })?;
 
