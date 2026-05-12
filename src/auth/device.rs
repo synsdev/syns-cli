@@ -43,6 +43,7 @@ async fn extract_api_error(response: reqwest::Response, status_code: u16) -> Cli
     CliError::Api {
         status: Some(status_code),
         error,
+        context: None,
     }
 }
 
@@ -70,6 +71,7 @@ fn classify_poll_error(error: &str, current_interval: u64) -> PollAction {
         other => PollAction::Error(CliError::Api {
             status: Some(400),
             error: format!("login failed: {other}"),
+            context: None,
         }),
     }
 }

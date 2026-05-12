@@ -1,13 +1,29 @@
 #[derive(Debug)]
 #[allow(dead_code)] // Variants used by downstream units (U09, U10, etc.)
 pub enum CliError {
-    Api { status: Option<u16>, error: String },
+    Api {
+        status: Option<u16>,
+        error: String,
+        context: Option<ApiErrorContext>,
+    },
     AuthRequired,
     RepoIdentityUnknown,
-    ServerUnreachable { url: String },
-    Io { message: String },
-    Config { message: String },
+    ServerUnreachable {
+        url: String,
+    },
+    Io {
+        message: String,
+    },
+    Config {
+        message: String,
+    },
     Upgrade(crate::commands::upgrade::UpgradeError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApiErrorContext {
+    LsPath { path: String },
+    CatPath { path: String },
 }
 
 impl CliError {
@@ -19,18 +35,52 @@ impl CliError {
             _ => 1,
         }
     }
+
+    pub fn with_ls_path_context(self, path: String) -> CliError {
+        match self {
+            CliError::Api { status, error, .. } => CliError::Api {
+                status,
+                error,
+                context: Some(ApiErrorContext::LsPath { path }),
+            },
+            other => other,
+        }
+    }
+
+    pub fn with_cat_path_context(self, path: String) -> CliError {
+        match self {
+            CliError::Api { status, error, .. } => CliError::Api {
+                status,
+                error,
+                context: Some(ApiErrorContext::CatPath { path }),
+            },
+            other => other,
+        }
+    }
 }
 
 impl std::fmt::Display for CliError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CliError::Api {
+                status: Some(404),
+                error,
+                context: Some(ApiErrorContext::LsPath { path }),
+            } if error == "not_found" => write!(f, "path not found: {path}"),
+            CliError::Api {
+                status: Some(404),
+                error,
+                context: Some(ApiErrorContext::CatPath { path }),
+            } if error == "not_found" => write!(f, "file not found: {path}"),
+            CliError::Api {
                 status: Some(s),
                 error,
+                ..
             } => write!(f, "server error ({s}): {error}"),
             CliError::Api {
                 status: None,
                 error,
+                ..
             } => write!(f, "network error: {error}"),
             CliError::AuthRequired => {
                 write!(f, "authentication required \u{2014} run 'syns login' first")
@@ -67,6 +117,7 @@ impl From<reqwest::Error> for CliError {
             CliError::Api {
                 status: err.status().map(|s| s.as_u16()),
                 error: err.to_string(),
+                context: None,
             }
         }
     }
@@ -94,7 +145,8 @@ mod tests {
         assert_eq!(
             (CliError::Api {
                 status: Some(500),
-                error: "x".into()
+                error: "x".into(),
+                context: None,
             })
             .exit_code(),
             1
@@ -129,12 +181,14 @@ mod tests {
         let api_with = CliError::Api {
             status: Some(404),
             error: "not_found".into(),
+            context: None,
         };
         assert_eq!(api_with.to_string(), "server error (404): not_found");
 
         let api_without = CliError::Api {
             status: None,
             error: "timeout".into(),
+            context: None,
         };
         assert_eq!(api_without.to_string(), "network error: timeout");
 
@@ -171,5 +225,102 @@ mod tests {
             .to_string(),
             "configuration error: bad url"
         );
+    }
+
+    #[test]
+    fn display_api_404_not_found_with_ls_context_renders_path_not_found() {
+        let err = CliError::Api {
+            status: Some(404),
+            error: "not_found".into(),
+            context: Some(ApiErrorContext::LsPath {
+                path: "does/not/exist".into(),
+            }),
+        };
+        assert_eq!(err.to_string(), "path not found: does/not/exist");
+    }
+
+    #[test]
+    fn display_api_404_not_found_with_cat_context_renders_file_not_found() {
+        let err = CliError::Api {
+            status: Some(404),
+            error: "not_found".into(),
+            context: Some(ApiErrorContext::CatPath {
+                path: "README.md".into(),
+            }),
+        };
+        assert_eq!(err.to_string(), "file not found: README.md");
+    }
+
+    #[test]
+    fn display_api_404_repo_not_found_with_ls_context_falls_through_to_generic() {
+        let err = CliError::Api {
+            status: Some(404),
+            error: "repo_not_found".into(),
+            context: Some(ApiErrorContext::LsPath { path: "foo".into() }),
+        };
+        assert_eq!(err.to_string(), "server error (404): repo_not_found");
+    }
+
+    #[test]
+    fn display_api_404_not_found_without_context_falls_through_to_generic() {
+        let err = CliError::Api {
+            status: Some(404),
+            error: "not_found".into(),
+            context: None,
+        };
+        assert_eq!(err.to_string(), "server error (404): not_found");
+    }
+
+    #[test]
+    fn display_api_non_404_with_ls_context_falls_through_to_generic() {
+        let err = CliError::Api {
+            status: Some(500),
+            error: "internal_error".into(),
+            context: Some(ApiErrorContext::LsPath { path: "foo".into() }),
+        };
+        assert_eq!(err.to_string(), "server error (500): internal_error");
+    }
+
+    #[test]
+    fn with_ls_path_context_attaches_context_to_api_variant() {
+        let err = CliError::Api {
+            status: Some(404),
+            error: "not_found".into(),
+            context: None,
+        };
+        let rewrapped = err.with_ls_path_context("a/b/c".into());
+        assert!(matches!(
+            rewrapped,
+            CliError::Api {
+                status: Some(404),
+                ref error,
+                context: Some(ApiErrorContext::LsPath { ref path }),
+            } if error == "not_found" && path == "a/b/c"
+        ));
+    }
+
+    #[test]
+    fn with_cat_path_context_attaches_context_to_api_variant() {
+        let err = CliError::Api {
+            status: Some(404),
+            error: "not_found".into(),
+            context: None,
+        };
+        let rewrapped = err.with_cat_path_context("README.md".into());
+        assert!(matches!(
+            rewrapped,
+            CliError::Api {
+                status: Some(404),
+                ref error,
+                context: Some(ApiErrorContext::CatPath { ref path }),
+            } if error == "not_found" && path == "README.md"
+        ));
+    }
+
+    #[test]
+    fn with_ls_path_context_passes_through_non_api_variants() {
+        let err = CliError::AuthRequired;
+        let rewrapped = err.with_ls_path_context("foo".into());
+        assert!(matches!(rewrapped, CliError::AuthRequired));
     }
 }

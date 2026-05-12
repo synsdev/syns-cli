@@ -23,9 +23,20 @@ pub async fn cmd_ls(
         .flatten();
     let client = SynsClient::new(config.server_url())?;
 
-    let mut response = client
+    let mut response = match client
         .get_tree(&repo_id, token.as_deref(), path.as_deref(), false, None)
-        .await?;
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            if !output.is_json()
+                && let Some(p) = path.as_ref()
+            {
+                return Err(e.with_ls_path_context(p.clone()));
+            }
+            return Err(e);
+        }
+    };
 
     response.entries.sort_by(|a, b| {
         let type_order = |t: &EntryType| match t {
@@ -160,5 +171,107 @@ mod tests {
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn ls_404_not_found_renders_friendly_message_with_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".syns.yaml"),
+            "owner: alice\nname: my-project\n",
+        )
+        .unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/my-project/tree/does/not/exist"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error": "not_found",
+                "message": "File not found"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(false);
+
+        let result = cmd_ls(&config, &output, Some("does/not/exist".to_string())).await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        let err = result.unwrap_err();
+        assert_eq!(err.to_string(), "path not found: does/not/exist");
+        assert_eq!(err.exit_code(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn ls_404_repo_not_found_preserves_generic_display() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".syns.yaml"),
+            "owner: alice\nname: my-project\n",
+        )
+        .unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/my-project/tree/some/path"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error": "repo_not_found",
+                "message": "Repository not found"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(false);
+
+        let result = cmd_ls(&config, &output, Some("some/path".to_string())).await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        let err = result.unwrap_err();
+        assert_eq!(err.to_string(), "server error (404): repo_not_found");
+        assert_eq!(err.exit_code(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn ls_404_not_found_in_json_mode_preserves_generic_display() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".syns.yaml"),
+            "owner: alice\nname: my-project\n",
+        )
+        .unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/my-project/tree/does/not/exist"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error": "not_found",
+                "message": "File not found"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(true);
+
+        let result = cmd_ls(&config, &output, Some("does/not/exist".to_string())).await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        let err = result.unwrap_err();
+        assert_eq!(err.to_string(), "server error (404): not_found");
+        assert_eq!(err.exit_code(), 1);
     }
 }

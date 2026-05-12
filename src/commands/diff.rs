@@ -53,6 +53,7 @@ pub async fn cmd_diff(
                 return Err(CliError::Api {
                     status: None,
                     error: "repository has fewer than 2 versions — cannot diff".to_string(),
+                    context: None,
                 });
             }
             (

@@ -532,12 +532,14 @@ async fn check_response(response: reqwest::Response) -> Result<reqwest::Response
         return Err(CliError::Api {
             status: Some(code),
             error,
+            context: None,
         });
     }
     if !status.is_success() {
         return Err(CliError::Api {
             status: Some(status.as_u16()),
             error: format!("unexpected status {}", status.as_u16()),
+            context: None,
         });
     }
     Ok(response)
@@ -551,6 +553,7 @@ async fn process_response<T: serde::de::DeserializeOwned>(
     response.json::<T>().await.map_err(|e| CliError::Api {
         status: Some(status.as_u16()),
         error: format!("invalid response body: {e}"),
+        context: None,
     })
 }
 

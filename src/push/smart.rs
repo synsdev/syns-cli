@@ -183,6 +183,7 @@ pub async fn smart_push(
         Err(CliError::Api {
             status: Some(409),
             ref error,
+            ..
         }) if error == "missing_blobs" => {
             let retry_entries = upgrade_to_full(&request.files, &local_files)?;
             let retry_request = PushRequest {
