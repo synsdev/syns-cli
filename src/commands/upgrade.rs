@@ -523,9 +523,25 @@ fn archive_extension() -> &'static str {
 /// any non-`https://` value that is not a `http://127.0.0.1` /
 /// `http://localhost` loopback carve-out for local testing.
 fn resolve_override_url(env_var: &'static str, default: &str) -> Result<String, UpgradeError> {
-    let value = match std::env::var(env_var) {
-        Ok(v) => v,
-        Err(_) => return Ok(default.to_string()),
+    let raw = std::env::var(env_var).ok();
+    resolve_override_url_from(env_var, raw, default)
+}
+
+/// CR R2 § Medium #3 — DI-friendly variant of `resolve_override_url`.
+///
+/// Takes the env-var value as a parameter instead of reading the process
+/// environment. Tests call this directly with `None` / `Some("")` /
+/// `Some("https://...")` to avoid mutating the process env (the
+/// `unsafe { std::env::set_var }` anti-pattern U74 already retired from
+/// the codebase).
+fn resolve_override_url_from(
+    env_var: &'static str,
+    raw: Option<String>,
+    default: &str,
+) -> Result<String, UpgradeError> {
+    let value = match raw {
+        Some(v) => v,
+        None => return Ok(default.to_string()),
     };
     if value.is_empty() {
         return Err(UpgradeError::OverrideUrlInvalid {
@@ -540,24 +556,27 @@ fn resolve_override_url(env_var: &'static str, default: &str) -> Result<String, 
     }
 }
 
+/// CR R2 § H-R2-1 — URL validation for the `_INTERNAL_GH_*` override surface.
+///
+/// Accepts `https://` (any host) OR `http://` with host `127.0.0.1` or
+/// `localhost`. Refuses anything carrying userinfo (username or password)
+/// because `http://localhost:80@attacker.example/path` parses with the
+/// userinfo `"localhost:80"` and the host `"attacker.example"` — the
+/// manual-prefix predicate in R2 accepted such URLs and the trust-root
+/// guarantee broke. Validation runs through the same `url` crate reqwest
+/// uses transitively, so what we validate is what reqwest will dial.
 fn is_https_or_loopback(value: &str) -> bool {
-    if value.starts_with("https://") {
-        return true;
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return false;
     }
-    // Loopback carve-out — match the host component literally, NOT a generic
-    // `http://` prefix (which would re-open the trust-root bypass). A trailing
-    // `/` or `:port` after the host means we're still on loopback.
-    for host in ["http://127.0.0.1", "http://localhost"] {
-        if value == host {
-            return true;
-        }
-        if let Some(rest) = value.strip_prefix(host)
-            && (rest.starts_with('/') || rest.starts_with(':'))
-        {
-            return true;
-        }
+    match url.scheme() {
+        "https" => url.host_str().is_some(),
+        "http" => matches!(url.host_str(), Some("127.0.0.1") | Some("localhost")),
+        _ => false,
     }
-    false
 }
 
 fn print_provenance_disclosure(stderr: &mut dyn Write, no_checksum: bool) {
@@ -1172,26 +1191,116 @@ mod tests {
         assert!(!is_https_or_loopback(""));
     }
 
+    // CR R2 § H-R2-1 — userinfo-prefix bypass attack. The R2 manual prefix
+    // predicate accepted these URLs as loopback while `url::Url::parse`
+    // resolves the host to `attacker.example`. After the rewrite to
+    // url::Url::parse-based validation with userinfo refusal, all five MUST
+    // be refused. See CODE_REVIEW_R2.md § High-Priority Issues #1 for the
+    // empirical accept-table from the R2 predicate.
     #[test]
-    fn resolve_override_url_returns_default_when_unset() {
-        // SAFETY: tests in this module run serially in a single thread via
-        // cargo test's per-crate runtime; the env var is removed eagerly.
-        unsafe { std::env::remove_var("_INTERNAL_TEST_NEVER_SET_API_BASE") };
+    fn is_https_or_loopback_refuses_userinfo_bypass() {
+        assert!(!is_https_or_loopback(
+            "http://localhost:80@attacker.example/path"
+        ));
+        assert!(!is_https_or_loopback(
+            "http://127.0.0.1:80@attacker.example/path"
+        ));
+        assert!(!is_https_or_loopback(
+            "http://localhost:@attacker.example/path"
+        ));
+        assert!(!is_https_or_loopback(
+            "http://127.0.0.1:@attacker.example/path"
+        ));
+        assert!(!is_https_or_loopback(
+            "http://localhost:8080@attacker.example/path"
+        ));
+    }
+
+    // CR R2 § Low #5 fold — bare scheme with no host previously returned
+    // true and produced `https:///releases/latest` downstream (a *transient*
+    // reqwest error rather than the intended *permanent* OverrideUrlInvalid).
+    // After the url::Url::parse rewrite, host is None → refused at validation.
+    #[test]
+    fn is_https_or_loopback_refuses_bare_scheme_no_host() {
+        assert!(!is_https_or_loopback("https://"));
+        assert!(!is_https_or_loopback("http://"));
+    }
+
+    // CR R2 § H-R2-1 fix recommends an explicit userinfo guard as defense in
+    // depth on top of host-matching. The host check alone catches the five
+    // bypass URLs above (host parses to `attacker.example`), but `url::Url`
+    // can be coaxed into producing `host=localhost` with attacker-controlled
+    // username — `http://attacker.example@localhost/path`. The userinfo
+    // guard refuses anything carrying credentials, so override URLs cannot
+    // leak Basic-Auth headers to loopback either. These cases REQUIRE the
+    // userinfo guard for refusal; mutation-deleting `url.username().is_empty()`
+    // makes this test fail.
+    #[test]
+    fn is_https_or_loopback_refuses_userinfo_on_loopback_and_https() {
+        // username set, host = loopback → would slip past host check without guard
+        assert!(!is_https_or_loopback(
+            "http://attacker.example@localhost/path"
+        ));
+        assert!(!is_https_or_loopback("http://user@127.0.0.1/path"));
+        // password set on https → guard refuses any credential on the wire
+        assert!(!is_https_or_loopback("https://user:pass@github.com/path"));
+    }
+
+    // CR R2 § Medium #3 — these tests previously used
+    // `unsafe { std::env::set_var(..) }` / `remove_var(..)` and a false
+    // SAFETY comment claiming the test module runs serially (cargo runs
+    // `#[test]`s in parallel by default within a binary). The R3 fix
+    // splits `resolve_override_url` into a thin env-reading shim plus a
+    // pure `resolve_override_url_from(raw: Option<String>, ...)` helper;
+    // tests exercise the helper directly with explicit inputs. No env
+    // mutation, no unsafe block, panic-safe.
+
+    #[test]
+    fn resolve_override_url_from_returns_default_when_none() {
         let result =
-            resolve_override_url("_INTERNAL_TEST_NEVER_SET_API_BASE", DEFAULT_API_BASE).unwrap();
+            resolve_override_url_from("_INTERNAL_GH_API_BASE", None, DEFAULT_API_BASE).unwrap();
         assert_eq!(result, DEFAULT_API_BASE);
     }
 
     #[test]
-    fn resolve_override_url_refuses_empty_string() {
-        // SAFETY: see above.
-        unsafe { std::env::set_var("_INTERNAL_TEST_EMPTY_OVERRIDE", "") };
-        let result = resolve_override_url("_INTERNAL_TEST_EMPTY_OVERRIDE", DEFAULT_API_BASE);
-        unsafe { std::env::remove_var("_INTERNAL_TEST_EMPTY_OVERRIDE") };
+    fn resolve_override_url_from_refuses_empty_string() {
+        let result = resolve_override_url_from(
+            "_INTERNAL_GH_API_BASE",
+            Some(String::new()),
+            DEFAULT_API_BASE,
+        );
         match result {
             Err(UpgradeError::OverrideUrlInvalid { env_var, value }) => {
-                assert_eq!(env_var, "_INTERNAL_TEST_EMPTY_OVERRIDE");
+                assert_eq!(env_var, "_INTERNAL_GH_API_BASE");
                 assert_eq!(value, "");
+            }
+            other => panic!("expected OverrideUrlInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_override_url_from_accepts_valid_https() {
+        let result = resolve_override_url_from(
+            "_INTERNAL_GH_API_BASE",
+            Some("https://fixture.example/api".to_string()),
+            DEFAULT_API_BASE,
+        )
+        .unwrap();
+        assert_eq!(result, "https://fixture.example/api");
+    }
+
+    #[test]
+    fn resolve_override_url_from_refuses_userinfo_bypass() {
+        // CR R2 § H-R2-1 attacker vector at the resolver boundary.
+        let result = resolve_override_url_from(
+            "_INTERNAL_GH_API_BASE",
+            Some("http://localhost:80@attacker.example/path".to_string()),
+            DEFAULT_API_BASE,
+        );
+        match result {
+            Err(UpgradeError::OverrideUrlInvalid { env_var, value }) => {
+                assert_eq!(env_var, "_INTERNAL_GH_API_BASE");
+                assert_eq!(value, "http://localhost:80@attacker.example/path");
             }
             other => panic!("expected OverrideUrlInvalid, got {other:?}"),
         }
