@@ -17,6 +17,33 @@
 //!   downloading → {verifying-checksum | atomic-replace}
 //!   verifying-checksum → atomic-replace
 //!   atomic-replace → complete
+//!
+//! # Internal environment-variable overrides (test/CI use only)
+//!
+//! Two environment variables, when set, redirect HTTP traffic away from the
+//! hardcoded GitHub bases:
+//!
+//! - `_INTERNAL_GH_API_BASE` — overrides the base of `/releases/latest`
+//!   (and `/releases?per_page=1` under `--prerelease`).
+//! - `_INTERNAL_GH_DOWNLOAD_BASE` — overrides the base of `sha256.sum`
+//!   downloads.
+//!
+//! These are honoured in production so the install-detect-smoke CI matrix can
+//! point at a fixture HTTP server (PD-3). To keep the v1 trust root intact
+//! (HTTPS transport + SHA-256 integrity check), `run_with` enforces:
+//!
+//! 1. Empty-string overrides are refused (an empty value would silently slip
+//!    past scheme validation and break URL construction downstream).
+//! 2. The scheme must be `https://` OR a loopback `http://127.0.0.1` /
+//!    `http://localhost` carve-out for local testing — any other plain-HTTP
+//!    override is refused with `UpgradeError::OverrideUrlInvalid`.
+//! 3. When either override is active, a `WARNING:` line is printed to stderr
+//!    so a misconfigured production user notices.
+//!
+//! This is a defense-in-depth measure against the trust-boundary bypass
+//! flagged in CR H-3. The formal SPEC § 3.8 documentation of this surface is
+//! a G8 RECONCILE concern; this doc-comment is the in-source contract until
+//! reconcile lands.
 
 use crate::checksum_verify::{ChecksumError, download_sha256sum, verify_archive_sha256};
 use crate::install_detect::{
@@ -129,6 +156,20 @@ pub enum UpgradeError {
     #[error("release {tag} does not include a build for {target_triple}")]
     NoMatchingArtifact { target_triple: String, tag: String },
 
+    /// CR H-3 (env-var hardening): the user (or attacker) set
+    /// `_INTERNAL_GH_API_BASE` / `_INTERNAL_GH_DOWNLOAD_BASE` to a URL whose
+    /// scheme is not `https://` and not a loopback `http://127.0.0.1` /
+    /// `http://localhost` carve-out. Refusing keeps the v1 HTTPS-transport
+    /// half of the trust root intact even when the env-var surface is honored.
+    /// Surface change pending G8 RECONCILE into SPEC § 3.3 / § 7.
+    #[error(
+        "invalid override URL for {env_var}: integrity check requires HTTPS or loopback (got {value:?})"
+    )]
+    OverrideUrlInvalid {
+        env_var: &'static str,
+        value: String,
+    },
+
     /// Informational — NEVER returned from `run` as `Err`. The variant exists
     /// so the wire-form discriminator `upgrade_package_manager_managed` is
     /// reachable for grep consistency with the other seven codes.
@@ -153,7 +194,8 @@ impl UpgradeError {
             UpgradeError::Sha256sumLineMissing { .. }
             | UpgradeError::ChecksumMismatch { .. }
             | UpgradeError::BinaryLocked { .. }
-            | UpgradeError::NoMatchingArtifact { .. } => 1,
+            | UpgradeError::NoMatchingArtifact { .. }
+            | UpgradeError::OverrideUrlInvalid { .. } => 1,
             // PackageManagerManaged never reaches exit_code() in practice
             // because it doesn't flow through Result::Err. Defensive default
             // matches SPEC § 7 (the redirect path exits 0).
@@ -171,6 +213,7 @@ impl UpgradeError {
             UpgradeError::ChecksumMismatch { .. } => "upgrade_checksum_mismatch",
             UpgradeError::BinaryLocked { .. } => "upgrade_binary_locked",
             UpgradeError::NoMatchingArtifact { .. } => "upgrade_no_matching_artifact",
+            UpgradeError::OverrideUrlInvalid { .. } => "upgrade_override_url_invalid",
             UpgradeError::PackageManagerManaged { .. } => "upgrade_package_manager_managed",
         }
     }
@@ -241,10 +284,18 @@ pub async fn run_with(
     // Env-var-honored base URLs (PD-3). The install-detect-smoke CI job
     // overrides these to point at a local fixture HTTP server. Production
     // uses the hardcoded synsdev/syns-cli URLs.
-    let api_base =
-        std::env::var("_INTERNAL_GH_API_BASE").unwrap_or_else(|_| DEFAULT_API_BASE.to_string());
-    let download_base = std::env::var("_INTERNAL_GH_DOWNLOAD_BASE")
-        .unwrap_or_else(|_| DEFAULT_DOWNLOAD_BASE.to_string());
+    //
+    // CR H-3: validate scheme + refuse empty + warn-on-active so the v1 trust
+    // root (HTTPS transport) holds even when the env-var surface is honored.
+    // See the module-level doc-comment for the full contract.
+    let api_base = resolve_override_url("_INTERNAL_GH_API_BASE", DEFAULT_API_BASE)?;
+    let download_base = resolve_override_url("_INTERNAL_GH_DOWNLOAD_BASE", DEFAULT_DOWNLOAD_BASE)?;
+    if api_base != DEFAULT_API_BASE || download_base != DEFAULT_DOWNLOAD_BASE {
+        eprintln!(
+            "WARNING: using fixture URL for syns upgrade — for testing only \
+             (_INTERNAL_GH_API_BASE / _INTERNAL_GH_DOWNLOAD_BASE override active)"
+        );
+    }
 
     let client = Client::builder()
         .user_agent(format!("syns/{}", env!("CARGO_PKG_VERSION")))
@@ -373,6 +424,51 @@ fn archive_extension() -> &'static str {
     } else {
         "tar.gz"
     }
+}
+
+/// CR H-3 — env-var override URL resolver.
+///
+/// Returns the override value when `env_var` is set to a syntactically valid
+/// override URL, the `default` otherwise. Refuses empty strings (which would
+/// silently slip past scheme validation if folded into `unwrap_or_else`) and
+/// any non-`https://` value that is not a `http://127.0.0.1` /
+/// `http://localhost` loopback carve-out for local testing.
+fn resolve_override_url(env_var: &'static str, default: &str) -> Result<String, UpgradeError> {
+    let value = match std::env::var(env_var) {
+        Ok(v) => v,
+        Err(_) => return Ok(default.to_string()),
+    };
+    if value.is_empty() {
+        return Err(UpgradeError::OverrideUrlInvalid {
+            env_var,
+            value: String::new(),
+        });
+    }
+    if is_https_or_loopback(&value) {
+        Ok(value)
+    } else {
+        Err(UpgradeError::OverrideUrlInvalid { env_var, value })
+    }
+}
+
+fn is_https_or_loopback(value: &str) -> bool {
+    if value.starts_with("https://") {
+        return true;
+    }
+    // Loopback carve-out — match the host component literally, NOT a generic
+    // `http://` prefix (which would re-open the trust-root bypass). A trailing
+    // `/` or `:port` after the host means we're still on loopback.
+    for host in ["http://127.0.0.1", "http://localhost"] {
+        if value == host {
+            return true;
+        }
+        if let Some(rest) = value.strip_prefix(host)
+            && (rest.starts_with('/') || rest.starts_with(':'))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn print_provenance_disclosure(no_checksum: bool) {
@@ -758,6 +854,14 @@ mod tests {
             .exit_code(),
             1
         );
+        assert_eq!(
+            UpgradeError::OverrideUrlInvalid {
+                env_var: "_INTERNAL_GH_API_BASE",
+                value: "http://attacker.example".into(),
+            }
+            .exit_code(),
+            1
+        );
     }
 
     #[test]
@@ -811,6 +915,14 @@ mod tests {
             "upgrade_no_matching_artifact"
         );
         assert_eq!(
+            UpgradeError::OverrideUrlInvalid {
+                env_var: "_INTERNAL_GH_API_BASE",
+                value: "http://attacker.example".into(),
+            }
+            .wire_form(),
+            "upgrade_override_url_invalid"
+        );
+        assert_eq!(
             UpgradeError::PackageManagerManaged {
                 method: InstallMethod::Nix,
                 command: "x".into(),
@@ -834,6 +946,85 @@ mod tests {
             managed_redirect_command(InstallMethod::Nix),
             "nix profile upgrade syns"
         );
+    }
+
+    // ----- CR H-3 — env-var hardening helpers -----------------------------
+    //
+    // The `resolve_override_url` helper is the choke point; we exercise both
+    // accept and reject branches via the pure-string `is_https_or_loopback`
+    // predicate (which is what `resolve_override_url` consults). The env-var
+    // wiring itself is exercised end-to-end by T8 + T10 in the integration
+    // suite; here we only verify the predicate's tolerance + intolerance
+    // matrix.
+
+    #[test]
+    fn is_https_or_loopback_accepts_https() {
+        assert!(is_https_or_loopback(
+            "https://api.github.com/repos/synsdev/syns-cli"
+        ));
+        assert!(is_https_or_loopback(
+            "https://github.com/synsdev/syns-cli/releases/download"
+        ));
+    }
+
+    #[test]
+    fn is_https_or_loopback_accepts_loopback_carve_outs() {
+        assert!(is_https_or_loopback("http://127.0.0.1"));
+        assert!(is_https_or_loopback("http://127.0.0.1/"));
+        assert!(is_https_or_loopback("http://127.0.0.1:18080"));
+        assert!(is_https_or_loopback(
+            "http://127.0.0.1:18080/repos/synsdev/syns-cli"
+        ));
+        assert!(is_https_or_loopback("http://localhost"));
+        assert!(is_https_or_loopback("http://localhost/"));
+        assert!(is_https_or_loopback("http://localhost:18080"));
+        assert!(is_https_or_loopback(
+            "http://localhost:18080/repos/synsdev/syns-cli"
+        ));
+    }
+
+    #[test]
+    fn is_https_or_loopback_refuses_plain_http_non_loopback() {
+        assert!(!is_https_or_loopback("http://attacker.example"));
+        assert!(!is_https_or_loopback("http://api.github.com"));
+        // The most dangerous near-miss: a host that *contains* "localhost" or
+        // "127.0.0.1" but is NOT loopback. The predicate uses literal-host
+        // match with required '/' or ':' boundary, so this MUST be refused.
+        assert!(!is_https_or_loopback("http://localhost.attacker.example"));
+        assert!(!is_https_or_loopback("http://127.0.0.1.attacker.example"));
+    }
+
+    #[test]
+    fn is_https_or_loopback_refuses_unsupported_schemes() {
+        assert!(!is_https_or_loopback("file:///etc/passwd"));
+        assert!(!is_https_or_loopback("ftp://attacker.example"));
+        assert!(!is_https_or_loopback("javascript:alert(1)"));
+        assert!(!is_https_or_loopback(""));
+    }
+
+    #[test]
+    fn resolve_override_url_returns_default_when_unset() {
+        // SAFETY: tests in this module run serially in a single thread via
+        // cargo test's per-crate runtime; the env var is removed eagerly.
+        unsafe { std::env::remove_var("_INTERNAL_TEST_NEVER_SET_API_BASE") };
+        let result =
+            resolve_override_url("_INTERNAL_TEST_NEVER_SET_API_BASE", DEFAULT_API_BASE).unwrap();
+        assert_eq!(result, DEFAULT_API_BASE);
+    }
+
+    #[test]
+    fn resolve_override_url_refuses_empty_string() {
+        // SAFETY: see above.
+        unsafe { std::env::set_var("_INTERNAL_TEST_EMPTY_OVERRIDE", "") };
+        let result = resolve_override_url("_INTERNAL_TEST_EMPTY_OVERRIDE", DEFAULT_API_BASE);
+        unsafe { std::env::remove_var("_INTERNAL_TEST_EMPTY_OVERRIDE") };
+        match result {
+            Err(UpgradeError::OverrideUrlInvalid { env_var, value }) => {
+                assert_eq!(env_var, "_INTERNAL_TEST_EMPTY_OVERRIDE");
+                assert_eq!(value, "");
+            }
+            other => panic!("expected OverrideUrlInvalid, got {other:?}"),
+        }
     }
 
     #[test]
