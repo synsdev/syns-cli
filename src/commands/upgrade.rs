@@ -307,18 +307,29 @@ struct Asset {
 // =============================================================================
 
 /// Production entry point. Wires `RealCurrentExecutable` and forwards to
-/// `run_with`.
+/// `run_with` with the process stderr stream as the warning/diagnostic
+/// writer.
 pub async fn run(args: UpgradeArgs, output: &Output) -> Result<(), UpgradeError> {
-    run_with(args, output, &RealCurrentExecutable).await
+    let mut stderr = std::io::stderr();
+    run_with(args, output, &RealCurrentExecutable, &mut stderr).await
 }
 
-/// Test-injectable entry point. The `executable` is consulted via
-/// `detect_install_method_with` to allow `FakeCurrentExecutable` to drive the
-/// install-method branch from integration tests.
+/// Test-injectable entry point. Three injection axes:
+///
+/// - `executable` — substituted via `FakeCurrentExecutable` to drive the
+///   install-method branch deterministically.
+/// - `stderr` — `&mut dyn Write` (CR H-6 fix). Production passes
+///   `&mut std::io::stderr()`; integration tests pass a `Vec<u8>` and
+///   assert on the captured bytes (the SPEC § 4.2 disclosure text +
+///   `upgrade_package_manager_managed` label + `(integrity-checked)`
+///   success token live here).
+/// - The `_INTERNAL_GH_*` env-var override surface — see the
+///   module-level doc-comment for the contract.
 pub async fn run_with(
     args: UpgradeArgs,
     output: &Output,
     executable: &dyn CurrentExecutable,
+    stderr: &mut dyn Write,
 ) -> Result<(), UpgradeError> {
     // Env-var-honored base URLs (PD-3). The install-detect-smoke CI job
     // overrides these to point at a local fixture HTTP server. Production
@@ -330,7 +341,8 @@ pub async fn run_with(
     let api_base = resolve_override_url("_INTERNAL_GH_API_BASE", DEFAULT_API_BASE)?;
     let download_base = resolve_override_url("_INTERNAL_GH_DOWNLOAD_BASE", DEFAULT_DOWNLOAD_BASE)?;
     if api_base != DEFAULT_API_BASE || download_base != DEFAULT_DOWNLOAD_BASE {
-        eprintln!(
+        let _ = writeln!(
+            stderr,
             "WARNING: using fixture URL for syns upgrade — for testing only \
              (_INTERNAL_GH_API_BASE / _INTERNAL_GH_DOWNLOAD_BASE override active)"
         );
@@ -348,13 +360,13 @@ pub async fn run_with(
     // State 2: managed-redirect.
     if install_method.is_managed() {
         let command = managed_redirect_command(install_method);
-        print_managed_redirect(output, install_method, &command);
+        print_managed_redirect(output, stderr, install_method, &command);
         return Ok(());
     }
 
     // From here on, we are on an unmanaged install path. Print the honest
     // provenance disclosure on stderr before doing anything else.
-    print_provenance_disclosure(args.no_checksum);
+    print_provenance_disclosure(stderr, args.no_checksum);
 
     // State 3: fetching-metadata.
     let metadata = fetch_release_metadata(&client, &api_base, args.prerelease).await?;
@@ -370,13 +382,19 @@ pub async fn run_with(
     let is_up_to_date = running_version >= latest_version && !args.force;
     if is_up_to_date {
         // State 5: up-to-date.
-        print_up_to_date(output, &running_version);
+        print_up_to_date(output, stderr, &running_version);
         return Ok(());
     }
 
     if args.check_only {
         // --check-only short-circuit (SPEC § 4.2 happy-path step 8).
-        print_check_only_would_upgrade(output, install_method, &running_version, &latest_version);
+        print_check_only_would_upgrade(
+            output,
+            stderr,
+            install_method,
+            &running_version,
+            &latest_version,
+        );
         return Ok(());
     }
 
@@ -477,7 +495,7 @@ pub async fn run_with(
     drop(staging);
 
     // State 9: complete.
-    print_complete(output, &running_version, &latest_version);
+    print_complete(output, stderr, &running_version, &latest_version);
     Ok(())
 }
 
@@ -538,10 +556,10 @@ fn is_https_or_loopback(value: &str) -> bool {
     false
 }
 
-fn print_provenance_disclosure(no_checksum: bool) {
-    eprintln!("{}", PROVENANCE_DISCLOSURE);
+fn print_provenance_disclosure(stderr: &mut dyn Write, no_checksum: bool) {
+    let _ = writeln!(stderr, "{}", PROVENANCE_DISCLOSURE);
     if no_checksum {
-        eprintln!("{}", NO_CHECKSUM_WARNING);
+        let _ = writeln!(stderr, "{}", NO_CHECKSUM_WARNING);
     }
 }
 
@@ -757,7 +775,12 @@ fn managed_redirect_command(method: InstallMethod) -> String {
     }
 }
 
-fn print_managed_redirect(output: &Output, method: InstallMethod, command: &str) {
+fn print_managed_redirect(
+    output: &Output,
+    stderr: &mut dyn Write,
+    method: InstallMethod,
+    command: &str,
+) {
     if output.is_json() {
         let value = serde_json::json!({
             "installMethod": method.wire_form(),
@@ -772,14 +795,15 @@ fn print_managed_redirect(output: &Output, method: InstallMethod, command: &str)
             command
         );
     }
-    eprintln!(
+    let _ = writeln!(
+        stderr,
         "upgrade_package_manager_managed: install method '{}' is package-manager-managed; no binary swap performed",
         method.wire_form()
     );
 }
 
-fn print_up_to_date(output: &Output, running: &Version) {
-    eprintln!("syns is up to date");
+fn print_up_to_date(output: &Output, stderr: &mut dyn Write, running: &Version) {
+    let _ = writeln!(stderr, "syns is up to date");
     if output.is_json() {
         let v = running.to_string();
         let value = serde_json::json!({
@@ -793,6 +817,7 @@ fn print_up_to_date(output: &Output, running: &Version) {
 
 fn print_check_only_would_upgrade(
     output: &Output,
+    stderr: &mut dyn Write,
     method: InstallMethod,
     running: &Version,
     latest: &Version,
@@ -806,15 +831,19 @@ fn print_check_only_would_upgrade(
         });
         println!("{}", value);
     } else {
-        eprintln!("syns {} would be upgraded to {}", running, latest);
+        let _ = writeln!(stderr, "syns {} would be upgraded to {}", running, latest);
     }
 }
 
-fn print_complete(output: &Output, old: &Version, new: &Version) {
+fn print_complete(output: &Output, stderr: &mut dyn Write, old: &Version, new: &Version) {
     // SPEC § 5 D7 / PROTOTYPE C-04: literal token `(integrity-checked)`.
     // NEVER replace with `(verified)` — that would falsely imply cryptographic
     // provenance, which v1 does not provide. Tests T8 / T10 assert this token.
-    eprintln!("syns upgraded {} \u{2192} {} (integrity-checked)", old, new);
+    let _ = writeln!(
+        stderr,
+        "syns upgraded {} \u{2192} {} (integrity-checked)",
+        old, new
+    );
     if output.is_json() {
         let value = serde_json::json!({
             "upgradedFrom": old.to_string(),

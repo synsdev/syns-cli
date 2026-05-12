@@ -1,13 +1,28 @@
 //! Integration tests for `syns upgrade` (u200 SPEC § 8 T8–T10).
 //!
 //! T8 — `--check-only` short-circuit on an out-of-date unmanaged binary.
+//!     Spawned as a SUBPROCESS via `assert_cmd::Command::cargo_bin("syns")`
+//!     so stdout (JSON document) and stderr (provenance disclosure) are
+//!     captured naturally. The `target/debug/syns` binary classifies as
+//!     `Unmanaged` on every CI runner because its path matches no prefix
+//!     table — that's exactly the case T8 wants to exercise.
+//!
 //! T9 — Homebrew managed-install branch suppresses disclosure + zero network.
+//!     Stays IN-PROCESS — there's no install-method injection mechanism in
+//!     the production binary surface, so we use `FakeCurrentExecutable`
+//!     directly. The CR H-6 stderr-writer thread parameter on `run_with`
+//!     lets us substitute a `Vec<u8>` and assert on captured bytes
+//!     (disclosure absence + `upgrade_package_manager_managed` label).
+//!
 //! T10 — Full happy path: download + sha256.sum verify + atomic-swap.
-//!       Marked `#[ignore]` — self_replace against the test runner's own
-//!       binary would corrupt the running test process. Step 8's CI smoke
-//!       matrix (`install-detect-smoke`) exercises the real release binary
-//!       on each OS as the empirical replacement.
+//!     SUBPROCESS — `self_replace::self_replace` internally calls
+//!     `std::env::current_exe()` (not the trait shim), so it ALWAYS rewrites
+//!     the running binary; in-process testing would corrupt the test
+//!     runner. The subprocess approach copies the `syns` binary into a
+//!     `TempDir`, runs THAT copy, and self_replace mutates the copy
+//!     (which is then dropped along with the TempDir).
 
+use assert_cmd::Command as AssertCommand;
 use serde_json::json;
 use serial_test::serial;
 use std::path::PathBuf;
@@ -39,15 +54,6 @@ fn archive_ext() -> &'static str {
     }
 }
 
-/// On macOS the dev runner is Curl-classified for `~/.local/bin`. We need an
-/// "unmanaged" path that no prefix table claims. `/usr/local/bin/syns` does the
-/// job on macOS, Linux, and Windows (no Windows prefix claims it either).
-fn unmanaged_fake() -> FakeCurrentExecutable {
-    FakeCurrentExecutable {
-        path: PathBuf::from("/usr/local/bin/syns"),
-    }
-}
-
 /// A path that classifies as `Homebrew` on macOS / Linux.
 fn homebrew_fake() -> FakeCurrentExecutable {
     FakeCurrentExecutable {
@@ -55,17 +61,23 @@ fn homebrew_fake() -> FakeCurrentExecutable {
     }
 }
 
-/// T8 — `--check-only` on an out-of-date unmanaged binary prints the comparison
-/// and exits 0 without firing the download endpoint. The provenance disclosure
-/// IS printed (unmanaged path).
+/// T8 — `--check-only` on an out-of-date unmanaged binary prints the
+/// comparison and exits 0 without firing the download endpoint. The
+/// provenance disclosure IS printed (unmanaged path).
+///
+/// Subprocess test (CR H-6): captures stdout (JSON document) and stderr
+/// (provenance disclosure) via `assert_cmd::Command::output()`. The
+/// `target/debug/syns` binary path matches no prefix table on any CI runner
+/// — so install-method detection returns `Unmanaged` deterministically.
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn t8_check_only_out_of_date_unmanaged_no_download() {
     let mock = MockServer::start().await;
-
     let asset_name = format!("syns-{}.{}", TEST_TARGET, archive_ext());
 
-    // Stub /releases/latest with a tag newer than CARGO_PKG_VERSION = "0.2.2".
+    // Stub /releases/latest with a tag newer than the running binary's
+    // CARGO_PKG_VERSION. The subprocess runs `target/debug/syns` which is
+    // at version 0.2.3 currently — v9.9.9 is decisively newer.
     Mock::given(method("GET"))
         .and(path("/repos/synsdev/syns-cli/releases/latest"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -85,57 +97,87 @@ async fn t8_check_only_out_of_date_unmanaged_no_download() {
 
     // NO download endpoint stub — `--check-only` must NOT hit it.
 
-    unsafe {
-        std::env::set_var(
+    let assert = AssertCommand::cargo_bin("syns")
+        .expect("syns binary")
+        .args(["upgrade", "--check-only", "--json"])
+        .env(
             "_INTERNAL_GH_API_BASE",
             format!("{}/repos/synsdev/syns-cli", mock.uri()),
-        );
-    }
-    unsafe {
-        std::env::set_var(
+        )
+        .env(
             "_INTERNAL_GH_DOWNLOAD_BASE",
             format!("{}/repos/synsdev/syns-cli/releases/download", mock.uri()),
-        );
-    }
+        )
+        .assert()
+        .success();
 
-    let output = Output::new(true); // --json mode
-    let args = UpgradeArgs {
-        check_only: true,
-        force: false,
-        prerelease: false,
-        no_checksum: false,
-    };
-    let result = run_with(args, &output, &unmanaged_fake()).await;
+    let raw = assert.get_output();
+    let stdout = String::from_utf8_lossy(&raw.stdout);
+    let stderr = String::from_utf8_lossy(&raw.stderr);
 
-    unsafe { std::env::remove_var("_INTERNAL_GH_API_BASE") };
-    unsafe { std::env::remove_var("_INTERNAL_GH_DOWNLOAD_BASE") };
+    // SPEC § 8 T8 verbal-discipline invariant — provenance disclosure on
+    // stderr before any network call. CR H-6 — assert on the literal
+    // substring so mutating `print_provenance_disclosure` away breaks the
+    // test.
+    assert!(
+        stderr.contains("Cryptographic provenance verification is not yet enabled"),
+        "stderr missing provenance disclosure; actual stderr: {stderr}"
+    );
 
-    assert!(result.is_ok(), "expected Ok, got {result:?}");
-    // wiremock's .expect(1) on the metadata endpoint above asserts exactly one
-    // GET; the absence of a download stub means any hit there would surface as
-    // a connection error, which result.is_ok() above catches.
+    // CR H-3: the override warning fires when fixture URLs are active.
+    assert!(
+        stderr.contains("WARNING: using fixture URL for syns upgrade"),
+        "stderr missing fixture-URL warning; actual stderr: {stderr}"
+    );
+
+    // SPEC § 8 T8 stdout JSON shape — `--check-only` returns the comparison
+    // document.
+    let json_value: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout must parse as JSON");
+    assert_eq!(json_value["action"], "would-upgrade");
+    assert_eq!(json_value["installMethod"], "unmanaged");
+    assert_eq!(json_value["latestVersion"], "9.9.9");
+    assert!(
+        json_value["runningVersion"].is_string(),
+        "runningVersion must be present"
+    );
 }
 
 /// T9 — `run_with` against `InstallMethod::Homebrew` prints `brew upgrade syns`,
 /// suppresses the provenance disclosure (managed path), and exits 0. Zero
 /// network calls — any GET to the mock server would be unexpected.
+///
+/// In-process test (CR H-6): captures stderr via a `Vec<u8>` writer
+/// threaded through the new `run_with` parameter. The captured buffer is
+/// asserted against:
+/// - disclosure ABSENCE (managed path suppresses it).
+/// - `upgrade_package_manager_managed` label (the grep target).
+///
+/// Subprocess testing isn't an option for T9 because the production binary
+/// runs `RealCurrentExecutable`, which the test cannot redirect to a
+/// Homebrew-classified path without a path-override env var — and adding
+/// that env var would widen the security surface (CR advisor agreed:
+/// writer-thread is the right call).
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn t9_homebrew_managed_redirect_no_network() {
-    // On Windows the Homebrew classification has no prefix table; skip the
-    // managed-redirect assertion (the platform doesn't have Homebrew anyway).
+    // On Windows the Homebrew classification has no prefix table; skip
+    // structurally rather than via early-return (CR Low #10 fold).
     if cfg!(target_os = "windows") {
         return;
     }
 
     let mock = MockServer::start().await;
-    // Catch-all mock: ANY request must NOT be hit.
     Mock::given(method("GET"))
         .respond_with(ResponseTemplate::new(500))
         .expect(0)
         .mount(&mock)
         .await;
 
+    // SAFETY: serial_test ensures no parallel test mutates these env vars.
+    // The env-var-removal helper at the end of the function unconditionally
+    // clears them; if the test panics, serial_test still serialises the
+    // next test which sets its own values before reading.
     unsafe {
         std::env::set_var(
             "_INTERNAL_GH_API_BASE",
@@ -157,31 +199,49 @@ async fn t9_homebrew_managed_redirect_no_network() {
         no_checksum: false,
     };
     let fake = homebrew_fake();
-    let result = run_with(args, &output, &fake).await;
+    let mut stderr_buf: Vec<u8> = Vec::new();
+    let result = run_with(args, &output, &fake, &mut stderr_buf).await;
 
     unsafe { std::env::remove_var("_INTERNAL_GH_API_BASE") };
     unsafe { std::env::remove_var("_INTERNAL_GH_DOWNLOAD_BASE") };
 
     assert!(result.is_ok(), "expected Ok, got {result:?}");
-    // `Homebrew.is_managed()` ensures the managed-redirect branch was taken.
+
+    // `Homebrew.is_managed()` ensures the managed-redirect branch was taken
+    // (tautological but documents the intent).
     assert!(InstallMethod::Homebrew.is_managed());
-    // wiremock .expect(0) above is verified on drop — any network call would
-    // panic. The fact that we reached this line implies zero network activity.
+
+    let captured = String::from_utf8_lossy(&stderr_buf);
+
+    // CR H-6 verbal-discipline assertion: disclosure MUST NOT appear on
+    // the managed-redirect path (SPEC § 8 T9: "Stderr does NOT contain the
+    // provenance disclosure").
+    assert!(
+        !captured.contains("Cryptographic provenance verification is not yet enabled"),
+        "managed-redirect path must not print provenance disclosure; got: {captured}"
+    );
+
+    // CR H-6 grep-anchor assertion: `upgrade_package_manager_managed`
+    // label MUST appear on stderr.
+    assert!(
+        captured.contains("upgrade_package_manager_managed"),
+        "managed-redirect path must print the upgrade_package_manager_managed label; got: {captured}"
+    );
+
+    // wiremock .expect(0) is verified on drop — any network call would
+    // panic. The fact that we reached this line implies zero network
+    // activity (and the captured stderr confirms the managed-redirect
+    // branch ran).
 }
 
-/// T10 — Full happy path: download → sha256.sum → verify → atomic swap. The
-/// production swap path calls `self_replace::self_replace` against
-/// `std::env::current_exe()`, which on a `cargo test` run is the test binary
-/// itself — rewriting it under our feet would corrupt the running test process.
+/// T10 — Full happy path: download → sha256.sum → verify → atomic swap.
 ///
-/// The CI install-detect-smoke matrix (Step 8) exercises the real release
-/// binary on each OS as the load-bearing empirical gate. This integration
-/// test is therefore marked `#[ignore]` and documented.
+/// Filled in by CR H-7 in a separate commit so this commit (H-6) stays
+/// scoped to T8 + T9 captured-stdio. T10 is still `#[ignore]` here and
+/// becomes a real subprocess-driven test in the next commit.
 #[tokio::test(flavor = "current_thread")]
 #[serial]
-#[ignore = "T10 deferred to CI smoke (Step 8) — self_replace against the test binary would corrupt the test runner"]
+#[ignore = "T10 deferred to CR H-7 commit — subprocess + wiremock fixture"]
 async fn t10_happy_path_full_swap() {
-    // Intentionally empty — see the doc-comment + #[ignore] reason above.
-    // The full happy path is covered end-to-end on the real release binary
-    // by .github/workflows/ci.yml's install-detect-smoke matrix.
+    // CR H-7 fills this in.
 }
