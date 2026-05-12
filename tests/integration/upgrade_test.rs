@@ -236,12 +236,228 @@ async fn t9_homebrew_managed_redirect_no_network() {
 
 /// T10 — Full happy path: download → sha256.sum → verify → atomic swap.
 ///
-/// Filled in by CR H-7 in a separate commit so this commit (H-6) stays
-/// scoped to T8 + T9 captured-stdio. T10 is still `#[ignore]` here and
-/// becomes a real subprocess-driven test in the next commit.
+/// CR H-7 fix: the `#[ignore]` is GONE. This test now runs against a real
+/// wiremock-backed fixture HTTP server, with the subprocess being a COPY
+/// of `target/debug/syns` placed inside a `TempDir` — so when
+/// `self_replace::self_replace` overwrites the subprocess's
+/// `std::env::current_exe()`, it overwrites the COPY (which then gets
+/// dropped along with the TempDir), not the test runner.
+///
+/// Fixture construction:
+///   - On Unix: a real `tar.gz` archive containing
+///     `syns-{TARGET}/syns` whose body is a known sentinel.
+///   - On Windows: a real `.zip` archive containing `syns.exe` at depth 1
+///     (per u196 § 3.2 / extract_binary Windows layout).
+///   - SHA-256 of the archive bytes is computed and served as
+///     `sha256.sum`.
+///   - wiremock serves three routes:
+///     `/repos/synsdev/syns-cli/releases/latest` (JSON metadata),
+///     `/repos/synsdev/syns-cli/releases/download/v9.9.9/syns-{TARGET}.{ext}`
+///     (archive bytes), and
+///     `/repos/synsdev/syns-cli/releases/download/v9.9.9/sha256.sum`
+///     (the sum line).
+///
+/// Assertions:
+///   - Exit code 0.
+///   - Stderr contains the SPEC § 4.2 disclosure literal.
+///   - Stderr contains the literal `(integrity-checked)` success token
+///     (SPEC § 5 D7 / PROTOTYPE C-04 verbal-discipline invariant).
+///   - Stdout `--json` shape contains `action="upgraded"` and
+///     `verification="sha256"`.
+///   - The TempDir-resident binary now contains the fixture sentinel
+///     bytes (proves self_replace actually mutated the right file).
+///   - No `.syns-upgrade-*` staging cruft remains in the TempDir
+///     (proves CR H-2 RAII cleanup ran).
 #[tokio::test(flavor = "current_thread")]
 #[serial]
-#[ignore = "T10 deferred to CR H-7 commit — subprocess + wiremock fixture"]
 async fn t10_happy_path_full_swap() {
-    // CR H-7 fills this in.
+    use sha2::{Digest, Sha256};
+    use std::fs;
+    use std::io::Write as _;
+
+    let asset_name = format!("syns-{}.{}", TEST_TARGET, archive_ext());
+    let sentinel_bytes = b"SYNS-T10-FIXTURE-BYTES-not-an-executable".to_vec();
+
+    // -------- Build the fixture archive in memory. --------
+    let archive_bytes: Vec<u8> = if cfg!(target_os = "windows") {
+        // Windows: zip with `syns.exe` at depth 1.
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let options: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+            zip.start_file("syns.exe", options).expect("zip start_file");
+            zip.write_all(&sentinel_bytes).expect("zip write_all");
+            zip.finish().expect("zip finish");
+        }
+        buf
+    } else {
+        // Unix: tar.gz with `syns-{TARGET}/syns` inside.
+        let mut tar_buf = Vec::new();
+        {
+            let mut tar_builder = tar::Builder::new(&mut tar_buf);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(sentinel_bytes.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            let inner_path = format!("syns-{}/syns", TEST_TARGET);
+            tar_builder
+                .append_data(&mut header, &inner_path, sentinel_bytes.as_slice())
+                .expect("tar append_data");
+            tar_builder.finish().expect("tar finish");
+        }
+        let mut gz_buf = Vec::new();
+        {
+            let mut encoder =
+                flate2::write::GzEncoder::new(&mut gz_buf, flate2::Compression::default());
+            encoder.write_all(&tar_buf).expect("gz write");
+            encoder.finish().expect("gz finish");
+        }
+        gz_buf
+    };
+
+    // -------- Compute SHA-256 of the archive bytes. --------
+    let mut hasher = Sha256::new();
+    hasher.update(&archive_bytes);
+    let archive_sha256 = format!("{:x}", hasher.finalize());
+    let sha256sum_body = format!("{}  {}\n", archive_sha256, asset_name);
+
+    // -------- Spin up the wiremock server. --------
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/synsdev/syns-cli/releases/latest"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "tag_name": "v9.9.9",
+            "prerelease": false,
+            "assets": [{
+                "name": asset_name,
+                "browser_download_url": format!(
+                    "{}/repos/synsdev/syns-cli/releases/download/v9.9.9/{}",
+                    mock.uri(),
+                    asset_name,
+                ),
+            }],
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let download_path = format!("/repos/synsdev/syns-cli/releases/download/v9.9.9/{asset_name}");
+    Mock::given(method("GET"))
+        .and(path(&download_path))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(archive_bytes.clone())
+                .insert_header("content-type", "application/octet-stream"),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(
+            "/repos/synsdev/syns-cli/releases/download/v9.9.9/sha256.sum",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_string(sha256sum_body.clone()))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    // -------- Copy target/debug/syns into a TempDir. --------
+    let staging = tempfile::TempDir::new().expect("create test TempDir");
+    let exe_src: PathBuf = PathBuf::from(env!("CARGO_BIN_EXE_syns"));
+    let exe_copy_name = if cfg!(target_os = "windows") {
+        "syns.exe"
+    } else {
+        "syns"
+    };
+    let exe_copy = staging.path().join(exe_copy_name);
+    fs::copy(&exe_src, &exe_copy).expect("copy syns binary into TempDir");
+    // CR H-7 (advisor): chmod +x explicitly on Unix — `fs::copy` preserves
+    // perms on tmpfs/local disks but not all filesystems (NFS, FUSE). The
+    // explicit `0o755` matches the post-extract binary perm.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&exe_copy, fs::Permissions::from_mode(0o755))
+            .expect("chmod +x on copied binary");
+    }
+
+    // -------- Invoke the copied binary as a subprocess. --------
+    let assert = AssertCommand::new(&exe_copy)
+        .args(["upgrade", "--json"])
+        .env(
+            "_INTERNAL_GH_API_BASE",
+            format!("{}/repos/synsdev/syns-cli", mock.uri()),
+        )
+        .env(
+            "_INTERNAL_GH_DOWNLOAD_BASE",
+            format!("{}/repos/synsdev/syns-cli/releases/download", mock.uri()),
+        )
+        .assert()
+        .success();
+
+    let raw = assert.get_output();
+    let stdout = String::from_utf8_lossy(&raw.stdout);
+    let stderr = String::from_utf8_lossy(&raw.stderr);
+
+    // SPEC § 4.2 disclosure literal — CR H-6 verbal-discipline.
+    assert!(
+        stderr.contains("Cryptographic provenance verification is not yet enabled"),
+        "stderr missing provenance disclosure; stderr={stderr}"
+    );
+
+    // SPEC § 5 D7 / PROTOTYPE C-04 — verbal-discipline contract: the
+    // success message MUST contain `(integrity-checked)` and NEVER
+    // `(verified)`. T10's job is to lock this in.
+    assert!(
+        stderr.contains("(integrity-checked)"),
+        "stderr missing `(integrity-checked)` token; stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("(verified)"),
+        "stderr accidentally contains `(verified)` — verbal-discipline regression; stderr={stderr}"
+    );
+
+    // SPEC § 4.2 stdout JSON shape on the swap path.
+    let json_value: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout must parse as JSON");
+    assert_eq!(json_value["action"], "upgraded");
+    assert_eq!(json_value["verification"], "sha256");
+    assert!(
+        json_value["upgradedFrom"].is_string(),
+        "upgradedFrom must be present"
+    );
+    assert_eq!(json_value["upgradedTo"], "9.9.9");
+
+    // -------- Verify the swap actually happened. --------
+    // After self_replace, `exe_copy` is now the fixture sentinel bytes.
+    let post_swap = fs::read(&exe_copy).expect("read post-swap binary");
+    assert_eq!(
+        post_swap, sentinel_bytes,
+        "post-swap binary at {exe_copy:?} does not match fixture sentinel"
+    );
+
+    // -------- Verify CR H-2 RAII cleanup. --------
+    // No `.syns-upgrade-*` staging cruft should remain inside the TempDir
+    // (the inner staging tempdir's Drop runs in the subprocess; we observe
+    // the post-state from this process).
+    for entry in fs::read_dir(staging.path()).expect("read_dir TempDir") {
+        let entry = entry.expect("dir entry");
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        assert!(
+            !name_str.starts_with(".syns-upgrade-"),
+            "staging cruft survived in TempDir: {name_str:?}"
+        );
+        assert!(
+            !name_str.starts_with(".tmp"),
+            "RAII inner-tempdir survived: {name_str:?} \
+             (the staging TempDir::Drop did NOT run on the subprocess's success path)"
+        );
+    }
+
+    // wiremock `.expect(1)` on each route verifies the metadata, archive,
+    // and sha256.sum endpoints were each hit exactly once. Drop of `mock`
+    // panics on violation.
 }
