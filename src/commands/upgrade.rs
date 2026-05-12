@@ -146,12 +146,40 @@ pub enum UpgradeError {
         actual: String,
     },
 
+    /// CR H-5: narrowed semantics — `BinaryLocked` is now ONLY raised when
+    /// `self_replace::self_replace` returns an `io::Error` at the atomic-swap
+    /// step. POSIX `EACCES`/`EPERM`/`EROFS`/`EXDEV` and Windows file-sharing
+    /// races land here. All other I/O errors (open/write/copy/chmod/walk)
+    /// surface as `IoError`; archive-format failures surface as `ExtractFailed`.
     #[error("could not replace the running binary at {}: {source}", path.display())]
     BinaryLocked {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
+
+    /// CR H-5: generic-but-accurate I/O error wrapper. Used for tempfile
+    /// creation, writes, copies, chmod calls — anything filesystem-shaped
+    /// that does NOT belong to the narrow `BinaryLocked` self_replace path.
+    /// The `operation` discriminator (a static string like
+    /// `"download-archive-write"`, `"extract-binary-copy"`,
+    /// `"extract-binary-chmod"`) keeps user-facing diagnostics from
+    /// misdirecting users to "close any process holding it open".
+    /// Surface change pending G8 RECONCILE into SPEC § 3.3 / § 7.
+    #[error("{operation} failed at {}: {source}", path.display())]
+    IoError {
+        path: PathBuf,
+        operation: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// CR H-5: archive-format or archive-walking error during `extract_binary`.
+    /// Distinguishes "the archive bytes are corrupt or in the wrong format"
+    /// from "the local filesystem refused an I/O operation" (the latter is
+    /// `IoError`). Surface change pending G8 RECONCILE into SPEC § 3.3 / § 7.
+    #[error("could not extract upgrade archive: {message}")]
+    ExtractFailed { message: String },
 
     #[error("release {tag} does not include a build for {target_triple}")]
     NoMatchingArtifact { target_triple: String, tag: String },
@@ -194,6 +222,8 @@ impl UpgradeError {
             UpgradeError::Sha256sumLineMissing { .. }
             | UpgradeError::ChecksumMismatch { .. }
             | UpgradeError::BinaryLocked { .. }
+            | UpgradeError::IoError { .. }
+            | UpgradeError::ExtractFailed { .. }
             | UpgradeError::NoMatchingArtifact { .. }
             | UpgradeError::OverrideUrlInvalid { .. } => 1,
             // PackageManagerManaged never reaches exit_code() in practice
@@ -212,6 +242,8 @@ impl UpgradeError {
             UpgradeError::Sha256sumLineMissing { .. } => "upgrade_sha256sum_line_missing",
             UpgradeError::ChecksumMismatch { .. } => "upgrade_checksum_mismatch",
             UpgradeError::BinaryLocked { .. } => "upgrade_binary_locked",
+            UpgradeError::IoError { .. } => "upgrade_io_failed",
+            UpgradeError::ExtractFailed { .. } => "upgrade_extract_failed",
             UpgradeError::NoMatchingArtifact { .. } => "upgrade_no_matching_artifact",
             UpgradeError::OverrideUrlInvalid { .. } => "upgrade_override_url_invalid",
             UpgradeError::PackageManagerManaged { .. } => "upgrade_package_manager_managed",
@@ -237,10 +269,17 @@ impl From<ChecksumError> for UpgradeError {
                 expected,
                 actual,
             },
-            // I/O error during the streaming hash. Per PLAN advisor guidance,
-            // fold extract / streaming-hash I/O into BinaryLocked so we avoid
-            // adding a 9th variant + ERRORS.md registry churn.
-            ChecksumError::Io { source, path } => UpgradeError::BinaryLocked { path, source },
+            // CR H-5: I/O error during the streaming hash now maps to the new
+            // `IoError` variant (was `BinaryLocked` in R1 — that overloaded
+            // the binary-locked diagnostic with disk-full / permission-denied
+            // semantics). User-facing message correctly says
+            // "verify-checksum-read failed at <path>: <io error>" instead of
+            // "could not replace the running binary at <archive_path>".
+            ChecksumError::Io { source, path } => UpgradeError::IoError {
+                path,
+                operation: "verify-checksum-read",
+                source,
+            },
         }
     }
 }
@@ -352,19 +391,18 @@ pub async fn run_with(
     // internally calls its own `std::env::current_exe()` — the trait routing
     // governs staging paths, not the swap target itself; T10 spawns a
     // subprocess so the swap mutates a tempdir-resident binary copy.)
-    let current_exe =
-        executable
-            .current_executable_path()
-            .map_err(|e| UpgradeError::BinaryLocked {
-                path: PathBuf::from("(unknown)"),
-                source: e,
-            })?;
-    let current_exe_dir = current_exe
-        .parent()
-        .ok_or_else(|| UpgradeError::BinaryLocked {
-            path: current_exe.clone(),
-            source: std::io::Error::other("current_exe has no parent directory"),
+    let current_exe = executable
+        .current_executable_path()
+        .map_err(|e| UpgradeError::IoError {
+            path: PathBuf::from("(current_exe)"),
+            operation: "resolve-current-exe",
+            source: e,
         })?;
+    let current_exe_dir = current_exe.parent().ok_or_else(|| UpgradeError::IoError {
+        path: current_exe.clone(),
+        operation: "resolve-current-exe-dir",
+        source: std::io::Error::other("current_exe has no parent directory"),
+    })?;
     let pid = std::process::id();
     let archive_path = current_exe_dir.join(format!(
         ".syns-upgrade-{}-{}.{}",
@@ -553,15 +591,16 @@ async fn download_archive(client: &Client, url: &str, dest: &Path) -> Result<(),
             source: e,
             url: url.to_string(),
         })?;
-    let mut file = fs::File::create(dest).map_err(|e| UpgradeError::BinaryLocked {
+    let mut file = fs::File::create(dest).map_err(|e| UpgradeError::IoError {
         path: dest.to_path_buf(),
+        operation: "download-archive-create",
         source: e,
     })?;
-    file.write_all(&bytes)
-        .map_err(|e| UpgradeError::BinaryLocked {
-            path: dest.to_path_buf(),
-            source: e,
-        })?;
+    file.write_all(&bytes).map_err(|e| UpgradeError::IoError {
+        path: dest.to_path_buf(),
+        operation: "download-archive-write",
+        source: e,
+    })?;
     Ok(())
 }
 
@@ -581,42 +620,43 @@ fn extract_binary(
     target_triple: &str,
     dest: &Path,
 ) -> Result<(), UpgradeError> {
-    let f = fs::File::open(archive_path).map_err(|e| UpgradeError::BinaryLocked {
+    let f = fs::File::open(archive_path).map_err(|e| UpgradeError::IoError {
         path: archive_path.to_path_buf(),
+        operation: "extract-binary-open-archive",
         source: e,
     })?;
     let gz = flate2::read::GzDecoder::new(f);
     let mut archive = tar::Archive::new(gz);
     // u196 § 3.2 Unix layout: `syns-{TARGET_TRIPLE}/syns` inside the archive.
     let inner_path = format!("syns-{}/syns", target_triple);
-    let entries = archive.entries().map_err(|e| UpgradeError::BinaryLocked {
-        path: archive_path.to_path_buf(),
-        source: e,
+    let entries = archive.entries().map_err(|e| UpgradeError::ExtractFailed {
+        message: format!("tar entries: {e}"),
     })?;
     for entry in entries {
-        let mut entry = entry.map_err(|e| UpgradeError::BinaryLocked {
-            path: archive_path.to_path_buf(),
-            source: e,
+        let mut entry = entry.map_err(|e| UpgradeError::ExtractFailed {
+            message: format!("tar entry: {e}"),
         })?;
-        let path = entry.path().map_err(|e| UpgradeError::BinaryLocked {
-            path: archive_path.to_path_buf(),
-            source: e,
+        let path = entry.path().map_err(|e| UpgradeError::ExtractFailed {
+            message: format!("tar entry path: {e}"),
         })?;
         if path.to_string_lossy() == inner_path {
-            let mut out = fs::File::create(dest).map_err(|e| UpgradeError::BinaryLocked {
+            let mut out = fs::File::create(dest).map_err(|e| UpgradeError::IoError {
                 path: dest.to_path_buf(),
+                operation: "extract-binary-create",
                 source: e,
             })?;
-            std::io::copy(&mut entry, &mut out).map_err(|e| UpgradeError::BinaryLocked {
+            std::io::copy(&mut entry, &mut out).map_err(|e| UpgradeError::IoError {
                 path: dest.to_path_buf(),
+                operation: "extract-binary-copy",
                 source: e,
             })?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 fs::set_permissions(dest, fs::Permissions::from_mode(0o755)).map_err(|e| {
-                    UpgradeError::BinaryLocked {
+                    UpgradeError::IoError {
                         path: dest.to_path_buf(),
+                        operation: "extract-binary-chmod",
                         source: e,
                     }
                 })?;
@@ -636,29 +676,30 @@ fn extract_binary(
     target_triple: &str,
     dest: &Path,
 ) -> Result<(), UpgradeError> {
-    let f = fs::File::open(archive_path).map_err(|e| UpgradeError::BinaryLocked {
+    let f = fs::File::open(archive_path).map_err(|e| UpgradeError::IoError {
         path: archive_path.to_path_buf(),
+        operation: "extract-binary-open-archive",
         source: e,
     })?;
-    let mut archive = zip::ZipArchive::new(f).map_err(|e| UpgradeError::BinaryLocked {
-        path: archive_path.to_path_buf(),
-        source: std::io::Error::other(e.to_string()),
+    let mut archive = zip::ZipArchive::new(f).map_err(|e| UpgradeError::ExtractFailed {
+        message: format!("zip open: {e}"),
     })?;
     // u196 § 3.2 Windows layout: `syns.exe` at depth 1 (no wrapper directory).
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
-            .map_err(|e| UpgradeError::BinaryLocked {
-                path: archive_path.to_path_buf(),
-                source: std::io::Error::other(e.to_string()),
+            .map_err(|e| UpgradeError::ExtractFailed {
+                message: format!("zip by_index({i}): {e}"),
             })?;
         if entry.name() == "syns.exe" {
-            let mut out = fs::File::create(dest).map_err(|e| UpgradeError::BinaryLocked {
+            let mut out = fs::File::create(dest).map_err(|e| UpgradeError::IoError {
                 path: dest.to_path_buf(),
+                operation: "extract-binary-create",
                 source: e,
             })?;
-            std::io::copy(&mut entry, &mut out).map_err(|e| UpgradeError::BinaryLocked {
+            std::io::copy(&mut entry, &mut out).map_err(|e| UpgradeError::IoError {
                 path: dest.to_path_buf(),
+                operation: "extract-binary-copy",
                 source: e,
             })?;
             return Ok(());
@@ -862,6 +903,22 @@ mod tests {
             .exit_code(),
             1
         );
+        assert_eq!(
+            UpgradeError::IoError {
+                path: PathBuf::from("/x"),
+                operation: "download-archive-write",
+                source: std::io::Error::other("disk full"),
+            }
+            .exit_code(),
+            1
+        );
+        assert_eq!(
+            UpgradeError::ExtractFailed {
+                message: "tar entries: bad magic".into()
+            }
+            .exit_code(),
+            1
+        );
     }
 
     #[test]
@@ -921,6 +978,22 @@ mod tests {
             }
             .wire_form(),
             "upgrade_override_url_invalid"
+        );
+        assert_eq!(
+            UpgradeError::IoError {
+                path: PathBuf::from("/x"),
+                operation: "extract-binary-copy",
+                source: std::io::Error::other("disk full"),
+            }
+            .wire_form(),
+            "upgrade_io_failed"
+        );
+        assert_eq!(
+            UpgradeError::ExtractFailed {
+                message: "zip open".into()
+            }
+            .wire_form(),
+            "upgrade_extract_failed"
         );
         assert_eq!(
             UpgradeError::PackageManagerManaged {
@@ -1049,18 +1122,43 @@ mod tests {
     }
 
     #[test]
-    fn checksum_error_io_folds_into_binary_locked() {
+    fn checksum_error_io_maps_to_upgrade_io_error() {
+        // CR H-5: was `BinaryLocked` (catch-all overload) — now `IoError`
+        // with an accurate `operation` tag. The user-facing message no
+        // longer misdirects "could not replace the running binary" at a
+        // failure in the verify-checksum-read step.
         let e = ChecksumError::Io {
             source: std::io::Error::other("disk gone"),
             path: PathBuf::from("/x"),
         };
         let mapped: UpgradeError = e.into();
         match mapped {
-            UpgradeError::BinaryLocked { path, .. } => {
+            UpgradeError::IoError {
+                path, operation, ..
+            } => {
                 assert_eq!(path, PathBuf::from("/x"));
+                assert_eq!(operation, "verify-checksum-read");
             }
-            other => panic!("expected BinaryLocked, got {other:?}"),
+            other => panic!("expected IoError, got {other:?}"),
         }
+        assert_eq!(
+            (UpgradeError::IoError {
+                path: PathBuf::from("/x"),
+                operation: "verify-checksum-read",
+                source: std::io::Error::other("disk gone"),
+            })
+            .wire_form(),
+            "upgrade_io_failed"
+        );
+    }
+
+    #[test]
+    fn extract_failed_wire_form_and_exit_code() {
+        let e = UpgradeError::ExtractFailed {
+            message: "tar entries: corrupt header".into(),
+        };
+        assert_eq!(e.wire_form(), "upgrade_extract_failed");
+        assert_eq!(e.exit_code(), 1);
     }
 
     #[test]
