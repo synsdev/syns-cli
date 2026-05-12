@@ -60,8 +60,26 @@ pub struct RealCurrentExecutable;
 impl CurrentExecutable for RealCurrentExecutable {
     fn current_executable_path(&self) -> std::io::Result<PathBuf> {
         let raw = std::env::current_exe()?;
-        std::fs::canonicalize(&raw)
+        let canon = std::fs::canonicalize(&raw)?;
+        Ok(strip_verbatim_prefix(canon))
     }
+}
+
+/// On Windows, `std::fs::canonicalize` returns paths prefixed with `\\?\`
+/// (the verbatim / extended-length prefix). `dirs::data_local_dir()` and
+/// `dirs::home_dir()` return non-verbatim paths, so a `Path::starts_with`
+/// comparison fails component-by-component when one side has `\\?\` and the
+/// other does not. Strip the prefix on Windows so both sides compare apples-
+/// to-apples. No-op on non-Windows.
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        let s = path.to_string_lossy();
+        if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(stripped);
+        }
+    }
+    path
 }
 
 /// Top-level entry point — classifies the live binary's install method.
