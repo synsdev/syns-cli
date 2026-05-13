@@ -565,9 +565,9 @@ async fn process_response<T: serde::de::DeserializeOwned>(
 /// pretty-print whitespace and key order) while still feeding the typed
 /// representation to comfy-table renders, manifest writes, and success banners.
 ///
-/// `Value::clone` is a shallow-tree clone whose cost is dwarfed by the network
-/// round-trip; reading the body twice is impossible because `reqwest::Response::bytes`
-/// consumes the response.
+/// `Value::clone` is a deep clone, but its cost is dwarfed by the network round-trip
+/// for typical CLI payloads; the response body cannot be read twice because
+/// `reqwest::Response::bytes` consumes the response.
 async fn process_response_raw<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
 ) -> Result<(T, serde_json::Value), CliError> {

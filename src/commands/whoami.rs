@@ -18,6 +18,11 @@ pub async fn cmd_whoami(config: &Config, output: &Output) -> Result<(), CliError
     let user = session.user;
 
     if output.is_json() {
+        // Safe to index `raw["user"]` here because `SessionResponse.user` is non-optional
+        // (see `src/client.rs::SessionResponse`); if the wire body lacked `"user"` or it
+        // was null, the typed-side `serde_json::from_value::<SessionResponse>` inside
+        // `process_response_raw` would have already failed with CliError::Api before this
+        // branch can run. Revisit this projection if `user` ever becomes Option<…>.
         output.json(&raw["user"]);
     } else {
         output.table(
@@ -77,6 +82,8 @@ mod tests {
             serde_json::json!("2026-04-17T07:22:30.617Z")
         );
         assert_eq!(typed.user.username, "alice");
+        let expected: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(raw, expected);
     }
 
     #[tokio::test]

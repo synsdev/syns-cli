@@ -184,5 +184,7 @@ mod tests {
         assert_eq!(raw["forkedFrom"]["owner"], serde_json::json!("alice"));
         assert_eq!(raw["role"], serde_json::json!("owner"));
         assert_eq!(raw["visibility"], serde_json::json!("public"));
+        let expected: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(raw, expected);
     }
 }

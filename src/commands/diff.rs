@@ -322,5 +322,7 @@ mod tests {
         assert_eq!(raw["files"][0]["oldPath"], serde_json::json!("src/old.ts"));
         assert_eq!(raw["files"][0]["status"], serde_json::json!("renamed"));
         assert_eq!(typed.files[0].path, "src/new.ts");
+        let expected: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(raw, expected);
     }
 }

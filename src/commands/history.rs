@@ -293,5 +293,43 @@ mod tests {
                 .contains("detailed body")
         );
         assert_eq!(typed.data[0].version, 2);
+        let expected: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(raw, expected);
+    }
+
+    #[tokio::test]
+    async fn history_get_file_history_raw_preserves_blob_sha_and_content_and_diff() {
+        let mock_server = MockServer::start().await;
+        let body = r#"{"data":[{"version":3,"sha":"ccc33333","blobSha":"blob3","message":"update main","author":"alice","createdAt":"2026-01-03T00:00:00Z","content":"console.log('v3');","diff":"--- a\n+++ b\n@@ -1 +1 @@\n-v2\n+v3"},{"version":1,"sha":"aaa11111","blobSha":"blob1","message":"add main","author":"alice","createdAt":"2026-01-01T00:00:00Z","content":"console.log('v1');","diff":null}],"total":2,"limit":50,"offset":0}"#;
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/repos/alice/my-project/files/src/main.ts/history",
+            ))
+            .and(query_param("limit", "50"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let (typed, raw) = client
+            .get_file_history("alice/my-project", None, "src/main.ts", 50)
+            .await
+            .unwrap();
+
+        assert!(raw["data"][0].get("blobSha").is_some());
+        assert_eq!(raw["data"][0]["blobSha"], serde_json::json!("blob3"));
+        assert!(raw["data"][0].get("content").is_some());
+        assert_eq!(
+            raw["data"][0]["content"],
+            serde_json::json!("console.log('v3');")
+        );
+        assert!(raw["data"][0].get("diff").is_some());
+        assert!(raw["data"][0]["diff"].as_str().unwrap().contains("+v3"));
+        // The second entry has `diff: null` — verify the null is preserved verbatim.
+        assert!(raw["data"][1].get("diff").is_some());
+        assert!(raw["data"][1]["diff"].is_null());
+        assert_eq!(typed.data[0].version, 3);
+        let expected: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(raw, expected);
     }
 }

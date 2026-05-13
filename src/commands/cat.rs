@@ -276,6 +276,8 @@ mod tests {
         assert!(raw.get("content").is_some());
         assert!(raw.get("sha").is_some());
         assert!(raw.get("size").is_some());
+        let expected: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(raw, expected);
     }
 
     #[tokio::test]

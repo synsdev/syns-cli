@@ -477,5 +477,7 @@ mod tests {
         assert!(raw["data"][0].get("createdAt").is_some());
         assert!(raw.get("limit").is_some());
         assert!(raw.get("offset").is_some());
+        let expected: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(raw, expected);
     }
 }
