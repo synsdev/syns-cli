@@ -48,6 +48,14 @@ impl Output {
 
     pub(crate) fn format_error(&self, error: &CliError) -> String {
         if self.json_mode {
+            // SPEC § 7 binds specific structured shapes for some error
+            // variants (PUSH_EMPTY, PUSH_PARTIAL). Route through
+            // `CliError::json_value` so those variants emit the
+            // SPEC-mandated wire form; fall back to the generic
+            // `{"error": "<Display>"}` envelope otherwise.
+            if let Some(v) = error.json_value() {
+                return v.to_string();
+            }
             serde_json::json!({"error": error.to_string()}).to_string()
         } else {
             format!("error: {error}")
@@ -216,5 +224,41 @@ mod tests {
         let output = Output::new(false);
         let s = output.format_skip();
         assert_eq!(s, None);
+    }
+
+    #[test]
+    fn format_error_json_mode_uses_push_empty_structured_envelope() {
+        let output = Output::new(true);
+        let err = CliError::PushEmpty {
+            path: "/tmp/proj".into(),
+            total_walked: 4,
+            cause: "every file matches a --exclude pattern".into(),
+        };
+        let text = output.format_error(&err);
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["error"], "push_empty");
+        assert_eq!(parsed["path"], "/tmp/proj");
+        assert_eq!(parsed["cause"], "every file matches a --exclude pattern");
+        assert_eq!(parsed["totalWalked"], 4);
+    }
+
+    #[test]
+    fn format_error_json_mode_uses_push_partial_structured_envelope() {
+        use crate::push::collector::{SkipReason, SkippedFile};
+        let output = Output::new(true);
+        let err = CliError::PushPartial {
+            skipped: vec![SkippedFile {
+                path: "a/b.png".into(),
+                reason: SkipReason::Binary,
+            }],
+            no_default_excludes: false,
+        };
+        let text = output.format_error(&err);
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["error"], "push_partial");
+        let arr = parsed["skipped"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["path"], "a/b.png");
+        assert_eq!(arr[0]["reason"], "binary");
     }
 }

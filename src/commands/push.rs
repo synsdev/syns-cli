@@ -8,7 +8,7 @@ use crate::commands::repo::{CliRepoStatus, CliVisibility};
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
-use crate::push::collector::{SkipReason, SkippedFile};
+use crate::push::collector::{SkippedFile, write_skip_summary};
 use crate::push::smart::{PushPipelineMeta, SmartPushOptions, smart_push};
 use crate::repo::if_repo::resolve_or_skip;
 
@@ -146,18 +146,14 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
         None => SynsClient::new(config.server_url())?,
     };
 
-    let push_result = smart_push(&client, &token, &repo_id, &push_path, opts).await;
-    let (response, raw, meta) = match push_result {
-        Ok(triple) => triple,
-        Err(CliError::PushPartial { skipped }) => {
-            // Render the per-category breakdown to stderr BEFORE
-            // bubbling the error so the one-line Display message and
-            // the breakdown appear in the right order (SPEC § 7).
-            render_skip_summary(&skipped, /* strict = */ true, args.no_default_excludes);
-            return Err(CliError::PushPartial { skipped });
-        }
-        Err(e) => return Err(e),
-    };
+    // CODE_REVIEW M3 / H2: the per-category breakdown for
+    // `PushPartial` is now rendered inside `Display for
+    // CliError::PushPartial` (SPEC § 7 — headline-then-detail order
+    // structurally enforced). In `--json` mode, `Output::format_error`
+    // short-circuits through `CliError::json_value` to the structured
+    // wire form before any prose reaches the output stream — no
+    // separate intercept site needed.
+    let (response, raw, meta) = smart_push(&client, &token, &repo_id, &push_path, opts).await?;
 
     format_response(output, &response, &raw, &repo_id, &meta);
 
@@ -171,68 +167,34 @@ fn build_json_envelope(raw: &serde_json::Value, skipped: &[SkippedFile]) -> serd
         return raw.clone();
     }
     let mut envelope = raw.as_object().cloned().unwrap_or_default();
+    // CODE_REVIEW L6: SkippedFile is `String + unit-enum`, so
+    // `to_value` is infallible. Use `.expect` with an explanatory
+    // message instead of silently coercing a failure to `null` —
+    // that fallback hid bugs if the type ever gained a non-trivial
+    // field.
     envelope.insert(
         "skipped".into(),
-        serde_json::to_value(skipped).unwrap_or(serde_json::Value::Null),
+        serde_json::to_value(skipped)
+            .expect("SkippedFile must serialize (String + unit-enum, infallible)"),
     );
     serde_json::Value::Object(envelope)
 }
 
 /// Render the SPEC § 3.4 skip-summary block to stderr.
-/// `strict` and `no_default_excludes` are the runtime flag values
-/// used to gate the hint lines.
+/// Thin wrapper over [`write_skip_summary`] that targets a `String`
+/// buffer and forwards to `eprint!` (a single syscall keeps the
+/// block atomic against interleaved subprocess output).
+///
+/// In `--json` mode this function is NOT called from the success
+/// path — `format_response` early-returns through `output.json` —
+/// and the error path no longer rounds through `cmd_push` at all
+/// (the `PushPartial` Display impl renders the breakdown itself,
+/// and `Output::format_error` short-circuits to the structured
+/// envelope via `CliError::json_value` before any prose surfaces).
 fn render_skip_summary(skipped: &[SkippedFile], strict: bool, no_default_excludes: bool) {
-    use SkipReason::*;
-    const MAX_PER_CATEGORY: usize = 5;
-
-    // Group by reason (fixed declaration-order indexing).
-    let mut groups: [(SkipReason, Vec<&str>); 5] = [
-        (Binary, Vec::new()),
-        (DefaultExcludeDir, Vec::new()),
-        (UserExclude, Vec::new()),
-        (Gitignore, Vec::new()),
-        (Synsignore, Vec::new()),
-    ];
-    for sf in skipped {
-        let idx = sf.reason as usize;
-        groups[idx].1.push(sf.path.as_str());
-    }
-    // Local lex sort per bucket — defensive even though the
-    // collector already sorts globally.
-    for (_, paths) in groups.iter_mut() {
-        paths.sort();
-    }
-
-    eprintln!("warning: {} file(s) skipped from push", skipped.len());
-    for (reason, paths) in &groups {
-        if paths.is_empty() {
-            continue;
-        }
-        let total = paths.len();
-        let shown: Vec<&str> = paths.iter().take(MAX_PER_CATEGORY).copied().collect();
-        let joined = shown.join(", ");
-        if total > MAX_PER_CATEGORY {
-            let more = total - MAX_PER_CATEGORY;
-            eprintln!("  {reason} ({total}): {joined}, +{more} more");
-        } else {
-            eprintln!("  {reason} ({total}): {joined}");
-        }
-    }
-
-    // Conditional hints (SPEC § 3.4 rule 6).
-    if !strict {
-        eprintln!("  hint: pass --strict to fail the push when any file is skipped");
-    }
-    if skipped.iter().any(|sf| sf.reason == Binary) {
-        eprintln!(
-            "  hint: add binary extensions (e.g. *.png, *.pdf) to .synsignore to silence the binary warning"
-        );
-    }
-    if !no_default_excludes && skipped.iter().any(|sf| sf.reason == DefaultExcludeDir) {
-        eprintln!(
-            "  hint: pass --no-default-excludes to include build / cache directories in the push"
-        );
-    }
+    let mut buf = String::new();
+    let _ = write_skip_summary(&mut buf, skipped, strict, no_default_excludes);
+    eprint!("{buf}");
 }
 
 fn format_response(
@@ -286,6 +248,7 @@ fn format_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::push::collector::SkipReason;
     use serial_test::serial;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

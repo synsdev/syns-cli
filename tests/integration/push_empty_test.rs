@@ -5,51 +5,30 @@ use assert_cmd::Command as AssertCommand;
 use serde_json::json;
 use serial_test::serial;
 use std::fs;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+
+use super::common::{SpawnOpts, spawn_mock_env};
 
 #[test]
 #[serial]
 fn empty_collection_exits_6_with_cause_diagnostic() {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let (server, project_dir, config_dir, cache_dir, mock_uri) = rt.block_on(async {
-        let server = MockServer::start().await;
-        // No mocks mounted — empty guard must fire before any wire call.
-
-        let project_dir = tempfile::tempdir().unwrap();
-        let config_dir = tempfile::tempdir().unwrap();
-        let cache_dir = tempfile::tempdir().unwrap();
-        let uri = server.uri();
-
-        unsafe { std::env::set_var("SYNS_CONFIG_DIR", config_dir.path()) };
-        let config = syns_cli::config::Config::new(Some(&uri)).unwrap();
-        let store = syns_cli::auth::token::TokenStore::new(config.credentials_path());
-        store
-            .write_with_username("test-token", Some("alice"))
-            .unwrap();
-        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
-
-        (server, project_dir, config_dir, cache_dir, uri)
-    });
+    let env = spawn_mock_env(SpawnOpts::default());
+    // No PUT mock mounted — empty guard must fire before any wire call.
 
     // .gitignore: * — every file (including .syns.yaml that Phase 1
     // auto-writes) is gitignored, so files is empty.
-    fs::write(project_dir.path().join(".gitignore"), "*\n").unwrap();
+    fs::write(env.project_dir.path().join(".gitignore"), "*\n").unwrap();
 
     let output = AssertCommand::cargo_bin("syns")
         .expect("syns binary")
-        .env("SYNS_CONFIG_DIR", config_dir.path())
-        .env("SYNS_CACHE_DIR", cache_dir.path())
+        .env("SYNS_CONFIG_DIR", env.config_dir.path())
+        .env("SYNS_CACHE_DIR", env.cache_dir.path())
         .args([
             "--server",
-            &mock_uri,
+            &env.mock_uri,
             "push",
             "--name",
             "repo",
-            project_dir.path().to_str().unwrap(),
+            env.project_dir.path().to_str().unwrap(),
         ])
         .output()
         .expect("subprocess output");
@@ -78,7 +57,7 @@ fn empty_collection_exits_6_with_cause_diagnostic() {
         .build()
         .unwrap();
     rt.block_on(async {
-        let requests = server.received_requests().await.unwrap();
+        let requests = env.server.received_requests().await.unwrap();
         assert!(
             requests.is_empty(),
             "empty guard must fire before any wire call"
@@ -89,59 +68,31 @@ fn empty_collection_exits_6_with_cause_diagnostic() {
 #[test]
 #[serial]
 fn allow_empty_lets_empty_collection_through() {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let (server, project_dir, config_dir, cache_dir, mock_uri) = rt.block_on(async {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/v1/repos/alice/repo/tree"))
-            .respond_with(ResponseTemplate::new(404).set_body_json(json!({"error": "not_found"})))
-            .mount(&server)
-            .await;
-        Mock::given(method("PUT"))
-            .and(path("/api/v1/repos/alice/repo/push"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "commitSha": "abcd",
-                "version": 1,
-                "filesChanged": 0,
-                "created": true
-            })))
-            .mount(&server)
-            .await;
-
-        let project_dir = tempfile::tempdir().unwrap();
-        let config_dir = tempfile::tempdir().unwrap();
-        let cache_dir = tempfile::tempdir().unwrap();
-        let uri = server.uri();
-
-        unsafe { std::env::set_var("SYNS_CONFIG_DIR", config_dir.path()) };
-        let config = syns_cli::config::Config::new(Some(&uri)).unwrap();
-        let store = syns_cli::auth::token::TokenStore::new(config.credentials_path());
-        store
-            .write_with_username("test-token", Some("alice"))
-            .unwrap();
-        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
-
-        (server, project_dir, config_dir, cache_dir, uri)
+    let env = spawn_mock_env(SpawnOpts {
+        put_response: Some(json!({
+            "commitSha": "abcd",
+            "version": 1,
+            "filesChanged": 0,
+            "created": true,
+        })),
+        ..Default::default()
     });
 
     // .gitignore: * → collection empty; --allow-empty bypasses the guard.
-    fs::write(project_dir.path().join(".gitignore"), "*\n").unwrap();
+    fs::write(env.project_dir.path().join(".gitignore"), "*\n").unwrap();
 
     let output = AssertCommand::cargo_bin("syns")
         .expect("syns binary")
-        .env("SYNS_CONFIG_DIR", config_dir.path())
-        .env("SYNS_CACHE_DIR", cache_dir.path())
+        .env("SYNS_CONFIG_DIR", env.config_dir.path())
+        .env("SYNS_CACHE_DIR", env.cache_dir.path())
         .args([
             "--server",
-            &mock_uri,
+            &env.mock_uri,
             "push",
             "--name",
             "repo",
             "--allow-empty",
-            project_dir.path().to_str().unwrap(),
+            env.project_dir.path().to_str().unwrap(),
         ])
         .output()
         .expect("subprocess output");
@@ -157,11 +108,72 @@ fn allow_empty_lets_empty_collection_through() {
         .build()
         .unwrap();
     rt.block_on(async {
-        let requests = server.received_requests().await.unwrap();
+        let requests = env.server.received_requests().await.unwrap();
         let put_requests: Vec<_> = requests
             .iter()
             .filter(|r| r.method == reqwest::Method::PUT)
             .collect();
         assert_eq!(put_requests.len(), 1, "exactly one PUT expected");
     });
+}
+
+/// CODE_REVIEW H1: `--json` mode must emit the SPEC § 7 structured
+/// envelope `{"error":"push_empty","path":..,"cause":..,"totalWalked":..}`
+/// to stdout (NOT stderr — `Output::error` `println!`s in JSON mode).
+/// Scripted consumers can therefore `jq '.error == "push_empty"'`
+/// directly instead of substring-matching a prose blob.
+#[test]
+#[serial]
+fn push_empty_json_envelope_has_structured_fields() {
+    let env = spawn_mock_env(SpawnOpts::default());
+    // No PUT mock — empty guard fires first.
+
+    fs::write(env.project_dir.path().join(".gitignore"), "*\n").unwrap();
+
+    let output = AssertCommand::cargo_bin("syns")
+        .expect("syns binary")
+        .env("SYNS_CONFIG_DIR", env.config_dir.path())
+        .env("SYNS_CACHE_DIR", env.cache_dir.path())
+        .args([
+            "--json",
+            "--server",
+            &env.mock_uri,
+            "push",
+            "--name",
+            "repo",
+            env.project_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("subprocess output");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(6),
+        "exit code should be 6 (PUSH_EMPTY) — stdout was: {stdout}, stderr was: {stderr}"
+    );
+
+    // The JSON envelope is on STDOUT (Output::error in JSON mode uses
+    // println! per output.rs:88-89).
+    let trimmed = stdout.trim();
+    let parsed: serde_json::Value = serde_json::from_str(trimmed).unwrap_or_else(|e| {
+        panic!("stdout was not valid JSON ({e}): {stdout}");
+    });
+    assert_eq!(
+        parsed["error"], "push_empty",
+        "envelope.error mismatch: {parsed}"
+    );
+    assert!(
+        parsed["path"].is_string(),
+        "envelope.path is not a string: {parsed}"
+    );
+    assert!(
+        parsed["cause"].is_string(),
+        "envelope.cause is not a string: {parsed}"
+    );
+    assert!(
+        parsed["totalWalked"].is_number(),
+        "envelope.totalWalked is not a number: {parsed}"
+    );
 }

@@ -5,65 +5,38 @@ use assert_cmd::Command as AssertCommand;
 use serde_json::json;
 use serial_test::serial;
 use std::fs;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+
+use super::common::{SpawnOpts, spawn_mock_env};
 
 #[test]
 #[serial]
 fn parent_gitignore_star_does_not_empty_push() {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let (server, ancestor_dir, config_dir, cache_dir, mock_uri) = rt.block_on(async {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/v1/repos/alice/repo/tree"))
-            .respond_with(ResponseTemplate::new(404).set_body_json(json!({"error": "not_found"})))
-            .mount(&server)
-            .await;
-        Mock::given(method("PUT"))
-            .and(path("/api/v1/repos/alice/repo/push"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "commitSha": "abcd",
-                "version": 1,
-                "filesChanged": 2,
-                "created": true
-            })))
-            .mount(&server)
-            .await;
-
-        let ancestor = tempfile::tempdir().unwrap();
-        let config_dir = tempfile::tempdir().unwrap();
-        let cache_dir = tempfile::tempdir().unwrap();
-        let uri = server.uri();
-
-        unsafe { std::env::set_var("SYNS_CONFIG_DIR", config_dir.path()) };
-        let config = syns_cli::config::Config::new(Some(&uri)).unwrap();
-        let store = syns_cli::auth::token::TokenStore::new(config.credentials_path());
-        store
-            .write_with_username("test-token", Some("alice"))
-            .unwrap();
-        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
-
-        (server, ancestor, config_dir, cache_dir, uri)
+    let env = spawn_mock_env(SpawnOpts {
+        put_response: Some(json!({
+            "commitSha": "abcd",
+            "version": 1,
+            "filesChanged": 2,
+            "created": true,
+        })),
+        ..Default::default()
     });
 
-    // Hostile ancestor .gitignore.
-    fs::write(ancestor_dir.path().join(".gitignore"), "*\n").unwrap();
-    // Child source/ subdir with real content.
-    fs::create_dir_all(ancestor_dir.path().join("source")).unwrap();
-    fs::write(ancestor_dir.path().join("source/important.md"), "important").unwrap();
-    fs::write(ancestor_dir.path().join("source/code.rs"), "fn main() {}").unwrap();
+    // Treat env.project_dir as the *ancestor* dir; push from
+    // {ancestor}/source/.
+    let ancestor_dir = env.project_dir.path();
+    fs::write(ancestor_dir.join(".gitignore"), "*\n").unwrap();
+    fs::create_dir_all(ancestor_dir.join("source")).unwrap();
+    fs::write(ancestor_dir.join("source/important.md"), "important").unwrap();
+    fs::write(ancestor_dir.join("source/code.rs"), "fn main() {}").unwrap();
 
-    let source_dir = ancestor_dir.path().join("source");
+    let source_dir = ancestor_dir.join("source");
     let output = AssertCommand::cargo_bin("syns")
         .expect("syns binary")
-        .env("SYNS_CONFIG_DIR", config_dir.path())
-        .env("SYNS_CACHE_DIR", cache_dir.path())
+        .env("SYNS_CONFIG_DIR", env.config_dir.path())
+        .env("SYNS_CACHE_DIR", env.cache_dir.path())
         .args([
             "--server",
-            &mock_uri,
+            &env.mock_uri,
             "push",
             "--name",
             "repo",
@@ -87,7 +60,7 @@ fn parent_gitignore_star_does_not_empty_push() {
         .build()
         .unwrap();
     rt.block_on(async {
-        let requests = server.received_requests().await.unwrap();
+        let requests = env.server.received_requests().await.unwrap();
         let put_request = requests
             .iter()
             .find(|r| r.method == reqwest::Method::PUT)

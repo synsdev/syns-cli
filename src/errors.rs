@@ -1,4 +1,4 @@
-use crate::push::collector::SkippedFile;
+use crate::push::collector::{SkippedFile, write_skip_summary};
 
 #[derive(Debug)]
 #[allow(dead_code)] // Variants used by downstream units (U09, U10, etc.)
@@ -27,6 +27,10 @@ pub enum CliError {
     },
     PushPartial {
         skipped: Vec<SkippedFile>,
+        /// Mirrors `args.no_default_excludes`; consumed by the
+        /// per-category breakdown rendered inside `Display` so the
+        /// no-default-excludes hint line is gated correctly (SPEC § 7).
+        no_default_excludes: bool,
     },
 }
 
@@ -45,6 +49,34 @@ impl CliError {
             CliError::PushEmpty { .. } => 6,
             CliError::Upgrade(e) => e.exit_code(),
             _ => 1,
+        }
+    }
+
+    /// Render this error as a structured JSON envelope when one is
+    /// bound by SPEC § 7 (currently `PushEmpty` and `PushPartial`).
+    /// Returning `None` means the generic `{"error":"<Display>"}`
+    /// fallback in `Output::format_error` should be used instead.
+    ///
+    /// Wire shapes (SPEC u213 § 7):
+    /// - `PushEmpty` → `{"error":"push_empty","path":..,"cause":..,"totalWalked":..}`
+    /// - `PushPartial` → `{"error":"push_partial","skipped":[..]}`
+    pub fn json_value(&self) -> Option<serde_json::Value> {
+        match self {
+            CliError::PushEmpty {
+                path,
+                total_walked,
+                cause,
+            } => Some(serde_json::json!({
+                "error": "push_empty",
+                "path": path,
+                "cause": cause,
+                "totalWalked": total_walked,
+            })),
+            CliError::PushPartial { skipped, .. } => Some(serde_json::json!({
+                "error": "push_partial",
+                "skipped": skipped,
+            })),
+            _ => None,
         }
     }
 
@@ -115,12 +147,24 @@ impl std::fmt::Display for CliError {
                     "nothing to push from {path}\n  source contained {total_walked} files but all were excluded.\n  most likely cause: {cause}.\n  to debug: rerun with --debug to see per-file exclusion decisions.\n  to override: rerun with --allow-empty to push an empty change set."
                 )
             }
-            CliError::PushPartial { skipped } => {
+            CliError::PushPartial {
+                skipped,
+                no_default_excludes,
+            } => {
+                // SPEC § 7: headline first, then the same per-category
+                // skip-summary block from § 3.4 (without the strict
+                // hint — strict is true by construction here; the
+                // binary and no-default-excludes hints remain).
                 write!(
                     f,
                     "push aborted: {} file(s) were skipped under --strict",
                     skipped.len()
-                )
+                )?;
+                if !skipped.is_empty() {
+                    writeln!(f)?;
+                    write_skip_summary(f, skipped, /* strict = */ true, *no_default_excludes)?;
+                }
+                Ok(())
             }
         }
     }
@@ -204,7 +248,14 @@ mod tests {
             1
         );
 
-        assert_eq!((CliError::PushPartial { skipped: vec![] }).exit_code(), 3);
+        assert_eq!(
+            (CliError::PushPartial {
+                skipped: vec![],
+                no_default_excludes: false,
+            })
+            .exit_code(),
+            3
+        );
         assert_eq!(
             (CliError::PushEmpty {
                 path: "/tmp/x".into(),
@@ -277,10 +328,95 @@ mod tests {
         assert!(pe_text.contains("every file appears to be binary"));
         assert!(pe_text.contains("--allow-empty"));
 
-        let pp = CliError::PushPartial { skipped: vec![] };
+        let pp = CliError::PushPartial {
+            skipped: vec![],
+            no_default_excludes: false,
+        };
+        // Empty-skipped short-circuit: headline only, no breakdown.
         assert_eq!(
             pp.to_string(),
             "push aborted: 0 file(s) were skipped under --strict"
+        );
+    }
+
+    #[test]
+    fn display_push_partial_includes_per_category_breakdown_after_headline() {
+        // SPEC § 7 ordering: headline first, then the per-category
+        // skip-summary block (without the strict hint).
+        use crate::push::collector::SkipReason;
+        let pp = CliError::PushPartial {
+            skipped: vec![
+                SkippedFile {
+                    path: "logo.png".into(),
+                    reason: SkipReason::Binary,
+                },
+                SkippedFile {
+                    path: "dist/bundle.js".into(),
+                    reason: SkipReason::DefaultExcludeDir,
+                },
+            ],
+            no_default_excludes: false,
+        };
+        let s = pp.to_string();
+        let headline_pos = s.find("push aborted: 2 file(s)").expect("headline missing");
+        let warning_pos = s
+            .find("warning: 2 file(s) skipped")
+            .expect("breakdown missing");
+        assert!(
+            headline_pos < warning_pos,
+            "headline must come BEFORE per-category breakdown (SPEC § 7); got: {s}"
+        );
+        assert!(s.contains("binary content (1): logo.png"));
+        assert!(s.contains("default-excluded directory (1): dist/bundle.js"));
+        // strict hint absent (PushPartial implies strict=true).
+        assert!(!s.contains("pass --strict to fail the push"));
+        // binary hint present.
+        assert!(s.contains("add binary extensions"));
+        // no-default-excludes hint present (no_default_excludes=false + DefaultExcludeDir entry).
+        assert!(s.contains("pass --no-default-excludes"));
+    }
+
+    #[test]
+    fn json_value_push_empty_uses_structured_shape() {
+        let pe = CliError::PushEmpty {
+            path: "/tmp/proj".into(),
+            total_walked: 3,
+            cause: "every file matches a --exclude pattern".into(),
+        };
+        let v = pe.json_value().expect("PushEmpty has a json_value");
+        assert_eq!(v["error"], "push_empty");
+        assert_eq!(v["path"], "/tmp/proj");
+        assert_eq!(v["cause"], "every file matches a --exclude pattern");
+        assert_eq!(v["totalWalked"], 3);
+    }
+
+    #[test]
+    fn json_value_push_partial_uses_structured_shape() {
+        use crate::push::collector::SkipReason;
+        let pp = CliError::PushPartial {
+            skipped: vec![SkippedFile {
+                path: "logo.png".into(),
+                reason: SkipReason::Binary,
+            }],
+            no_default_excludes: false,
+        };
+        let v = pp.json_value().expect("PushPartial has a json_value");
+        assert_eq!(v["error"], "push_partial");
+        let arr = v["skipped"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["path"], "logo.png");
+        assert_eq!(arr[0]["reason"], "binary");
+    }
+
+    #[test]
+    fn json_value_returns_none_for_unrelated_variants() {
+        assert!(CliError::AuthRequired.json_value().is_none());
+        assert!(
+            CliError::Io {
+                message: "x".into()
+            }
+            .json_value()
+            .is_none()
         );
     }
 

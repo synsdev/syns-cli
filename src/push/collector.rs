@@ -25,30 +25,29 @@ const DEFAULT_EXCLUDE_DIRS: &[&str] = &[
 
 /// Options for `collect_files`. Wired from the CLI flags
 /// `--no-default-excludes` and `--debug` (see SPEC u213 § 3.2).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CollectOptions {
+    /// Mirror of CLI `--no-default-excludes`. When `true`, the
+    /// built-in skip list (`DEFAULT_EXCLUDE_DIRS`) is bypassed and
+    /// build / cache directory contents flow into the kept set.
     pub no_default_excludes: bool,
+    /// Mirror of CLI `--debug`. When `true`, every skip decision is
+    /// emitted to stderr as `[debug] skip {path}: {reason} ({source})`.
+    /// Uncoloured / not styled — these lines are documented as
+    /// copy-pastable in SPEC u213 § 3.2.
     pub debug: bool,
-}
-
-impl CollectOptions {
-    /// Zero-config defaults — preserves the u13 walker contract.
-    pub const fn default_const() -> Self {
-        CollectOptions {
-            no_default_excludes: false,
-            debug: false,
-        }
-    }
-}
-
-impl Default for CollectOptions {
-    fn default() -> Self {
-        Self::default_const()
-    }
 }
 
 /// One reason a file was excluded from the push. First match wins per
 /// SPEC u213 § 5 D2: `Binary > DefaultExcludeDir > UserExclude > Gitignore > Synsignore`.
+///
+/// IMPORTANT: declaration order is contractual. The enum is cast as
+/// `u8` (sort key in `SkippedFile.cmp` at line 352) and as `usize`
+/// (group index in `render_skip_summary` and `skip_summary_cause`).
+/// New variants MUST be appended at the END; reordering or inserting
+/// in the middle silently corrupts the sort order on existing data
+/// and the stderr layout.
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkipReason {
@@ -119,6 +118,22 @@ fn in_default_exclude_dir(rel_path: &Path) -> bool {
 /// classifier); the actual exclusion decision uses the kept walker's
 /// hierarchical filters which respect nested negation semantics.
 ///
+/// `extra_filenames` is folded into the same builder. For the
+/// gitignore attribution chain we also read `.ignore` files so the
+/// fallback `SkipReason::Gitignore` bucket no longer silently absorbs
+/// `.ignore`-driven exclusions (CODE_REVIEW M2). `.ignore` files are
+/// part of `WalkBuilder::standard_filters(true)` on the kept walker;
+/// without them in the attribution matcher, the kept walker would
+/// (correctly) skip the file but the attribution loop would fall
+/// through to the catch-all bucket and mis-label it.
+///
+/// NOTE on the remaining mis-attribution path (M2 case 2): a binary
+/// `is_binary` error on the attribution walker still routes through
+/// the catch-all `SkipReason::Gitignore` bucket. The lower-effort fix
+/// for case 1 (`.ignore` files) is applied here; case 2 is observable
+/// via the `[debug]` breadcrumb on the attribution walker's
+/// `is_binary` Err path (see `collect_files`).
+///
 /// Positive-only means: lines starting with `!` (negation) are
 /// dropped. This prevents a deeper-tree negation from masking a
 /// shallower-tree positive pattern in the flat matcher — at the cost
@@ -126,7 +141,12 @@ fn in_default_exclude_dir(rel_path: &Path) -> bool {
 /// negation would not appear here, but in that case the kept walker
 /// would have re-included the file anyway, so no attribution is
 /// needed.
-fn build_positive_only_matcher(source: &Path, filename: &str) -> Gitignore {
+fn build_positive_only_matcher(
+    source: &Path,
+    filename: &str,
+    extra_filenames: &[&str],
+    debug: bool,
+) -> Gitignore {
     let mut builder = GitignoreBuilder::new(source);
     for entry in WalkBuilder::new(source)
         .hidden(false)
@@ -139,7 +159,10 @@ fn build_positive_only_matcher(source: &Path, filename: &str) -> Gitignore {
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
-        if entry.file_name() != OsStr::new(filename) {
+        let name = entry.file_name();
+        let matches_primary = name == OsStr::new(filename);
+        let matches_extra = extra_filenames.iter().any(|f| name == OsStr::new(*f));
+        if !matches_primary && !matches_extra {
             continue;
         }
         let content = match std::fs::read_to_string(entry.path()) {
@@ -158,9 +181,43 @@ fn build_positive_only_matcher(source: &Path, filename: &str) -> Gitignore {
             let _ = builder.add_line(Some(from.clone()), trimmed);
         }
     }
-    builder.build().unwrap_or_else(|_| Gitignore::empty())
+    builder.build().unwrap_or_else(|err| {
+        if debug {
+            eprintln!("[debug] build_positive_only_matcher({filename}) build error: {err}");
+        }
+        Gitignore::empty()
+    })
 }
 
+/// Collect every file under `path` that should be pushed, plus an
+/// attributed list of every file the walker rejected.
+///
+/// # Two-walk invariant
+///
+/// This function deliberately runs TWO walkers over the source tree:
+///
+/// 1. **Kept walker** — uses `WalkBuilder::standard_filters(true)` so
+///    the `ignore` crate's own hierarchical filter chain (which
+///    correctly scopes nested `.gitignore` / `.synsignore` files,
+///    including negation patterns like `!*.tmp` in a deeper subdir)
+///    decides keep-vs-skip.
+/// 2. **Attribution walker** — uses `standard_filters(false)` so every
+///    file leaf surfaces and we can diff against the kept set to
+///    discover what the kept walker rejected, then classify the
+///    reason via a flat positive-only matcher.
+///
+/// Folding back to a single walker requires re-implementing nested
+/// `.gitignore` precedence by hand, which silently regresses the
+/// following tests:
+///
+/// - `nested_gitignore_precedence`
+/// - `source_local_gitignore_attributed_to_gitignore_reason`
+/// - `source_local_synsignore_attributed_to_synsignore_reason`
+/// - `dotfiles_bare_repo_reproduction_passes_after_fix`
+///
+/// Per D-067 § 5 both walkers also call `parents(false)` so ancestor
+/// ignore files are never consulted (a hostile `~/.gitignore: *`
+/// must NOT empty a push from a child directory).
 pub fn collect_files(
     path: &Path,
     excludes: &[String],
@@ -182,9 +239,14 @@ pub fn collect_files(
     // Positive-only attribution matchers used by the skip-reason
     // classifier to disambiguate Gitignore vs Synsignore. They are
     // NOT used to decide kept-vs-excluded — that is the kept walker's
-    // responsibility.
-    let attribution_gitignore = build_positive_only_matcher(path, ".gitignore");
-    let attribution_synsignore = build_positive_only_matcher(path, ".synsignore");
+    // responsibility. The gitignore attribution chain also folds in
+    // `.ignore` files (M2 case 1): the kept walker's `standard_filters`
+    // honours `.ignore` files, so without them in the attribution
+    // matcher, an `.ignore`-driven skip would mis-attribute via the
+    // catch-all fallback bucket.
+    let attribution_gitignore =
+        build_positive_only_matcher(path, ".gitignore", &[".ignore"], opts.debug);
+    let attribution_synsignore = build_positive_only_matcher(path, ".synsignore", &[], opts.debug);
 
     // Walk 1: kept walker — uses the `ignore` crate's hierarchical
     // filters which correctly respect nested .gitignore / .synsignore
@@ -239,9 +301,22 @@ pub fn collect_files(
             None => continue,
         };
 
-        if is_binary(entry.path()).unwrap_or(false) {
-            binary_among_kept.insert(rel_path_str);
-            continue;
+        // M1: explicit error propagation on the kept walker — matches
+        // the u13 contract. A short-read failure on `is_binary` must
+        // not silently route to the read-and-keep branch (where the
+        // same IO error would surface with a different message and
+        // partial state); surface it directly.
+        match is_binary(entry.path()) {
+            Ok(true) => {
+                binary_among_kept.insert(rel_path_str);
+                continue;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                return Err(CliError::Io {
+                    message: format!("could not read {rel_path_str}: {err}"),
+                });
+            }
         }
 
         let contents = std::fs::read(entry.path()).map_err(|err| CliError::Io {
@@ -298,9 +373,27 @@ pub fn collect_files(
 
         // Attribute the skip reason. Precedence per SPEC § 5 D2:
         // Binary > DefaultExcludeDir > UserExclude > Gitignore > Synsignore.
-        let reason = if binary_among_kept.contains(&rel_path_str)
-            || is_binary(entry.path()).unwrap_or(false)
-        {
+        //
+        // M1 (attribution side): the attribution loop is recovery-
+        // tolerant — a single unreadable file should not kill the
+        // push when the kept walker already decided to skip it. But
+        // the failure must be observable: emit a debug-gated
+        // breadcrumb so the rare path is at least visible under
+        // `--debug`. The file then falls through to the non-binary
+        // chain and ends up in whichever bucket claims it (or the
+        // catch-all `SkipReason::Gitignore` fallback, see M2 case 2).
+        let binary_check = match is_binary(entry.path()) {
+            Ok(b) => b,
+            Err(err) => {
+                if opts.debug {
+                    eprintln!(
+                        "[debug] skip {rel_path_str}: is_binary IO error on attribution walker: {err}"
+                    );
+                }
+                false
+            }
+        };
+        let reason = if binary_among_kept.contains(&rel_path_str) || binary_check {
             // Files inside default-excluded dirs are also checked
             // for binary content, so the precedence Binary > DefaultExcludeDir
             // is observed.
@@ -356,6 +449,90 @@ pub fn collect_files(
         skipped,
         total_walked,
     })
+}
+
+/// Maximum file paths shown per category in the skip-summary block
+/// before the `+K more` truncation suffix kicks in (SPEC u213 § 3.4).
+pub const MAX_PER_CATEGORY: usize = 5;
+
+/// Write the SPEC § 3.4 / § 7 per-category skip-summary block to
+/// `out`. Used by both `commands::push::render_skip_summary` (writes
+/// to a `String` buffer then `eprint!`s it to stderr) and by
+/// `errors::CliError::PushPartial`'s `Display` impl (writes to the
+/// formatter directly, so the headline-then-detail order from SPEC
+/// § 7 is structurally enforced — no caller-side intercept needed).
+///
+/// `strict` and `no_default_excludes` are the runtime flag values
+/// used to gate the conditional hint lines. The function emits no
+/// output (and no trailing newline) when `skipped.is_empty()`.
+pub fn write_skip_summary<W: std::fmt::Write>(
+    out: &mut W,
+    skipped: &[SkippedFile],
+    strict: bool,
+    no_default_excludes: bool,
+) -> std::fmt::Result {
+    use SkipReason::*;
+
+    if skipped.is_empty() {
+        return Ok(());
+    }
+
+    // Group by reason (fixed declaration-order indexing; relies on
+    // the `#[repr(u8)]` ABI contract on `SkipReason`).
+    let mut groups: [(SkipReason, Vec<&str>); 5] = [
+        (Binary, Vec::new()),
+        (DefaultExcludeDir, Vec::new()),
+        (UserExclude, Vec::new()),
+        (Gitignore, Vec::new()),
+        (Synsignore, Vec::new()),
+    ];
+    for sf in skipped {
+        let idx = sf.reason as usize;
+        groups[idx].1.push(sf.path.as_str());
+    }
+    // Local lex sort per bucket — defensive even though the
+    // collector already sorts globally.
+    for (_, paths) in groups.iter_mut() {
+        paths.sort();
+    }
+
+    writeln!(out, "warning: {} file(s) skipped from push", skipped.len())?;
+    for (reason, paths) in &groups {
+        if paths.is_empty() {
+            continue;
+        }
+        let total = paths.len();
+        let shown: Vec<&str> = paths.iter().take(MAX_PER_CATEGORY).copied().collect();
+        let joined = shown.join(", ");
+        if total > MAX_PER_CATEGORY {
+            let more = total - MAX_PER_CATEGORY;
+            writeln!(out, "  {reason} ({total}): {joined}, +{more} more")?;
+        } else {
+            writeln!(out, "  {reason} ({total}): {joined}")?;
+        }
+    }
+
+    // Conditional hints (SPEC § 3.4 rule 6 / § 7).
+    if !strict {
+        writeln!(
+            out,
+            "  hint: pass --strict to fail the push when any file is skipped"
+        )?;
+    }
+    if skipped.iter().any(|sf| sf.reason == Binary) {
+        writeln!(
+            out,
+            "  hint: add binary extensions (e.g. *.png, *.pdf) to .synsignore to silence the binary warning"
+        )?;
+    }
+    if !no_default_excludes && skipped.iter().any(|sf| sf.reason == DefaultExcludeDir) {
+        writeln!(
+            out,
+            "  hint: pass --no-default-excludes to include build / cache directories in the push"
+        )?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -698,6 +875,36 @@ mod tests {
                 .skipped
                 .iter()
                 .any(|s| s.path == "a.tmp" && s.reason == SkipReason::Gitignore)
+        );
+    }
+
+    /// CODE_REVIEW M2 case 1: `.ignore` files (honoured by the
+    /// kept walker's `standard_filters(true)`) must also be folded
+    /// into the gitignore attribution chain — otherwise the skip
+    /// lands in the fallback `SkipReason::Gitignore` bucket but for
+    /// a phantom reason. Regression backstop for the
+    /// `build_positive_only_matcher` extension that reads `.ignore`
+    /// alongside `.gitignore` / `.synsignore`.
+    #[test]
+    fn dot_ignore_file_is_attributed_to_gitignore_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("keep.txt"), "k").unwrap();
+        std::fs::write(dir.path().join("noisy.log"), "n").unwrap();
+        // Source-local `.ignore` file (NOT `.gitignore`) excludes the
+        // log file. The kept walker honours this via standard_filters;
+        // the attribution chain must too.
+        std::fs::write(dir.path().join(".ignore"), "*.log\n").unwrap();
+
+        let result = collect_files(dir.path(), &[], CollectOptions::default()).unwrap();
+        assert!(result.files.contains_key("keep.txt"));
+        assert!(!result.files.contains_key("noisy.log"));
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(
+            result.skipped[0],
+            SkippedFile {
+                path: "noisy.log".into(),
+                reason: SkipReason::Gitignore,
+            }
         );
     }
 

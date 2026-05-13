@@ -13,6 +13,11 @@ use crate::push::hash::blob_sha1;
 use crate::push::manifest::Manifest;
 use crate::repo::syns_yaml::write_syns_yaml;
 
+/// Knobs passed into `smart_push` from the CLI layer. Wraps the
+/// historical push options (force, message, author, excludes, …) plus
+/// the four u213 push-feedback flags (`strict`, `allow_empty`,
+/// `debug`, `no_default_excludes`). See SPEC u213 § 3.2 for the
+/// per-flag semantics.
 pub struct SmartPushOptions {
     pub force: bool,
     pub message: String,
@@ -24,9 +29,23 @@ pub struct SmartPushOptions {
     pub tags: Option<Vec<String>>,
     pub status: Option<RepoStatus>,
     pub visibility: Option<Visibility>,
+    /// Mirror of CLI `--strict`. When `true` and any file is skipped,
+    /// `smart_push` returns `CliError::PushPartial` before any wire
+    /// call (SPEC § 3.2, Phase 2b).
     pub strict: bool,
+    /// Mirror of CLI `--allow-empty`. When `true`, bypasses the
+    /// empty-collection guard so an empty push proceeds to the wire
+    /// (SPEC § 3.2, Phase 2c).
     pub allow_empty: bool,
+    /// Mirror of CLI `--debug`. When `true`, the collector emits one
+    /// `[debug] skip {path}: {reason} ({source})` line per excluded
+    /// file to stderr (SPEC § 3.2).
     pub debug: bool,
+    /// Mirror of CLI `--no-default-excludes`. When `true`, the
+    /// built-in `DEFAULT_EXCLUDE_DIRS` skip list is bypassed (SPEC
+    /// § 3.2). Also threaded into the `PushPipelineMeta` and into
+    /// `CliError::PushPartial` so the no-default-excludes hint line
+    /// is gated correctly in both the success and the error paths.
     pub no_default_excludes: bool,
 }
 
@@ -193,7 +212,10 @@ pub async fn smart_push(
 
     // Phase 2b — Strict guard (supersedes empty per SPEC D10).
     if opts.strict && !skipped.is_empty() {
-        return Err(CliError::PushPartial { skipped });
+        return Err(CliError::PushPartial {
+            skipped,
+            no_default_excludes: opts.no_default_excludes,
+        });
     }
 
     // Phase 2c — Empty guard.
@@ -939,7 +961,7 @@ mod tests {
         .await;
 
         match result {
-            Err(CliError::PushPartial { skipped }) => {
+            Err(CliError::PushPartial { skipped, .. }) => {
                 assert_eq!(skipped.len(), 1);
                 assert_eq!(skipped[0].path, "binary.bin");
             }
@@ -984,12 +1006,16 @@ mod tests {
                 total_walked: _,
                 cause,
             }) => {
-                // Cause should reflect the user-exclude majority (the
-                // .syns.yaml entry matched `*`).
-                assert!(
-                    cause.contains("exclude") || cause.contains("contains no files"),
-                    "cause was: {cause}"
-                );
+                // CODE_REVIEW M6: assert the SPECIFIC user-exclude
+                // cause. Setup uses `excludes: ["*"]`, so the only
+                // skipped file (.syns.yaml) lands in UserExclude and
+                // the cause sentence MUST contain "--exclude pattern".
+                // Previously the assertion `contains("exclude")` would
+                // also pass for the DefaultExcludeDir, Gitignore, and
+                // Synsignore majority strings — a regression that
+                // misattributed user-exclude as gitignore would have
+                // gone unnoticed.
+                assert!(cause.contains("--exclude pattern"), "cause was: {cause}");
             }
             other => panic!("expected PushEmpty, got {other:?}"),
         }
@@ -1068,7 +1094,7 @@ mod tests {
         .await;
 
         match result {
-            Err(CliError::PushPartial { skipped }) => {
+            Err(CliError::PushPartial { skipped, .. }) => {
                 assert_eq!(skipped.len(), 1);
             }
             Err(CliError::PushEmpty { .. }) => {
