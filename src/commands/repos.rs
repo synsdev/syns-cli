@@ -58,11 +58,7 @@ impl CliRepoSort {
     }
 }
 
-pub async fn cmd_repos(
-    config: &Config,
-    output: &Output,
-    args: &ReposArgs,
-) -> Result<(), CliError> {
+pub async fn cmd_repos(config: &Config, output: &Output, args: &ReposArgs) -> Result<(), CliError> {
     // 1. Client-side pagination validation (avoid a wire round-trip for an
     //    out-of-range --limit). Bounds match the server's
     //    paginationFields.limit schema (.min(1).max(100)).
@@ -153,7 +149,7 @@ pub async fn cmd_repos(
 mod tests {
     use super::*;
     use serial_test::serial;
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{method, path, query_param, query_param_is_missing};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn default_args() -> ReposArgs {
@@ -177,6 +173,13 @@ mod tests {
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/repos"))
+            .and(query_param("limit", "20"))
+            .and(query_param("offset", "0"))
+            .and(query_param_is_missing("q"))
+            .and(query_param_is_missing("owner"))
+            .and(query_param_is_missing("status"))
+            .and(query_param_is_missing("visibility"))
+            .and(query_param_is_missing("sort"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": [
                     {
@@ -303,31 +306,17 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn repos_invalid_limit_rejected_client_side_without_wire_call() {
-        let dir = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
-
-        let mock_server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/v1/repos"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": [],
-                "total": 0,
-                "limit": 20,
-                "offset": 0
-            })))
-            .mount(&mock_server)
-            .await;
-
-        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        // The bounds check fires before any token load or HTTP call, so this
+        // test needs neither SYNS_CONFIG_DIR nor a mock server — Config alone
+        // is enough.
+        let config = Config::new(Some("https://example.invalid")).unwrap();
         let output = Output::new(false);
 
         let mut args = default_args();
         args.limit = 200; // out of [1, 100]
 
         let result = cmd_repos(&config, &output, &args).await;
-        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         let err = result.expect_err("limit=200 must be rejected client-side");
         match err {
@@ -337,11 +326,6 @@ mod tests {
             }
             other => panic!("expected CliError::Config, got {other:?}"),
         }
-
-        assert!(
-            mock_server.received_requests().await.unwrap().is_empty(),
-            "no wire call should be made when --limit is out of range"
-        );
     }
 
     #[tokio::test]

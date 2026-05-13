@@ -19,7 +19,7 @@ pub enum RepoStatus {
 }
 
 impl RepoStatus {
-    pub fn as_query_str(&self) -> &str {
+    pub fn as_query_str(&self) -> &'static str {
         match self {
             RepoStatus::Active => "active",
             RepoStatus::Draft => "draft",
@@ -1171,7 +1171,6 @@ impl SynsClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
     use wiremock::matchers::{header, method, path, query_param, query_param_is_missing};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1442,7 +1441,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn list_repos_emits_q_param_not_search_param() {
         let mock_server = MockServer::start().await;
 
@@ -1470,7 +1468,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn list_repos_emits_all_filter_params() {
         let mock_server = MockServer::start().await;
 
@@ -1511,7 +1508,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn list_repos_omits_absent_filters() {
         let mock_server = MockServer::start().await;
 
@@ -1543,7 +1539,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn list_repos_sends_bearer_token_when_provided() {
         let mock_server = MockServer::start().await;
 
@@ -1566,5 +1561,42 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn repo_list_response_serializes_verbatim_envelope() {
+        // Lock the Serialize behaviour end-to-end: a hand-built RepoListResponse
+        // round-trips through serde_json::to_string and matches the canonical
+        // wire string byte-for-byte. Guards JSON-mode pass-through in cmd_repos
+        // against silent drops of any field (e.g., a future regression that
+        // removes Serialize from RepoListResponse or any transitive type).
+        let response = RepoListResponse {
+            data: vec![RepoResponse {
+                owner: "bart".to_string(),
+                name: "syns".to_string(),
+                description: Some("a repo".to_string()),
+                commit_sha: Some("abc123".to_string()),
+                status: RepoStatus::Active,
+                author: Some("Alice".to_string()),
+                tags: vec!["alpha".to_string(), "beta".to_string()],
+                visibility: Visibility::Public,
+                forked_from: Some(ForkedFrom {
+                    owner: "upstream".to_string(),
+                    name: "syns".to_string(),
+                }),
+                fork_count: 2,
+                file_count: 436,
+                role: Some(CollaboratorRole::Owner),
+                created_at: "2025-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-05-07T13:00:01Z".to_string(),
+            }],
+            total: 1,
+            limit: 20,
+            offset: 0,
+        };
+
+        let actual = serde_json::to_string(&response).unwrap();
+        let expected = r#"{"data":[{"owner":"bart","name":"syns","description":"a repo","commitSha":"abc123","status":"active","author":"Alice","tags":["alpha","beta"],"visibility":"public","forkedFrom":{"owner":"upstream","name":"syns"},"forkCount":2,"fileCount":436,"role":"owner","createdAt":"2025-01-01T00:00:00Z","updatedAt":"2026-05-07T13:00:01Z"}],"total":1,"limit":20,"offset":0}"#;
+        assert_eq!(actual, expected);
     }
 }
