@@ -56,6 +56,10 @@ async fn push_creates_repo_and_sends_files() {
         status: None,
         visibility: None,
         if_repo: false,
+        strict: false,
+        allow_empty: false,
+        debug: false,
+        no_default_excludes: false,
     };
     let result = cmd_push(&ctx.config, &ctx.output, &args).await;
     assert!(result.is_ok());
@@ -110,6 +114,10 @@ async fn push_sends_only_changed_files() {
         status: None,
         visibility: None,
         if_repo: false,
+        strict: false,
+        allow_empty: false,
+        debug: false,
+        no_default_excludes: false,
     };
     let result = cmd_push(&ctx.config, &ctx.output, &args).await;
     assert!(result.is_ok());

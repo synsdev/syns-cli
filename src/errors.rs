@@ -1,3 +1,5 @@
+use crate::push::collector::SkippedFile;
+
 #[derive(Debug)]
 #[allow(dead_code)] // Variants used by downstream units (U09, U10, etc.)
 pub enum CliError {
@@ -18,6 +20,14 @@ pub enum CliError {
         message: String,
     },
     Upgrade(crate::commands::upgrade::UpgradeError),
+    PushEmpty {
+        path: String,
+        total_walked: usize,
+        cause: String,
+    },
+    PushPartial {
+        skipped: Vec<SkippedFile>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +41,8 @@ impl CliError {
         match self {
             CliError::RepoIdentityUnknown => 2,
             CliError::ServerUnreachable { .. } => 3,
+            CliError::PushPartial { .. } => 3,
+            CliError::PushEmpty { .. } => 6,
             CliError::Upgrade(e) => e.exit_code(),
             _ => 1,
         }
@@ -93,6 +105,23 @@ impl std::fmt::Display for CliError {
             CliError::Io { message } => write!(f, "{message}"),
             CliError::Config { message } => write!(f, "configuration error: {message}"),
             CliError::Upgrade(e) => write!(f, "{e}"),
+            CliError::PushEmpty {
+                path,
+                total_walked,
+                cause,
+            } => {
+                write!(
+                    f,
+                    "nothing to push from {path}\n  source contained {total_walked} files but all were excluded.\n  most likely cause: {cause}.\n  to debug: rerun with --debug to see per-file exclusion decisions.\n  to override: rerun with --allow-empty to push an empty change set."
+                )
+            }
+            CliError::PushPartial { skipped } => {
+                write!(
+                    f,
+                    "push aborted: {} file(s) were skipped under --strict",
+                    skipped.len()
+                )
+            }
         }
     }
 }
@@ -174,6 +203,17 @@ mod tests {
             .exit_code(),
             1
         );
+
+        assert_eq!((CliError::PushPartial { skipped: vec![] }).exit_code(), 3);
+        assert_eq!(
+            (CliError::PushEmpty {
+                path: "/tmp/x".into(),
+                total_walked: 0,
+                cause: "test".into(),
+            })
+            .exit_code(),
+            6
+        );
     }
 
     #[test]
@@ -224,6 +264,23 @@ mod tests {
             }
             .to_string(),
             "configuration error: bad url"
+        );
+
+        let pe = CliError::PushEmpty {
+            path: "/tmp/x".into(),
+            total_walked: 3,
+            cause: "every file appears to be binary".into(),
+        };
+        let pe_text = pe.to_string();
+        assert!(pe_text.starts_with("nothing to push from /tmp/x"));
+        assert!(pe_text.contains("source contained 3 files but all were excluded"));
+        assert!(pe_text.contains("every file appears to be binary"));
+        assert!(pe_text.contains("--allow-empty"));
+
+        let pp = CliError::PushPartial { skipped: vec![] };
+        assert_eq!(
+            pp.to_string(),
+            "push aborted: 0 file(s) were skipped under --strict"
         );
     }
 

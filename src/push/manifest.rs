@@ -13,7 +13,20 @@ impl Manifest {
     pub fn load(cache_dir: &Path, owner: &str, name: &str) -> Option<Manifest> {
         let path = cache_dir.join(owner).join(format!("{name}.json"));
         let content = std::fs::read_to_string(&path).ok()?;
-        serde_json::from_str(&content).ok()
+        let manifest: Manifest = serde_json::from_str(&content).ok()?;
+        // Defensive stub guard (SPEC u213 § 4): reject manifests that
+        // carry an empty/missing commit_sha OR an empty files map.
+        // Both shapes are produced by issue 070's empty-sha write
+        // path or by a corrupted disk artifact; either way they
+        // cannot be trusted as an authoritative reference.
+        match manifest.commit_sha.as_deref() {
+            None | Some("") => return None,
+            Some(_) => {}
+        }
+        if manifest.files.is_empty() {
+            return None;
+        }
+        Some(manifest)
     }
 
     pub fn save(&self, cache_dir: &Path, owner: &str, name: &str) -> Result<(), CliError> {
@@ -130,5 +143,32 @@ mod tests {
             HashMap::from([("known.txt".to_string(), "abc123".to_string())]),
         );
         assert_eq!(manifest.file_sha("unknown.txt"), None);
+    }
+
+    #[test]
+    fn load_rejects_stub_with_empty_commit_sha() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("alice").join("repo.json");
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        std::fs::write(&manifest_path, r#"{"commit_sha":"","files":{}}"#).unwrap();
+        assert!(Manifest::load(dir.path(), "alice", "repo").is_none());
+    }
+
+    #[test]
+    fn load_rejects_stub_with_missing_commit_sha() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("alice").join("repo.json");
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        std::fs::write(&manifest_path, r#"{"files":{"a.txt":"abc"}}"#).unwrap();
+        assert!(Manifest::load(dir.path(), "alice", "repo").is_none());
+    }
+
+    #[test]
+    fn load_rejects_manifest_with_empty_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("alice").join("repo.json");
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        std::fs::write(&manifest_path, r#"{"commit_sha":"deadbeef","files":{}}"#).unwrap();
+        assert!(Manifest::load(dir.path(), "alice", "repo").is_none());
     }
 }

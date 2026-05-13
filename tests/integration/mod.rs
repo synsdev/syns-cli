@@ -1,4 +1,9 @@
 mod auth_test;
 mod if_repo_test;
+mod push_empty_test;
+mod push_manifest_stub_test;
+mod push_no_parent_ignore_test;
+mod push_skipped_summary_test;
+mod push_strict_test;
 mod push_test;
 mod upgrade_test;

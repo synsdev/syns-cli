@@ -8,7 +8,8 @@ use crate::commands::repo::{CliRepoStatus, CliVisibility};
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
-use crate::push::smart::{SmartPushOptions, smart_push};
+use crate::push::collector::{SkipReason, SkippedFile};
+use crate::push::smart::{PushPipelineMeta, SmartPushOptions, smart_push};
 use crate::repo::if_repo::resolve_or_skip;
 
 const DEFAULT_COMMIT_MESSAGE: &str = "push";
@@ -55,6 +56,22 @@ pub struct PushArgs {
     /// Silently skip (exit 0) when no Syns repo identity resolves
     #[arg(long)]
     pub if_repo: bool,
+
+    /// Fail the push (exit 3, PUSH_PARTIAL) when one or more files were excluded.
+    #[arg(long)]
+    pub strict: bool,
+
+    /// Allow pushing an empty change set (mirrors `git commit --allow-empty`).
+    #[arg(long)]
+    pub allow_empty: bool,
+
+    /// Print per-file exclusion decisions to stderr (useful for debugging PUSH_EMPTY).
+    #[arg(long)]
+    pub debug: bool,
+
+    /// Disable the built-in skip list (node_modules, dist, build, target, .next, .nuxt, __pycache__, .venv, .tox, .cache).
+    #[arg(long)]
+    pub no_default_excludes: bool,
 }
 
 async fn resolve_owner(
@@ -118,6 +135,10 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
         },
         status,
         visibility,
+        strict: args.strict,
+        allow_empty: args.allow_empty,
+        debug: args.debug,
+        no_default_excludes: args.no_default_excludes,
     };
 
     let client = match client {
@@ -125,11 +146,93 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
         None => SynsClient::new(config.server_url())?,
     };
 
-    let (response, raw) = smart_push(&client, &token, &repo_id, &push_path, opts).await?;
+    let push_result = smart_push(&client, &token, &repo_id, &push_path, opts).await;
+    let (response, raw, meta) = match push_result {
+        Ok(triple) => triple,
+        Err(CliError::PushPartial { skipped }) => {
+            // Render the per-category breakdown to stderr BEFORE
+            // bubbling the error so the one-line Display message and
+            // the breakdown appear in the right order (SPEC § 7).
+            render_skip_summary(&skipped, /* strict = */ true, args.no_default_excludes);
+            return Err(CliError::PushPartial { skipped });
+        }
+        Err(e) => return Err(e),
+    };
 
-    format_response(output, &response, &raw, &repo_id);
+    format_response(output, &response, &raw, &repo_id, &meta);
 
     Ok(())
+}
+
+/// Build the JSON envelope for `--json` mode: the verbatim server
+/// response, augmented with `skipped: [...]` iff non-empty.
+fn build_json_envelope(raw: &serde_json::Value, skipped: &[SkippedFile]) -> serde_json::Value {
+    if skipped.is_empty() {
+        return raw.clone();
+    }
+    let mut envelope = raw.as_object().cloned().unwrap_or_default();
+    envelope.insert(
+        "skipped".into(),
+        serde_json::to_value(skipped).unwrap_or(serde_json::Value::Null),
+    );
+    serde_json::Value::Object(envelope)
+}
+
+/// Render the SPEC § 3.4 skip-summary block to stderr.
+/// `strict` and `no_default_excludes` are the runtime flag values
+/// used to gate the hint lines.
+fn render_skip_summary(skipped: &[SkippedFile], strict: bool, no_default_excludes: bool) {
+    use SkipReason::*;
+    const MAX_PER_CATEGORY: usize = 5;
+
+    // Group by reason (fixed declaration-order indexing).
+    let mut groups: [(SkipReason, Vec<&str>); 5] = [
+        (Binary, Vec::new()),
+        (DefaultExcludeDir, Vec::new()),
+        (UserExclude, Vec::new()),
+        (Gitignore, Vec::new()),
+        (Synsignore, Vec::new()),
+    ];
+    for sf in skipped {
+        let idx = sf.reason as usize;
+        groups[idx].1.push(sf.path.as_str());
+    }
+    // Local lex sort per bucket — defensive even though the
+    // collector already sorts globally.
+    for (_, paths) in groups.iter_mut() {
+        paths.sort();
+    }
+
+    eprintln!("warning: {} file(s) skipped from push", skipped.len());
+    for (reason, paths) in &groups {
+        if paths.is_empty() {
+            continue;
+        }
+        let total = paths.len();
+        let shown: Vec<&str> = paths.iter().take(MAX_PER_CATEGORY).copied().collect();
+        let joined = shown.join(", ");
+        if total > MAX_PER_CATEGORY {
+            let more = total - MAX_PER_CATEGORY;
+            eprintln!("  {reason} ({total}): {joined}, +{more} more");
+        } else {
+            eprintln!("  {reason} ({total}): {joined}");
+        }
+    }
+
+    // Conditional hints (SPEC § 3.4 rule 6).
+    if !strict {
+        eprintln!("  hint: pass --strict to fail the push when any file is skipped");
+    }
+    if skipped.iter().any(|sf| sf.reason == Binary) {
+        eprintln!(
+            "  hint: add binary extensions (e.g. *.png, *.pdf) to .synsignore to silence the binary warning"
+        );
+    }
+    if !no_default_excludes && skipped.iter().any(|sf| sf.reason == DefaultExcludeDir) {
+        eprintln!(
+            "  hint: pass --no-default-excludes to include build / cache directories in the push"
+        );
+    }
 }
 
 fn format_response(
@@ -137,10 +240,19 @@ fn format_response(
     response: &PushResponse,
     raw: &serde_json::Value,
     repo_id: &str,
+    meta: &PushPipelineMeta,
 ) {
     if output.is_json() {
-        output.json(raw);
-    } else if response.files_changed > 0 || response.created {
+        // SPEC § 3.5: augment the verbatim server response with the
+        // additive `skipped` field when meta.skipped is non-empty.
+        let envelope = build_json_envelope(raw, &meta.skipped);
+        output.json(&envelope);
+        return;
+    }
+
+    let changed = response.files_changed > 0 || response.created;
+
+    if changed {
         output.success(&format!("Pushed to {repo_id}"));
         output.table(
             &["", ""],
@@ -153,8 +265,21 @@ fn format_response(
                 vec!["files changed".into(), response.files_changed.to_string()],
             ],
         );
-    } else {
+    } else if meta.manifest_existed {
+        // Subsequent-push-noop — preserved behaviour from u41.
         output.success(&format!("No changes — {repo_id} is up to date"));
+    } else {
+        // First-push-noop suspicious branch — SPEC § 4 matrix bottom row.
+        let short_name = repo_id.split('/').nth(1).unwrap_or(repo_id);
+        eprintln!(
+            "warning: Push response indicates no changes were committed and no prior \
+             manifest existed for {repo_id}. The server may have accepted an empty push — \
+             verify with `syns ls --name {short_name}`."
+        );
+    }
+
+    if !meta.skipped.is_empty() {
+        render_skip_summary(&meta.skipped, meta.strict, meta.no_default_excludes);
     }
 }
 
@@ -177,6 +302,10 @@ mod tests {
             visibility: None,
             path: None,
             if_repo: false,
+            strict: false,
+            allow_empty: false,
+            debug: false,
+            no_default_excludes: false,
         }
     }
 
@@ -520,5 +649,51 @@ mod tests {
         let expected: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(raw, expected);
         assert!(typed.commit_sha.starts_with("abc1234567890"));
+    }
+
+    #[test]
+    fn build_json_envelope_includes_skipped_field() {
+        let raw = serde_json::json!({
+            "commitSha": "abc",
+            "version": 1,
+            "filesChanged": 1,
+            "created": false
+        });
+        let skipped = vec![
+            SkippedFile {
+                path: "a.png".into(),
+                reason: SkipReason::Binary,
+            },
+            SkippedFile {
+                path: "b/c.js".into(),
+                reason: SkipReason::DefaultExcludeDir,
+            },
+        ];
+        let envelope = build_json_envelope(&raw, &skipped);
+        let arr = envelope
+            .as_object()
+            .unwrap()
+            .get("skipped")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["path"], "a.png");
+        assert_eq!(arr[0]["reason"], "binary");
+        assert_eq!(arr[1]["path"], "b/c.js");
+        assert_eq!(arr[1]["reason"], "default_exclude_dir");
+    }
+
+    #[test]
+    fn build_json_envelope_omits_skipped_when_empty() {
+        let raw = serde_json::json!({
+            "commitSha": "abc",
+            "version": 1,
+            "filesChanged": 1,
+            "created": false
+        });
+        let envelope = build_json_envelope(&raw, &[]);
+        assert!(envelope.as_object().unwrap().get("skipped").is_none());
+        assert_eq!(envelope, raw);
     }
 }
