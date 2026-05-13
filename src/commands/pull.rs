@@ -398,4 +398,66 @@ mod tests {
         assert!(result.is_ok());
         assert!(mock_server.received_requests().await.unwrap().is_empty());
     }
+
+    /// CR Low-2 regression backstop. SPEC § 4 `cmd_pull` and § 9
+    /// `pull.rs` Invariants state: "when `repo_arg.is_some()`,
+    /// `if_repo` is structurally unreachable (the resolver is
+    /// bypassed); behavior is identical to today." This test
+    /// exercises that branch from an empty tempdir (no `.syns.yaml`)
+    /// with `if_repo: true` AND `repo_arg: Some("alice/my-project")`
+    /// — the positional MUST drive identity and `--if-repo` MUST NOT
+    /// short-circuit. A future refactor that moves the resolver call
+    /// before the `repo_arg` branch (or that suppresses the HTTP call
+    /// under `--if-repo` regardless of `repo_arg`) would cause this
+    /// test to fail by either (a) returning `Ok` with zero received
+    /// requests, or (b) returning an error from the resolver miss.
+    #[tokio::test]
+    #[serial]
+    async fn pull_with_if_repo_and_positional_owner_name_uses_positional_not_resolver() {
+        let dir = tempfile::tempdir().unwrap();
+        // No .syns.yaml — the resolver would miss if it were called.
+        std::env::set_current_dir(dir.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v1/repos/alice/repo/tree"))
+            .and(wiremock::matchers::query_param("recursive", "true"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "entries": [],
+                    "commitSha": "abc123",
+                    "truncated": false
+                })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(false);
+
+        let result = cmd_pull(
+            &config,
+            &output,
+            Some("alice/repo".into()),
+            None,
+            None,
+            true,
+        )
+        .await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        assert!(result.is_ok(), "cmd_pull returned: {result:?}");
+        let requests = mock_server.received_requests().await.unwrap();
+        assert!(
+            !requests.is_empty(),
+            "--if-repo short-circuited even though positional OWNER/NAME was provided"
+        );
+        assert!(
+            requests.iter().any(|r| r.method == reqwest::Method::GET
+                && r.url.path() == "/api/v1/repos/alice/repo/tree"),
+            "positional did not drive the GET tree request: {requests:?}"
+        );
+    }
 }

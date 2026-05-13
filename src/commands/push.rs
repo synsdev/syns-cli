@@ -77,13 +77,13 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
         })?,
     };
 
-    let token_store = TokenStore::new(config.credentials_path());
-    let token = token_store.read()?.ok_or(CliError::AuthRequired)?;
-
     let identity = match resolve_or_skip(args.name.as_deref(), &push_path, args.if_repo, output)? {
         Some(id) => id,
         None => return Ok(()),
     };
+
+    let token_store = TokenStore::new(config.credentials_path());
+    let token = token_store.read()?.ok_or(CliError::AuthRequired)?;
 
     let (owner, client) = if let Some(owner) = identity.owner {
         (owner, None)
@@ -340,6 +340,11 @@ mod tests {
     #[serial]
     async fn push_requires_authentication() {
         let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp_dir.path().join(".syns.yaml"),
+            "owner: alice\nname: repo\n",
+        )
+        .unwrap();
 
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", temp_dir.path()) };
         let config = Config::new(Some("https://syns.dev")).unwrap();
@@ -462,12 +467,6 @@ mod tests {
         let mock_server = MockServer::start().await;
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
-
-        // Write a token so the AuthRequired check doesn't pre-empt the resolver miss.
-        let token_store = TokenStore::new(config.credentials_path());
-        token_store
-            .write_with_username("test-token", Some("alice"))
-            .unwrap();
 
         let args = PushArgs {
             path: Some(temp_dir.path().into()),

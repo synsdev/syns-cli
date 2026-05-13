@@ -140,4 +140,31 @@ mod tests {
         let result = resolve_full_or_skip(None, dir.path(), true, &output);
         assert!(matches!(result, Ok(None)));
     }
+
+    /// CR Low-4 regression backstop. Mirrors
+    /// `resolve_full_or_skip_returns_none_with_if_repo_when_owner_missing`
+    /// but with `if_repo: false` — the synthetic-`RepoIdentityUnknown` arm
+    /// on line 59 of this file (the `None => Err(...)` fallthrough when
+    /// owner is missing AND if_repo is false). Without this test, that
+    /// arm is reachable only through the per-command integration suites
+    /// that already covered it pre-u208; a future refactor of
+    /// `resolve_full_or_skip` that simplified or restructured its match
+    /// could silently regress today's behavior (which is: name-only
+    /// `RepoIdentity` without `--if-repo` exits with `RepoIdentityUnknown`
+    /// just as it did before this helper existed).
+    #[test]
+    fn resolve_full_or_skip_returns_err_without_if_repo_when_owner_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+        fs::write(
+            git_dir.join("config"),
+            "[remote \"origin\"]\n\turl = https://github.com/user/just-name.git\n",
+        )
+        .unwrap();
+        let output = Output::new(false);
+
+        let result = resolve_full_or_skip(None, dir.path(), false, &output);
+        assert!(matches!(result, Err(CliError::RepoIdentityUnknown)));
+    }
 }
