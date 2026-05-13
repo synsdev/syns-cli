@@ -80,8 +80,8 @@ pub enum TeamsAction {
     Role {
         /// Team name (or owner/team-name to disambiguate)
         name: String,
-        /// User ID of the member
-        user_id: String,
+        /// Username (or user ID) of the member
+        member: String,
         /// New role (admin, member)
         #[arg(long)]
         role: String,
@@ -90,8 +90,8 @@ pub enum TeamsAction {
     Remove {
         /// Team name (or owner/team-name to disambiguate)
         name: String,
-        /// User ID of the member to remove
-        user_id: String,
+        /// Username (or user ID) of the member
+        member: String,
         /// Skip confirmation prompt
         #[arg(long, short)]
         yes: bool,
@@ -235,6 +235,27 @@ async fn resolve_team_id(
             Ok(matches.into_iter().nth(selection - 1).unwrap().id)
         }
     }
+}
+
+async fn resolve_member_user_id(
+    client: &SynsClient,
+    token: &str,
+    team_id: &str,
+    team_display_name: &str,
+    identifier: &str,
+) -> Result<String, CliError> {
+    let (response, _raw) = client.list_members(token, team_id).await?;
+    for member in response.data {
+        if member.user.username == identifier || member.user.id == identifier {
+            return Ok(member.user.id);
+        }
+    }
+    Err(CliError::Config {
+        message: format!(
+            "no member '{}' found in team '{}'",
+            identifier, team_display_name
+        ),
+    })
 }
 
 fn display_team(output: &Output, team: &crate::client::TeamResponse, raw: &serde_json::Value) {
@@ -482,22 +503,20 @@ pub async fn cmd_teams(
                 output.success(&format!("Declined invitation '{}'.", invitation_id));
             }
         }
-        Some(TeamsAction::Role {
-            name,
-            user_id,
-            role,
-        }) => {
+        Some(TeamsAction::Role { name, member, role }) => {
             let parsed_role = parse_team_role(&role)?;
             let team_id = resolve_team_id(&client, &token, &name, output).await?;
+            let user_id = resolve_member_user_id(&client, &token, &team_id, &name, &member).await?;
             let request = ChangeRoleRequest { role: parsed_role };
             let (response, raw) = client
                 .change_role(&token, &team_id, &user_id, &request)
                 .await?;
             display_member(output, &response, &raw);
         }
-        Some(TeamsAction::Remove { name, user_id, yes }) => {
+        Some(TeamsAction::Remove { name, member, yes }) => {
             let team_id = resolve_team_id(&client, &token, &name, output).await?;
-            let prompt = format!("Remove member '{}' from team '{}'? [y/N]: ", user_id, name);
+            let user_id = resolve_member_user_id(&client, &token, &team_id, &name, &member).await?;
+            let prompt = format!("Remove member '{}' from team '{}'? [y/N]: ", member, name);
             match confirm_or_yes(yes, &prompt)? {
                 ConfirmOutcome::SkipPrompt => { /* proceed */ }
                 ConfirmOutcome::Input(input) => {
@@ -510,11 +529,11 @@ pub async fn cmd_teams(
             }
             client.remove_member(&token, &team_id, &user_id).await?;
             if output.is_json() {
-                output.json(&json!({"removed": true, "userId": user_id}));
+                output.json(&json!({"removed": true, "member": member}));
             } else {
                 output.success(&format!(
                     "Removed member '{}' from team '{}'.",
-                    user_id, name
+                    member, name
                 ));
             }
         }
@@ -787,6 +806,306 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("no team named 'gamma' found"));
+    }
+
+    #[tokio::test]
+    async fn resolve_member_user_id_matches_by_username() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/teams/uuid-alpha/members"))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {
+                        "user": {
+                            "id": "u_bob_001",
+                            "username": "bob",
+                            "name": "Bob",
+                            "email": "bob@example.com",
+                            "image": null
+                        },
+                        "role": "member",
+                        "joinedAt": "2026-04-01T10:00:00Z"
+                    },
+                    {
+                        "user": {
+                            "id": "u_alice_002",
+                            "username": "alice",
+                            "name": "Alice",
+                            "email": "alice@example.com",
+                            "image": null
+                        },
+                        "role": "owner",
+                        "joinedAt": "2026-03-01T10:00:00Z"
+                    }
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+
+        let result =
+            resolve_member_user_id(&client, "test-token", "uuid-alpha", "alpha", "bob").await;
+        assert_eq!(result.unwrap(), "u_bob_001".to_string());
+    }
+
+    #[tokio::test]
+    async fn resolve_member_user_id_matches_by_user_id_back_compat() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/teams/uuid-alpha/members"))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {
+                        "user": {
+                            "id": "u_bob_001",
+                            "username": "bob",
+                            "name": "Bob",
+                            "email": "bob@example.com",
+                            "image": null
+                        },
+                        "role": "member",
+                        "joinedAt": "2026-04-01T10:00:00Z"
+                    },
+                    {
+                        "user": {
+                            "id": "u_alice_002",
+                            "username": "alice",
+                            "name": "Alice",
+                            "email": "alice@example.com",
+                            "image": null
+                        },
+                        "role": "owner",
+                        "joinedAt": "2026-03-01T10:00:00Z"
+                    }
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+
+        let result =
+            resolve_member_user_id(&client, "test-token", "uuid-alpha", "alpha", "u_bob_001").await;
+        assert_eq!(result.unwrap(), "u_bob_001".to_string());
+    }
+
+    #[tokio::test]
+    async fn resolve_member_user_id_returns_descriptive_not_found() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/teams/uuid-alpha/members"))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {
+                        "user": {
+                            "id": "u_bob_001",
+                            "username": "bob",
+                            "name": "Bob",
+                            "email": "bob@example.com",
+                            "image": null
+                        },
+                        "role": "member",
+                        "joinedAt": "2026-04-01T10:00:00Z"
+                    },
+                    {
+                        "user": {
+                            "id": "u_alice_002",
+                            "username": "alice",
+                            "name": "Alice",
+                            "email": "alice@example.com",
+                            "image": null
+                        },
+                        "role": "owner",
+                        "joinedAt": "2026-03-01T10:00:00Z"
+                    }
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+
+        let result =
+            resolve_member_user_id(&client, "test-token", "uuid-alpha", "alpha", "charlie").await;
+        let err = result.unwrap_err();
+        match err {
+            CliError::Config { message } => {
+                assert_eq!(message, "no member 'charlie' found in team 'alpha'");
+            }
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn cmd_teams_role_with_username_succeeds_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        TokenStore::new(dir.path().join("credentials.json"))
+            .write("test-token")
+            .unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+
+        let mock_server = MockServer::start().await;
+
+        // Mock 1: GET /api/v1/teams (used by resolve_team_id)
+        Mock::given(method("GET"))
+            .and(path("/api/v1/teams"))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {
+                        "id": "uuid-alpha",
+                        "name": "alpha",
+                        "description": null,
+                        "owner": { "id": "u_alice_002", "username": "alice", "name": "Alice", "image": null },
+                        "memberCount": 2,
+                        "role": "owner",
+                        "createdAt": "2026-03-01T10:00:00Z",
+                        "updatedAt": "2026-04-01T10:00:00Z"
+                    }
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Mock 2: GET /api/v1/teams/uuid-alpha/members (used by resolve_member_user_id)
+        Mock::given(method("GET"))
+            .and(path("/api/v1/teams/uuid-alpha/members"))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {
+                        "user": { "id": "u_bob_001", "username": "bob", "name": "Bob", "email": "bob@example.com", "image": null },
+                        "role": "member",
+                        "joinedAt": "2026-04-01T10:00:00Z"
+                    },
+                    {
+                        "user": { "id": "u_alice_002", "username": "alice", "name": "Alice", "email": "alice@example.com", "image": null },
+                        "role": "owner",
+                        "joinedAt": "2026-03-01T10:00:00Z"
+                    }
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Mock 3: POST /api/v1/teams/uuid-alpha/members/u_bob_001/role
+        // The path segment u_bob_001 is the resolved user ID — proves the
+        // resolver supplied it rather than the raw "bob" string.
+        Mock::given(method("POST"))
+            .and(path("/api/v1/teams/uuid-alpha/members/u_bob_001/role"))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "user": { "id": "u_bob_001", "username": "bob", "name": "Bob", "email": "bob@example.com", "image": null },
+                "role": "admin",
+                "joinedAt": "2026-04-01T10:00:00Z"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(false);
+
+        let result = cmd_teams(
+            &config,
+            &output,
+            Some(TeamsAction::Role {
+                name: "alpha".to_string(),
+                member: "bob".to_string(),
+                role: "admin".to_string(),
+            }),
+        )
+        .await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn cmd_teams_remove_with_unknown_member_short_circuits_before_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        TokenStore::new(dir.path().join("credentials.json"))
+            .write("test-token")
+            .unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+
+        let mock_server = MockServer::start().await;
+
+        // Mock 1: GET /api/v1/teams
+        Mock::given(method("GET"))
+            .and(path("/api/v1/teams"))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {
+                        "id": "uuid-alpha",
+                        "name": "alpha",
+                        "description": null,
+                        "owner": { "id": "u_alice_002", "username": "alice", "name": "Alice", "image": null },
+                        "memberCount": 2,
+                        "role": "owner",
+                        "createdAt": "2026-03-01T10:00:00Z",
+                        "updatedAt": "2026-04-01T10:00:00Z"
+                    }
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Mock 2: GET /api/v1/teams/uuid-alpha/members
+        Mock::given(method("GET"))
+            .and(path("/api/v1/teams/uuid-alpha/members"))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {
+                        "user": { "id": "u_bob_001", "username": "bob", "name": "Bob", "email": "bob@example.com", "image": null },
+                        "role": "member",
+                        "joinedAt": "2026-04-01T10:00:00Z"
+                    },
+                    {
+                        "user": { "id": "u_alice_002", "username": "alice", "name": "Alice", "email": "alice@example.com", "image": null },
+                        "role": "owner",
+                        "joinedAt": "2026-03-01T10:00:00Z"
+                    }
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Deliberately register NO DELETE mock. Wiremock returns 404 for any
+        // unmocked request; if the resolver short-circuits correctly, the
+        // DELETE is never attempted and this scaffolding is irrelevant.
+
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(false);
+
+        let result = cmd_teams(
+            &config,
+            &output,
+            Some(TeamsAction::Remove {
+                name: "alpha".to_string(),
+                member: "charlie".to_string(),
+                yes: true,
+            }),
+        )
+        .await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        let err = result.expect_err("expected Err for unknown member, got Ok");
+        let message = err.to_string();
+        assert!(
+            message.contains("no member 'charlie' found in team 'alpha'"),
+            "expected descriptive resolver error, got: {message}"
+        );
     }
 
     #[tokio::test]
