@@ -39,9 +39,9 @@ impl From<AssignableRole> for CollaboratorRole {
 pub enum CollaboratorsAction {
     /// Add a collaborator to the repository
     Add {
-        /// User ID of the collaborator to add
+        /// Username or email of the user to add
         #[arg()]
-        user_id: String,
+        target: String,
         /// Role to assign
         #[arg(long)]
         role: AssignableRole,
@@ -129,23 +129,63 @@ pub async fn cmd_collaborators(
                 }
             }
         }
-        Some(CollaboratorsAction::Add { user_id, role, .. }) => {
+        Some(CollaboratorsAction::Add { target, role, .. }) => {
             let token = TokenStore::new(config.credentials_path())
                 .read()?
                 .ok_or(CliError::AuthRequired)?;
+            let trimmed = target.trim();
+            if trimmed.is_empty() {
+                return Err(CliError::Config {
+                    message: "target cannot be empty — provide a username or email".to_string(),
+                });
+            }
+            // Compute role_str (borrows) BEFORE role.into() (moves) — order matters.
             let role_str = role.as_str().to_string();
-            let request = AddCollaboratorRequest {
-                user_id: user_id.clone(),
-                role: role.into(),
-            };
-            client.add_collaborator(&repo_id, &token, &request).await?;
-            if output.is_json() {
-                output.json(&json!({"added": true, "userId": user_id, "role": role_str}));
+            let request_role: CollaboratorRole = role.into();
+            let request = if trimmed.contains('@') {
+                AddCollaboratorRequest::Email {
+                    email: trimmed.to_string(),
+                    role: request_role,
+                }
             } else {
-                output.success(&format!(
-                    "Added '{}' as {} collaborator.",
-                    user_id, role_str
-                ));
+                AddCollaboratorRequest::Username {
+                    username: trimmed.to_string(),
+                    role: request_role,
+                }
+            };
+            let result = client.add_collaborator(&repo_id, &token, &request).await;
+            match result {
+                Ok(()) => {
+                    if output.is_json() {
+                        output.json(&json!({
+                            "added": true,
+                            "target": trimmed,
+                            "role": role_str,
+                        }));
+                    } else {
+                        output.success(&format!(
+                            "Added '{}' as {} collaborator.",
+                            trimmed, role_str
+                        ));
+                    }
+                }
+                Err(CliError::Api {
+                    status: Some(404),
+                    error,
+                    context: None,
+                }) if matches!(
+                    error.as_str(),
+                    "not_found_user_by_username"
+                        | "not_found_user_by_email"
+                        | "not_found_user_by_id"
+                ) => {
+                    return Err(CliError::Api {
+                        status: Some(404),
+                        error: format!("no user '{}' found", trimmed),
+                        context: None,
+                    });
+                }
+                Err(e) => return Err(e),
             }
         }
         Some(CollaboratorsAction::Remove { user_id, yes, .. }) => {
@@ -174,12 +214,12 @@ pub async fn cmd_collaborators(
 mod tests {
     use super::*;
     use serial_test::serial;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
     #[serial]
-    async fn collaborators_add_sends_correct_request() {
+    async fn collaborators_add_sends_username_form_for_bare_identifiers() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(".syns.yaml"),
@@ -196,7 +236,11 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/api/v1/repos/alice/my-project/collaborators"))
-            .respond_with(ResponseTemplate::new(200))
+            .and(body_json(serde_json::json!({
+                "username": "bartad498",
+                "role": "write"
+            })))
+            .respond_with(ResponseTemplate::new(201))
             .mount(&mock_server)
             .await;
 
@@ -207,7 +251,7 @@ mod tests {
             &config,
             &output,
             Some(CollaboratorsAction::Add {
-                user_id: "bob-123".to_string(),
+                target: "bartad498".to_string(),
                 role: AssignableRole::Write,
                 if_repo: false,
             }),
@@ -216,7 +260,175 @@ mod tests {
         .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "got error: {:?}", result.err());
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let auth = requests[0]
+            .headers
+            .get("authorization")
+            .map(|v| v.to_str().unwrap())
+            .unwrap_or("");
+        assert_eq!(auth, "Bearer test-token");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn collaborators_add_sends_email_form_for_at_containing_identifiers() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".syns.yaml"),
+            "owner: alice\nname: my-project\n",
+        )
+        .unwrap();
+        TokenStore::new(dir.path().join("credentials.json"))
+            .write("test-token")
+            .unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/repos/alice/my-project/collaborators"))
+            .and(body_json(serde_json::json!({
+                "email": "bart@example.com",
+                "role": "admin"
+            })))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&mock_server)
+            .await;
+
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(false);
+
+        let result = cmd_collaborators(
+            &config,
+            &output,
+            Some(CollaboratorsAction::Add {
+                target: "bart@example.com".to_string(),
+                role: AssignableRole::Admin,
+                if_repo: false,
+            }),
+            false,
+        )
+        .await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        assert!(result.is_ok(), "got error: {:?}", result.err());
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn collaborators_add_maps_404_with_reason_to_descriptive_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".syns.yaml"),
+            "owner: alice\nname: my-project\n",
+        )
+        .unwrap();
+        TokenStore::new(dir.path().join("credentials.json"))
+            .write("test-token")
+            .unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/repos/alice/my-project/collaborators"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error": "not_found",
+                "message": "User not found",
+                "reason": "not_found_user_by_username"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(false);
+
+        let result = cmd_collaborators(
+            &config,
+            &output,
+            Some(CollaboratorsAction::Add {
+                target: "bartad498".to_string(),
+                role: AssignableRole::Write,
+                if_repo: false,
+            }),
+            false,
+        )
+        .await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        match result {
+            Err(CliError::Api {
+                status: Some(404),
+                ref error,
+                context: None,
+            }) => assert_eq!(error, "no user 'bartad498' found"),
+            other => panic!(
+                "expected Api error with status 404 and target-bearing message, got: {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn collaborators_add_propagates_404_without_reason_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".syns.yaml"),
+            "owner: alice\nname: my-project\n",
+        )
+        .unwrap();
+        TokenStore::new(dir.path().join("credentials.json"))
+            .write("test-token")
+            .unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/repos/alice/my-project/collaborators"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error": "not_found",
+                "message": "Repository not found"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(false);
+
+        let result = cmd_collaborators(
+            &config,
+            &output,
+            Some(CollaboratorsAction::Add {
+                target: "bartad498".to_string(),
+                role: AssignableRole::Write,
+                if_repo: false,
+            }),
+            false,
+        )
+        .await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        match result {
+            Err(CliError::Api {
+                status: Some(404),
+                ref error,
+                context: None,
+            }) => {
+                assert_eq!(error, "not_found");
+                assert!(
+                    !error.contains("bartad498"),
+                    "INV-38 violation: visibility-hidden 404 leaked target name in error: {error}"
+                );
+            }
+            other => panic!(
+                "expected Api error with status 404 and unchanged 'not_found' payload, got: {other:?}"
+            ),
+        }
     }
 
     #[tokio::test]
@@ -339,7 +551,7 @@ mod tests {
             &config,
             &output,
             Some(CollaboratorsAction::Add {
-                user_id: "bob-123".to_string(),
+                target: "bob-123".to_string(),
                 role: AssignableRole::Write,
                 if_repo: true,
             }),
@@ -366,7 +578,7 @@ mod tests {
             &config,
             &output,
             Some(CollaboratorsAction::Add {
-                user_id: "anyone".to_string(),
+                target: "anyone".to_string(),
                 role: AssignableRole::Read,
                 if_repo: true,
             }),

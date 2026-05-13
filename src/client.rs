@@ -150,11 +150,17 @@ pub struct RepoUpdate {
     pub tags: Option<Vec<String>>,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AddCollaboratorRequest {
-    pub user_id: String,
-    pub role: CollaboratorRole,
+#[derive(Serialize, Debug)]
+#[serde(untagged)]
+pub enum AddCollaboratorRequest {
+    Username {
+        username: String,
+        role: CollaboratorRole,
+    },
+    Email {
+        email: String,
+        role: CollaboratorRole,
+    },
 }
 
 #[derive(Serialize)]
@@ -510,6 +516,13 @@ struct ApiErrorBody {
     error: String,
 }
 
+#[derive(Deserialize)]
+struct AddCollaboratorErrorBody {
+    error: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
 fn encode_path_segments(path: &str) -> String {
     path.split('/')
         .filter(|segment| !segment.is_empty())
@@ -852,6 +865,37 @@ impl SynsClient {
             .json(request)
             .send()
             .await?;
+
+        if response.status().as_u16() == 404 {
+            // Bespoke 404 carve-out: the server distinguishes between
+            // "target user not found" (carries a `reason` discriminator)
+            // and "repo not visible" (no `reason`). We surface the
+            // `reason` through CliError::Api.error so the command layer
+            // can format a target-bearing message.
+            let bytes = match response.bytes().await {
+                Ok(b) => b,
+                Err(_) => {
+                    return Err(CliError::Api {
+                        status: Some(404),
+                        error: "unknown error".to_string(),
+                        context: None,
+                    });
+                }
+            };
+            return match serde_json::from_slice::<AddCollaboratorErrorBody>(&bytes) {
+                Ok(body) => Err(CliError::Api {
+                    status: Some(404),
+                    error: body.reason.unwrap_or(body.error),
+                    context: None,
+                }),
+                Err(_) => Err(CliError::Api {
+                    status: Some(404),
+                    error: "unknown error".to_string(),
+                    context: None,
+                }),
+            };
+        }
+
         process_empty_response(response).await
     }
 
