@@ -3,20 +3,23 @@ use crate::client::{EntryType, SynsClient};
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
-use crate::repo::resolve::resolve_repo_identity;
+use crate::repo::if_repo::resolve_full_or_skip;
 use serde_json::json;
 
 pub async fn cmd_ls(
     config: &Config,
     output: &Output,
     path: Option<String>,
+    if_repo: bool,
 ) -> Result<(), CliError> {
     let current_dir = std::env::current_dir().map_err(|e| CliError::Io {
         message: format!("could not determine current directory: {e}"),
     })?;
-    let identity = resolve_repo_identity(None, &current_dir)?;
-    let owner = identity.owner.ok_or(CliError::RepoIdentityUnknown)?;
-    let repo_id = format!("{}/{}", owner, identity.name);
+    let (owner, name) = match resolve_full_or_skip(None, &current_dir, if_repo, output)? {
+        Some(pair) => pair,
+        None => return Ok(()),
+    };
+    let repo_id = format!("{owner}/{name}");
     let token = TokenStore::new(config.credentials_path())
         .read()
         .ok()
@@ -131,7 +134,7 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_ls(&config, &output, None).await;
+        let result = cmd_ls(&config, &output, None, false).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
@@ -167,7 +170,7 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(true);
 
-        let result = cmd_ls(&config, &output, None).await;
+        let result = cmd_ls(&config, &output, None, false).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
@@ -199,7 +202,7 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_ls(&config, &output, Some("does/not/exist".to_string())).await;
+        let result = cmd_ls(&config, &output, Some("does/not/exist".to_string()), false).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         let err = result.unwrap_err();
@@ -233,7 +236,7 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_ls(&config, &output, Some("some/path".to_string())).await;
+        let result = cmd_ls(&config, &output, Some("some/path".to_string()), false).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         let err = result.unwrap_err();
@@ -267,11 +270,64 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(true);
 
-        let result = cmd_ls(&config, &output, Some("does/not/exist".to_string())).await;
+        let result = cmd_ls(&config, &output, Some("does/not/exist".to_string()), false).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         let err = result.unwrap_err();
         assert_eq!(err.to_string(), "server error (404): not_found");
         assert_eq!(err.exit_code(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn ls_with_if_repo_set_and_identity_resolved_runs_normally() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".syns.yaml"),
+            "owner: alice\nname: my-project\n",
+        )
+        .unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/my-project/tree"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "entries": [
+                    { "name": "README.md", "path": "README.md", "type": "file", "size": 256, "sha": "abc123" }
+                ],
+                "commitSha": "def456",
+                "truncated": false
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(false);
+
+        let result = cmd_ls(&config, &output, None, true).await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn ls_with_if_repo_set_and_no_identity_skips_silently() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+
+        let mock_server = MockServer::start().await;
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(false);
+
+        let result = cmd_ls(&config, &output, None, true).await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        assert!(result.is_ok());
+        assert!(mock_server.received_requests().await.unwrap().is_empty());
     }
 }

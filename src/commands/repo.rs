@@ -3,7 +3,7 @@ use crate::client::{RepoResponse, RepoStatus, RepoUpdate, SynsClient, Visibility
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
-use crate::repo::resolve::resolve_repo_identity;
+use crate::repo::if_repo::resolve_full_or_skip;
 
 #[derive(clap::ValueEnum, Debug, Clone)]
 pub enum CliRepoStatus {
@@ -95,6 +95,7 @@ pub async fn cmd_repo(
     status: Option<CliRepoStatus>,
     visibility: Option<CliVisibility>,
     tags: Vec<String>,
+    if_repo: bool,
 ) -> Result<(), CliError> {
     let is_update =
         description.is_some() || status.is_some() || visibility.is_some() || !tags.is_empty();
@@ -102,9 +103,11 @@ pub async fn cmd_repo(
     let current_dir = std::env::current_dir().map_err(|e| CliError::Io {
         message: format!("could not determine current directory: {e}"),
     })?;
-    let identity = resolve_repo_identity(None, &current_dir)?;
-    let owner = identity.owner.ok_or(CliError::RepoIdentityUnknown)?;
-    let repo_id = format!("{}/{}", owner, identity.name);
+    let (owner, name) = match resolve_full_or_skip(None, &current_dir, if_repo, output)? {
+        Some(pair) => pair,
+        None => return Ok(()),
+    };
+    let repo_id = format!("{owner}/{name}");
     let client = SynsClient::new(config.server_url())?;
 
     if is_update {
@@ -175,7 +178,7 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_repo(&config, &output, None, None, None, vec![]).await;
+        let result = cmd_repo(&config, &output, None, None, None, vec![], false).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
@@ -227,10 +230,70 @@ mod tests {
             None,
             Some(CliVisibility::Public),
             vec![],
+            false,
         )
         .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn repo_with_if_repo_set_and_identity_resolved_runs_normally() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".syns.yaml"),
+            "owner: alice\nname: my-project\n",
+        )
+        .unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/my-project"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "owner": "alice",
+                "name": "my-project",
+                "description": "Test repo",
+                "status": "active",
+                "visibility": "public",
+                "tags": [],
+                "commitSha": "abc12345def67890",
+                "fileCount": 42,
+                "forkCount": 0,
+                "forkedFrom": null,
+                "createdAt": "2025-01-01T00:00:00Z",
+                "updatedAt": "2025-06-01T00:00:00Z"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(false);
+
+        let result = cmd_repo(&config, &output, None, None, None, vec![], true).await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn repo_with_if_repo_set_and_no_identity_skips_silently() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+
+        let mock_server = MockServer::start().await;
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(false);
+
+        let result = cmd_repo(&config, &output, None, None, None, vec![], true).await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        assert!(result.is_ok());
+        assert!(mock_server.received_requests().await.unwrap().is_empty());
     }
 }

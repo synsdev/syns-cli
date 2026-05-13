@@ -9,7 +9,7 @@ use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
 use crate::push::smart::{SmartPushOptions, smart_push};
-use crate::repo::resolve::resolve_repo_identity;
+use crate::repo::if_repo::resolve_or_skip;
 
 const DEFAULT_COMMIT_MESSAGE: &str = "push";
 const SHORT_SHA_LENGTH: usize = 8;
@@ -51,6 +51,10 @@ pub struct PushArgs {
     /// Directory to push (defaults to current directory)
     #[arg(value_name = "PATH")]
     pub path: Option<PathBuf>,
+
+    /// Silently skip (exit 0) when no Syns repo identity resolves
+    #[arg(long)]
+    pub if_repo: bool,
 }
 
 async fn resolve_owner(
@@ -76,7 +80,10 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
     let token_store = TokenStore::new(config.credentials_path());
     let token = token_store.read()?.ok_or(CliError::AuthRequired)?;
 
-    let identity = resolve_repo_identity(args.name.as_deref(), &push_path)?;
+    let identity = match resolve_or_skip(args.name.as_deref(), &push_path, args.if_repo, output)? {
+        Some(id) => id,
+        None => return Ok(()),
+    };
 
     let (owner, client) = if let Some(owner) = identity.owner {
         (owner, None)
@@ -169,6 +176,7 @@ mod tests {
             status: None,
             visibility: None,
             path: None,
+            if_repo: false,
         }
     }
 
@@ -391,5 +399,86 @@ mod tests {
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn push_with_if_repo_set_and_identity_resolved_runs_normally() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/new-repo/tree"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(serde_json::json!({"error": "not_found"})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/repos/alice/new-repo/push"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "commitSha": "abc12345def67890",
+                "version": 1,
+                "filesChanged": 1,
+                "created": true
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join("hello.txt"), "hello").unwrap();
+
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", temp_dir.path()) };
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(false);
+
+        let token_store = TokenStore::new(config.credentials_path());
+        token_store
+            .write_with_username("test-token", Some("alice"))
+            .unwrap();
+
+        let args = PushArgs {
+            name: Some("new-repo".into()),
+            path: Some(temp_dir.path().into()),
+            if_repo: true,
+            ..default_push_args()
+        };
+
+        let result = cmd_push(&config, &output, &args).await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn push_with_if_repo_set_and_no_identity_skips_silently() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        // No .syns.yaml, no .git, no --name flag → resolver returns RepoIdentityUnknown.
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", temp_dir.path()) };
+
+        let mock_server = MockServer::start().await;
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(false);
+
+        // Write a token so the AuthRequired check doesn't pre-empt the resolver miss.
+        let token_store = TokenStore::new(config.credentials_path());
+        token_store
+            .write_with_username("test-token", Some("alice"))
+            .unwrap();
+
+        let args = PushArgs {
+            path: Some(temp_dir.path().into()),
+            if_repo: true,
+            ..default_push_args()
+        };
+
+        let result = cmd_push(&config, &output, &args).await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        assert!(result.is_ok());
+        assert!(mock_server.received_requests().await.unwrap().is_empty());
     }
 }

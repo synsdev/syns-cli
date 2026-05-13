@@ -40,21 +40,34 @@ enum Commands {
         /// Pull files at a specific version (number or SHA)
         #[arg(long)]
         version: Option<String>,
+        /// Silently skip (exit 0) when no Syns repo identity resolves
+        #[arg(long)]
+        if_repo: bool,
     },
     /// List files in a repository
     Ls {
         /// Subdirectory path to list
         #[arg()]
         path: Option<String>,
+        /// Silently skip (exit 0) when no Syns repo identity resolves
+        #[arg(long)]
+        if_repo: bool,
     },
     /// View a file's content
     Cat {
         /// File path to display
         #[arg()]
         path: String,
+        /// Silently skip (exit 0) when no Syns repo identity resolves
+        #[arg(long)]
+        if_repo: bool,
     },
     /// Show repository status
-    Status {},
+    Status {
+        /// Silently skip (exit 0) when no Syns repo identity resolves
+        #[arg(long)]
+        if_repo: bool,
+    },
     /// View version history
     History {
         /// Filter to a specific file path
@@ -63,6 +76,9 @@ enum Commands {
         /// Maximum number of entries to show
         #[arg(long, default_value_t = 50)]
         limit: u32,
+        /// Silently skip (exit 0) when no Syns repo identity resolves
+        #[arg(long)]
+        if_repo: bool,
     },
     /// Show changes between versions
     Diff {
@@ -72,6 +88,9 @@ enum Commands {
         /// Ending version (number or SHA)
         #[arg(long)]
         to: Option<String>,
+        /// Silently skip (exit 0) when no Syns repo identity resolves
+        #[arg(long)]
+        if_repo: bool,
     },
     /// Revert a file to a previous version
     Revert {
@@ -84,6 +103,9 @@ enum Commands {
         /// Custom commit message
         #[arg(long)]
         message: Option<String>,
+        /// Silently skip (exit 0) when no Syns repo identity resolves
+        #[arg(long)]
+        if_repo: bool,
     },
     /// Repository management
     Repo {
@@ -99,17 +121,26 @@ enum Commands {
         /// Set repository tags (replaces existing)
         #[arg(long)]
         tag: Vec<String>,
+        /// Silently skip (exit 0) when no Syns repo identity resolves
+        #[arg(long)]
+        if_repo: bool,
     },
     /// Manage repository collaborators
     Collaborators {
         #[command(subcommand)]
         action: Option<CollaboratorsAction>,
+        /// Silently skip (exit 0) when no Syns repo identity resolves
+        #[arg(long)]
+        if_repo: bool,
     },
     /// Delete a repository
     Delete {
         /// Skip confirmation prompt
         #[arg(long, short)]
         yes: bool,
+        /// Silently skip (exit 0) when no Syns repo identity resolves
+        #[arg(long)]
+        if_repo: bool,
     },
     /// Browse public repositories
     Explore {
@@ -185,27 +216,69 @@ async fn run(
             repo,
             path,
             version,
-        } => commands::pull::cmd_pull(config, output, repo, path, version).await?,
-        Commands::Ls { path } => commands::ls::cmd_ls(config, output, path).await?,
-        Commands::Cat { path } => commands::cat::cmd_cat(config, output, path).await?,
-        Commands::Status {} => commands::status::cmd_status(config, output).await?,
-        Commands::History { file, limit } => {
-            commands::history::cmd_history(config, output, file, limit).await?
+            if_repo,
+        } => commands::pull::cmd_pull(config, output, repo, path, version, if_repo).await?,
+        Commands::Ls { path, if_repo } => {
+            commands::ls::cmd_ls(config, output, path, if_repo).await?
         }
-        Commands::Diff { from, to } => commands::diff::cmd_diff(config, output, from, to).await?,
-        Commands::Revert { path, to, message } => {
-            commands::revert::cmd_revert(config, output, path, to, message).await?
+        Commands::Cat { path, if_repo } => {
+            commands::cat::cmd_cat(config, output, path, if_repo).await?
         }
+        Commands::Status { if_repo } => {
+            commands::status::cmd_status(config, output, if_repo).await?
+        }
+        Commands::History {
+            file,
+            limit,
+            if_repo,
+        } => commands::history::cmd_history(config, output, file, limit, if_repo).await?,
+        Commands::Diff { from, to, if_repo } => {
+            commands::diff::cmd_diff(config, output, from, to, if_repo).await?
+        }
+        Commands::Revert {
+            path,
+            to,
+            message,
+            if_repo,
+        } => commands::revert::cmd_revert(config, output, path, to, message, if_repo).await?,
         Commands::Repo {
             description,
             status,
             visibility,
             tag,
-        } => commands::repo::cmd_repo(config, output, description, status, visibility, tag).await?,
-        Commands::Collaborators { action } => {
-            commands::collaborators::cmd_collaborators(config, output, action).await?
+            if_repo,
+        } => {
+            commands::repo::cmd_repo(
+                config,
+                output,
+                description,
+                status,
+                visibility,
+                tag,
+                if_repo,
+            )
+            .await?
         }
-        Commands::Delete { yes } => commands::delete::cmd_delete(config, output, yes).await?,
+        Commands::Collaborators {
+            action,
+            if_repo: parent_if_repo,
+        } => {
+            let action_if_repo = match &action {
+                Some(CollaboratorsAction::Add { if_repo, .. }) => *if_repo,
+                Some(CollaboratorsAction::Remove { if_repo, .. }) => *if_repo,
+                None => false,
+            };
+            commands::collaborators::cmd_collaborators(
+                config,
+                output,
+                action,
+                parent_if_repo || action_if_repo,
+            )
+            .await?
+        }
+        Commands::Delete { yes, if_repo } => {
+            commands::delete::cmd_delete(config, output, yes, if_repo).await?
+        }
         Commands::Explore {
             query,
             tag,

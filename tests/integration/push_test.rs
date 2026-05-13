@@ -55,6 +55,7 @@ async fn push_creates_repo_and_sends_files() {
         tag: vec![],
         status: None,
         visibility: None,
+        if_repo: false,
     };
     let result = cmd_push(&ctx.config, &ctx.output, &args).await;
     assert!(result.is_ok());
@@ -108,6 +109,7 @@ async fn push_sends_only_changed_files() {
         tag: vec![],
         status: None,
         visibility: None,
+        if_repo: false,
     };
     let result = cmd_push(&ctx.config, &ctx.output, &args).await;
     assert!(result.is_ok());

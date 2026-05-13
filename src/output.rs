@@ -62,6 +62,14 @@ impl Output {
         }
     }
 
+    pub(crate) fn format_skip(&self) -> Option<String> {
+        if self.json_mode {
+            Some(r#"{"skipped":true,"reason":"no_syns_repo"}"#.to_string())
+        } else {
+            None
+        }
+    }
+
     pub fn table(&self, headers: &[&str], rows: Vec<Vec<String>>) {
         if let Some(text) = self.format_table(headers, rows) {
             println!("{text}");
@@ -89,6 +97,12 @@ impl Output {
         if let Some(text) = self.format_success(message) {
             let styled = style(&text).green();
             println!("{styled}");
+        }
+    }
+
+    pub fn skip(&self) {
+        if let Some(text) = self.format_skip() {
+            println!("{text}");
         }
     }
 }
@@ -183,5 +197,24 @@ mod tests {
         let output = Output::new(true);
         let result = output.format_success("done");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn format_skip_json_mode_emits_single_line_envelope() {
+        let output = Output::new(true);
+        let s = output.format_skip();
+        assert_eq!(
+            s,
+            Some(r#"{"skipped":true,"reason":"no_syns_repo"}"#.to_string())
+        );
+        assert!(!s.as_ref().unwrap().contains('\n'));
+        assert!(!s.as_ref().unwrap().contains(' '));
+    }
+
+    #[test]
+    fn format_skip_default_mode_is_noop() {
+        let output = Output::new(false);
+        let s = output.format_skip();
+        assert_eq!(s, None);
     }
 }

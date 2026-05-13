@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
 use crate::push::manifest::Manifest;
-use crate::repo::resolve::resolve_repo_identity;
+use crate::repo::if_repo::resolve_full_or_skip;
 use crate::repo::syns_yaml::write_syns_yaml;
 use console::style;
 use serde_json::json;
@@ -41,6 +41,7 @@ pub async fn cmd_pull(
     repo_arg: Option<String>,
     path_arg: Option<String>,
     version: Option<String>,
+    if_repo: bool,
 ) -> Result<(), CliError> {
     let target_dir = match &path_arg {
         Some(p) => PathBuf::from(p),
@@ -60,9 +61,10 @@ pub async fn cmd_pull(
         }
         (o.to_string(), n.to_string())
     } else {
-        let identity = resolve_repo_identity(None, &target_dir)?;
-        let owner = identity.owner.ok_or(CliError::RepoIdentityUnknown)?;
-        (owner, identity.name)
+        match resolve_full_or_skip(None, &target_dir, if_repo, output)? {
+            Some(pair) => pair,
+            None => return Ok(()),
+        }
     };
 
     let repo_id = format!("{owner}/{name}");
@@ -194,6 +196,7 @@ pub async fn cmd_pull(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn validate_entry_path_accepts_normal_paths() {
@@ -339,5 +342,60 @@ mod tests {
         // File exists and SHA matches — should be unchanged
         assert_eq!(unchanged_count, 1);
         assert!(to_download.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn pull_with_if_repo_set_and_identity_resolved_runs_normally() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".syns.yaml"),
+            "owner: alice\nname: my-project\n",
+        )
+        .unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/api/v1/repos/alice/my-project/tree",
+            ))
+            .and(wiremock::matchers::query_param("recursive", "true"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "entries": [],
+                    "commitSha": "abc123",
+                    "truncated": false
+                })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(false);
+
+        let result = cmd_pull(&config, &output, None, None, None, true).await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn pull_with_if_repo_set_and_no_identity_skips_silently() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+
+        let mock_server = wiremock::MockServer::start().await;
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(false);
+
+        let result = cmd_pull(&config, &output, None, None, None, true).await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        assert!(result.is_ok());
+        assert!(mock_server.received_requests().await.unwrap().is_empty());
     }
 }
