@@ -5,7 +5,6 @@ use crate::errors::CliError;
 use crate::output::Output;
 use crate::repo::syns_yaml::write_syns_yaml;
 use console::style;
-use serde_json::json;
 
 fn validate_repo_id(repo: &str) -> Result<(), CliError> {
     let parts: Vec<&str> = repo.split('/').collect();
@@ -43,18 +42,13 @@ pub async fn cmd_fork(
 
     let request = ForkRequest { name };
 
-    let response = client.fork(&repo, &token, &request).await?;
+    let (response, raw) = client.fork(&repo, &token, &request).await?;
 
     let fork_id = format!("{}/{}", response.owner, response.name);
     let fork_identity = parse_fork_identity(&fork_id);
 
     if output.is_json() {
-        output.json(&json!({
-            "owner": response.owner,
-            "name": response.name,
-            "commitSha": response.commit_sha,
-            "fileCount": response.file_count,
-        }));
+        output.json(&raw);
     } else {
         output.success(&format!("Forked {} → {}", repo, fork_id));
         eprintln!("{}", style(format!("{} files", response.file_count)).dim());
@@ -167,5 +161,28 @@ mod tests {
         assert!(format!("{:?}", result.unwrap_err()).contains("AuthRequired"));
 
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+    }
+
+    #[tokio::test]
+    async fn fork_raw_emits_full_repository_object() {
+        let mock_server = MockServer::start().await;
+        let body = r#"{"owner":"bob","name":"my-project","description":"forked","commitSha":"abc123","status":"active","author":"bob","tags":["api"],"visibility":"public","forkedFrom":{"owner":"alice","name":"my-project"},"forkCount":0,"fileCount":5,"role":"owner","createdAt":"2026-04-18T00:00:00Z","updatedAt":"2026-04-18T00:00:00Z"}"#;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/repos/alice/my-project/fork"))
+            .respond_with(ResponseTemplate::new(201).set_body_string(body))
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let request = ForkRequest { name: None };
+        let (_typed, raw) = client
+            .fork("alice/my-project", "test-token", &request)
+            .await
+            .unwrap();
+
+        assert_eq!(raw.as_object().unwrap().keys().count(), 14);
+        assert_eq!(raw["forkedFrom"]["owner"], serde_json::json!("alice"));
+        assert_eq!(raw["role"], serde_json::json!("owner"));
+        assert_eq!(raw["visibility"], serde_json::json!("public"));
     }
 }

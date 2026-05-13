@@ -101,19 +101,11 @@ pub async fn cmd_collaborators(
                 .read()
                 .ok()
                 .flatten();
-            let response = client
+            let (response, raw) = client
                 .list_collaborators(&repo_id, token.as_deref(), DEFAULT_COLLABORATOR_LIMIT, 0)
                 .await?;
             if output.is_json() {
-                output.json(&json!({
-                    "data": response.data.iter().map(|c| json!({
-                        "userId": c.user.id,
-                        "name": c.user.name,
-                        "email": c.user.email,
-                        "role": format!("{:?}", c.role).to_lowercase(),
-                    })).collect::<Vec<_>>(),
-                    "total": response.total,
-                }));
+                output.json(&raw);
             } else {
                 let rows = response
                     .data
@@ -454,5 +446,36 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(mock_server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn collaborators_list_raw_preserves_full_user_and_added_by() {
+        use wiremock::matchers::query_param;
+
+        let mock_server = MockServer::start().await;
+        let body = r#"{"data":[{"user":{"id":"u-bob","username":"bob","name":"Bob","email":"bob@test.com","emailVerified":true,"image":null,"createdAt":"2026-04-17T07:22:30.617Z","updatedAt":"2026-04-17T07:22:30.617Z"},"role":"write","addedBy":"u-alice","createdAt":"2026-04-18T00:00:00Z"}],"total":1,"limit":100,"offset":0}"#;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/my-project/collaborators"))
+            .and(query_param("limit", "100"))
+            .and(query_param("offset", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let (_typed, raw) = client
+            .list_collaborators("alice/my-project", None, 100, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            raw["data"][0]["user"].as_object().unwrap().keys().count(),
+            8
+        );
+        assert!(raw["data"][0].get("addedBy").is_some());
+        assert_eq!(raw["data"][0]["addedBy"], serde_json::json!("u-alice"));
+        assert!(raw["data"][0].get("createdAt").is_some());
+        assert!(raw.get("limit").is_some());
+        assert!(raw.get("offset").is_some());
     }
 }

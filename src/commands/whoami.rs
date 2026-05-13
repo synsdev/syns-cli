@@ -3,7 +3,6 @@ use crate::client::SynsClient;
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
-use serde_json::json;
 
 pub async fn cmd_whoami(config: &Config, output: &Output) -> Result<(), CliError> {
     let store = TokenStore::new(config.credentials_path());
@@ -15,20 +14,11 @@ pub async fn cmd_whoami(config: &Config, output: &Output) -> Result<(), CliError
     };
 
     let client = SynsClient::new(config.server_url())?;
-    let session = client.get_session(&token).await?;
+    let (session, raw) = client.get_session(&token).await?;
     let user = session.user;
 
     if output.is_json() {
-        let mut value = json!({
-            "id": user.id,
-            "username": user.username,
-            "name": user.name,
-            "email": user.email,
-        });
-        if let Some(image) = &user.image {
-            value["image"] = json!(image);
-        }
-        output.json(&value);
+        output.json(&raw["user"]);
     } else {
         output.table(
             &["Field", "Value"],
@@ -63,6 +53,30 @@ mod tests {
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(matches!(result, Err(CliError::AuthRequired)));
+    }
+
+    #[tokio::test]
+    async fn whoami_get_session_raw_preserves_full_user_with_8_fields() {
+        use crate::client::SynsClient;
+
+        let mock_server = MockServer::start().await;
+        let body = r#"{"session":{"id":"sess-1","userId":"u-1","expiresAt":"2026-05-01T00:00:00.000Z"},"user":{"id":"u-1","username":"alice","name":"Alice","email":"alice@test.com","emailVerified":true,"image":null,"createdAt":"2026-04-17T07:22:30.617Z","updatedAt":"2026-04-17T07:22:30.617Z"}}"#;
+        Mock::given(method("GET"))
+            .and(path("/api/auth/get-session"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let (typed, raw) = client.get_session("test-token").await.unwrap();
+
+        assert_eq!(raw["user"].as_object().unwrap().keys().count(), 8);
+        assert_eq!(raw["user"]["emailVerified"], serde_json::json!(true));
+        assert_eq!(
+            raw["user"]["createdAt"],
+            serde_json::json!("2026-04-17T07:22:30.617Z")
+        );
+        assert_eq!(typed.user.username, "alice");
     }
 
     #[tokio::test]

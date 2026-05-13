@@ -65,7 +65,7 @@ async fn resolve_owner(
     if let Some(username) = token_store.read_username()? {
         return Ok(username);
     }
-    let session = client.get_session(token).await?;
+    let (session, _raw) = client.get_session(token).await?;
     Ok(session.user.username)
 }
 
@@ -125,21 +125,21 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
         None => SynsClient::new(config.server_url())?,
     };
 
-    let response = smart_push(&client, &token, &repo_id, &push_path, opts).await?;
+    let (response, raw) = smart_push(&client, &token, &repo_id, &push_path, opts).await?;
 
-    format_response(output, &response, &repo_id);
+    format_response(output, &response, &raw, &repo_id);
 
     Ok(())
 }
 
-fn format_response(output: &Output, response: &PushResponse, repo_id: &str) {
+fn format_response(
+    output: &Output,
+    response: &PushResponse,
+    raw: &serde_json::Value,
+    repo_id: &str,
+) {
     if output.is_json() {
-        output.json(&serde_json::json!({
-            "commitSha": response.commit_sha,
-            "version": response.version,
-            "filesChanged": response.files_changed,
-            "created": response.created,
-        }));
+        output.json(raw);
     } else if response.files_changed > 0 || response.created {
         output.success(&format!("Pushed to {repo_id}"));
         output.table(
@@ -479,5 +479,46 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(mock_server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn push_raw_emits_full_push_response_envelope() {
+        use crate::client::PushRequest;
+
+        let mock_server = MockServer::start().await;
+        let body = r#"{"commitSha":"abc1234567890abcdef0123456789abcdef012345","version":3,"filesChanged":2,"created":false}"#;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/repos/alice/my-project/push"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let request = PushRequest {
+            files: vec![],
+            deletions: None,
+            message: None,
+            author: None,
+            parent_sha: None,
+            description: None,
+            tags: None,
+            status: None,
+            visibility: None,
+        };
+        let (typed, raw) = client
+            .push("alice/my-project", "test-token", &request)
+            .await
+            .unwrap();
+
+        assert_eq!(raw.as_object().unwrap().keys().count(), 4);
+        assert_eq!(
+            raw["commitSha"],
+            serde_json::json!("abc1234567890abcdef0123456789abcdef012345")
+        );
+        assert_eq!(raw["filesChanged"], serde_json::json!(2));
+        assert_eq!(raw["created"], serde_json::json!(false));
+        let expected: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(raw, expected);
+        assert!(typed.commit_sha.starts_with("abc1234567890"));
     }
 }

@@ -5,16 +5,6 @@ use crate::errors::CliError;
 use crate::output::Output;
 use crate::repo::if_repo::resolve_full_or_skip;
 use console::style;
-use serde_json::json;
-
-fn status_str(status: &DiffStatus) -> &'static str {
-    match status {
-        DiffStatus::Added => "added",
-        DiffStatus::Modified => "modified",
-        DiffStatus::Deleted => "deleted",
-        DiffStatus::Unknown => "unknown",
-    }
-}
 
 fn style_status(status: &DiffStatus) -> console::StyledObject<&'static str> {
     match status {
@@ -49,7 +39,7 @@ pub async fn cmd_diff(
     let (from_val, to_val) = match (from, to) {
         (Some(f), Some(t)) => (f, t),
         (None, None) => {
-            let response = client
+            let (response, _raw) = client
                 .list_versions(&repo_id, token.as_deref(), 2, 0)
                 .await?;
             if response.data.len() < 2 {
@@ -71,20 +61,12 @@ pub async fn cmd_diff(
         }
     };
 
-    let response = client
+    let (response, raw) = client
         .get_diff(&repo_id, token.as_deref(), &from_val, &to_val)
         .await?;
 
     if output.is_json() {
-        output.json(&json!({
-            "from": { "version": response.from.version, "sha": response.from.sha },
-            "to": { "version": response.to.version, "sha": response.to.sha },
-            "files": response.files.iter().map(|e| json!({
-                "path": e.path,
-                "status": status_str(&e.status),
-                "diff": e.diff,
-            })).collect::<Vec<_>>(),
-        }));
+        output.json(&raw);
     } else {
         if response.files.is_empty() {
             output.success("No differences found.");
@@ -314,5 +296,31 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(mock_server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn diff_get_diff_raw_includes_old_path_on_renames() {
+        use crate::client::SynsClient;
+
+        let mock_server = MockServer::start().await;
+        let body = r#"{"from":{"version":1,"sha":"aaa11111"},"to":{"version":2,"sha":"bbb22222"},"files":[{"path":"src/new.ts","oldPath":"src/old.ts","status":"renamed","diff":"diff --git a/src/old.ts b/src/new.ts\nsimilarity index 100%\nrename from src/old.ts\nrename to src/new.ts\n"}]}"#;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/my-project/diff"))
+            .and(query_param("from", "1"))
+            .and(query_param("to", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let (typed, raw) = client
+            .get_diff("alice/my-project", None, "1", "2")
+            .await
+            .unwrap();
+
+        assert!(raw["files"][0].get("oldPath").is_some());
+        assert_eq!(raw["files"][0]["oldPath"], serde_json::json!("src/old.ts"));
+        assert_eq!(raw["files"][0]["status"], serde_json::json!("renamed"));
+        assert_eq!(typed.files[0].path, "src/new.ts");
     }
 }

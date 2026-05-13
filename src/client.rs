@@ -173,7 +173,7 @@ pub struct RevertFileRequest {
 
 // --- Response Types ---
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct PushResponse {
     pub commit_sha: String,
@@ -494,7 +494,7 @@ pub struct SessionUser {
     pub image: Option<String>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct RevertResponse {
     pub commit_sha: String,
@@ -557,6 +557,40 @@ async fn process_response<T: serde::de::DeserializeOwned>(
     })
 }
 
+/// Reads the response body once, parses it to `serde_json::Value`, and additionally
+/// materializes the typed `T`. Returns `(T, serde_json::Value)`.
+///
+/// Used by every `SynsClient::*` method whose response is emitted under `--json`,
+/// so the CLI can pass the server's byte sequence through verbatim (modulo
+/// pretty-print whitespace and key order) while still feeding the typed
+/// representation to comfy-table renders, manifest writes, and success banners.
+///
+/// `Value::clone` is a shallow-tree clone whose cost is dwarfed by the network
+/// round-trip; reading the body twice is impossible because `reqwest::Response::bytes`
+/// consumes the response.
+async fn process_response_raw<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<(T, serde_json::Value), CliError> {
+    let response = check_response(response).await?;
+    let status = response.status();
+    let bytes = response.bytes().await.map_err(|e| CliError::Api {
+        status: Some(status.as_u16()),
+        error: format!("invalid response body: {e}"),
+        context: None,
+    })?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| CliError::Api {
+        status: Some(status.as_u16()),
+        error: format!("invalid response body: {e}"),
+        context: None,
+    })?;
+    let typed: T = serde_json::from_value(value.clone()).map_err(|e| CliError::Api {
+        status: Some(status.as_u16()),
+        error: format!("invalid response body: {e}"),
+        context: None,
+    })?;
+    Ok((typed, value))
+}
+
 async fn process_empty_response(response: reqwest::Response) -> Result<(), CliError> {
     check_response(response).await?;
     Ok(())
@@ -598,7 +632,7 @@ impl SynsClient {
         repo_id: &str,
         token: &str,
         request: &PushRequest,
-    ) -> Result<PushResponse, CliError> {
+    ) -> Result<(PushResponse, serde_json::Value), CliError> {
         let url = format!("{}/api/v1/repos/{}/push", self.base_url, repo_id);
         let response = self
             .client
@@ -607,7 +641,7 @@ impl SynsClient {
             .json(request)
             .send()
             .await?;
-        process_response(response).await
+        process_response_raw(response).await
     }
 
     pub async fn pull(&self, repo_id: &str, token: Option<&str>) -> Result<PullResponse, CliError> {
@@ -681,7 +715,7 @@ impl SynsClient {
         path: Option<&str>,
         recursive: bool,
         version_ref: Option<&str>,
-    ) -> Result<TreeResponse, CliError> {
+    ) -> Result<(TreeResponse, serde_json::Value), CliError> {
         let url = match path {
             Some(p) => format!(
                 "{}/api/v1/repos/{}/tree/{}",
@@ -702,7 +736,7 @@ impl SynsClient {
             req = req.bearer_auth(t);
         }
         let response = req.send().await?;
-        process_response(response).await
+        process_response_raw(response).await
     }
 
     pub async fn get_file(
@@ -711,7 +745,7 @@ impl SynsClient {
         token: Option<&str>,
         path: &str,
         version_ref: Option<&str>,
-    ) -> Result<FileResponse, CliError> {
+    ) -> Result<(FileResponse, serde_json::Value), CliError> {
         let url = format!(
             "{}/api/v1/repos/{}/files/{}",
             self.base_url,
@@ -726,7 +760,7 @@ impl SynsClient {
             req = req.bearer_auth(t);
         }
         let response = req.send().await?;
-        process_response(response).await
+        process_response_raw(response).await
     }
 
     pub async fn get_file_history(
@@ -735,7 +769,7 @@ impl SynsClient {
         token: Option<&str>,
         path: &str,
         limit: u32,
-    ) -> Result<FileHistoryResponse, CliError> {
+    ) -> Result<(FileHistoryResponse, serde_json::Value), CliError> {
         let url = format!(
             "{}/api/v1/repos/{}/files/{}/history",
             self.base_url,
@@ -747,7 +781,7 @@ impl SynsClient {
             req = req.bearer_auth(t);
         }
         let response = req.send().await?;
-        process_response(response).await
+        process_response_raw(response).await
     }
 
     pub async fn list_versions(
@@ -756,7 +790,7 @@ impl SynsClient {
         token: Option<&str>,
         limit: u32,
         offset: u32,
-    ) -> Result<VersionListResponse, CliError> {
+    ) -> Result<(VersionListResponse, serde_json::Value), CliError> {
         let url = format!("{}/api/v1/repos/{}/versions", self.base_url, repo_id);
         let mut req = self
             .client
@@ -766,7 +800,7 @@ impl SynsClient {
             req = req.bearer_auth(t);
         }
         let response = req.send().await?;
-        process_response(response).await
+        process_response_raw(response).await
     }
 
     pub async fn get_diff(
@@ -775,14 +809,14 @@ impl SynsClient {
         token: Option<&str>,
         from: &str,
         to: &str,
-    ) -> Result<DiffResponse, CliError> {
+    ) -> Result<(DiffResponse, serde_json::Value), CliError> {
         let url = format!("{}/api/v1/repos/{}/diff", self.base_url, repo_id);
         let mut req = self.client.get(&url).query(&[("from", from), ("to", to)]);
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
         let response = req.send().await?;
-        process_response(response).await
+        process_response_raw(response).await
     }
 
     pub async fn list_collaborators(
@@ -791,7 +825,7 @@ impl SynsClient {
         token: Option<&str>,
         limit: u32,
         offset: u32,
-    ) -> Result<CollaboratorListResponse, CliError> {
+    ) -> Result<(CollaboratorListResponse, serde_json::Value), CliError> {
         let url = format!("{}/api/v1/repos/{}/collaborators", self.base_url, repo_id);
         let mut req = self
             .client
@@ -801,7 +835,7 @@ impl SynsClient {
             req = req.bearer_auth(t);
         }
         let response = req.send().await?;
-        process_response(response).await
+        process_response_raw(response).await
     }
 
     pub async fn add_collaborator(
@@ -867,7 +901,7 @@ impl SynsClient {
         status: Option<&RepoStatus>,
         limit: u32,
         offset: u32,
-    ) -> Result<ExploreResponse, CliError> {
+    ) -> Result<(ExploreResponse, serde_json::Value), CliError> {
         let url = format!("{}/api/v1/explore", self.base_url);
         let mut req = self
             .client
@@ -883,7 +917,7 @@ impl SynsClient {
             req = req.query(&[("status", s.as_query_str())]);
         }
         let response = req.send().await?;
-        process_response(response).await
+        process_response_raw(response).await
     }
 
     pub async fn fork(
@@ -891,7 +925,7 @@ impl SynsClient {
         repo_id: &str,
         token: &str,
         request: &ForkRequest,
-    ) -> Result<ForkResponse, CliError> {
+    ) -> Result<(ForkResponse, serde_json::Value), CliError> {
         let url = format!("{}/api/v1/repos/{}/fork", self.base_url, repo_id);
         let response = self
             .client
@@ -900,7 +934,7 @@ impl SynsClient {
             .json(request)
             .send()
             .await?;
-        process_response(response).await
+        process_response_raw(response).await
     }
 
     pub async fn delete_repo(&self, repo_id: &str, token: &str) -> Result<(), CliError> {
@@ -909,15 +943,23 @@ impl SynsClient {
         process_empty_response(response).await
     }
 
-    pub async fn get_session(&self, token: &str) -> Result<SessionResponse, CliError> {
+    pub async fn get_session(
+        &self,
+        token: &str,
+    ) -> Result<(SessionResponse, serde_json::Value), CliError> {
         let url = format!("{}/api/auth/get-session", self.base_url);
         let response = self.client.get(&url).bearer_auth(token).send().await?;
         let response = check_response(response).await?;
-        // Special handling: better-auth returns 200 with null when token is invalid
-        response
-            .json::<SessionResponse>()
-            .await
-            .map_err(|_| CliError::AuthRequired)
+        // Special handling: better-auth returns 200 with null when token is invalid.
+        // Every body-read / parse / typed-deserialize failure on this endpoint
+        // maps to AuthRequired (not the generic "invalid response body" surface),
+        // preserving observable behavior on token-expiry for cmd_login / cmd_whoami.
+        let bytes = response.bytes().await.map_err(|_| CliError::AuthRequired)?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| CliError::AuthRequired)?;
+        let typed: SessionResponse =
+            serde_json::from_value(value.clone()).map_err(|_| CliError::AuthRequired)?;
+        Ok((typed, value))
     }
 
     pub async fn update_repo(
@@ -943,7 +985,7 @@ impl SynsClient {
         token: &str,
         path: &str,
         request: &RevertFileRequest,
-    ) -> Result<RevertResponse, CliError> {
+    ) -> Result<(RevertResponse, serde_json::Value), CliError> {
         let url = format!(
             "{}/api/v1/repos/{}/files/{}/revert",
             self.base_url,
@@ -957,7 +999,7 @@ impl SynsClient {
             .json(request)
             .send()
             .await?;
-        process_response(response).await
+        process_response_raw(response).await
     }
 }
 
@@ -970,7 +1012,7 @@ impl SynsClient {
         &self,
         token: &str,
         request: &CreateTeamRequest,
-    ) -> Result<TeamResponse, CliError> {
+    ) -> Result<(TeamResponse, serde_json::Value), CliError> {
         let url = format!("{}/api/v1/teams", self.base_url);
         let response = self
             .client
@@ -979,19 +1021,26 @@ impl SynsClient {
             .json(request)
             .send()
             .await?;
-        process_response(response).await
+        process_response_raw(response).await
     }
 
-    pub async fn list_teams(&self, token: &str) -> Result<TeamListResponse, CliError> {
+    pub async fn list_teams(
+        &self,
+        token: &str,
+    ) -> Result<(TeamListResponse, serde_json::Value), CliError> {
         let url = format!("{}/api/v1/teams", self.base_url);
         let response = self.client.get(&url).bearer_auth(token).send().await?;
-        process_response(response).await
+        process_response_raw(response).await
     }
 
-    pub async fn get_team(&self, token: &str, team_id: &str) -> Result<TeamResponse, CliError> {
+    pub async fn get_team(
+        &self,
+        token: &str,
+        team_id: &str,
+    ) -> Result<(TeamResponse, serde_json::Value), CliError> {
         let url = format!("{}/api/v1/teams/{}", self.base_url, team_id);
         let response = self.client.get(&url).bearer_auth(token).send().await?;
-        process_response(response).await
+        process_response_raw(response).await
     }
 
     pub async fn update_team(
@@ -999,7 +1048,7 @@ impl SynsClient {
         token: &str,
         team_id: &str,
         request: &UpdateTeamRequest,
-    ) -> Result<TeamResponse, CliError> {
+    ) -> Result<(TeamResponse, serde_json::Value), CliError> {
         let url = format!("{}/api/v1/teams/{}", self.base_url, team_id);
         let response = self
             .client
@@ -1008,7 +1057,7 @@ impl SynsClient {
             .json(request)
             .send()
             .await?;
-        process_response(response).await
+        process_response_raw(response).await
     }
 
     pub async fn delete_team(&self, token: &str, team_id: &str) -> Result<(), CliError> {
@@ -1023,10 +1072,10 @@ impl SynsClient {
         &self,
         token: &str,
         team_id: &str,
-    ) -> Result<TeamMembersResponse, CliError> {
+    ) -> Result<(TeamMembersResponse, serde_json::Value), CliError> {
         let url = format!("{}/api/v1/teams/{}/members", self.base_url, team_id);
         let response = self.client.get(&url).bearer_auth(token).send().await?;
-        process_response(response).await
+        process_response_raw(response).await
     }
 
     pub async fn invite_member(
@@ -1034,7 +1083,7 @@ impl SynsClient {
         token: &str,
         team_id: &str,
         request: &InviteRequest,
-    ) -> Result<InvitationResponse, CliError> {
+    ) -> Result<(InvitationResponse, serde_json::Value), CliError> {
         let url = format!("{}/api/v1/teams/{}/invite", self.base_url, team_id);
         let response = self
             .client
@@ -1043,7 +1092,7 @@ impl SynsClient {
             .json(request)
             .send()
             .await?;
-        process_response(response).await
+        process_response_raw(response).await
     }
 
     pub async fn change_role(
@@ -1052,7 +1101,7 @@ impl SynsClient {
         team_id: &str,
         user_id: &str,
         request: &ChangeRoleRequest,
-    ) -> Result<TeamMemberResponse, CliError> {
+    ) -> Result<(TeamMemberResponse, serde_json::Value), CliError> {
         let url = format!(
             "{}/api/v1/teams/{}/members/{}/role",
             self.base_url, team_id, user_id
@@ -1064,7 +1113,7 @@ impl SynsClient {
             .json(request)
             .send()
             .await?;
-        process_response(response).await
+        process_response_raw(response).await
     }
 
     pub async fn remove_member(
@@ -1086,23 +1135,23 @@ impl SynsClient {
     pub async fn list_my_invitations(
         &self,
         token: &str,
-    ) -> Result<InvitationListResponse, CliError> {
+    ) -> Result<(InvitationListResponse, serde_json::Value), CliError> {
         let url = format!("{}/api/v1/teams/invitations", self.base_url);
         let response = self.client.get(&url).bearer_auth(token).send().await?;
-        process_response(response).await
+        process_response_raw(response).await
     }
 
     pub async fn accept_invitation(
         &self,
         token: &str,
         invitation_id: &str,
-    ) -> Result<TeamMemberResponse, CliError> {
+    ) -> Result<(TeamMemberResponse, serde_json::Value), CliError> {
         let url = format!(
             "{}/api/v1/teams/invitations/{}/accept",
             self.base_url, invitation_id
         );
         let response = self.client.post(&url).bearer_auth(token).send().await?;
-        process_response(response).await
+        process_response_raw(response).await
     }
 
     pub async fn decline_invitation(
@@ -1127,7 +1176,7 @@ impl SynsClient {
         owner: &str,
         name: &str,
         request: &TeamRepoAccessRequest,
-    ) -> Result<TeamRepoResponse, CliError> {
+    ) -> Result<(TeamRepoResponse, serde_json::Value), CliError> {
         let url = format!(
             "{}/api/v1/teams/{}/repos/{}/{}",
             self.base_url, team_id, owner, name
@@ -1139,7 +1188,7 @@ impl SynsClient {
             .json(request)
             .send()
             .await?;
-        process_response(response).await
+        process_response_raw(response).await
     }
 
     pub async fn remove_team_repo(
@@ -1161,10 +1210,10 @@ impl SynsClient {
         &self,
         token: &str,
         team_id: &str,
-    ) -> Result<TeamReposResponse, CliError> {
+    ) -> Result<(TeamReposResponse, serde_json::Value), CliError> {
         let url = format!("{}/api/v1/teams/{}/repos", self.base_url, team_id);
         let response = self.client.get(&url).bearer_auth(token).send().await?;
-        process_response(response).await
+        process_response_raw(response).await
     }
 }
 
@@ -1598,5 +1647,120 @@ mod tests {
         let actual = serde_json::to_string(&response).unwrap();
         let expected = r#"{"data":[{"owner":"bart","name":"syns","description":"a repo","commitSha":"abc123","status":"active","author":"Alice","tags":["alpha","beta"],"visibility":"public","forkedFrom":{"owner":"upstream","name":"syns"},"forkCount":2,"fileCount":436,"role":"owner","createdAt":"2025-01-01T00:00:00Z","updatedAt":"2026-05-07T13:00:01Z"}],"total":1,"limit":20,"offset":0}"#;
         assert_eq!(actual, expected);
+    }
+
+    // --- process_response_raw tests (u210) ---
+
+    #[derive(serde::Deserialize, Debug)]
+    struct TestShape {
+        foo: String,
+        nested: serde_json::Value,
+    }
+
+    #[tokio::test]
+    async fn process_response_raw_returns_typed_and_raw_value_byte_equivalent() {
+        let mock_server = MockServer::start().await;
+        let body = r#"{"foo":"bar","nested":{"a":1,"b":[2,3]}}"#;
+        Mock::given(method("GET"))
+            .and(path("/test-endpoint"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&mock_server)
+            .await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{}/test-endpoint", mock_server.uri()))
+            .send()
+            .await
+            .unwrap();
+
+        let result = process_response_raw::<TestShape>(response).await;
+        let (typed, raw) = result.unwrap();
+        assert_eq!(typed.foo, "bar");
+        assert_eq!(typed.nested, serde_json::json!({"a": 1, "b": [2, 3]}));
+        let expected_raw: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(raw, expected_raw);
+    }
+
+    #[tokio::test]
+    async fn process_response_raw_propagates_check_response_errors() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/test-error"))
+            .respond_with(ResponseTemplate::new(401).set_body_string(r#"{"error":"unauthorized"}"#))
+            .mount(&mock_server)
+            .await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{}/test-error", mock_server.uri()))
+            .send()
+            .await
+            .unwrap();
+
+        let result = process_response_raw::<TestShape>(response).await;
+        assert!(matches!(result, Err(CliError::AuthRequired)));
+    }
+
+    #[tokio::test]
+    async fn process_response_raw_fails_on_unparseable_body() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/test-bad"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not-json-at-all"))
+            .mount(&mock_server)
+            .await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{}/test-bad", mock_server.uri()))
+            .send()
+            .await
+            .unwrap();
+
+        let result = process_response_raw::<TestShape>(response).await;
+        match result {
+            Err(CliError::Api {
+                status: Some(200),
+                ref error,
+                ..
+            }) => assert!(
+                error.starts_with("invalid response body:"),
+                "expected 'invalid response body:' prefix, got: {error}"
+            ),
+            other => panic!("expected Api error with status 200, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn process_response_raw_fails_on_shape_mismatch() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/test-shape"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"unrelated":"x"}"#))
+            .mount(&mock_server)
+            .await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{}/test-shape", mock_server.uri()))
+            .send()
+            .await
+            .unwrap();
+
+        let result = process_response_raw::<TestShape>(response).await;
+        match result {
+            Err(CliError::Api {
+                status: Some(200),
+                ref error,
+                ..
+            }) => {
+                assert!(
+                    error.contains("invalid response body"),
+                    "expected message containing 'invalid response body', got: {error}"
+                );
+                assert!(
+                    error.contains("foo"),
+                    "expected message mentioning missing field 'foo', got: {error}"
+                );
+            }
+            other => panic!("expected Api error with status 200, got: {other:?}"),
+        }
     }
 }

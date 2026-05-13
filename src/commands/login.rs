@@ -14,7 +14,7 @@ pub async fn cmd_login(config: &Config, output: &Output) -> Result<(), CliError>
 
     let client = SynsClient::new(config.server_url())?;
     match client.get_session(&token).await {
-        Ok(session) => {
+        Ok((session, _raw)) => {
             let username = &session.user.username;
             // Re-write credentials with username for downstream identity resolution (U11)
             let _ = store.write_with_username(&token, Some(username));

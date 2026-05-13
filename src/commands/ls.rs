@@ -4,7 +4,6 @@ use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
 use crate::repo::if_repo::resolve_full_or_skip;
-use serde_json::json;
 
 pub async fn cmd_ls(
     config: &Config,
@@ -26,11 +25,11 @@ pub async fn cmd_ls(
         .flatten();
     let client = SynsClient::new(config.server_url())?;
 
-    let mut response = match client
+    let (mut response, raw) = match client
         .get_tree(&repo_id, token.as_deref(), path.as_deref(), false, None)
         .await
     {
-        Ok(r) => r,
+        Ok(tuple) => tuple,
         Err(e) => {
             if !output.is_json()
                 && let Some(p) = path.as_ref()
@@ -53,24 +52,7 @@ pub async fn cmd_ls(
     });
 
     if output.is_json() {
-        let entries: Vec<_> = response
-            .entries
-            .iter()
-            .map(|e| {
-                json!({
-                    "name": e.name,
-                    "path": e.path,
-                    "type": match e.entry_type {
-                        EntryType::File => "file",
-                        EntryType::Dir => "dir",
-                        EntryType::Unknown => "unknown",
-                    },
-                    "size": e.size,
-                    "sha": e.sha,
-                })
-            })
-            .collect();
-        output.json(&json!({ "entries": entries, "commitSha": response.commit_sha }));
+        output.json(&raw);
     } else {
         let rows: Vec<Vec<String>> = response
             .entries
@@ -311,6 +293,30 @@ mod tests {
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn ls_get_tree_raw_includes_truncated_field() {
+        let mock_server = MockServer::start().await;
+        let body = r#"{"entries":[{"name":"README.md","path":"README.md","type":"file","size":256,"sha":"abc123"}],"commitSha":"def456","truncated":false}"#;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/my-project/tree"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let (_typed, raw) = client
+            .get_tree("alice/my-project", None, None, false, None)
+            .await
+            .unwrap();
+
+        assert!(raw.get("entries").is_some() && raw["entries"].is_array());
+        assert!(raw.get("commitSha").is_some());
+        assert!(raw.get("truncated").is_some());
+        assert_eq!(raw["truncated"], serde_json::json!(false));
+        let expected: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(raw, expected);
     }
 
     #[tokio::test]

@@ -170,7 +170,7 @@ async fn resolve_team_id(
     name: &str,
     output: &Output,
 ) -> Result<String, CliError> {
-    let response = client.list_teams(token).await?;
+    let (response, _raw) = client.list_teams(token).await?;
 
     let matches: Vec<_> = if let Some((owner_part, team_part)) = name.split_once('/') {
         response
@@ -237,23 +237,9 @@ async fn resolve_team_id(
     }
 }
 
-fn display_team(output: &Output, team: &crate::client::TeamResponse) {
+fn display_team(output: &Output, team: &crate::client::TeamResponse, raw: &serde_json::Value) {
     if output.is_json() {
-        output.json(&json!({
-            "id": team.id,
-            "name": team.name,
-            "description": team.description,
-            "owner": {
-                "id": team.owner.id,
-                "username": team.owner.username,
-                "name": team.owner.name,
-                "image": team.owner.image,
-            },
-            "memberCount": team.member_count,
-            "role": format!("{:?}", team.role).to_lowercase(),
-            "createdAt": team.created_at,
-            "updatedAt": team.updated_at,
-        }));
+        output.json(raw);
     } else {
         let rows = vec![
             vec!["Name".to_string(), team.name.clone()],
@@ -274,19 +260,13 @@ fn display_team(output: &Output, team: &crate::client::TeamResponse) {
     }
 }
 
-fn display_member(output: &Output, member: &crate::client::TeamMemberResponse) {
+fn display_member(
+    output: &Output,
+    member: &crate::client::TeamMemberResponse,
+    raw: &serde_json::Value,
+) {
     if output.is_json() {
-        output.json(&json!({
-            "user": {
-                "id": member.user.id,
-                "username": member.user.username,
-                "name": member.user.name,
-                "email": member.user.email,
-                "image": member.user.image,
-            },
-            "role": format!("{:?}", member.role).to_lowercase(),
-            "joinedAt": member.joined_at,
-        }));
+        output.json(raw);
     } else {
         let rows = vec![
             vec!["Username".to_string(), member.user.username.clone()],
@@ -305,27 +285,13 @@ fn display_member(output: &Output, member: &crate::client::TeamMemberResponse) {
     }
 }
 
-fn display_invitation(output: &Output, invitation: &crate::client::InvitationResponse) {
+fn display_invitation(
+    output: &Output,
+    invitation: &crate::client::InvitationResponse,
+    raw: &serde_json::Value,
+) {
     if output.is_json() {
-        output.json(&json!({
-            "id": invitation.id,
-            "team": {
-                "id": invitation.team.id,
-                "name": invitation.team.name,
-                "description": invitation.team.description,
-            },
-            "email": invitation.email,
-            "role": format!("{:?}", invitation.role).to_lowercase(),
-            "invitedBy": invitation.invited_by.as_ref().map(|u| json!({
-                "id": u.id,
-                "username": u.username,
-                "name": u.name,
-                "image": u.image,
-            })),
-            "status": format!("{:?}", invitation.status).to_lowercase(),
-            "expiresAt": invitation.expires_at,
-            "createdAt": invitation.created_at,
-        }));
+        output.json(raw);
     } else {
         let rows = vec![
             vec!["ID".to_string(), invitation.id.clone()],
@@ -365,25 +331,9 @@ pub async fn cmd_teams(
 
     match action {
         None => {
-            let response = client.list_teams(&token).await?;
+            let (response, raw) = client.list_teams(&token).await?;
             if output.is_json() {
-                output.json(&json!({
-                    "teams": response.data.iter().map(|t| json!({
-                        "id": t.id,
-                        "name": t.name,
-                        "description": t.description,
-                        "owner": {
-                            "id": t.owner.id,
-                            "username": t.owner.username,
-                            "name": t.owner.name,
-                            "image": t.owner.image,
-                        },
-                        "memberCount": t.member_count,
-                        "role": format!("{:?}", t.role).to_lowercase(),
-                        "createdAt": t.created_at,
-                        "updatedAt": t.updated_at,
-                    })).collect::<Vec<_>>(),
-                }));
+                output.json(&raw);
             } else {
                 let rows = response
                     .data
@@ -403,13 +353,13 @@ pub async fn cmd_teams(
         }
         Some(TeamsAction::Create { name, description }) => {
             let request = CreateTeamRequest { name, description };
-            let response = client.create_team(&token, &request).await?;
-            display_team(output, &response);
+            let (response, raw) = client.create_team(&token, &request).await?;
+            display_team(output, &response, &raw);
         }
         Some(TeamsAction::Show { name }) => {
             let team_id = resolve_team_id(&client, &token, &name, output).await?;
-            let response = client.get_team(&token, &team_id).await?;
-            display_team(output, &response);
+            let (response, raw) = client.get_team(&token, &team_id).await?;
+            display_team(output, &response, &raw);
         }
         Some(TeamsAction::Update {
             name,
@@ -438,8 +388,8 @@ pub async fn cmd_teams(
                 name: rename,
                 description: desc,
             };
-            let response = client.update_team(&token, &team_id, &request).await?;
-            display_team(output, &response);
+            let (response, raw) = client.update_team(&token, &team_id, &request).await?;
+            display_team(output, &response, &raw);
         }
         Some(TeamsAction::Delete { name, yes }) => {
             let team_id = resolve_team_id(&client, &token, &name, output).await?;
@@ -466,21 +416,9 @@ pub async fn cmd_teams(
         }
         Some(TeamsAction::Members { name }) => {
             let team_id = resolve_team_id(&client, &token, &name, output).await?;
-            let response = client.list_members(&token, &team_id).await?;
+            let (response, raw) = client.list_members(&token, &team_id).await?;
             if output.is_json() {
-                output.json(&json!({
-                    "members": response.data.iter().map(|m| json!({
-                        "user": {
-                            "id": m.user.id,
-                            "username": m.user.username,
-                            "name": m.user.name,
-                            "email": m.user.email,
-                            "image": m.user.image,
-                        },
-                        "role": format!("{:?}", m.role).to_lowercase(),
-                        "joinedAt": m.joined_at,
-                    })).collect::<Vec<_>>(),
-                }));
+                output.json(&raw);
             } else {
                 let rows = response
                     .data
@@ -505,33 +443,13 @@ pub async fn cmd_teams(
                 email,
                 role: parsed_role,
             };
-            let response = client.invite_member(&token, &team_id, &request).await?;
-            display_invitation(output, &response);
+            let (response, raw) = client.invite_member(&token, &team_id, &request).await?;
+            display_invitation(output, &response, &raw);
         }
         Some(TeamsAction::Invitations) => {
-            let response = client.list_my_invitations(&token).await?;
+            let (response, raw) = client.list_my_invitations(&token).await?;
             if output.is_json() {
-                output.json(&json!({
-                    "invitations": response.data.iter().map(|inv| json!({
-                        "id": inv.id,
-                        "team": {
-                            "id": inv.team.id,
-                            "name": inv.team.name,
-                            "description": inv.team.description,
-                        },
-                        "email": inv.email,
-                        "role": format!("{:?}", inv.role).to_lowercase(),
-                        "invitedBy": inv.invited_by.as_ref().map(|u| json!({
-                            "id": u.id,
-                            "username": u.username,
-                            "name": u.name,
-                            "image": u.image,
-                        })),
-                        "status": format!("{:?}", inv.status).to_lowercase(),
-                        "expiresAt": inv.expires_at,
-                        "createdAt": inv.created_at,
-                    })).collect::<Vec<_>>(),
-                }));
+                output.json(&raw);
             } else {
                 let rows = response
                     .data
@@ -553,8 +471,8 @@ pub async fn cmd_teams(
             }
         }
         Some(TeamsAction::Accept { invitation_id }) => {
-            let response = client.accept_invitation(&token, &invitation_id).await?;
-            display_member(output, &response);
+            let (response, raw) = client.accept_invitation(&token, &invitation_id).await?;
+            display_member(output, &response, &raw);
         }
         Some(TeamsAction::Decline { invitation_id }) => {
             client.decline_invitation(&token, &invitation_id).await?;
@@ -572,10 +490,10 @@ pub async fn cmd_teams(
             let parsed_role = parse_team_role(&role)?;
             let team_id = resolve_team_id(&client, &token, &name, output).await?;
             let request = ChangeRoleRequest { role: parsed_role };
-            let response = client
+            let (response, raw) = client
                 .change_role(&token, &team_id, &user_id, &request)
                 .await?;
-            display_member(output, &response);
+            display_member(output, &response, &raw);
         }
         Some(TeamsAction::Remove { name, user_id, yes }) => {
             let team_id = resolve_team_id(&client, &token, &name, output).await?;
@@ -605,24 +523,11 @@ pub async fn cmd_teams(
             let team_id = resolve_team_id(&client, &token, &name, output).await?;
             let (repo_owner, repo_name) = parse_repo_string(&repo)?;
             let request = TeamRepoAccessRequest { role: parsed_role };
-            let response = client
+            let (response, raw) = client
                 .add_team_repo(&token, &team_id, repo_owner, repo_name, &request)
                 .await?;
             if output.is_json() {
-                output.json(&json!({
-                    "owner": response.owner,
-                    "name": response.name,
-                    "description": response.description,
-                    "visibility": format!("{:?}", response.visibility).to_lowercase(),
-                    "role": format!("{:?}", response.role).to_lowercase(),
-                    "addedBy": response.added_by.as_ref().map(|u| json!({
-                        "id": u.id,
-                        "username": u.username,
-                        "name": u.name,
-                        "image": u.image,
-                    })),
-                    "addedAt": response.added_at,
-                }));
+                output.json(&raw);
             } else {
                 let rows = vec![
                     vec![
@@ -681,24 +586,9 @@ pub async fn cmd_teams(
         }
         Some(TeamsAction::Repos { name }) => {
             let team_id = resolve_team_id(&client, &token, &name, output).await?;
-            let response = client.list_team_repos(&token, &team_id).await?;
+            let (response, raw) = client.list_team_repos(&token, &team_id).await?;
             if output.is_json() {
-                output.json(&json!({
-                    "repos": response.data.iter().map(|r| json!({
-                        "owner": r.owner,
-                        "name": r.name,
-                        "description": r.description,
-                        "visibility": format!("{:?}", r.visibility).to_lowercase(),
-                        "role": format!("{:?}", r.role).to_lowercase(),
-                        "addedBy": r.added_by.as_ref().map(|u| json!({
-                            "id": u.id,
-                            "username": u.username,
-                            "name": u.name,
-                            "image": u.image,
-                        })),
-                        "addedAt": r.added_at,
-                    })).collect::<Vec<_>>(),
-                }));
+                output.json(&raw);
             } else {
                 let rows = response
                     .data
@@ -941,5 +831,101 @@ mod tests {
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
+    }
+
+    // --- u210 raw-passthrough tests ---
+
+    #[tokio::test]
+    async fn teams_members_raw_preserves_full_user_and_uses_data_envelope() {
+        let mock_server = MockServer::start().await;
+        let body = r#"{"data":[{"user":{"id":"u-alice","username":"alice","name":"Alice","email":"alice@test.com","emailVerified":true,"image":null,"createdAt":"2026-04-17T07:22:30.617Z","updatedAt":"2026-04-17T07:22:30.617Z"},"role":"owner","joinedAt":"2026-04-17T07:24:32.045Z"}]}"#;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/teams/team-1/members"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let (typed, raw) = client.list_members("test-token", "team-1").await.unwrap();
+
+        assert!(raw.get("data").is_some());
+        assert!(raw["data"].is_array());
+        assert_eq!(
+            raw["data"][0]["user"].as_object().unwrap().keys().count(),
+            8
+        );
+        assert_eq!(
+            raw["data"][0]["user"]["emailVerified"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            raw["data"][0]["user"]["createdAt"],
+            serde_json::json!("2026-04-17T07:22:30.617Z")
+        );
+        assert_eq!(
+            raw["data"][0]["user"]["updatedAt"],
+            serde_json::json!("2026-04-17T07:22:30.617Z")
+        );
+        assert_eq!(typed.data[0].user.email.as_deref(), Some("alice@test.com"));
+        let expected: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(raw, expected);
+    }
+
+    #[tokio::test]
+    async fn teams_list_emits_data_envelope_not_teams_key() {
+        let mock_server = MockServer::start().await;
+        let body = r#"{"data":[{"id":"t-1","name":"team-a","description":"first","owner":{"id":"u-1","username":"alice","name":"Alice","image":null},"memberCount":2,"role":"owner","createdAt":"2026-04-17T07:22:30.617Z","updatedAt":"2026-04-17T07:22:30.617Z"}]}"#;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/teams"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let (typed, raw) = client.list_teams("test-token").await.unwrap();
+
+        assert!(raw["data"].is_array());
+        assert!(raw.get("teams").is_none());
+        assert_eq!(typed.data.len(), 1);
+        let expected: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(raw, expected);
+    }
+
+    #[tokio::test]
+    async fn teams_invitations_emits_data_envelope_not_invitations_key() {
+        let mock_server = MockServer::start().await;
+        let body = r#"{"data":[{"id":"inv-1","team":{"id":"t-1","name":"team-a","description":null},"email":"bob@test.com","role":"member","invitedBy":{"id":"u-1","username":"alice","name":"Alice","image":null},"status":"pending","expiresAt":"2026-05-01T00:00:00.000Z","createdAt":"2026-04-17T07:22:30.617Z"}]}"#;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/teams/invitations"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let (_typed, raw) = client.list_my_invitations("test-token").await.unwrap();
+
+        assert!(raw["data"].is_array());
+        assert!(raw.get("invitations").is_none());
+        let expected: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(raw, expected);
+    }
+
+    #[tokio::test]
+    async fn teams_repos_emits_data_envelope_not_repos_key() {
+        let mock_server = MockServer::start().await;
+        let body = r#"{"data":[{"owner":"alice","name":"my-project","description":null,"visibility":"private","role":"admin","addedBy":{"id":"u-1","username":"alice","name":"Alice","image":null},"addedAt":"2026-04-17T07:22:30.617Z"}]}"#;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/teams/t-1/repos"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let (_typed, raw) = client.list_team_repos("test-token", "t-1").await.unwrap();
+
+        assert!(raw["data"].is_array());
+        assert!(raw.get("repos").is_none());
+        let expected: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(raw, expected);
     }
 }

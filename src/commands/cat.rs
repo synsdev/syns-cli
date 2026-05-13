@@ -4,7 +4,6 @@ use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
 use crate::repo::if_repo::resolve_full_or_skip;
-use serde_json::json;
 
 pub async fn cmd_cat(
     config: &Config,
@@ -26,11 +25,11 @@ pub async fn cmd_cat(
         .flatten();
     let client = SynsClient::new(config.server_url())?;
 
-    let response = match client
+    let (response, raw) = match client
         .get_file(&repo_id, token.as_deref(), &path, None)
         .await
     {
-        Ok(r) => r,
+        Ok(tuple) => tuple,
         Err(e) => {
             if !output.is_json() {
                 return Err(e.with_cat_path_context(path.clone()));
@@ -40,11 +39,7 @@ pub async fn cmd_cat(
     };
 
     if output.is_json() {
-        output.json(&json!({
-            "content": response.content,
-            "sha": response.sha,
-            "size": response.size,
-        }));
+        output.json(&raw);
     } else {
         print!("{}", response.content);
     }
@@ -257,6 +252,30 @@ mod tests {
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn cat_get_file_raw_includes_path_field() {
+        let mock_server = MockServer::start().await;
+        let body =
+            r#"{"path":"src/main.ts","sha":"abc123","content":"console.log('hello');","size":21}"#;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/my-project/files/src/main.ts"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let (_typed, raw) = client
+            .get_file("alice/my-project", None, "src/main.ts", None)
+            .await
+            .unwrap();
+
+        assert!(raw.get("path").is_some());
+        assert_eq!(raw["path"], serde_json::json!("src/main.ts"));
+        assert!(raw.get("content").is_some());
+        assert!(raw.get("sha").is_some());
+        assert!(raw.get("size").is_some());
     }
 
     #[tokio::test]

@@ -109,7 +109,7 @@ pub async fn smart_push(
     repo_id: &str,
     path: &Path,
     opts: SmartPushOptions,
-) -> Result<PushResponse, CliError> {
+) -> Result<(PushResponse, serde_json::Value), CliError> {
     // Phase 1 — Setup
     let (owner, name) = split_repo_id(repo_id)?;
 
@@ -178,8 +178,8 @@ pub async fn smart_push(
         visibility: opts.visibility.clone(),
     };
 
-    let response = match client.push(repo_id, token, &request).await {
-        Ok(response) => response,
+    let (response, raw) = match client.push(repo_id, token, &request).await {
+        Ok((response, raw)) => (response, raw),
         Err(CliError::Api {
             status: Some(409),
             ref error,
@@ -209,7 +209,7 @@ pub async fn smart_push(
         eprintln!("warning: could not save manifest (next push will re-upload all files): {e}");
     }
 
-    Ok(response)
+    Ok((response, raw))
 }
 
 #[cfg(test)]
@@ -271,7 +271,7 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
-        let response = result.unwrap();
+        let (response, _raw) = result.unwrap();
         assert_eq!(response.commit_sha, "abc123");
 
         // .syns.yaml was auto-created

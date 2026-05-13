@@ -75,9 +75,10 @@ pub async fn cmd_pull(
     let client = SynsClient::new(config.server_url())?;
 
     let tree_response = if version.is_some() {
-        client
+        let (resp, _raw) = client
             .get_tree(&repo_id, token.as_deref(), None, true, version.as_deref())
-            .await?
+            .await?;
+        resp
     } else {
         client.pull(&repo_id, token.as_deref()).await?
     };
@@ -124,7 +125,7 @@ pub async fn cmd_pull(
     })?;
 
     for entry in &to_download {
-        let response = client
+        let (response, _raw) = client
             .get_file(&repo_id, token.as_deref(), &entry.path, version.as_deref())
             .await?;
         let file_path = safe_join(&target_dir, &entry.path)?;

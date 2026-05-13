@@ -4,7 +4,6 @@ use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
 use crate::repo::if_repo::resolve_full_or_skip;
-use serde_json::json;
 
 pub async fn cmd_history(
     config: &Config,
@@ -28,26 +27,12 @@ pub async fn cmd_history(
     let client = SynsClient::new(config.server_url())?;
 
     if let Some(path) = file {
-        let response = client
+        let (response, raw) = client
             .get_file_history(&repo_id, token.as_deref(), &path, limit)
             .await?;
 
         if output.is_json() {
-            output.json(&json!({
-                "data": response.data.iter().map(|c| json!({
-                    "version": c.version,
-                    "sha": c.sha,
-                    "blobSha": c.blob_sha,
-                    "message": c.message,
-                    "author": c.author,
-                    "createdAt": c.created_at,
-                    "content": c.content,
-                    "diff": c.diff,
-                })).collect::<Vec<_>>(),
-                "total": response.total,
-                "limit": response.limit,
-                "offset": response.offset,
-            }));
+            output.json(&raw);
         } else {
             let rows = response
                 .data
@@ -64,24 +49,12 @@ pub async fn cmd_history(
             output.table(&["SHA", "Message", "Author", "Date"], rows);
         }
     } else {
-        let response = client
+        let (response, raw) = client
             .list_versions(&repo_id, token.as_deref(), limit, 0)
             .await?;
 
         if output.is_json() {
-            output.json(&json!({
-                "data": response.data.iter().map(|v| json!({
-                    "version": v.version,
-                    "sha": v.sha,
-                    "message": v.message,
-                    "author": v.author,
-                    "createdAt": v.created_at,
-                    "filesChanged": v.files_changed,
-                })).collect::<Vec<_>>(),
-                "total": response.total,
-                "limit": response.limit,
-                "offset": response.offset,
-            }));
+            output.json(&raw);
         } else {
             let rows = response
                 .data
@@ -290,5 +263,35 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(mock_server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn history_list_versions_raw_includes_parent_sha_and_message_body() {
+        let mock_server = MockServer::start().await;
+        let body = r#"{"data":[{"version":2,"sha":"bbb22222","parentSha":"aaa11111","message":"second","messageBody":"detailed body\nwith multiple lines","author":"alice","createdAt":"2026-01-02T00:00:00Z","filesChanged":["a.ts"]}],"total":2,"limit":50,"offset":0}"#;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/my-project/versions"))
+            .and(query_param("limit", "50"))
+            .and(query_param("offset", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let (typed, raw) = client
+            .list_versions("alice/my-project", None, 50, 0)
+            .await
+            .unwrap();
+
+        assert!(raw["data"][0].get("parentSha").is_some());
+        assert_eq!(raw["data"][0]["parentSha"], serde_json::json!("aaa11111"));
+        assert!(raw["data"][0].get("messageBody").is_some());
+        assert!(
+            raw["data"][0]["messageBody"]
+                .as_str()
+                .unwrap()
+                .contains("detailed body")
+        );
+        assert_eq!(typed.data[0].version, 2);
     }
 }

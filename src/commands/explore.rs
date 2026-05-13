@@ -4,7 +4,6 @@ use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
 use console::style;
-use serde_json::to_value;
 
 pub async fn cmd_explore(
     config: &Config,
@@ -23,7 +22,7 @@ pub async fn cmd_explore(
         Some(tags.join(","))
     };
 
-    let response = client
+    let (response, raw) = client
         .explore(
             query.as_deref(),
             tag_str.as_deref(),
@@ -34,15 +33,7 @@ pub async fn cmd_explore(
         .await?;
 
     if output.is_json() {
-        let repos = to_value(&response.data).map_err(|e| CliError::Io {
-            message: format!("serialization error: {e}"),
-        })?;
-        output.json(&serde_json::json!({
-            "repositories": repos,
-            "total": response.total,
-            "limit": response.limit,
-            "offset": response.offset,
-        }));
+        output.json(&raw);
     } else {
         let rows: Vec<Vec<String>> = response
             .data
@@ -174,5 +165,28 @@ mod tests {
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn explore_raw_emits_data_envelope_not_repositories_key() {
+        use wiremock::matchers::query_param;
+
+        let mock_server = MockServer::start().await;
+        let body = r#"{"data":[{"owner":"alice","name":"a","description":null,"commitSha":"abc","status":"active","author":null,"tags":[],"visibility":"public","forkedFrom":null,"forkCount":0,"fileCount":1,"role":null,"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z"}],"total":1,"limit":20,"offset":0}"#;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/explore"))
+            .and(query_param("limit", "20"))
+            .and(query_param("offset", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let (_typed, raw) = client.explore(None, None, None, 20, 0).await.unwrap();
+
+        assert!(raw["data"].is_array());
+        assert!(raw.get("repositories").is_none());
+        let expected: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(raw, expected);
     }
 }

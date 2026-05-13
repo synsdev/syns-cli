@@ -4,7 +4,6 @@ use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
 use crate::repo::if_repo::resolve_full_or_skip;
-use serde_json::json;
 
 pub async fn cmd_revert(
     config: &Config,
@@ -31,18 +30,12 @@ pub async fn cmd_revert(
         to: to.clone(),
         message: message.clone(),
     };
-    let response = client
+    let (response, raw) = client
         .revert_file(&repo_id, &token, &path, &request)
         .await?;
 
     if output.is_json() {
-        output.json(&json!({
-            "commitSha": response.commit_sha,
-            "version": response.version,
-            "filesChanged": response.files_changed,
-            "created": response.created,
-            "path": path,
-        }));
+        output.json(&raw);
     } else if response.files_changed > 0 {
         output.success(&format!(
             "Reverted {} to {} (commit {})",
@@ -215,5 +208,39 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(mock_server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn revert_raw_emits_server_wire_shape_without_synthetic_path() {
+        let mock_server = MockServer::start().await;
+        let body = r#"{"commitSha":"def4567890abcdef0123456789abcdef01234567","version":5,"filesChanged":1,"created":false}"#;
+        Mock::given(method("POST"))
+            .and(path(
+                "/api/v1/repos/alice/my-project/files/src/main.ts/revert",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let request = RevertFileRequest {
+            to: "3".into(),
+            message: None,
+        };
+        let (typed, raw) = client
+            .revert_file("alice/my-project", "test-token", "src/main.ts", &request)
+            .await
+            .unwrap();
+
+        assert_eq!(raw.as_object().unwrap().keys().count(), 4);
+        assert!(raw.get("path").is_none());
+        assert_eq!(
+            raw["commitSha"],
+            serde_json::json!("def4567890abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(raw["filesChanged"], serde_json::json!(1));
+        let expected: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(raw, expected);
+        assert!(typed.commit_sha.starts_with("def4567890"));
     }
 }
