@@ -11,6 +11,7 @@ pub mod ls;
 pub mod pull;
 pub mod push;
 pub mod repo;
+pub mod repos;
 pub mod revert;
 pub mod status;
 pub mod teams;

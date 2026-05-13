@@ -3,7 +3,8 @@ use syns_cli::{commands, config, errors, output};
 use clap::{Parser, Subcommand};
 use syns_cli::commands::collaborators::CollaboratorsAction;
 use syns_cli::commands::push::PushArgs;
-use syns_cli::commands::repo::{CliRepoStatus, CliVisibility};
+use syns_cli::commands::repo::{CliRepoStatus, CliVisibility, RepoAction};
+use syns_cli::commands::repos::ReposArgs;
 use syns_cli::commands::teams::TeamsAction;
 use syns_cli::commands::upgrade::UpgradeArgs;
 
@@ -124,7 +125,11 @@ enum Commands {
         /// Silently skip (exit 0) when no Syns repo identity resolves
         #[arg(long)]
         if_repo: bool,
+        #[command(subcommand)]
+        action: Option<RepoAction>,
     },
+    /// List the caller's repositories
+    Repos(ReposArgs),
     /// Manage repository collaborators
     Collaborators {
         #[command(subcommand)]
@@ -247,6 +252,7 @@ async fn run(
             visibility,
             tag,
             if_repo,
+            action,
         } => {
             commands::repo::cmd_repo(
                 config,
@@ -256,9 +262,11 @@ async fn run(
                 visibility,
                 tag,
                 if_repo,
+                action,
             )
             .await?
         }
+        Commands::Repos(args) => commands::repos::cmd_repos(config, output, &args).await?,
         Commands::Collaborators {
             action,
             if_repo: parent_if_repo,

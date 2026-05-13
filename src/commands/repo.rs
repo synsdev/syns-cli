@@ -1,5 +1,6 @@
 use crate::auth::token::TokenStore;
 use crate::client::{RepoResponse, RepoStatus, RepoUpdate, SynsClient, Visibility};
+use crate::commands::repos::ReposArgs;
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
@@ -37,6 +38,12 @@ impl From<CliVisibility> for Visibility {
             CliVisibility::Private => Visibility::Private,
         }
     }
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum RepoAction {
+    /// List the caller's repositories
+    List(ReposArgs),
 }
 
 fn display_repo(output: &Output, response: &RepoResponse) {
@@ -88,6 +95,7 @@ fn display_repo(output: &Output, response: &RepoResponse) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn cmd_repo(
     config: &Config,
     output: &Output,
@@ -96,7 +104,12 @@ pub async fn cmd_repo(
     visibility: Option<CliVisibility>,
     tags: Vec<String>,
     if_repo: bool,
+    action: Option<RepoAction>,
 ) -> Result<(), CliError> {
+    if let Some(RepoAction::List(repos_args)) = action {
+        return crate::commands::repos::cmd_repos(config, output, &repos_args).await;
+    }
+
     let is_update =
         description.is_some() || status.is_some() || visibility.is_some() || !tags.is_empty();
 
@@ -178,7 +191,7 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_repo(&config, &output, None, None, None, vec![], false).await;
+        let result = cmd_repo(&config, &output, None, None, None, vec![], false, None).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
@@ -231,6 +244,7 @@ mod tests {
             Some(CliVisibility::Public),
             vec![],
             false,
+            None,
         )
         .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
@@ -273,7 +287,7 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_repo(&config, &output, None, None, None, vec![], true).await;
+        let result = cmd_repo(&config, &output, None, None, None, vec![], true, None).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
@@ -290,7 +304,7 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_repo(&config, &output, None, None, None, vec![], true).await;
+        let result = cmd_repo(&config, &output, None, None, None, vec![], true, None).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());

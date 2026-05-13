@@ -260,7 +260,7 @@ pub struct RepoResponse {
     pub updated_at: String,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct RepoListResponse {
     pub data: Vec<RepoResponse>,
@@ -620,10 +620,15 @@ impl SynsClient {
         process_response(response).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_repos(
         &self,
         token: Option<&str>,
-        search: Option<&str>,
+        q: Option<&str>,
+        owner: Option<&str>,
+        status: Option<&RepoStatus>,
+        visibility: Option<&Visibility>,
+        sort: Option<&str>,
         limit: u32,
         offset: u32,
     ) -> Result<RepoListResponse, CliError> {
@@ -632,8 +637,21 @@ impl SynsClient {
             .client
             .get(&url)
             .query(&[("limit", limit.to_string()), ("offset", offset.to_string())]);
-        if let Some(q) = search {
-            req = req.query(&[("search", q)]);
+        if let Some(q_val) = q {
+            req = req.query(&[("q", q_val)]);
+        }
+        if let Some(owner_val) = owner {
+            req = req.query(&[("owner", owner_val)]);
+        }
+        if let Some(status_val) = status {
+            req = req.query(&[("status", status_val.as_query_str())]);
+        }
+        if let Some(visibility_val) = visibility {
+            let v = format!("{:?}", visibility_val).to_lowercase();
+            req = req.query(&[("visibility", v.as_str())]);
+        }
+        if let Some(sort_val) = sort {
+            req = req.query(&[("sort", sort_val)]);
         }
         if let Some(t) = token {
             req = req.bearer_auth(t);
@@ -1153,6 +1171,9 @@ impl SynsClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+    use wiremock::matchers::{header, method, path, query_param, query_param_is_missing};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn new_accepts_https() {
@@ -1418,5 +1439,132 @@ mod tests {
         let update_empty_json = serde_json::to_value(&update_empty).unwrap();
         assert!(update_empty_json.get("name").is_none());
         assert!(update_empty_json.get("description").is_none());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn list_repos_emits_q_param_not_search_param() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos"))
+            .and(query_param("q", "myproject"))
+            .and(query_param("limit", "20"))
+            .and(query_param("offset", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [],
+                "total": 0,
+                "limit": 20,
+                "offset": 0
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let result = client
+            .list_repos(None, Some("myproject"), None, None, None, None, 20, 0)
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn list_repos_emits_all_filter_params() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos"))
+            .and(query_param("q", "needle"))
+            .and(query_param("owner", "alice"))
+            .and(query_param("status", "active"))
+            .and(query_param("visibility", "public"))
+            .and(query_param("sort", "name"))
+            .and(query_param("limit", "10"))
+            .and(query_param("offset", "20"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [],
+                "total": 0,
+                "limit": 10,
+                "offset": 20
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let result = client
+            .list_repos(
+                None,
+                Some("needle"),
+                Some("alice"),
+                Some(&RepoStatus::Active),
+                Some(&Visibility::Public),
+                Some("name"),
+                10,
+                20,
+            )
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn list_repos_omits_absent_filters() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos"))
+            .and(query_param("limit", "20"))
+            .and(query_param("offset", "0"))
+            .and(query_param_is_missing("q"))
+            .and(query_param_is_missing("owner"))
+            .and(query_param_is_missing("status"))
+            .and(query_param_is_missing("visibility"))
+            .and(query_param_is_missing("sort"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [],
+                "total": 0,
+                "limit": 20,
+                "offset": 0
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let result = client
+            .list_repos(None, None, None, None, None, None, 20, 0)
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn list_repos_sends_bearer_token_when_provided() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos"))
+            .and(header("authorization", "Bearer test-token-abc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [],
+                "total": 0,
+                "limit": 20,
+                "offset": 0
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let result = client
+            .list_repos(Some("test-token-abc"), None, None, None, None, None, 20, 0)
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
     }
 }
