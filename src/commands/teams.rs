@@ -1026,6 +1026,187 @@ mod tests {
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
+
+        // M2 (CODE_REVIEW R2 medium #2): pin the resolver→path-segment chain
+        // as an explicit assertion rather than relying on wiremock's
+        // "404 on unmatched route" default to make `result.is_ok()`
+        // load-bearing. After `cmd_teams` returns Ok, exactly one POST must
+        // have hit the resolved-UUID path segment `u_bob_001`.
+        let recorded = mock_server
+            .received_requests()
+            .await
+            .expect("request recording must be enabled");
+        let role_hits: Vec<&wiremock::Request> = recorded
+            .iter()
+            .filter(|r| {
+                r.method == wiremock::http::Method::POST
+                    && r.url.path() == "/api/v1/teams/uuid-alpha/members/u_bob_001/role"
+            })
+            .collect();
+        assert_eq!(
+            role_hits.len(),
+            1,
+            "expected exactly one POST to the resolved-UUID role path, got: {:?}",
+            recorded
+                .iter()
+                .map(|r| (r.method.clone(), r.url.path().to_string()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn cmd_teams_remove_with_known_username_succeeds_end_to_end() {
+        // M1 (CODE_REVIEW R2 medium #1): mirrors test 4's structure for the
+        // Remove arm with JSON-mode output. The DELETE mock's path segment
+        // `u_bob_001` proves the resolver supplied the resolved UUID rather
+        // than the raw "bob" string; the explicit `received_requests`
+        // assertion below pins the resolver→DELETE path-segment chain.
+        let dir = tempfile::tempdir().unwrap();
+        TokenStore::new(dir.path().join("credentials.json"))
+            .write("test-token")
+            .unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+
+        let mock_server = MockServer::start().await;
+
+        // Mock 1: GET /api/v1/teams (used by resolve_team_id)
+        Mock::given(method("GET"))
+            .and(path("/api/v1/teams"))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {
+                        "id": "uuid-alpha",
+                        "name": "alpha",
+                        "description": null,
+                        "owner": { "id": "u_alice_002", "username": "alice", "name": "Alice", "image": null },
+                        "memberCount": 2,
+                        "role": "owner",
+                        "createdAt": "2026-03-01T10:00:00Z",
+                        "updatedAt": "2026-04-01T10:00:00Z"
+                    }
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Mock 2: GET /api/v1/teams/uuid-alpha/members (used by resolve_member_user_id)
+        Mock::given(method("GET"))
+            .and(path("/api/v1/teams/uuid-alpha/members"))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {
+                        "user": { "id": "u_bob_001", "username": "bob", "name": "Bob", "email": "bob@example.com", "image": null },
+                        "role": "member",
+                        "joinedAt": "2026-04-01T10:00:00Z"
+                    },
+                    {
+                        "user": { "id": "u_alice_002", "username": "alice", "name": "Alice", "email": "alice@example.com", "image": null },
+                        "role": "owner",
+                        "joinedAt": "2026-03-01T10:00:00Z"
+                    }
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Mock 3: DELETE /api/v1/teams/uuid-alpha/members/u_bob_001
+        // Resolved-UUID path segment proves the resolver supplied
+        // `u_bob_001` rather than the raw "bob" string. The 204 response
+        // matches `SynsClient::remove_member`'s no-body contract.
+        Mock::given(method("DELETE"))
+            .and(path("/api/v1/teams/uuid-alpha/members/u_bob_001"))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&mock_server)
+            .await;
+
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(true);
+
+        let result = cmd_teams(
+            &config,
+            &output,
+            Some(TeamsAction::Remove {
+                name: "alpha".to_string(),
+                member: "bob".to_string(),
+                yes: true,
+            }),
+        )
+        .await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+
+        // M1+M2: explicit `received_requests` inspection pins the
+        // resolver→DELETE path-segment chain. Exactly one DELETE to
+        // the resolved-UUID path proves (a) the resolver fired and
+        // returned `u_bob_001` and (b) the JSON branch of the Remove
+        // arm reached `client.remove_member` after the resolver. The
+        // JSON envelope's `{"removed": true, "member": "bob"}` shape
+        // is the single literal `json!({...})` at the production
+        // call site (src/commands/teams.rs Remove arm); its key
+        // semantics are pinned by reading that source line plus
+        // `Output::format_json`'s unit tests in src/output.rs.
+        let recorded = mock_server
+            .received_requests()
+            .await
+            .expect("request recording must be enabled");
+        let delete_hits: Vec<&wiremock::Request> = recorded
+            .iter()
+            .filter(|r| {
+                r.method == wiremock::http::Method::DELETE
+                    && r.url.path() == "/api/v1/teams/uuid-alpha/members/u_bob_001"
+            })
+            .collect();
+        assert_eq!(
+            delete_hits.len(),
+            1,
+            "expected exactly one DELETE to the resolved-UUID path, got: {:?}",
+            recorded
+                .iter()
+                .map(|r| (r.method.clone(), r.url.path().to_string()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_propagates_list_members_5xx() {
+        // M3 (CODE_REVIEW R2 medium #3): pins SPEC §4 error-path
+        // contract that transport-layer errors from
+        // `client.list_members` propagate verbatim through the
+        // resolver — NOT remapped to the "no member found"
+        // `CliError::Config` no-match path. Without this guard, a
+        // future refactor could swallow 5xx into a Config error and
+        // mask real server failures behind a misleading message.
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/teams/uuid-alpha/members"))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+
+        let result =
+            resolve_member_user_id(&client, "test-token", "uuid-alpha", "alpha", "bob").await;
+        let err = result.expect_err("expected transport-layer error to propagate");
+        match err {
+            CliError::Api { status, .. } => {
+                assert_eq!(
+                    status,
+                    Some(500),
+                    "expected status 500 to propagate verbatim, got: {status:?}"
+                );
+            }
+            other => panic!(
+                "expected CliError::Api with status=500 (transport-layer propagation); got: {other:?}"
+            ),
+        }
     }
 
     #[tokio::test]
