@@ -3,7 +3,7 @@
 use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
 
-use crate::errors::CliError;
+use crate::errors::{CliError, EdgeRejecter};
 
 // --- Domain Enums ---
 
@@ -535,6 +535,26 @@ async fn check_response(response: reqwest::Response) -> Result<reqwest::Response
     let status = response.status();
     if status == reqwest::StatusCode::UNAUTHORIZED {
         return Err(CliError::AuthRequired);
+    }
+    if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+        let bytes = response.bytes().await.unwrap_or_default();
+        let prefix = &bytes[..bytes.len().min(4096)];
+        let lower = String::from_utf8_lossy(prefix).to_ascii_lowercase();
+        let rejecter = if lower.contains("cloudflare") {
+            EdgeRejecter::Cloudflare
+        } else if serde_json::from_slice::<ApiErrorBody>(prefix)
+            .map(|b| b.error == "payload_too_large")
+            .unwrap_or(false)
+        {
+            EdgeRejecter::Server
+        } else {
+            EdgeRejecter::CloudRunOrFrontend
+        };
+        return Err(CliError::PayloadTooLarge {
+            bytes_sent: 0,
+            file_count: 0,
+            rejecter,
+        });
     }
     if status.is_client_error() || status.is_server_error() {
         let code = status.as_u16();
@@ -1806,5 +1826,63 @@ mod tests {
             }
             other => panic!("expected Api error with status 200, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn process_response_raw_413_html_with_cloudflare_marker_maps_to_cloudflare_variant() {
+        let mock_server = MockServer::start().await;
+        let body = "<html><head><title>413 Request Entity Too Large</title></head><body>\n<center>cloudflare</center>\n</body></html>";
+        Mock::given(method("PUT"))
+            .and(path("/test-413-cf"))
+            .respond_with(ResponseTemplate::new(413).set_body_string(body))
+            .mount(&mock_server)
+            .await;
+
+        let response = reqwest::Client::new()
+            .put(format!("{}/test-413-cf", mock_server.uri()))
+            .send()
+            .await
+            .unwrap();
+
+        let result = process_response_raw::<TestShape>(response).await;
+        assert!(
+            matches!(
+                result,
+                Err(CliError::PayloadTooLarge {
+                    rejecter: EdgeRejecter::Cloudflare,
+                    ..
+                })
+            ),
+            "expected Err(PayloadTooLarge{{ rejecter: Cloudflare, .. }}), got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_response_raw_413_html_without_cloudflare_marker_maps_to_cloud_run_variant() {
+        let mock_server = MockServer::start().await;
+        let body = "<html><head><title>413 Request Entity Too Large</title></head><body>413 Request Entity Too Large</body></html>";
+        Mock::given(method("PUT"))
+            .and(path("/test-413-gcp"))
+            .respond_with(ResponseTemplate::new(413).set_body_string(body))
+            .mount(&mock_server)
+            .await;
+
+        let response = reqwest::Client::new()
+            .put(format!("{}/test-413-gcp", mock_server.uri()))
+            .send()
+            .await
+            .unwrap();
+
+        let result = process_response_raw::<TestShape>(response).await;
+        assert!(
+            matches!(
+                result,
+                Err(CliError::PayloadTooLarge {
+                    rejecter: EdgeRejecter::CloudRunOrFrontend,
+                    ..
+                })
+            ),
+            "expected Err(PayloadTooLarge{{ rejecter: CloudRunOrFrontend, .. }}), got: {result:?}"
+        );
     }
 }

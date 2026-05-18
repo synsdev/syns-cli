@@ -20,6 +20,11 @@ pub enum CliError {
         message: String,
     },
     Upgrade(crate::commands::upgrade::UpgradeError),
+    PayloadTooLarge {
+        bytes_sent: u64,
+        file_count: usize,
+        rejecter: EdgeRejecter,
+    },
     PushEmpty {
         path: String,
         total_walked: usize,
@@ -38,6 +43,13 @@ pub enum CliError {
 pub enum ApiErrorContext {
     LsPath { path: String },
     CatPath { path: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeRejecter {
+    Cloudflare,
+    CloudRunOrFrontend,
+    Server,
 }
 
 impl CliError {
@@ -76,6 +88,24 @@ impl CliError {
                 "error": "push_partial",
                 "skipped": skipped,
             })),
+            CliError::PayloadTooLarge {
+                bytes_sent,
+                file_count,
+                rejecter,
+            } => {
+                let rejecter_wire = match rejecter {
+                    EdgeRejecter::Cloudflare => "cloudflare",
+                    EdgeRejecter::CloudRunOrFrontend => "cloud_run",
+                    EdgeRejecter::Server => "server",
+                };
+                Some(serde_json::json!({
+                    "error": "payload_too_large",
+                    "rejecter": rejecter_wire,
+                    "bytesSent": bytes_sent,
+                    "fileCount": file_count,
+                    "suggestion": "auto-chunked when feasible; otherwise split with --exclude PATTERN and re-run",
+                }))
+            }
             _ => None,
         }
     }
@@ -137,6 +167,22 @@ impl std::fmt::Display for CliError {
             CliError::Io { message } => write!(f, "{message}"),
             CliError::Config { message } => write!(f, "configuration error: {message}"),
             CliError::Upgrade(e) => write!(f, "{e}"),
+            CliError::PayloadTooLarge {
+                bytes_sent,
+                file_count,
+                rejecter,
+            } => {
+                let rejecter_phrase = match rejecter {
+                    EdgeRejecter::Cloudflare => "Cloudflare's edge",
+                    EdgeRejecter::CloudRunOrFrontend => "Cloud Run's frontend",
+                    EdgeRejecter::Server => "the Syns server",
+                };
+                let bytes_mib = *bytes_sent as f64 / (1024.0 * 1024.0);
+                write!(
+                    f,
+                    "push body rejected by {rejecter_phrase} (HTTP 413).\n  attempted {file_count} file(s), ~{bytes_mib:.1} MiB.\n  approximate caps: Cloudflare Free tier ~100 MiB; Cloud Run HTTP/1.1 ~32 MiB.\n  the CLI auto-chunks below a 25 MiB per-commit budget when feasible; if a single file exceeds the budget, split with:\n    syns push --exclude '<pattern>'\n  subsequent pushes deduplicate via the local manifest, so only new content is sent each time."
+                )
+            }
             CliError::PushEmpty {
                 path,
                 total_walked,
@@ -418,6 +464,103 @@ mod tests {
             .json_value()
             .is_none()
         );
+    }
+
+    #[test]
+    fn display_payload_too_large_renders_actionable_multi_line_message() {
+        let cf = CliError::PayloadTooLarge {
+            bytes_sent: 40 * 1024 * 1024,
+            file_count: 1234,
+            rejecter: EdgeRejecter::Cloudflare,
+        };
+        let cf_text = cf.to_string();
+        assert!(
+            cf_text.contains("Cloudflare's edge"),
+            "missing Cloudflare's edge phrase: {cf_text}"
+        );
+        assert!(cf_text.contains("HTTP 413"), "missing HTTP 413: {cf_text}");
+        assert!(
+            cf_text.contains("1234 file(s)"),
+            "missing file count: {cf_text}"
+        );
+        assert!(cf_text.contains("~40.0 MiB"), "missing MiB: {cf_text}");
+        assert!(
+            cf_text.contains("25 MiB"),
+            "missing budget mention: {cf_text}"
+        );
+        assert!(
+            cf_text.contains("syns push --exclude"),
+            "missing exclude hint: {cf_text}"
+        );
+        assert!(
+            cf_text.contains("manifest"),
+            "missing manifest mention: {cf_text}"
+        );
+        assert_eq!(
+            cf_text.lines().count(),
+            6,
+            "expected 6 lines, got:\n{cf_text}"
+        );
+
+        let cr = CliError::PayloadTooLarge {
+            bytes_sent: 40 * 1024 * 1024,
+            file_count: 1234,
+            rejecter: EdgeRejecter::CloudRunOrFrontend,
+        };
+        let cr_text = cr.to_string();
+        assert!(cr_text.contains("Cloud Run's frontend"));
+        assert!(!cr_text.contains("Cloudflare's edge"));
+        assert_eq!(cr_text.lines().count(), 6);
+
+        let srv = CliError::PayloadTooLarge {
+            bytes_sent: 40 * 1024 * 1024,
+            file_count: 1234,
+            rejecter: EdgeRejecter::Server,
+        };
+        let srv_text = srv.to_string();
+        assert!(srv_text.contains("the Syns server"));
+        assert!(!srv_text.contains("Cloudflare's edge"));
+        assert!(!srv_text.contains("Cloud Run's frontend"));
+        assert_eq!(srv_text.lines().count(), 6);
+    }
+
+    #[test]
+    fn exit_code_payload_too_large_is_one() {
+        let err = CliError::PayloadTooLarge {
+            bytes_sent: 0,
+            file_count: 0,
+            rejecter: EdgeRejecter::CloudRunOrFrontend,
+        };
+        assert_eq!(err.exit_code(), 1);
+    }
+
+    #[test]
+    fn json_value_payload_too_large_returns_structured_envelope() {
+        let cf = CliError::PayloadTooLarge {
+            bytes_sent: 33_554_432,
+            file_count: 42,
+            rejecter: EdgeRejecter::Cloudflare,
+        };
+        let v = cf.json_value().expect("PayloadTooLarge has a json_value");
+        assert_eq!(v["error"], "payload_too_large");
+        assert_eq!(v["rejecter"], "cloudflare");
+        assert_eq!(v["bytesSent"], 33_554_432);
+        assert_eq!(v["fileCount"], 42);
+        assert!(v["suggestion"].as_str().is_some_and(|s| !s.is_empty()));
+
+        let cr = CliError::PayloadTooLarge {
+            bytes_sent: 0,
+            file_count: 0,
+            rejecter: EdgeRejecter::CloudRunOrFrontend,
+        };
+        assert_eq!(cr.json_value().unwrap()["rejecter"], "cloud_run");
+
+        let srv = CliError::PayloadTooLarge {
+            bytes_sent: 0,
+            file_count: 0,
+            rejecter: EdgeRejecter::Server,
+        };
+        assert_eq!(srv.json_value().unwrap()["rejecter"], "server");
     }
 
     #[test]
