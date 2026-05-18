@@ -168,7 +168,19 @@ fn upgrade_to_full(
 /// exceeds the budget still becomes its own one-entry batch and may
 /// still 413 — the chunker then rewrites the propagated
 /// `PayloadTooLarge` with the offending batch's `bytes_sent` and
-/// `file_count`.
+/// `file_count` (both in the loop branch and in the n==1 short-circuit).
+///
+/// Per-batch manifest save (loop branch only): after each successful
+/// batch `k` where `1 ≤ k < n`, the chunker writes a manifest snapshot
+/// anchored to batch k's `commit_sha` and the cumulative `path → sha`
+/// map of every batch uploaded so far (seeded from `reference_shas` —
+/// the parent commit's state). This honours SPEC u225 § 2's "manifest
+/// tracks the SHA of the LAST SUCCESSFUL batch" promise: if batches
+/// `1..k-1` succeed and batch `k` fails, the local manifest matches
+/// server HEAD = batch `k-1`'s commit, and the next push computes
+/// diffs from there. The final batch's save is left to `smart_push`
+/// Phase 6 which uses the full `local_shas` map and handles deletions.
+#[allow(clippy::too_many_arguments)]
 async fn chunked_push(
     client: &SynsClient,
     token: &str,
@@ -176,6 +188,10 @@ async fn chunked_push(
     base_request: &PushRequest,
     local_files: &HashMap<String, Vec<u8>>,
     starting_parent_sha: Option<String>,
+    cache_dir: &Path,
+    owner: &str,
+    name: &str,
+    reference_shas: &HashMap<String, String>,
 ) -> Result<(PushResponse, serde_json::Value), CliError> {
     // Step 1: materialise (every entry carries content after this).
     let mut entries = upgrade_to_full(&base_request.files, local_files)?;
@@ -212,9 +228,21 @@ async fn chunked_push(
 
     let n = batches.len();
 
-    // Step 4: short-circuit if no chunking actually needed.
+    // Step 4: short-circuit if no chunking actually needed. The push
+    // is wrapped in the same match as the loop body so that a 413 on
+    // the only batch still rewrites bytes_sent/file_count with the
+    // batch's metrics (HIGH-1 fix — without this, a single oversized
+    // file's 413 would propagate with placeholder zeros from
+    // `check_response` and the Display message would render
+    // "attempted 0 file(s), ~0.0 MiB", defeating u225's actionable-
+    // error goal).
     if n == 1 {
         let only_batch = batches.into_iter().next().unwrap();
+        let batch_bytes: u64 = only_batch
+            .iter()
+            .map(|e| e.content.as_ref().map_or(0, |s| s.len()) as u64)
+            .sum();
+        let batch_files = only_batch.len();
         let request = PushRequest {
             files: only_batch,
             deletions: base_request.deletions.clone(),
@@ -226,7 +254,15 @@ async fn chunked_push(
             status: base_request.status.clone(),
             visibility: base_request.visibility.clone(),
         };
-        return client.push(repo_id, token, &request).await;
+        return match client.push(repo_id, token, &request).await {
+            Ok(ok) => Ok(ok),
+            Err(CliError::PayloadTooLarge { rejecter, .. }) => Err(CliError::PayloadTooLarge {
+                bytes_sent: batch_bytes,
+                file_count: batch_files,
+                rejecter,
+            }),
+            Err(other) => Err(other),
+        };
     }
 
     // Step 5: sequential batch submission with chained parent_sha.
@@ -235,6 +271,11 @@ async fn chunked_push(
     // (response, raw) pair in last_completed for the final return.
     let mut previous_commit_sha: Option<String> = starting_parent_sha;
     let mut last_completed: Option<(PushResponse, serde_json::Value)> = None;
+    // Cumulative `path → sha` map of every entry uploaded so far. After
+    // each successful batch, the per-batch manifest snapshot is
+    // `reference_shas ∪ uploaded` — i.e., server state at batch k =
+    // parent state + everything pushed in batches 1..k.
+    let mut uploaded: HashMap<String, String> = HashMap::new();
 
     for (k, batch) in batches.iter().enumerate() {
         let k1 = k + 1; // 1-indexed for human-facing progress and `(part k/n)`.
@@ -280,19 +321,61 @@ async fn chunked_push(
         );
 
         // Submit. On 413, rewrite the variant with this batch's metrics.
+        // On any error after at least one batch has committed, emit a
+        // stderr warning so the user understands that the local manifest
+        // now reflects server HEAD at batch k-1 (HIGH-2 fix).
         match client.push(repo_id, token, &request).await {
             Ok((response, raw)) => {
+                for entry in batch {
+                    uploaded.insert(entry.path.clone(), entry.sha.clone());
+                }
                 previous_commit_sha = Some(response.commit_sha.clone());
+                // Per-batch manifest save (HIGH-2): only for intermediate
+                // batches. The FINAL batch's save is owned by Phase 6 in
+                // smart_push, which uses the full local_shas map and
+                // applies the deletion list correctly.
+                if k1 < n {
+                    let mut cumulative: HashMap<String, String> = reference_shas.clone();
+                    for (p, s) in uploaded.iter() {
+                        cumulative.insert(p.clone(), s.clone());
+                    }
+                    let mut manifest = Manifest::default();
+                    manifest.update(response.commit_sha.clone(), cumulative);
+                    if let Err(e) = manifest.save(cache_dir, owner, name) {
+                        eprintln!(
+                            "warning: could not save per-batch manifest after chunk {}/{}: {}",
+                            k1, n, e,
+                        );
+                    }
+                }
                 last_completed = Some((response, raw));
             }
             Err(CliError::PayloadTooLarge { rejecter, .. }) => {
+                if k1 > 1 {
+                    eprintln!(
+                        "warning: chunked push failed at batch {}/{}; local manifest updated to last successful batch ({}); next push will commit only the remaining files.",
+                        k1,
+                        n,
+                        previous_commit_sha.as_deref().unwrap_or(""),
+                    );
+                }
                 return Err(CliError::PayloadTooLarge {
                     bytes_sent: batch_bytes as u64,
                     file_count: batch_files,
                     rejecter,
                 });
             }
-            Err(other) => return Err(other),
+            Err(other) => {
+                if k1 > 1 {
+                    eprintln!(
+                        "warning: chunked push failed at batch {}/{}; local manifest updated to last successful batch ({}); next push will commit only the remaining files.",
+                        k1,
+                        n,
+                        previous_commit_sha.as_deref().unwrap_or(""),
+                    );
+                }
+                return Err(other);
+            }
         }
     }
 
@@ -473,6 +556,10 @@ pub async fn smart_push(
             &request,
             &local_files,
             request.parent_sha.clone(),
+            &opts.cache_dir,
+            owner,
+            name,
+            &reference_shas,
         )
         .await?
     } else {
@@ -506,6 +593,10 @@ pub async fn smart_push(
                         &retry_request,
                         &local_files,
                         retry_request.parent_sha.clone(),
+                        &opts.cache_dir,
+                        owner,
+                        name,
+                        &reference_shas,
                     )
                     .await?
                 } else {
@@ -524,6 +615,10 @@ pub async fn smart_push(
                     &request,
                     &local_files,
                     request.parent_sha.clone(),
+                    &opts.cache_dir,
+                    owner,
+                    name,
+                    &reference_shas,
                 )
                 .await?
             }
@@ -1322,10 +1417,15 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         // First-push 404 on /tree so smart_push treats this as first push.
+        // Envelope matches INTERFACES.md § 1.4 (GET /tree returns
+        // {error: "repo_not_found", message: "Repository not found"}).
         Mock::given(method("GET"))
             .and(path("/api/v1/repos/alice/repo/tree"))
             .respond_with(
-                ResponseTemplate::new(404).set_body_json(serde_json::json!({"error": "not_found"})),
+                ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "error": "repo_not_found",
+                    "message": "Repository not found",
+                })),
             )
             .mount(&mock_server)
             .await;
@@ -1445,10 +1545,15 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         // First-push 404 on /tree.
+        // Envelope matches INTERFACES.md § 1.4 (GET /tree returns
+        // {error: "repo_not_found", message: "Repository not found"}).
         Mock::given(method("GET"))
             .and(path("/api/v1/repos/alice/repo/tree"))
             .respond_with(
-                ResponseTemplate::new(404).set_body_json(serde_json::json!({"error": "not_found"})),
+                ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "error": "repo_not_found",
+                    "message": "Repository not found",
+                })),
             )
             .mount(&mock_server)
             .await;
@@ -1466,6 +1571,17 @@ mod tests {
 
         let temp_dir = tempfile::tempdir().unwrap();
         // One file at 30 MiB — exceeds CHUNK_BUDGET_BYTES on its own.
+        // Pre-create .syns.yaml AND exclude it so the collector yields
+        // exactly ONE entry. Without the exclude, the collector picks
+        // up .syns.yaml as a second file (`.hidden(false)` in the walker
+        // does not skip hidden files), the chunker produces n==2
+        // batches, and the LOOP's rewrite arm fires — masking the
+        // n==1 short-circuit's correctness. This is the HIGH-1 fix.
+        std::fs::write(
+            temp_dir.path().join(".syns.yaml"),
+            "owner: alice\nname: repo\n",
+        )
+        .unwrap();
         let single_size = 30 * 1024 * 1024;
         std::fs::write(temp_dir.path().join("huge.txt"), vec![b'x'; single_size]).unwrap();
 
@@ -1482,7 +1598,7 @@ mod tests {
                 message: "init".into(),
                 author: "alice".into(),
                 parent_sha: None,
-                excludes: vec![],
+                excludes: vec![".syns.yaml".into()],
                 cache_dir: cache_dir.path().to_path_buf(),
                 description: None,
                 tags: None,
@@ -1514,5 +1630,268 @@ mod tests {
             }
             other => panic!("expected Err(PayloadTooLarge), got: {other:?}"),
         }
+    }
+
+    // MED-3: 409 missing_blobs retry → upgraded body exceeds budget →
+    // chunker fires. Primes the manifest with SHA-only entries whose
+    // upgraded full content total > CHUNK_BUDGET_BYTES (14 MiB + 14 MiB
+    // = 28 MiB > 25 MiB). Mocks: first PUT → 409 missing_blobs; second
+    // and subsequent PUTs → 200. Verifies (a) chunker fires after the
+    // 409 (≥ 2 PUTs after the first one), (b) final response is the
+    // last batch's, (c) parentSha chains across the chunked PUTs.
+    #[tokio::test]
+    async fn smart_push_chunks_when_409_missing_blobs_retry_body_exceeds_budget() {
+        let mock_server = MockServer::start().await;
+
+        // Priority 1, up_to_n_times(1) → first PUT returns 409 missing_blobs.
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/repos/charlie/repo/push"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "error": "missing_blobs",
+                "message": "some referenced blobs are missing on the server",
+            })))
+            .with_priority(1)
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        // Priority 2, up_to_n_times(1) → second PUT (chunked batch 1) returns 200 / aaaa...001.
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/repos/charlie/repo/push"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "commitSha": "aaaaaaaa00000000000000000000000000000001",
+                "version": 2,
+                "filesChanged": 1,
+                "created": false,
+            })))
+            .with_priority(2)
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        // Priority 3 → third PUT (chunked batch 2) returns 200 / bbbb...002.
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/repos/charlie/repo/push"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "commitSha": "bbbbbbbb00000000000000000000000000000002",
+                "version": 3,
+                "filesChanged": 1,
+                "created": false,
+            })))
+            .with_priority(3)
+            .mount(&mock_server)
+            .await;
+
+        // Pre-create local files (14 MiB + 14 MiB = 28 MiB > 25 MiB
+        // after upgrade) and .syns.yaml + matching manifest so the
+        // happy path emits SHA-only entries (no content) on the first
+        // PUT — the 409 then forces an upgrade to full content, and
+        // the upgraded body exceeds the budget → chunker fires.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let big1_content = vec![b'a'; 14 * 1024 * 1024];
+        let big2_content = vec![b'b'; 14 * 1024 * 1024];
+        std::fs::write(temp_dir.path().join("big1.txt"), &big1_content).unwrap();
+        std::fs::write(temp_dir.path().join("big2.txt"), &big2_content).unwrap();
+        std::fs::write(
+            temp_dir.path().join(".syns.yaml"),
+            "owner: charlie\nname: repo\n",
+        )
+        .unwrap();
+
+        // Prime the manifest with matching SHAs for big1 and big2 (so
+        // build_push_entries produces SHA-only entries — content is
+        // None for the changed=false files because their SHA matches
+        // the manifest's reference).
+        let cache_dir = tempfile::tempdir().unwrap();
+        let big1_sha = blob_sha1(&big1_content);
+        let big2_sha = blob_sha1(&big2_content);
+        let mut manifest = Manifest::default();
+        manifest.update(
+            "old-parent-sha".to_string(),
+            HashMap::from([
+                ("big1.txt".to_string(), big1_sha.clone()),
+                ("big2.txt".to_string(), big2_sha.clone()),
+            ]),
+        );
+        manifest.save(cache_dir.path(), "charlie", "repo").unwrap();
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let result = smart_push(
+            &client,
+            "test-token",
+            "charlie/repo",
+            temp_dir.path(),
+            SmartPushOptions {
+                force: false,
+                message: "retry-upgrade".into(),
+                author: "charlie".into(),
+                parent_sha: None,
+                excludes: vec![".syns.yaml".into()],
+                cache_dir: cache_dir.path().to_path_buf(),
+                description: None,
+                tags: None,
+                status: None,
+                visibility: None,
+                strict: false,
+                allow_empty: false,
+                debug: false,
+                no_default_excludes: false,
+            },
+        )
+        .await;
+
+        let (response, _raw, _meta) = result.expect("smart_push must succeed on 409→chunker path");
+        assert_eq!(
+            response.commit_sha, "bbbbbbbb00000000000000000000000000000002",
+            "final response should carry the LAST batch's commit_sha",
+        );
+
+        let requests = mock_server.received_requests().await.unwrap();
+        let puts: Vec<_> = requests
+            .iter()
+            .filter(|r| r.method == reqwest::Method::PUT)
+            .collect();
+        assert_eq!(
+            puts.len(),
+            3,
+            "expected 1 initial 409 PUT + 2 chunked PUTs = 3 total",
+        );
+
+        // First PUT: SHA-only entries (no content), parentSha = manifest.
+        let body0: serde_json::Value = serde_json::from_slice(&puts[0].body).unwrap();
+        assert_eq!(body0["parentSha"].as_str(), Some("old-parent-sha"));
+
+        // Second PUT (chunked batch 1): full content, parentSha inherits
+        // the original request's parent_sha (i.e. manifest's commit_sha).
+        let body1: serde_json::Value = serde_json::from_slice(&puts[1].body).unwrap();
+        assert_eq!(body1["parentSha"].as_str(), Some("old-parent-sha"));
+        assert!(
+            body1["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("(part 1/2)")),
+            "chunked batch 1 message should include '(part 1/2)', got: {:?}",
+            body1["message"],
+        );
+
+        // Third PUT (chunked batch 2): parentSha chains to batch 1's commit.
+        let body2: serde_json::Value = serde_json::from_slice(&puts[2].body).unwrap();
+        assert_eq!(
+            body2["parentSha"].as_str(),
+            Some("aaaaaaaa00000000000000000000000000000001"),
+        );
+        assert!(
+            body2["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("(part 2/2)")),
+        );
+    }
+
+    // HIGH-2 backstop: when batch k of n > 1 fails AFTER batch k-1 has
+    // committed, the chunker MUST save a per-batch manifest snapshot
+    // anchored to batch k-1's commit_sha so the next push computes
+    // diffs from the actual server HEAD (not the stale pre-push
+    // parent). Mocks: first PUT → 200 / aaaa...001; second PUT → 413
+    // Cloudflare HTML. Verifies (a) the chunker returns Err, (b) the
+    // local manifest now points at aaaa...001 (not at the original
+    // parent, which would be None for a first push).
+    #[tokio::test]
+    async fn smart_push_chunker_saves_partial_manifest_on_intermediate_batch_failure() {
+        let mock_server = MockServer::start().await;
+
+        // First-push 404 on /tree (matches INTERFACES.md § 1.4).
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/dave/repo/tree"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "error": "repo_not_found",
+                    "message": "Repository not found",
+                })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        // Priority 1, up_to_n_times(1): batch 1 succeeds with aaaa...001.
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/repos/dave/repo/push"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "commitSha": "aaaaaaaa00000000000000000000000000000001",
+                "version": 1,
+                "filesChanged": 1,
+                "created": true,
+            })))
+            .with_priority(1)
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        // Priority 2: batch 2 onwards fail with Cloudflare 413.
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/repos/dave/repo/push"))
+            .respond_with(ResponseTemplate::new(413).set_body_string(
+                "<html><head><title>413 Request Entity Too Large</title></head><body>\n<center>cloudflare</center>\n</body></html>",
+            ))
+            .with_priority(2)
+            .mount(&mock_server)
+            .await;
+
+        // Two 14 MiB files force n=2 (FFD packs big1 alone + big2 alone
+        // because 2 × 14 MiB > 25 MiB budget; small files would coalesce).
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join("big1.txt"), vec![b'a'; 14 * 1024 * 1024]).unwrap();
+        std::fs::write(temp_dir.path().join("big2.txt"), vec![b'b'; 14 * 1024 * 1024]).unwrap();
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+
+        let result = smart_push(
+            &client,
+            "test-token",
+            "dave/repo",
+            temp_dir.path(),
+            SmartPushOptions {
+                force: false,
+                message: "partial-fail".into(),
+                author: "dave".into(),
+                parent_sha: None,
+                excludes: vec![".syns.yaml".into()],
+                cache_dir: cache_dir.path().to_path_buf(),
+                description: None,
+                tags: None,
+                status: None,
+                visibility: None,
+                strict: false,
+                allow_empty: false,
+                debug: false,
+                no_default_excludes: false,
+            },
+        )
+        .await;
+
+        // The chunker fails on batch 2 — Err propagates out.
+        assert!(
+            matches!(result, Err(CliError::PayloadTooLarge { .. })),
+            "expected Err(PayloadTooLarge) on partial chunker failure, got: {result:?}",
+        );
+
+        // The per-batch manifest snapshot (HIGH-2) MUST have been
+        // saved against batch 1's commit_sha — not absent, not at the
+        // pre-push parent (None for a first push). The next push will
+        // diff from aaaa...001 and only re-upload the missing files.
+        let loaded = Manifest::load(cache_dir.path(), "dave", "repo")
+            .expect("per-batch manifest should be saved after batch 1 success");
+        assert_eq!(
+            loaded.commit_sha(),
+            Some("aaaaaaaa00000000000000000000000000000001"),
+            "manifest must point at batch 1's commit_sha (server HEAD), not the original parent",
+        );
+        let stored: std::collections::HashSet<&str> = loaded.file_paths().collect();
+        // Exactly the file in batch 1 should be recorded (which one
+        // depends on FFD order — both are 14 MiB so it's stable but
+        // we don't depend on it; we just assert at least one of the
+        // big files is recorded so the next push can dedup).
+        assert!(
+            stored.contains("big1.txt") || stored.contains("big2.txt"),
+            "manifest should contain at least one of the big files after batch 1, got: {stored:?}",
+        );
     }
 }

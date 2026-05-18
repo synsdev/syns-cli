@@ -550,6 +550,17 @@ async fn check_response(response: reqwest::Response) -> Result<reqwest::Response
         } else {
             EdgeRejecter::CloudRunOrFrontend
         };
+        // CONTRACT: bytes_sent and file_count are placeholder zeros here —
+        // check_response is on the response side of the wire and cannot
+        // see the outbound request. They are transit-state values: the
+        // push chunker (push::smart::chunked_push) rewrites both fields
+        // with the offending batch's actual metrics on both the n==1
+        // short-circuit and the n>1 loop paths before the variant
+        // escapes Phase 5. For non-push callers (no large body exists
+        // in today's stack) the placeholders propagate verbatim; the
+        // Display arm in errors.rs renders "attempted 0 file(s),
+        // ~0.0 MiB", which is the documented diagnostic for that
+        // unlikely path.
         return Err(CliError::PayloadTooLarge {
             bytes_sent: 0,
             file_count: 0,
@@ -1883,6 +1894,41 @@ mod tests {
                 })
             ),
             "expected Err(PayloadTooLarge{{ rejecter: CloudRunOrFrontend, .. }}), got: {result:?}"
+        );
+    }
+
+    // MED-2: cover the third sniff branch — a canonical ApiErrorBody
+    // JSON 413 body whose `error == "payload_too_large"` maps to
+    // EdgeRejecter::Server. Pins the future-compatibility path
+    // documented in SPEC § 3 EdgeRejecter table.
+    #[tokio::test]
+    async fn process_response_raw_413_json_payload_too_large_maps_to_server_variant() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/test-413-server"))
+            .respond_with(ResponseTemplate::new(413).set_body_json(serde_json::json!({
+                "error": "payload_too_large",
+                "message": "Request body too large",
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let response = reqwest::Client::new()
+            .put(format!("{}/test-413-server", mock_server.uri()))
+            .send()
+            .await
+            .unwrap();
+
+        let result = process_response_raw::<TestShape>(response).await;
+        assert!(
+            matches!(
+                result,
+                Err(CliError::PayloadTooLarge {
+                    rejecter: EdgeRejecter::Server,
+                    ..
+                })
+            ),
+            "expected Err(PayloadTooLarge{{ rejecter: Server, .. }}), got: {result:?}"
         );
     }
 }
