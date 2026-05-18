@@ -217,9 +217,7 @@ async fn chunked_push(
             status: base_request.status.clone(),
             visibility: base_request.visibility.clone(),
         };
-        if estimate_body_bytes(&probe) > CHUNK_BUDGET_BYTES
-            && batches.last().unwrap().len() > 1
-        {
+        if estimate_body_bytes(&probe) > CHUNK_BUDGET_BYTES && batches.last().unwrap().len() > 1 {
             // Over budget — pop and seed a new batch with this entry.
             let last_entry = batches.last_mut().unwrap().pop().unwrap();
             batches.push(vec![last_entry]);
@@ -1421,12 +1419,10 @@ mod tests {
         // {error: "repo_not_found", message: "Repository not found"}).
         Mock::given(method("GET"))
             .and(path("/api/v1/repos/alice/repo/tree"))
-            .respond_with(
-                ResponseTemplate::new(404).set_body_json(serde_json::json!({
-                    "error": "repo_not_found",
-                    "message": "Repository not found",
-                })),
-            )
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error": "repo_not_found",
+                "message": "Repository not found",
+            })))
             .mount(&mock_server)
             .await;
 
@@ -1458,8 +1454,16 @@ mod tests {
             .await;
 
         let temp_dir = tempfile::tempdir().unwrap();
-        std::fs::write(temp_dir.path().join("big1.txt"), vec![b'a'; 14 * 1024 * 1024]).unwrap();
-        std::fs::write(temp_dir.path().join("big2.txt"), vec![b'b'; 14 * 1024 * 1024]).unwrap();
+        std::fs::write(
+            temp_dir.path().join("big1.txt"),
+            vec![b'a'; 14 * 1024 * 1024],
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir.path().join("big2.txt"),
+            vec![b'b'; 14 * 1024 * 1024],
+        )
+        .unwrap();
         std::fs::write(temp_dir.path().join("small.txt"), vec![b'c'; 1024]).unwrap();
 
         let cache_dir = tempfile::tempdir().unwrap();
@@ -1549,12 +1553,10 @@ mod tests {
         // {error: "repo_not_found", message: "Repository not found"}).
         Mock::given(method("GET"))
             .and(path("/api/v1/repos/alice/repo/tree"))
-            .respond_with(
-                ResponseTemplate::new(404).set_body_json(serde_json::json!({
-                    "error": "repo_not_found",
-                    "message": "Repository not found",
-                })),
-            )
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error": "repo_not_found",
+                "message": "Repository not found",
+            })))
             .mount(&mock_server)
             .await;
 
@@ -1801,12 +1803,10 @@ mod tests {
         // First-push 404 on /tree (matches INTERFACES.md § 1.4).
         Mock::given(method("GET"))
             .and(path("/api/v1/repos/dave/repo/tree"))
-            .respond_with(
-                ResponseTemplate::new(404).set_body_json(serde_json::json!({
-                    "error": "repo_not_found",
-                    "message": "Repository not found",
-                })),
-            )
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error": "repo_not_found",
+                "message": "Repository not found",
+            })))
             .mount(&mock_server)
             .await;
 
@@ -1837,8 +1837,16 @@ mod tests {
         // Two 14 MiB files force n=2 (FFD packs big1 alone + big2 alone
         // because 2 × 14 MiB > 25 MiB budget; small files would coalesce).
         let temp_dir = tempfile::tempdir().unwrap();
-        std::fs::write(temp_dir.path().join("big1.txt"), vec![b'a'; 14 * 1024 * 1024]).unwrap();
-        std::fs::write(temp_dir.path().join("big2.txt"), vec![b'b'; 14 * 1024 * 1024]).unwrap();
+        std::fs::write(
+            temp_dir.path().join("big1.txt"),
+            vec![b'a'; 14 * 1024 * 1024],
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir.path().join("big2.txt"),
+            vec![b'b'; 14 * 1024 * 1024],
+        )
+        .unwrap();
 
         let cache_dir = tempfile::tempdir().unwrap();
         let client = SynsClient::new(&mock_server.uri()).unwrap();
