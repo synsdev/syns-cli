@@ -8,12 +8,7 @@ installers = ["shell", "powershell", "homebrew"]
 publish-jobs = ["homebrew"]
 tap = "synsdev/homebrew-syns"
 formula = "syns"
-# github-attestations disabled: synsdev/syns-cli is private and the synsdev
-# org has no GitHub Enterprise plan, so actions/attest-build-provenance fails
-# with "Feature not available for the synsdev organization". Empirically
-# observed on v0.2.0 (run 25694946181). u199 prototype NR-01: re-enable only
-# after either making syns-cli public or upgrading the org plan.
-github-attestations = false
+github-attestations = true
 unix-archive = ".tar.gz"
 windows-archive = ".zip"
 targets = [
