@@ -115,15 +115,6 @@ async fn t8_check_only_out_of_date_unmanaged_no_download() {
     let stdout = String::from_utf8_lossy(&raw.stdout);
     let stderr = String::from_utf8_lossy(&raw.stderr);
 
-    // SPEC § 8 T8 verbal-discipline invariant — provenance disclosure on
-    // stderr before any network call. CR H-6 — assert on the literal
-    // substring so mutating `print_provenance_disclosure` away breaks the
-    // test.
-    assert!(
-        stderr.contains("Cryptographic provenance verification is not yet enabled"),
-        "stderr missing provenance disclosure; actual stderr: {stderr}"
-    );
-
     // CR H-3: the override warning fires when fixture URLs are active.
     assert!(
         stderr.contains("WARNING: using fixture URL for syns upgrade"),
@@ -197,6 +188,7 @@ async fn t9_homebrew_managed_redirect_no_network() {
         force: false,
         prerelease: false,
         no_checksum: false,
+        no_attestation: false,
     };
     let fake = homebrew_fake();
     let mut stderr_buf: Vec<u8> = Vec::new();
@@ -212,14 +204,6 @@ async fn t9_homebrew_managed_redirect_no_network() {
     assert!(InstallMethod::Homebrew.is_managed());
 
     let captured = String::from_utf8_lossy(&stderr_buf);
-
-    // CR H-6 verbal-discipline assertion: disclosure MUST NOT appear on
-    // the managed-redirect path (SPEC § 8 T9: "Stderr does NOT contain the
-    // provenance disclosure").
-    assert!(
-        !captured.contains("Cryptographic provenance verification is not yet enabled"),
-        "managed-redirect path must not print provenance disclosure; got: {captured}"
-    );
 
     // CR H-6 grep-anchor assertion: `upgrade_package_manager_managed`
     // label MUST appear on stderr.
@@ -384,8 +368,13 @@ async fn t10_happy_path_full_swap() {
     }
 
     // -------- Invoke the copied binary as a subprocess. --------
+    // `--no-attestation` is required: the fixture archive is synthesized
+    // in-memory and carries no real SLSA attestation. The default flow
+    // (which now mandates `gh attestation verify`) would fail-closed at
+    // state 7a. Passing `--no-attestation` exercises the integrity-only
+    // path (still SHA-256-verified against the fixture sha256.sum).
     let assert = AssertCommand::new(&exe_copy)
-        .args(["upgrade", "--json"])
+        .args(["upgrade", "--json", "--no-attestation"])
         .env(
             "_INTERNAL_GH_API_BASE",
             format!("{}/repos/synsdev/syns-cli", mock.uri()),
@@ -401,22 +390,26 @@ async fn t10_happy_path_full_swap() {
     let stdout = String::from_utf8_lossy(&raw.stdout);
     let stderr = String::from_utf8_lossy(&raw.stderr);
 
-    // SPEC § 4.2 disclosure literal — CR H-6 verbal-discipline.
+    // --no-attestation surfaces the warning on stderr.
     assert!(
-        stderr.contains("Cryptographic provenance verification is not yet enabled"),
-        "stderr missing provenance disclosure; stderr={stderr}"
+        stderr.contains("--no-attestation was passed"),
+        "stderr missing --no-attestation warning; stderr={stderr}"
     );
 
-    // SPEC § 5 D7 / PROTOTYPE C-04 — verbal-discipline contract: the
-    // success message MUST contain `(integrity-checked)` and NEVER
-    // `(verified)`. T10's job is to lock this in.
+    // With --no-attestation but checksum still on, the success message MUST
+    // contain `(integrity-checked)` and NEVER `(SLSA-verified)` or
+    // `(verified)`.
     assert!(
         stderr.contains("(integrity-checked)"),
         "stderr missing `(integrity-checked)` token; stderr={stderr}"
     );
     assert!(
-        !stderr.contains("(verified)"),
-        "stderr accidentally contains `(verified)` — verbal-discipline regression; stderr={stderr}"
+        !stderr.contains("(SLSA-verified)"),
+        "stderr unexpectedly contains `(SLSA-verified)` with --no-attestation; stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("(verified)") || stderr.contains("SLSA-verified"),
+        "stderr accidentally contains bare `(verified)` — verbal-discipline regression; stderr={stderr}"
     );
 
     // SPEC § 4.2 stdout JSON shape on the swap path.

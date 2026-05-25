@@ -74,15 +74,21 @@ const DEFAULT_DOWNLOAD_BASE: &str = "https://github.com/synsdev/syns-cli/release
 
 const HTTP_TIMEOUT_SECONDS: u64 = 30;
 
-const PROVENANCE_DISCLOSURE: &str = "\
-NOTE: Cryptographic provenance verification is not yet enabled. Binaries are
-integrity-checked by HTTPS transport + SHA-256 only. Provenance signatures
-will be added in a future release (see
-https://github.com/synsdev/syns-cli/issues for status).";
-
 const NO_CHECKSUM_WARNING: &str = "\
 WARNING: --no-checksum was passed — SHA-256 integrity check skipped. \
 This downgrade is on the user's authority.";
+
+const NO_ATTESTATION_WARNING: &str = "\
+WARNING: --no-attestation was passed — SLSA build-provenance verification \
+skipped. This downgrade is on the user's authority.";
+
+const GH_MISSING_HINT: &str = "\
+syns upgrade verifies a SLSA build-provenance attestation against the
+synsdev/syns-cli release workflow via the GitHub CLI (`gh`). `gh` was not
+found on PATH.
+
+Install gh (https://cli.github.com/) to enable cryptographic verification,
+or pass --no-attestation to fall back to HTTPS + SHA-256 integrity only.";
 
 // =============================================================================
 // Args
@@ -106,6 +112,15 @@ pub struct UpgradeArgs {
     /// (advanced/dangerous) Skip SHA-256 integrity verification.
     #[arg(long)]
     pub no_checksum: bool,
+
+    /// (advanced/dangerous) Skip SLSA attestation verification.
+    /// The default flow requires `gh` (GitHub CLI) on PATH and fails closed
+    /// if the downloaded archive does not carry a verifiable attestation
+    /// from the synsdev/syns-cli release workflow. Pass this flag to fall
+    /// back to HTTPS+SHA-256 integrity-only — necessary in environments
+    /// without `gh` (CI matrices, locked-down sandboxes).
+    #[arg(long)]
+    pub no_attestation: bool,
 }
 
 // =============================================================================
@@ -213,6 +228,20 @@ pub enum UpgradeError {
         method: InstallMethod,
         command: String,
     },
+
+    /// `gh` (GitHub CLI) is not on PATH. The default flow requires it for
+    /// SLSA build-provenance verification before atomic-replace. Users can
+    /// install gh (https://cli.github.com/) or pass --no-attestation to
+    /// downgrade to integrity-only.
+    #[error("gh (GitHub CLI) is not on PATH; required for attestation verification")]
+    AttestationToolMissing,
+
+    /// `gh attestation verify` returned a non-zero exit code, indicating the
+    /// downloaded archive does NOT carry a valid SLSA attestation from the
+    /// synsdev/syns-cli release workflow. Fail-closed: the staged extracted
+    /// binary is dropped via the RAII TempDir and self_replace never runs.
+    #[error("SLSA attestation verification failed for {filename}: {message}")]
+    AttestationVerificationFailed { filename: String, message: String },
 }
 
 impl UpgradeError {
@@ -229,7 +258,9 @@ impl UpgradeError {
             | UpgradeError::IoError { .. }
             | UpgradeError::ExtractFailed { .. }
             | UpgradeError::NoMatchingArtifact { .. }
-            | UpgradeError::OverrideUrlInvalid { .. } => 1,
+            | UpgradeError::OverrideUrlInvalid { .. }
+            | UpgradeError::AttestationToolMissing
+            | UpgradeError::AttestationVerificationFailed { .. } => 1,
             // PackageManagerManaged never reaches exit_code() in practice
             // because it doesn't flow through Result::Err. Defensive default
             // matches SPEC § 7 (the redirect path exits 0).
@@ -251,6 +282,10 @@ impl UpgradeError {
             UpgradeError::NoMatchingArtifact { .. } => "upgrade_no_matching_artifact",
             UpgradeError::OverrideUrlInvalid { .. } => "upgrade_override_url_invalid",
             UpgradeError::PackageManagerManaged { .. } => "upgrade_package_manager_managed",
+            UpgradeError::AttestationToolMissing => "upgrade_attestation_tool_missing",
+            UpgradeError::AttestationVerificationFailed { .. } => {
+                "upgrade_attestation_verification_failed"
+            }
         }
     }
 }
@@ -368,9 +403,17 @@ pub async fn run_with(
         return Ok(());
     }
 
-    // From here on, we are on an unmanaged install path. Print the honest
-    // provenance disclosure on stderr before doing anything else.
-    print_provenance_disclosure(stderr, args.no_checksum);
+    // From here on, we are on an unmanaged install path. Surface any user
+    // authority overrides as warnings on stderr before doing anything else.
+    // The `gh`-on-PATH check is deferred until after `--check-only` and the
+    // up-to-date short-circuit so those non-downloading paths don't require
+    // the verification tool.
+    if args.no_checksum {
+        let _ = writeln!(stderr, "{}", NO_CHECKSUM_WARNING);
+    }
+    if args.no_attestation {
+        let _ = writeln!(stderr, "{}", NO_ATTESTATION_WARNING);
+    }
 
     // State 3: fetching-metadata.
     let metadata = fetch_release_metadata(&client, &api_base, args.prerelease).await?;
@@ -400,6 +443,13 @@ pub async fn run_with(
             &latest_version,
         );
         return Ok(());
+    }
+
+    // We will download. Verify the attestation tool is available BEFORE
+    // burning bandwidth on the archive. Skipped if --no-attestation.
+    if !args.no_attestation && !is_gh_on_path() {
+        let _ = writeln!(stderr, "{}", GH_MISSING_HINT);
+        return Err(UpgradeError::AttestationToolMissing);
     }
 
     // State 6: downloading.
@@ -483,6 +533,16 @@ pub async fn run_with(
             })?;
     }
 
+    // State 7a: verifying-attestation (skipped by --no-attestation).
+    // Runs AFTER checksum verification (cheap, fast pre-check) and BEFORE
+    // extract+swap. Fail-closed: if the attestation does not exist or does
+    // not bind to the synsdev/syns-cli release workflow, the staged
+    // extracted binary is never produced and self_replace never runs.
+    // The RAII `staging` TempDir cleans up on the error path.
+    if !args.no_attestation {
+        verify_attestation_with_gh(&archive_path, &asset_name, stderr)?;
+    }
+
     // Extract — reads from the same FD that was hashed.
     extract_binary(&mut archive_file, TARGET_TRIPLE, &extracted_path)?;
 
@@ -507,7 +567,14 @@ pub async fn run_with(
     // self_replace owns the *swap*'s own tempfiles; we don't.
 
     // State 9: complete.
-    print_complete(output, stderr, &running_version, &latest_version);
+    print_complete(
+        output,
+        stderr,
+        &running_version,
+        &latest_version,
+        args.no_attestation,
+        args.no_checksum,
+    );
     Ok(())
 }
 
@@ -587,11 +654,59 @@ fn is_https_or_loopback(value: &str) -> bool {
     }
 }
 
-fn print_provenance_disclosure(stderr: &mut dyn Write, no_checksum: bool) {
-    let _ = writeln!(stderr, "{}", PROVENANCE_DISCLOSURE);
-    if no_checksum {
-        let _ = writeln!(stderr, "{}", NO_CHECKSUM_WARNING);
+/// Detect whether `gh` is callable on the user's PATH. We deliberately do not
+/// version-check or feature-detect — `gh attestation verify` has been in
+/// `gh` since v2.50 (June 2024) and any reasonable user install will carry
+/// it. Returns false if the binary is absent OR exits non-zero on the trivial
+/// probe (`gh --version`).
+fn is_gh_on_path() -> bool {
+    std::process::Command::new("gh")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Verify the SLSA build-provenance attestation for `archive_path` by
+/// invoking `gh attestation verify --repo synsdev/syns-cli`. Exits 0 means
+/// the archive's digest is attested by a workflow with the expected OIDC
+/// subject identity (verified server-side by `gh` against the GitHub
+/// attestations API and Sigstore Rekor — we do not re-implement that
+/// chain). Exits non-zero is fail-closed: the attestation does not exist,
+/// the certificate identity does not bind to this repo's release workflow,
+/// or the transparency-log entry was revoked.
+///
+/// `stderr` is a writer for human-readable status; `gh` writes its own
+/// diagnostics to its own stderr which we capture and forward only on
+/// failure (to avoid noisy "Loaded N attestations from registry" lines on
+/// the happy path).
+fn verify_attestation_with_gh(
+    archive_path: &Path,
+    asset_name: &str,
+    stderr: &mut dyn Write,
+) -> Result<(), UpgradeError> {
+    let _ = writeln!(stderr, "Verifying SLSA build-provenance attestation...");
+    let output = std::process::Command::new("gh")
+        .arg("attestation")
+        .arg("verify")
+        .arg(archive_path)
+        .arg("--repo")
+        .arg("synsdev/syns-cli")
+        .output()
+        .map_err(|e| UpgradeError::AttestationVerificationFailed {
+            filename: asset_name.to_string(),
+            message: format!("failed to spawn `gh attestation verify`: {e}"),
+        })?;
+    if output.status.success() {
+        return Ok(());
     }
+    let stderr_bytes = String::from_utf8_lossy(&output.stderr);
+    Err(UpgradeError::AttestationVerificationFailed {
+        filename: asset_name.to_string(),
+        message: stderr_bytes.trim().to_string(),
+    })
 }
 
 fn parse_semver(raw: &str) -> Result<Version, UpgradeError> {
@@ -866,21 +981,31 @@ fn print_check_only_would_upgrade(
     }
 }
 
-fn print_complete(output: &Output, stderr: &mut dyn Write, old: &Version, new: &Version) {
-    // SPEC § 5 D7 / PROTOTYPE C-04: literal token `(integrity-checked)`.
-    // NEVER replace with `(verified)` — that would falsely imply cryptographic
-    // provenance, which v1 does not provide. Tests T8 / T10 assert this token.
-    let _ = writeln!(
-        stderr,
-        "syns upgraded {} \u{2192} {} (integrity-checked)",
-        old, new
-    );
+fn print_complete(
+    output: &Output,
+    stderr: &mut dyn Write,
+    old: &Version,
+    new: &Version,
+    no_attestation: bool,
+    no_checksum: bool,
+) {
+    let token = match (no_attestation, no_checksum) {
+        (false, _) => "(SLSA-verified)",
+        (true, false) => "(integrity-checked)",
+        (true, true) => "(unverified)",
+    };
+    let _ = writeln!(stderr, "syns upgraded {} \u{2192} {} {}", old, new, token);
     if output.is_json() {
+        let verification = match (no_attestation, no_checksum) {
+            (false, _) => "slsa-provenance",
+            (true, false) => "sha256",
+            (true, true) => "none",
+        };
         let value = serde_json::json!({
             "upgradedFrom": old.to_string(),
             "upgradedTo": new.to_string(),
             "action": "upgraded",
-            "verification": "sha256",
+            "verification": verification,
         });
         println!("{}", value);
     }
