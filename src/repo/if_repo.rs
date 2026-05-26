@@ -2,7 +2,7 @@ use std::path::Path;
 
 use crate::errors::CliError;
 use crate::output::Output;
-use crate::repo::resolve::{RepoIdentity, resolve_repo_identity};
+use crate::repo::resolve::{IdentitySource, RepoIdentity, resolve_repo_identity};
 
 /// Resolves a `RepoIdentity` or emits the silent-skip envelope and returns `Ok(None)`.
 ///
@@ -16,6 +16,11 @@ use crate::repo::resolve::{RepoIdentity, resolve_repo_identity};
 /// mode) and returns `Ok(None)`. Every other error variant is propagated
 /// verbatim; `--if-repo` does NOT suppress malformed-`.syns.yaml` errors
 /// or any other failure class.
+///
+/// Under `if_repo: true`, the helper additionally treats a successful
+/// resolve whose `IdentitySource` is not `SynsYaml` (i.e., `NameFlag` or
+/// `GitRemote`) as a skip case — emits `output.skip()` and returns
+/// `Ok(None)`. Only identity supplied by `.syns.yaml` opens the gate.
 pub fn resolve_or_skip(
     name_flag: Option<&str>,
     path: &Path,
@@ -23,7 +28,12 @@ pub fn resolve_or_skip(
     output: &Output,
 ) -> Result<Option<RepoIdentity>, CliError> {
     match resolve_repo_identity(name_flag, path) {
-        Ok(identity) => Ok(Some(identity)),
+        Ok((identity, IdentitySource::SynsYaml)) => Ok(Some(identity)),
+        Ok((_identity, _source)) if if_repo => {
+            output.skip();
+            Ok(None)
+        }
+        Ok((identity, _source)) => Ok(Some(identity)),
         Err(CliError::RepoIdentityUnknown) if if_repo => {
             output.skip();
             Ok(None)
@@ -166,5 +176,129 @@ mod tests {
 
         let result = resolve_full_or_skip(None, dir.path(), false, &output);
         assert!(matches!(result, Err(CliError::RepoIdentityUnknown)));
+    }
+
+    #[test]
+    fn resolve_or_skip_silent_skips_with_if_repo_when_name_flag_provided_identity_no_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        // No .syns.yaml, no .git — --name wins.
+        let output = Output::new(true);
+
+        let result = resolve_or_skip(Some("alice/foo"), dir.path(), true, &output);
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn resolve_or_skip_silent_skips_with_if_repo_when_name_flag_provided_identity_yaml_present() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".syns.yaml"),
+            "owner: bob\nname: yaml-repo\n",
+        )
+        .unwrap();
+        let output = Output::new(true);
+
+        // --name value DIFFERS from the yaml's identity — the test would behave
+        // observably differently under a yaml-first vs. name-first design.
+        // Locks SPEC D6: source=NameFlag wins precedence even when .syns.yaml
+        // is also reachable, so --if-repo silent-skips.
+        let result = resolve_or_skip(Some("alice/foo"), dir.path(), true, &output);
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn resolve_or_skip_silent_skips_with_if_repo_when_git_remote_provided_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+        fs::write(
+            git_dir.join("config"),
+            "[remote \"origin\"]\n\turl = https://github.com/user/non-syns-project.git\n",
+        )
+        .unwrap();
+        // No .syns.yaml.
+        let output = Output::new(true);
+
+        // Locks the 2026-05-25 bug fix at the helper layer: source=GitRemote
+        // under --if-repo silent-skips.
+        let result = resolve_or_skip(None, dir.path(), true, &output);
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn resolve_or_skip_returns_some_with_if_repo_when_syns_yaml_provided_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".syns.yaml"),
+            "owner: alice\nname: my-repo\n",
+        )
+        .unwrap();
+        let output = Output::new(false);
+
+        // Backstop: the gate IS opened by .syns.yaml even under --if-repo.
+        let result = resolve_or_skip(None, dir.path(), true, &output);
+        assert!(matches!(
+            result,
+            Ok(Some(RepoIdentity { owner: Some(ref o), ref name })) if o == "alice" && name == "my-repo"
+        ));
+    }
+
+    #[test]
+    fn resolve_or_skip_returns_some_without_if_repo_when_name_flag_provided_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = Output::new(false);
+
+        // Regression backstop: without --if-repo, source=NameFlag passes through.
+        let result = resolve_or_skip(Some("alice/foo"), dir.path(), false, &output);
+        assert!(matches!(
+            result,
+            Ok(Some(RepoIdentity { owner: Some(ref o), ref name })) if o == "alice" && name == "foo"
+        ));
+    }
+
+    #[test]
+    fn resolve_or_skip_returns_some_without_if_repo_when_git_remote_provided_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+        fs::write(
+            git_dir.join("config"),
+            "[remote \"origin\"]\n\turl = https://github.com/user/remote-repo.git\n",
+        )
+        .unwrap();
+        let output = Output::new(false);
+
+        // Regression backstop: without --if-repo, source=GitRemote passes through.
+        let result = resolve_or_skip(None, dir.path(), false, &output);
+        assert!(matches!(
+            result,
+            Ok(Some(RepoIdentity { owner: None, ref name })) if name == "remote-repo"
+        ));
+    }
+
+    #[test]
+    fn resolve_or_skip_returns_some_with_if_repo_when_both_yaml_and_git_remote_present() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".syns.yaml"),
+            "owner: alice\nname: yaml-repo\n",
+        )
+        .unwrap();
+        let git_dir = dir.path().join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+        fs::write(
+            git_dir.join("config"),
+            "[remote \"origin\"]\n\turl = https://github.com/user/remote-repo.git\n",
+        )
+        .unwrap();
+        let output = Output::new(false);
+
+        // Priority-chain invariant: .syns.yaml > git-remote even under --if-repo.
+        // Backstops future refactors that might reorder the resolver's chain.
+        let result = resolve_or_skip(None, dir.path(), true, &output);
+        assert!(matches!(
+            result,
+            Ok(Some(RepoIdentity { owner: Some(ref o), ref name })) if o == "alice" && name == "yaml-repo"
+        ));
     }
 }

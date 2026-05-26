@@ -525,6 +525,15 @@ mod tests {
 
         let temp_dir = tempfile::tempdir().unwrap();
         std::fs::write(temp_dir.path().join("hello.txt"), "hello").unwrap();
+        // Under u252, --if-repo opens the gate ONLY when .syns.yaml provided
+        // the identity. The pre-u252 form of this test relied on `--name` to
+        // resolve identity under --if-repo, which now silent-skips; switch
+        // to .syns.yaml so the test continues to assert "runs normally".
+        std::fs::write(
+            temp_dir.path().join(".syns.yaml"),
+            "owner: alice\nname: new-repo\n",
+        )
+        .unwrap();
 
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", temp_dir.path()) };
         let config = Config::new(Some(&mock_server.uri())).unwrap();
@@ -536,7 +545,6 @@ mod tests {
             .unwrap();
 
         let args = PushArgs {
-            name: Some("new-repo".into()),
             path: Some(temp_dir.path().into()),
             if_repo: true,
             ..default_push_args()
@@ -570,6 +578,45 @@ mod tests {
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
+        assert!(mock_server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn push_with_if_repo_and_only_git_remote_silent_skips_no_http_call() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        // Only source: a .git/config with origin remote — no .syns.yaml, no --name.
+        let git_dir = temp_dir.path().join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(
+            git_dir.join("config"),
+            "[remote \"origin\"]\n\turl = https://github.com/user/non-syns-project.git\n",
+        )
+        .unwrap();
+
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", temp_dir.path()) };
+
+        // No mocks registered — the test verifies absence of any HTTP request.
+        let mock_server = MockServer::start().await;
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(false);
+
+        let args = PushArgs {
+            path: Some(temp_dir.path().into()),
+            if_repo: true,
+            ..default_push_args()
+        };
+
+        let result = cmd_push(&config, &output, &args).await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        // Locks the 2026-05-25 bug fix at the command-handler layer: a push from
+        // a directory whose only identity source is the git remote silent-skips
+        // under --if-repo and makes no HTTP call. Under u208's semantics, this
+        // test would have proceeded to a PUT /api/v1/repos/.../push request and
+        // failed the is_empty() assertion.
+        assert!(result.is_ok(), "cmd_push returned: {result:?}");
         assert!(mock_server.received_requests().await.unwrap().is_empty());
     }
 

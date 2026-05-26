@@ -461,4 +461,39 @@ mod tests {
             "positional did not drive the GET tree request: {requests:?}"
         );
     }
+
+    #[tokio::test]
+    #[serial]
+    async fn pull_with_if_repo_and_only_git_remote_silent_skips_no_http_call() {
+        let dir = tempfile::tempdir().unwrap();
+        // Only source: a .git/config with origin remote — no .syns.yaml, no positional.
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(
+            git_dir.join("config"),
+            "[remote \"origin\"]\n\turl = https://github.com/user/non-syns-project.git\n",
+        )
+        .unwrap();
+
+        std::env::set_current_dir(dir.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+
+        // No mocks registered — verifies absence of any HTTP request.
+        let mock_server = wiremock::MockServer::start().await;
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(false);
+
+        // repo_arg = None, path_arg = None, version = None, if_repo = true.
+        // Reaches resolve_full_or_skip, which under u252 emits skip via the
+        // narrowed resolve_or_skip and returns Ok(None).
+        let result = cmd_pull(&config, &output, None, None, None, true).await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        // AC7 representative: a pull from a directory whose only identity source
+        // is the git remote silent-skips under --if-repo and makes no HTTP call.
+        // Locks the cmd_<read> → helper → short-circuit-before-HTTP linkage for
+        // at least one representative read command at the integration level.
+        assert!(result.is_ok(), "cmd_pull returned: {result:?}");
+        assert!(mock_server.received_requests().await.unwrap().is_empty());
+    }
 }

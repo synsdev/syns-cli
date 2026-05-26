@@ -10,10 +10,17 @@ pub struct RepoIdentity {
     pub name: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentitySource {
+    NameFlag,
+    SynsYaml,
+    GitRemote,
+}
+
 pub fn resolve_repo_identity(
     name_flag: Option<&str>,
     path: &Path,
-) -> Result<RepoIdentity, CliError> {
+) -> Result<(RepoIdentity, IdentitySource), CliError> {
     // 1. If name_flag is present and non-empty after trimming, use it directly.
     if let Some(raw) = name_flag {
         let trimmed = raw.trim();
@@ -24,26 +31,32 @@ pub fn resolve_repo_identity(
                         message: "invalid repository name: must be 'owner/name' format".into(),
                     });
                 }
-                return Ok(RepoIdentity {
-                    owner: Some(owner.to_lowercase()),
-                    name: name.to_lowercase(),
-                });
+                return Ok((
+                    RepoIdentity {
+                        owner: Some(owner.to_lowercase()),
+                        name: name.to_lowercase(),
+                    },
+                    IdentitySource::NameFlag,
+                ));
             }
-            return Ok(RepoIdentity {
-                owner: None,
-                name: trimmed.to_lowercase(),
-            });
+            return Ok((
+                RepoIdentity {
+                    owner: None,
+                    name: trimmed.to_lowercase(),
+                },
+                IdentitySource::NameFlag,
+            ));
         }
     }
 
     // 2-4. Try .syns.yaml — propagate errors (malformed yaml is a hard error).
     if let Some(identity) = read_syns_yaml(path)? {
-        return Ok(identity);
+        return Ok((identity, IdentitySource::SynsYaml));
     }
 
     // 5-7. Fall through to git remote extraction.
     match extract_from_git_remote(path) {
-        Some(identity) => Ok(identity),
+        Some(identity) => Ok((identity, IdentitySource::GitRemote)),
         None => Err(CliError::RepoIdentityUnknown),
     }
 }
@@ -64,13 +77,15 @@ mod tests {
         .unwrap();
 
         let result = resolve_repo_identity(Some("override-name"), dir.path());
+        let (identity, source) = result.unwrap();
         assert_eq!(
-            result.unwrap(),
+            identity,
             RepoIdentity {
                 owner: None,
                 name: "override-name".into(),
             }
         );
+        assert_eq!(source, IdentitySource::NameFlag);
     }
 
     #[test]
@@ -79,7 +94,7 @@ mod tests {
 
         let result = resolve_repo_identity(Some("My-Project"), dir.path());
         assert_eq!(
-            result.unwrap(),
+            result.unwrap().0,
             RepoIdentity {
                 owner: None,
                 name: "my-project".into(),
@@ -98,7 +113,7 @@ mod tests {
 
         let result = resolve_repo_identity(Some("  "), dir.path());
         assert_eq!(
-            result.unwrap(),
+            result.unwrap().0,
             RepoIdentity {
                 owner: Some("bob".into()),
                 name: "yaml-repo".into(),
@@ -124,13 +139,15 @@ mod tests {
         .unwrap();
 
         let result = resolve_repo_identity(None, dir.path());
+        let (identity, source) = result.unwrap();
         assert_eq!(
-            result.unwrap(),
+            identity,
             RepoIdentity {
                 owner: Some("bob".into()),
                 name: "yaml-repo".into(),
             }
         );
+        assert_eq!(source, IdentitySource::SynsYaml);
     }
 
     #[test]
@@ -146,13 +163,15 @@ mod tests {
         .unwrap();
 
         let result = resolve_repo_identity(None, dir.path());
+        let (identity, source) = result.unwrap();
         assert_eq!(
-            result.unwrap(),
+            identity,
             RepoIdentity {
                 owner: None,
                 name: "remote-repo".into(),
             }
         );
+        assert_eq!(source, IdentitySource::GitRemote);
     }
 
     #[test]
@@ -170,5 +189,66 @@ mod tests {
 
         let result = resolve_repo_identity(None, dir.path());
         assert!(matches!(result, Err(CliError::Io { .. })));
+    }
+
+    #[test]
+    fn resolve_repo_identity_with_name_flag_reports_source_name_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        // No .syns.yaml, no .git — only the --name flag should resolve.
+
+        let result = resolve_repo_identity(Some("alice/my-repo"), dir.path());
+        let (identity, source) = result.unwrap();
+        assert_eq!(
+            identity,
+            RepoIdentity {
+                owner: Some("alice".into()),
+                name: "my-repo".into(),
+            }
+        );
+        assert_eq!(source, IdentitySource::NameFlag);
+    }
+
+    #[test]
+    fn resolve_repo_identity_with_syns_yaml_reports_source_syns_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".syns.yaml"),
+            "owner: bob\nname: yaml-repo\n",
+        )
+        .unwrap();
+
+        let result = resolve_repo_identity(None, dir.path());
+        let (identity, source) = result.unwrap();
+        assert_eq!(
+            identity,
+            RepoIdentity {
+                owner: Some("bob".into()),
+                name: "yaml-repo".into(),
+            }
+        );
+        assert_eq!(source, IdentitySource::SynsYaml);
+    }
+
+    #[test]
+    fn resolve_repo_identity_with_git_remote_reports_source_git_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+        fs::write(
+            git_dir.join("config"),
+            "[remote \"origin\"]\n\turl = https://github.com/user/remote-repo.git\n",
+        )
+        .unwrap();
+
+        let result = resolve_repo_identity(None, dir.path());
+        let (identity, source) = result.unwrap();
+        assert_eq!(
+            identity,
+            RepoIdentity {
+                owner: None,
+                name: "remote-repo".into(),
+            }
+        );
+        assert_eq!(source, IdentitySource::GitRemote);
     }
 }
