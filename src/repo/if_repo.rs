@@ -52,6 +52,14 @@ pub fn resolve_or_skip(
 /// only a name). Both branches under `if_repo: true` emit skip and return
 /// `Ok(None)`; without `if_repo`, the function returns
 /// `Err(CliError::RepoIdentityUnknown)` to match today's behavior.
+///
+/// Note: under `if_repo: true`, case (b) is structurally unreachable in
+/// steady state — `resolve_or_skip` now short-circuits with skip + `Ok(None)`
+/// upstream whenever source is `NameFlag` or `GitRemote` (the only sources
+/// that can produce `owner: None`). The owner-`None`-AND-`if_repo` arm below
+/// is intentionally preserved as a defensive backstop per SPEC u252 D7;
+/// removing it would couple this helper's correctness to internal facts
+/// about `resolve_or_skip` that the signature alone cannot re-derive.
 pub fn resolve_full_or_skip(
     name_flag: Option<&str>,
     path: &Path,
