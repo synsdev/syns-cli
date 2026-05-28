@@ -10,3 +10,4 @@ mod push_strict_test;
 mod push_test;
 mod teams_remove_json_test;
 mod upgrade_test;
+mod version_test;

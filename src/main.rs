@@ -11,6 +11,7 @@ use syns_cli::commands::upgrade::UpgradeArgs;
 #[derive(Parser)]
 #[command(
     name = "syns",
+    version,
     about = "Push, pull, and manage versioned file repositories"
 )]
 struct Cli {
