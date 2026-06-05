@@ -14,7 +14,7 @@ jobs:
     name: dist generate --check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
       - name: Install cargo-dist 0.31.0
         run: cargo install cargo-dist --version=0.31.0 --locked
       - name: Verify generated workflow has no drift
@@ -24,7 +24,7 @@ jobs:
     name: cross-pin lint (scoop-bump.yml ↔ dist-workspace.toml)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
       - name: Verify actions/checkout SHA pin is consistent
         run: |
           TOML_SHA=$(grep -E '^\s*"actions/checkout"\s*=' dist-workspace.toml | grep -oE '"[0-9a-f]{40}"' | tr -d '"')
