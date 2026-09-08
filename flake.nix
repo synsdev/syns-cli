@@ -57,9 +57,28 @@
 
           src = synsSrc;
 
-          cargoLock = {
-            lockFile = ./Cargo.lock;
-          };
+          # PD-3 addendum: vendor through `fetchCargoVendor` (cargoHash)
+          # rather than `cargoLock` (importCargoLock).
+          #
+          # `importCargoLock` fetches every crate with one `fetchurl` per
+          # crate, from `https://crates.io/api/v1/crates/<name>/<version>/download`.
+          # crates.io answers that endpoint with 403 for a request whose
+          # User-Agent is curl's default, which is what the fetchurl
+          # builder sends — so `nix build` failed on whichever crate was
+          # not already in the store, on every push, regardless of what
+          # the commit changed. `NIX_CURL_FLAGS` is the documented lever
+          # for that builder, but it is an impure env var read from the
+          # nix DAEMON's environment, so a workflow-level `env:` never
+          # reaches it.
+          #
+          # `fetchCargoVendor` runs `cargo vendor` inside one fixed-output
+          # derivation instead: cargo fetches through the sparse index and
+          # `static.crates.io` under its own User-Agent, which crates.io
+          # serves. One FOD also replaces ~200 per-crate ones.
+          #
+          # `cargoHash` covers Cargo.lock's whole closure, so it changes
+          # whenever the lockfile does; `nix build` prints the new value.
+          cargoHash = "sha256-78fNUSvv1Ac7xYXU+x0nuuCHo0o/8JEzESoxtBTomR0=";
 
           nativeBuildInputs = [ pkgs.pkg-config ];
           buildInputs = [ pkgs.openssl ];
