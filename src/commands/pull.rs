@@ -5,7 +5,7 @@ use crate::errors::CliError;
 use crate::output::Output;
 use crate::push::manifest::Manifest;
 use crate::repo::if_repo::resolve_full_or_skip;
-use crate::repo::root::pull_root;
+use crate::repo::root::{pull_root, resolve_start_path};
 use crate::repo::syns_yaml::{find_repo_root_for, write_syns_yaml};
 use console::style;
 use serde_json::json;
@@ -44,20 +44,11 @@ pub async fn cmd_pull(
     version: Option<String>,
     if_repo: bool,
 ) -> Result<(), CliError> {
-    // The directory the identity walk starts at: the path argument
-    // where one was given, the working directory otherwise (SPEC u255
-    // `cmd_pull` 1). This is NOT yet the write root — a bare retrieval
-    // writes into the repository root, whichever descendant of it the
-    // run started in.
-    //
-    // The working directory is read ONLY on the no-argument branch,
-    // for the same reason `cmd_push` reads it lazily.
-    let start_dir = match &path_arg {
-        Some(p) => PathBuf::from(p),
-        None => std::env::current_dir().map_err(|e| CliError::Io {
-            message: format!("could not determine current directory: {e}"),
-        })?,
-    };
+    // The directory the identity walk starts at (SPEC u255 `cmd_pull`
+    // 1), in ABSOLUTE form — see `resolve_start_path`. This is NOT yet
+    // the write root: a bare retrieval writes into the repository root,
+    // whichever descendant of it the run started in.
+    let start_dir = resolve_start_path(path_arg.as_deref().map(Path::new))?;
 
     let (owner, name) = if let Some(ref arg) = repo_arg {
         let mut parts = arg.splitn(2, '/');
@@ -81,7 +72,7 @@ pub async fn cmd_pull(
     // taken from it, and the identity file is written into it. A path
     // argument still names a destination rather than a scope.
     let target_dir = pull_root(
-        path_arg.as_deref().map(Path::new),
+        path_arg.as_ref().map(|_| start_dir.as_path()),
         &start_dir,
         &owner,
         &name,

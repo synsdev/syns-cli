@@ -50,8 +50,22 @@ pub fn resolve_repo_identity(
     }
 
     // 2-4. Try .syns.yaml — propagate errors (malformed yaml is a hard error).
+    //
+    // The pair is ASCII-lower-cased, as a `--name` value is above. A
+    // repository address is lower-case on the server, so a marker
+    // reading `owner: Alice` / `name: Proj` otherwise addresses a
+    // repository the server answers 422 `validation_error` for — while
+    // `find_repo_root_for` matches that same marker case-insensitively
+    // and resolves the content root correctly, so the run gets as far
+    // as the wire before failing.
     if let Some(identity) = read_syns_yaml(path)? {
-        return Ok((identity, IdentitySource::SynsYaml));
+        return Ok((
+            RepoIdentity {
+                owner: identity.owner.map(|o| o.to_lowercase()),
+                name: identity.name.to_lowercase(),
+            },
+            IdentitySource::SynsYaml,
+        ));
     }
 
     // 5-7. Fall through to git remote extraction.
@@ -250,5 +264,17 @@ mod tests {
             }
         );
         assert_eq!(source, IdentitySource::GitRemote);
+    }
+
+    #[test]
+    fn syns_yaml_pair_is_lowercased_like_a_name_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".syns.yaml"), "owner: Alice\nname: Proj\n").unwrap();
+
+        let (identity, source) = resolve_repo_identity(None, dir.path()).unwrap();
+
+        assert_eq!(identity.owner.as_deref(), Some("alice"));
+        assert_eq!(identity.name, "proj");
+        assert_eq!(source, IdentitySource::SynsYaml);
     }
 }

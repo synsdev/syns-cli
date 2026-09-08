@@ -61,6 +61,38 @@ fn absolutize(path: &Path) -> Result<PathBuf, CliError> {
     })
 }
 
+/// The absolute directory every walk a run makes starts at: the path
+/// argument where one was given, the process working directory
+/// otherwise.
+///
+/// THE one place a command turns its arguments into a starting point.
+/// Every ancestor walk in this crate — the identity resolution, the
+/// content root, both marker guards — climbs with `Path::parent`, and a
+/// relative path climbs to the empty component and stops: `syns push .`
+/// from `repo/sub/` never reaches `repo/.syns.yaml` and refuses with
+/// `REPO_IDENTITY_UNKNOWN`, or, under `--if-repo`, exits `0` having
+/// published nothing. The trigger's own worked example is that spelling,
+/// so a call site that skips this function reintroduces the defect the
+/// unit exists to close.
+///
+/// The working directory is read only where no path argument was given,
+/// and by `std::path::absolute` where a relative one was: a run that
+/// addresses an absolute path must not depend on the process working
+/// directory resolving at all.
+///
+/// `std::path::absolute` rather than canonicalization, because a
+/// retrieval's destination need not exist yet.
+pub fn resolve_start_path(explicit: Option<&Path>) -> Result<PathBuf, CliError> {
+    match explicit {
+        Some(path) => std::path::absolute(path).map_err(|err| CliError::Io {
+            message: format!("could not resolve path {}: {err}", path.display()),
+        }),
+        None => std::env::current_dir().map_err(|err| CliError::Io {
+            message: format!("could not determine current directory: {err}"),
+        }),
+    }
+}
+
 /// The `/`-separated spelling of a relative path, or `None` where a
 /// component is not valid UTF-8.
 ///
@@ -165,12 +197,7 @@ pub fn pull_root(
     name: &str,
 ) -> Result<PathBuf, CliError> {
     if let Some(path) = explicit {
-        // `std::path::absolute` reads the process working directory
-        // only for a relative path, and unlike canonicalization it
-        // does not require the destination to exist yet.
-        return std::path::absolute(path).map_err(|err| CliError::Io {
-            message: format!("could not resolve path {}: {err}", path.display()),
-        });
+        return resolve_start_path(Some(path));
     }
 
     Ok(find_repo_root_for(cwd, owner, name)?.unwrap_or_else(|| cwd.to_path_buf()))
@@ -270,6 +297,32 @@ mod tests {
         let (_guard, root, deep) = tree();
 
         assert_eq!(pull_root(None, &deep, "alice", "proj").unwrap(), root);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_start_path_makes_a_relative_argument_absolute() {
+        let (_guard, root, deep) = tree();
+        let _cwd = CwdGuard::enter(&deep);
+
+        // The trigger's own spelling: `.` from a repository subdirectory.
+        let answered = resolve_start_path(Some(Path::new("."))).unwrap();
+
+        assert!(answered.is_absolute(), "answered {}", answered.display());
+        assert_eq!(
+            find_repo_root_for(&answered, "alice", "proj").unwrap(),
+            Some(root),
+            "the identity walk did not reach the repository above the argument"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_start_path_answers_the_working_directory_without_an_argument() {
+        let (_guard, _root, deep) = tree();
+        let _cwd = CwdGuard::enter(&deep);
+
+        assert_eq!(resolve_start_path(None).unwrap(), deep);
     }
 
     #[test]

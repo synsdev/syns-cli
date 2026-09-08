@@ -11,7 +11,7 @@ use crate::output::Output;
 use crate::push::collector::{SkippedFile, write_skip_summary};
 use crate::push::smart::{PushPipelineMeta, SmartPushOptions, smart_push};
 use crate::repo::if_repo::resolve_or_skip;
-use crate::repo::root::push_scope;
+use crate::repo::root::{push_scope, resolve_start_path};
 
 const DEFAULT_COMMIT_MESSAGE: &str = "push";
 const SHORT_SHA_LENGTH: usize = 8;
@@ -88,22 +88,12 @@ async fn resolve_owner(
 }
 
 pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Result<(), CliError> {
-    // The directory the identity walk starts at: the path argument
-    // where one was given, the working directory otherwise (SPEC u255
-    // `cmd_push` 1). The SAME path seeds the scope resolution below,
-    // so the identity and the content root can never be resolved from
-    // two different places.
-    //
-    // The working directory is read ONLY on the no-argument branch:
-    // `syns push <PATH>` must not depend on the process cwd resolving
-    // at all, and reading it eagerly would fail the run outright where
-    // the cwd has been unlinked underneath the process.
-    let start_path = match &args.path {
-        Some(p) => p.clone(),
-        None => std::env::current_dir().map_err(|e| CliError::Io {
-            message: format!("could not determine current directory: {e}"),
-        })?,
-    };
+    // The directory the identity walk starts at (SPEC u255 `cmd_push`
+    // 1), in ABSOLUTE form — see `resolve_start_path`, which is what
+    // makes `syns push ./sub` work from a subdirectory. The SAME path
+    // seeds the scope resolution below, so the identity and the
+    // content root can never be resolved from two different places.
+    let start_path = resolve_start_path(args.path.as_deref())?;
 
     let identity = match resolve_or_skip(args.name.as_deref(), &start_path, args.if_repo, output)? {
         Some(id) => id,
@@ -128,7 +118,12 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
     // 3). Before u255 the publication took `start_path` itself as the
     // root, so a run from `repo/sub/` published `sub/` as though it
     // were the whole repository.
-    let scope = push_scope(args.path.as_deref(), &start_path, &owner, &name)?;
+    let scope = push_scope(
+        args.path.as_ref().map(|_| start_path.as_path()),
+        &start_path,
+        &owner,
+        &name,
+    )?;
 
     let status = args.status.clone().map(Into::into);
     let visibility = args.visibility.clone().map(Into::into);

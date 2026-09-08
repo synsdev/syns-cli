@@ -760,3 +760,132 @@ async fn a_scoped_push_collecting_nothing_reports_the_scoped_directory() {
         other => panic!("expected PushEmpty, got {other:?}"),
     }
 }
+
+// ---- round 3: a relative path argument, and a mixed-case marker --------
+
+/// The trigger's own `## Expected` sanctions `syns push ./sub`, arguing
+/// the parallel with `cd repo/sub && git add .`. Every relative spelling
+/// refused with `REPO_IDENTITY_UNKNOWN` from any directory below the
+/// repository root, because the identity walk climbed a relative path to
+/// the empty component and stopped.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn push_scoped_by_a_relative_dot_from_a_subdirectory_scopes_that_subtree() {
+    let ctx = setup().await;
+    seed_credentials(&ctx, "test-token", "alice");
+    let root = seed_tree(&ctx);
+    mount_push_mocks(&ctx, "alice/proj").await;
+
+    {
+        let _cwd = CwdGuard::enter(&root.join("sub"));
+        cmd_push(&ctx.config, &ctx.output, &push_args(Some(".".into())))
+            .await
+            .expect("a relative path argument must resolve the repository above it");
+    }
+
+    let paths = body_paths(&last_push_body(&ctx).await);
+    assert_eq!(paths, vec!["sub/nested.md".to_string()], "{paths:?}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn push_scoped_by_a_relative_child_from_a_subdirectory_scopes_that_subtree() {
+    let ctx = setup().await;
+    seed_credentials(&ctx, "test-token", "alice");
+    let root = seed_tree(&ctx);
+    fs::create_dir_all(root.join("a/b")).unwrap();
+    fs::write(root.join("a/b/deep.md"), "d").unwrap();
+    mount_push_mocks(&ctx, "alice/proj").await;
+
+    {
+        let _cwd = CwdGuard::enter(&root.join("a"));
+        cmd_push(&ctx.config, &ctx.output, &push_args(Some("b".into())))
+            .await
+            .expect("a relative path argument must resolve the repository above it");
+    }
+
+    let paths = body_paths(&last_push_body(&ctx).await);
+    assert_eq!(paths, vec!["a/b/deep.md".to_string()], "{paths:?}");
+}
+
+/// The severe shape: under `--if-repo` the same refusal became a silent
+/// exit `0` that published nothing, telling the user nothing and losing
+/// the operation — the zero-detectability failure the trigger reports.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn push_scoped_by_a_relative_path_under_if_repo_reaches_the_server() {
+    let ctx = setup().await;
+    seed_credentials(&ctx, "test-token", "alice");
+    let root = seed_tree(&ctx);
+    mount_push_mocks(&ctx, "alice/proj").await;
+
+    {
+        let _cwd = CwdGuard::enter(&root.join("sub"));
+        let mut args = push_args(Some(".".into()));
+        args.if_repo = true;
+        cmd_push(&ctx.config, &ctx.output, &args).await.unwrap();
+    }
+
+    let requests = ctx.mock_server.received_requests().await.unwrap();
+    assert!(
+        requests.iter().any(|r| r.method == reqwest::Method::PUT),
+        "--if-repo silently skipped a publication whose identity file stands above it"
+    );
+    let paths = body_paths(&last_push_body(&ctx).await);
+    assert_eq!(paths, vec!["sub/nested.md".to_string()], "{paths:?}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn pull_into_a_relative_destination_resolves_the_repository_above_it() {
+    let ctx = setup().await;
+    seed_credentials(&ctx, "test-token", "alice");
+    let root = ctx.project_dir.path().to_path_buf();
+    fs::create_dir_all(root.join("sub")).unwrap();
+    fs::write(root.join(".syns.yaml"), "owner: alice\nname: proj\n").unwrap();
+    mount_pull_mocks(&ctx, "alice/proj", server_tree()).await;
+
+    {
+        let _cwd = CwdGuard::enter(&root.join("sub"));
+        cmd_pull(
+            &ctx.config,
+            &ctx.output,
+            None,
+            Some("dest".into()),
+            None,
+            false,
+        )
+        .await
+        .expect("a relative destination must resolve the repository above it");
+    }
+
+    assert!(root.join("sub/dest/root-a.md").is_file());
+}
+
+/// `resolve_repo_identity` lower-cases a `--name` value and returned an
+/// identity file's pair verbatim, so a marker naming `Alice/Proj`
+/// addressed a repository the server answers `422` for.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_mixed_case_identity_file_addresses_the_lower_cased_repository() {
+    let ctx = setup().await;
+    seed_credentials(&ctx, "test-token", "alice");
+    let root = seed_tree(&ctx);
+    fs::write(root.join(".syns.yaml"), "owner: Alice\nname: Proj\n").unwrap();
+    mount_push_mocks(&ctx, "alice/proj").await;
+
+    {
+        let _cwd = CwdGuard::enter(&root.join("sub"));
+        cmd_push(&ctx.config, &ctx.output, &push_args(None))
+            .await
+            .unwrap();
+    }
+
+    let requests = ctx.mock_server.received_requests().await.unwrap();
+    assert!(
+        requests
+            .iter()
+            .any(|r| r.url.path() == "/api/v1/repos/alice/proj/push"),
+        "the publication addressed a repository the server holds under another spelling"
+    );
+}
