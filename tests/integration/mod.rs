@@ -8,6 +8,7 @@ mod push_no_parent_ignore_test;
 mod push_skipped_summary_test;
 mod push_strict_test;
 mod push_test;
+mod repo_root_test;
 mod teams_remove_json_test;
 mod upgrade_test;
 mod version_test;

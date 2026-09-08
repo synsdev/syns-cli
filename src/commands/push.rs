@@ -11,6 +11,7 @@ use crate::output::Output;
 use crate::push::collector::{SkippedFile, write_skip_summary};
 use crate::push::smart::{PushPipelineMeta, SmartPushOptions, smart_push};
 use crate::repo::if_repo::resolve_or_skip;
+use crate::repo::root::push_scope;
 
 const DEFAULT_COMMIT_MESSAGE: &str = "push";
 const SHORT_SHA_LENGTH: usize = 8;
@@ -87,14 +88,24 @@ async fn resolve_owner(
 }
 
 pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Result<(), CliError> {
-    let push_path = match &args.path {
+    // The directory the identity walk starts at: the path argument
+    // where one was given, the working directory otherwise (SPEC u255
+    // `cmd_push` 1). The SAME path seeds the scope resolution below,
+    // so the identity and the content root can never be resolved from
+    // two different places.
+    //
+    // The working directory is read ONLY on the no-argument branch:
+    // `syns push <PATH>` must not depend on the process cwd resolving
+    // at all, and reading it eagerly would fail the run outright where
+    // the cwd has been unlinked underneath the process.
+    let start_path = match &args.path {
         Some(p) => p.clone(),
         None => std::env::current_dir().map_err(|e| CliError::Io {
             message: format!("could not determine current directory: {e}"),
         })?,
     };
 
-    let identity = match resolve_or_skip(args.name.as_deref(), &push_path, args.if_repo, output)? {
+    let identity = match resolve_or_skip(args.name.as_deref(), &start_path, args.if_repo, output)? {
         Some(id) => id,
         None => return Ok(()),
     };
@@ -102,6 +113,7 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
     let token_store = TokenStore::new(config.credentials_path());
     let token = token_store.read()?.ok_or(CliError::AuthRequired)?;
 
+    let name = identity.name;
     let (owner, client) = if let Some(owner) = identity.owner {
         (owner, None)
     } else {
@@ -110,7 +122,13 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
         (owner, Some(c))
     };
 
-    let repo_id = format!("{owner}/{}", identity.name);
+    let repo_id = format!("{owner}/{name}");
+
+    // The content root, and the scope inside it (SPEC u255 `cmd_push`
+    // 3). Before u255 the publication took `start_path` itself as the
+    // root, so a run from `repo/sub/` published `sub/` as though it
+    // were the whole repository.
+    let scope = push_scope(args.path.as_deref(), &start_path, &owner, &name)?;
 
     let status = args.status.clone().map(Into::into);
     let visibility = args.visibility.clone().map(Into::into);
@@ -139,6 +157,7 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
         allow_empty: args.allow_empty,
         debug: args.debug,
         no_default_excludes: args.no_default_excludes,
+        prefix: scope.prefix.clone(),
     };
 
     let client = match client {
@@ -153,7 +172,7 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
     // short-circuits through `CliError::json_value` to the structured
     // wire form before any prose reaches the output stream — no
     // separate intercept site needed.
-    let (response, raw, meta) = smart_push(&client, &token, &repo_id, &push_path, opts).await?;
+    let (response, raw, meta) = smart_push(&client, &token, &repo_id, &scope.root, opts).await?;
 
     format_response(output, &response, &raw, &repo_id, &meta);
 

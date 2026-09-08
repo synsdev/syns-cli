@@ -57,10 +57,15 @@ fn empty_collection_exits_6_with_cause_diagnostic() {
         .build()
         .unwrap();
     rt.block_on(async {
+        // SPEC u255 `smart_push` 5 moved the empty guard below the
+        // reference-set build (a delete-only publication carries no
+        // file and must still reach the server), so the run now reads
+        // `EP-tree` first. What the guard still promises is that
+        // nothing is PUBLISHED.
         let requests = env.server.received_requests().await.unwrap();
         assert!(
-            requests.is_empty(),
-            "empty guard must fire before any wire call"
+            requests.iter().all(|r| r.method != reqwest::Method::PUT),
+            "empty guard must fire before the publication reaches the server"
         );
     });
 }

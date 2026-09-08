@@ -5,7 +5,8 @@ use crate::errors::CliError;
 use crate::output::Output;
 use crate::push::manifest::Manifest;
 use crate::repo::if_repo::resolve_full_or_skip;
-use crate::repo::syns_yaml::write_syns_yaml;
+use crate::repo::root::pull_root;
+use crate::repo::syns_yaml::{find_repo_root_for, write_syns_yaml};
 use console::style;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -43,7 +44,15 @@ pub async fn cmd_pull(
     version: Option<String>,
     if_repo: bool,
 ) -> Result<(), CliError> {
-    let target_dir = match &path_arg {
+    // The directory the identity walk starts at: the path argument
+    // where one was given, the working directory otherwise (SPEC u255
+    // `cmd_pull` 1). This is NOT yet the write root — a bare retrieval
+    // writes into the repository root, whichever descendant of it the
+    // run started in.
+    //
+    // The working directory is read ONLY on the no-argument branch,
+    // for the same reason `cmd_push` reads it lazily.
+    let start_dir = match &path_arg {
         Some(p) => PathBuf::from(p),
         None => std::env::current_dir().map_err(|e| CliError::Io {
             message: format!("could not determine current directory: {e}"),
@@ -61,11 +70,22 @@ pub async fn cmd_pull(
         }
         (o.to_string(), n.to_string())
     } else {
-        match resolve_full_or_skip(None, &target_dir, if_repo, output)? {
+        match resolve_full_or_skip(None, &start_dir, if_repo, output)? {
             Some(pair) => pair,
             None => return Ok(()),
         }
     };
+
+    // The retrieval's ONE write root (SPEC u255 `cmd_pull` 2): every
+    // fetched path is joined under it, every reconciled removal is
+    // taken from it, and the identity file is written into it. A path
+    // argument still names a destination rather than a scope.
+    let target_dir = pull_root(
+        path_arg.as_deref().map(Path::new),
+        &start_dir,
+        &owner,
+        &name,
+    )?;
 
     let repo_id = format!("{owner}/{name}");
     let token = TokenStore::new(config.credentials_path())
@@ -154,7 +174,13 @@ pub async fn cmd_pull(
         }
     }
 
-    if repo_arg.is_some() {
+    // SPEC u255 `cmd_pull` 4: the marker is written after every
+    // fetched path stands and every reconciled removal is taken
+    // (`pull-write-then-delete`), and only where no `.syns.yaml` at or
+    // above the write root already names this repository — otherwise a
+    // retrieval run from `repo/sub/` entrenches `sub/` as a repository
+    // of its own and every later publication from there resolves to it.
+    if repo_arg.is_some() && find_repo_root_for(&target_dir, &owner, &name)?.is_none() {
         write_syns_yaml(&target_dir, &owner, &name)?;
     }
 

@@ -11,7 +11,8 @@ use crate::push::collector::{
 };
 use crate::push::hash::blob_sha1;
 use crate::push::manifest::Manifest;
-use crate::repo::syns_yaml::write_syns_yaml;
+use crate::repo::root::path_within_prefix;
+use crate::repo::syns_yaml::{find_repo_root_for, write_syns_yaml};
 
 /// Knobs passed into `smart_push` from the CLI layer. Wraps the
 /// historical push options (force, message, author, excludes, …) plus
@@ -47,6 +48,15 @@ pub struct SmartPushOptions {
     /// `CliError::PushPartial` so the no-default-excludes hint line
     /// is gated correctly in both the success and the error paths.
     pub no_default_excludes: bool,
+    /// `ContentScope.prefix` as the pipeline receives it (SPEC u255
+    /// § Contract Surface): the subtree, or the single path, a scoped
+    /// publication is confined to, relative to `path`.
+    ///
+    /// `path` stays the repository root whatever the prefix is, so
+    /// every path on the wire is repository-relative. The prefix
+    /// confines two things and nothing else: what the collector walks,
+    /// and which reference paths may be named as deletions.
+    pub prefix: Option<String>,
 }
 
 /// Metadata threaded from `smart_push` to `format_response` so the
@@ -94,11 +104,21 @@ fn tree_to_sha_map(tree: &TreeResponse) -> HashMap<String, String> {
         .collect()
 }
 
+/// Split the reference state against the collected state into the
+/// file entries and the deletion entries a push carries.
+///
+/// `prefix` confines the DELETION side alone (SPEC u255 `smart_push`
+/// 4): a scoped publication walks only its own subtree, so every
+/// reference path outside that subtree is absent from `local_shas`
+/// and would otherwise be named as a deletion — which is exactly the
+/// data loss issue 119 reports. A reference path lying outside
+/// `prefix` is named in neither returned list.
 fn build_push_entries(
     local_files: &HashMap<String, Vec<u8>>,
     local_shas: &HashMap<String, String>,
     reference_shas: &HashMap<String, String>,
     force: bool,
+    prefix: Option<&str>,
 ) -> Result<(Vec<PushFileEntry>, Vec<PushDeleteEntry>), CliError> {
     let mut entries = Vec::new();
     let mut deletes = Vec::new();
@@ -123,13 +143,43 @@ fn build_push_entries(
 
     if !force {
         for path in reference_shas.keys() {
-            if !local_shas.contains_key(path) {
-                deletes.push(PushDeleteEntry { path: path.clone() });
+            if local_shas.contains_key(path) {
+                continue;
             }
+            if let Some(prefix) = prefix
+                && !path_within_prefix(path, prefix)
+            {
+                continue;
+            }
+            deletes.push(PushDeleteEntry { path: path.clone() });
         }
     }
 
     Ok((entries, deletes))
+}
+
+/// The local record a run writes (SPEC u255 `smart_push` 7): the set
+/// this run has published laid over the record as it stood when the
+/// run began, with the paths the run named as deletions taken out.
+///
+/// Before u255 every record write was built from the published set
+/// ALONE, so a scoped publication rewrote the record to name its own
+/// subtree and nothing else — and the next bare publication then read
+/// that record as the whole repository's state and named every root
+/// path as a deletion (issue 119).
+fn merged_record(
+    record_base: &HashMap<String, String>,
+    deleted_paths: &[String],
+    published: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut merged = record_base.clone();
+    for path in deleted_paths {
+        merged.remove(path);
+    }
+    for (path, sha) in published {
+        merged.insert(path.clone(), sha.clone());
+    }
+    merged
 }
 
 fn upgrade_to_full(
@@ -173,13 +223,19 @@ fn upgrade_to_full(
 /// Per-batch manifest save (loop branch only): after each successful
 /// batch `k` where `1 ≤ k < n`, the chunker writes a manifest snapshot
 /// anchored to batch k's `commit_sha` and the cumulative `path → sha`
-/// map of every batch uploaded so far (seeded from `reference_shas` —
-/// the parent commit's state). This honours SPEC u225 § 2's "manifest
-/// tracks the SHA of the LAST SUCCESSFUL batch" promise: if batches
-/// `1..k-1` succeed and batch `k` fails, the local manifest matches
-/// server HEAD = batch `k-1`'s commit, and the next push computes
-/// diffs from there. The final batch's save is left to `smart_push`
-/// Phase 6 which uses the full `local_shas` map and handles deletions.
+/// map of every batch uploaded so far, laid over `record_base` — the
+/// record as it stood when the run began — with `deleted_paths` taken
+/// out. This honours SPEC u225 § 2's "manifest tracks the SHA of the
+/// LAST SUCCESSFUL batch" promise: if batches `1..k-1` succeed and
+/// batch `k` fails, the local manifest matches server HEAD = batch
+/// `k-1`'s commit, and the next push computes diffs from there.
+///
+/// SPEC u255 `smart_push` 7 binds every record write a run makes,
+/// these intermediate snapshots included: seeding them from the
+/// published set alone dropped every out-of-scope path from a scoped
+/// publication large enough to chunk. The final batch's save is left
+/// to `smart_push` Phase 6, which lays the full `local_shas` map over
+/// the same base and takes the same deletion list out.
 #[allow(clippy::too_many_arguments)]
 async fn chunked_push(
     client: &SynsClient,
@@ -191,7 +247,8 @@ async fn chunked_push(
     cache_dir: &Path,
     owner: &str,
     name: &str,
-    reference_shas: &HashMap<String, String>,
+    record_base: &HashMap<String, String>,
+    deleted_paths: &[String],
 ) -> Result<(PushResponse, serde_json::Value), CliError> {
     // Step 1: materialise (every entry carries content after this).
     let mut entries = upgrade_to_full(&base_request.files, local_files)?;
@@ -271,8 +328,8 @@ async fn chunked_push(
     let mut last_completed: Option<(PushResponse, serde_json::Value)> = None;
     // Cumulative `path → sha` map of every entry uploaded so far. After
     // each successful batch, the per-batch manifest snapshot is
-    // `reference_shas ∪ uploaded` — i.e., server state at batch k =
-    // parent state + everything pushed in batches 1..k.
+    // `record_base − deleted_paths ∪ uploaded` — i.e., the record the
+    // run started from, carrying everything pushed in batches 1..k.
     let mut uploaded: HashMap<String, String> = HashMap::new();
 
     for (k, batch) in batches.iter().enumerate() {
@@ -330,13 +387,12 @@ async fn chunked_push(
                 previous_commit_sha = Some(response.commit_sha.clone());
                 // Per-batch manifest save (HIGH-2): only for intermediate
                 // batches. The FINAL batch's save is owned by Phase 6 in
-                // smart_push, which uses the full local_shas map and
-                // applies the deletion list correctly.
+                // smart_push, which lays the full local_shas map over the
+                // same `record_base` and takes the same `deleted_paths`
+                // out — the two writes now differ only in which published
+                // set they carry.
                 if k1 < n {
-                    let mut cumulative: HashMap<String, String> = reference_shas.clone();
-                    for (p, s) in uploaded.iter() {
-                        cumulative.insert(p.clone(), s.clone());
-                    }
+                    let cumulative = merged_record(record_base, deleted_paths, &uploaded);
                     let mut manifest = Manifest::default();
                     manifest.update(response.commit_sha.clone(), cumulative);
                     if let Err(e) = manifest.save(cache_dir, owner, name) {
@@ -434,7 +490,14 @@ pub async fn smart_push(
     // Phase 1 — Setup (preserved from u21).
     let (owner, name) = split_repo_id(repo_id)?;
 
-    if !path.join(".syns.yaml").exists() {
+    // The identity marker is written only where NO `.syns.yaml` at or
+    // above `path` already names this repository (SPEC u255
+    // `smart_push` 1). The pre-u255 guard tested `path` alone, so a
+    // publication run from `repo/sub/` wrote `repo/sub/.syns.yaml` and
+    // permanently entrenched the subtree as a repository of its own —
+    // issue 119's most damaging symptom, because the next bare run
+    // then resolved to `sub/` however the content root was fixed.
+    if find_repo_root_for(path, owner, name)?.is_none() {
         write_syns_yaml(path, owner, name)?;
     }
 
@@ -449,6 +512,7 @@ pub async fn smart_push(
         CollectOptions {
             no_default_excludes: opts.no_default_excludes,
             debug: opts.debug,
+            prefix: opts.prefix.clone(),
         },
     )?;
 
@@ -460,15 +524,10 @@ pub async fn smart_push(
         });
     }
 
-    // Phase 2c — Empty guard.
-    if local_files.is_empty() && !opts.allow_empty {
-        let cause = skip_summary_cause(&skipped, path);
-        return Err(CliError::PushEmpty {
-            path: path.display().to_string(),
-            total_walked,
-            cause,
-        });
-    }
+    // Phase 2c — the empty guard used to stand here. It now stands
+    // below Phase 4, because a scoped publication carrying only
+    // deletions carries no file and must still reach the server
+    // (SPEC u255 `smart_push` 5).
 
     // Phase 3a — Compute local SHAs (preserved).
     let local_shas: HashMap<String, String> = local_files
@@ -480,23 +539,35 @@ pub async fn smart_push(
     // is set even when --force bypasses the reference state from it).
     let loaded_manifest = Manifest::load(&opts.cache_dir, owner, name);
     let manifest_existed = loaded_manifest.is_some();
+    let record_from_manifest: Option<(HashMap<String, String>, Option<String>)> = loaded_manifest
+        .map(|manifest| {
+            let shas: HashMap<String, String> = manifest
+                .file_paths()
+                .filter_map(|p| {
+                    manifest
+                        .file_sha(p)
+                        .map(|sha| (p.to_string(), sha.to_string()))
+                })
+                .collect();
+            let parent = manifest.commit_sha().map(String::from);
+            (shas, parent)
+        });
 
-    // Phase 3c — Build reference state.
-    let (reference_shas, base_parent_sha) = if opts.force {
-        (HashMap::new(), None)
-    } else if let Some(manifest) = loaded_manifest {
-        let ref_shas: HashMap<String, String> = manifest
-            .file_paths()
-            .filter_map(|p| {
-                manifest
-                    .file_sha(p)
-                    .map(|sha| (p.to_string(), sha.to_string()))
-            })
-            .collect();
-        let parent = manifest.commit_sha().map(String::from);
-        (ref_shas, parent)
-    } else {
-        match client.pull(repo_id, Some(token)).await {
+    // Phase 3c — the record as it stood when the run began (SPEC u255
+    // `smart_push` 7). Phase 6 lays the collected set over THIS map,
+    // which is what keeps a scoped publication's record naming the
+    // whole tree rather than just its scope.
+    //
+    // Where no local record loads — a checkout that has never written
+    // one, or `--force` having discarded it — the remote path set
+    // through `EP-tree` is the base instead. The extra request on that
+    // path is deliberate: a `--force` scoped publication with no
+    // record on disk is the one corner that would otherwise rewrite
+    // the record from the scope alone and hand the NEXT bare
+    // publication a deletion for every out-of-scope path.
+    let (record_base, remote_parent_sha) = match &record_from_manifest {
+        Some((shas, parent)) => (shas.clone(), parent.clone()),
+        None => match client.pull(repo_id, Some(token)).await {
             Ok(tree) => {
                 let parent = Some(tree.commit_sha.clone());
                 (tree_to_sha_map(&tree), parent)
@@ -505,7 +576,16 @@ pub async fn smart_push(
                 status: Some(404), ..
             }) => (HashMap::new(), None),
             Err(e) => return Err(e),
-        }
+        },
+    };
+
+    // Phase 3d — Build reference state: the diff base the wire payload
+    // is computed against. `--force` empties it so every collected
+    // file rides with content and nothing is named as a deletion.
+    let (reference_shas, base_parent_sha) = if opts.force {
+        (HashMap::new(), None)
+    } else {
+        (record_base.clone(), remote_parent_sha)
     };
 
     let parent_sha = if opts.parent_sha.is_some() {
@@ -514,9 +594,34 @@ pub async fn smart_push(
         base_parent_sha
     };
 
-    // Phase 4 — Build payload (preserved from u21).
-    let (entries, deletes) =
-        build_push_entries(&local_files, &local_shas, &reference_shas, opts.force)?;
+    // Phase 4 — Build payload (preserved from u21, prefix-gated on the
+    // deletion side per SPEC u255 `smart_push` 4).
+    let (entries, deletes) = build_push_entries(
+        &local_files,
+        &local_shas,
+        &reference_shas,
+        opts.force,
+        opts.prefix.as_deref(),
+    )?;
+
+    // Phase 4b — Empty guard (SPEC u255 `smart_push` 5). A publication
+    // is refused only where it carries neither a file nor a deletion:
+    // a scoped publication whose whole subtree was removed from disk
+    // carries deletions and nothing else, and must reach the server
+    // rather than exiting as if it had nothing to say.
+    if entries.is_empty() && deletes.is_empty() && !opts.allow_empty {
+        let cause = skip_summary_cause(&skipped, path);
+        return Err(CliError::PushEmpty {
+            path: path.display().to_string(),
+            total_walked,
+            cause,
+        });
+    }
+
+    // The paths this run takes out of the local record (SPEC u255
+    // `smart_push` 7). Captured before `deletes` is moved onto the
+    // request.
+    let deleted_paths: Vec<String> = deletes.iter().map(|d| d.path.clone()).collect();
 
     let deletions = if deletes.is_empty() {
         None
@@ -557,7 +662,8 @@ pub async fn smart_push(
             &opts.cache_dir,
             owner,
             name,
-            &reference_shas,
+            &record_base,
+            &deleted_paths,
         )
         .await?
     } else {
@@ -594,7 +700,8 @@ pub async fn smart_push(
                         &opts.cache_dir,
                         owner,
                         name,
-                        &reference_shas,
+                        &record_base,
+                        &deleted_paths,
                     )
                     .await?
                 } else {
@@ -616,7 +723,8 @@ pub async fn smart_push(
                     &opts.cache_dir,
                     owner,
                     name,
-                    &reference_shas,
+                    &record_base,
+                    &deleted_paths,
                 )
                 .await?
             }
@@ -632,7 +740,10 @@ pub async fn smart_push(
         );
     } else {
         let mut manifest = Manifest::default();
-        manifest.update(response.commit_sha.clone(), local_shas);
+        manifest.update(
+            response.commit_sha.clone(),
+            merged_record(&record_base, &deleted_paths, &local_shas),
+        );
         if let Err(e) = manifest.save(&opts.cache_dir, owner, name) {
             eprintln!("warning: could not save manifest (next push will re-upload all files): {e}");
         }
@@ -710,6 +821,7 @@ mod tests {
                 allow_empty: false,
                 debug: false,
                 no_default_excludes: false,
+                prefix: None,
             },
         )
         .await;
@@ -809,6 +921,7 @@ mod tests {
                 allow_empty: false,
                 debug: false,
                 no_default_excludes: false,
+                prefix: None,
             },
         )
         .await;
@@ -890,6 +1003,7 @@ mod tests {
                 allow_empty: false,
                 debug: false,
                 no_default_excludes: false,
+                prefix: None,
             },
         )
         .await;
@@ -990,6 +1104,7 @@ mod tests {
                 allow_empty: false,
                 debug: false,
                 no_default_excludes: false,
+                prefix: None,
             },
         )
         .await;
@@ -1083,6 +1198,7 @@ mod tests {
                 allow_empty: false,
                 debug: false,
                 no_default_excludes: false,
+                prefix: None,
             },
         )
         .await;
@@ -1132,6 +1248,7 @@ mod tests {
             allow_empty,
             debug: false,
             no_default_excludes: false,
+            prefix: None,
         }
     }
 
@@ -1326,8 +1443,17 @@ mod tests {
             other => panic!("expected PushEmpty, got {other:?}"),
         }
 
+        // SPEC u255 `smart_push` 5 moved the empty guard BELOW the
+        // reference-set build, so a run may now read `EP-tree` before
+        // refusing — a publication carrying only deletions has to be
+        // distinguishable from one carrying nothing at all. What the
+        // guard still promises is that no publication reaches the
+        // server: no PUT is issued.
         let requests = mock_server.received_requests().await.unwrap();
-        assert!(requests.is_empty());
+        assert!(
+            requests.iter().all(|r| r.method != reqwest::Method::PUT),
+            "empty guard must fire before the publication reaches the server"
+        );
     }
 
     #[tokio::test]
@@ -1489,6 +1615,7 @@ mod tests {
                 allow_empty: false,
                 debug: false,
                 no_default_excludes: false,
+                prefix: None,
             },
         )
         .await;
@@ -1610,6 +1737,7 @@ mod tests {
                 allow_empty: false,
                 debug: false,
                 no_default_excludes: false,
+                prefix: None,
             },
         )
         .await;
@@ -1738,6 +1866,7 @@ mod tests {
                 allow_empty: false,
                 debug: false,
                 no_default_excludes: false,
+                prefix: None,
             },
         )
         .await;
@@ -1871,6 +2000,7 @@ mod tests {
                 allow_empty: false,
                 debug: false,
                 no_default_excludes: false,
+                prefix: None,
             },
         )
         .await;
@@ -1901,5 +2031,68 @@ mod tests {
             stored.contains("big1.txt") || stored.contains("big2.txt"),
             "manifest should contain at least one of the big files after batch 1, got: {stored:?}",
         );
+    }
+
+    // ---- u255: prefix-confined deletions, and the record merge -----
+
+    fn sha_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(p, s)| (p.to_string(), s.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn build_push_entries_names_no_deletion_outside_the_prefix() {
+        let local_files: HashMap<String, Vec<u8>> = HashMap::new();
+        let local_shas = HashMap::new();
+        let reference_shas = sha_map(&[
+            ("root-a.md", "aaa"),
+            ("root-b.md", "bbb"),
+            ("sub/nested.md", "nnn"),
+        ]);
+
+        let (entries, deletes) = build_push_entries(
+            &local_files,
+            &local_shas,
+            &reference_shas,
+            false,
+            Some("sub"),
+        )
+        .unwrap();
+
+        assert!(entries.is_empty());
+        let paths: Vec<&str> = deletes.iter().map(|d| d.path.as_str()).collect();
+        assert_eq!(paths, vec!["sub/nested.md"]);
+    }
+
+    #[test]
+    fn build_push_entries_without_a_prefix_names_every_absent_reference_path() {
+        let local_files: HashMap<String, Vec<u8>> = HashMap::new();
+        let local_shas = HashMap::new();
+        let reference_shas = sha_map(&[("root-a.md", "aaa"), ("sub/nested.md", "nnn")]);
+
+        let (_entries, deletes) =
+            build_push_entries(&local_files, &local_shas, &reference_shas, false, None).unwrap();
+
+        let mut paths: Vec<&str> = deletes.iter().map(|d| d.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, vec!["root-a.md", "sub/nested.md"]);
+    }
+
+    #[test]
+    fn merged_record_keeps_the_run_start_paths_a_scoped_run_never_walked() {
+        let base = sha_map(&[
+            ("root-a.md", "aaa"),
+            ("root-b.md", "bbb"),
+            ("sub/nested.md", "nnn"),
+        ]);
+        let published = sha_map(&[("sub/added.md", "ddd")]);
+
+        let merged = merged_record(&base, &["sub/nested.md".to_string()], &published);
+
+        let mut paths: Vec<&str> = merged.keys().map(String::as_str).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, vec!["root-a.md", "root-b.md", "sub/added.md"]);
     }
 }

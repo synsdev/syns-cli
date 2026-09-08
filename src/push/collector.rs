@@ -1,4 +1,5 @@
 use crate::errors::CliError;
+use crate::repo::root::{path_is_prefix_ancestor, path_within_prefix};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::overrides::OverrideBuilder;
 use ignore::{Match, WalkBuilder};
@@ -36,6 +37,19 @@ pub struct CollectOptions {
     /// Uncoloured / not styled — these lines are documented as
     /// copy-pastable in SPEC u213 § 3.2.
     pub debug: bool,
+    /// The subtree — or the single path — both walks are confined to,
+    /// `/`-separated and relative to the `path` given to
+    /// `collect_files` (SPEC u255 § Contract Surface). `None` walks
+    /// the whole tree below `path`.
+    ///
+    /// The prefix is applied inside BOTH walkers' `filter_entry`, not
+    /// by re-rooting the walk: `D-067` fixes the ignore root at the
+    /// path given, and re-rooting would make a scoped publication
+    /// stop honouring the repository root's ignore files. Applying it
+    /// to the kept walk alone would be worse still — the enumeration
+    /// walk would then report every out-of-scope path as dropped and
+    /// `--strict` would refuse every scoped publication.
+    pub prefix: Option<String>,
 }
 
 /// One reason a file was excluded from the push. First match wins per
@@ -91,6 +105,30 @@ pub struct CollectResult {
 fn to_forward_slash_path(path: &Path) -> Option<String> {
     let parts: Option<Vec<&str>> = path.components().map(|c| c.as_os_str().to_str()).collect();
     parts.map(|p| p.join("/"))
+}
+
+/// Whether a walked entry is inside the scope `prefix` names, or is a
+/// directory the walk must descend through to reach it.
+///
+/// Returns `true` for the walk root itself and for anything that does
+/// not sit under `root` at all — neither is the prefix's business, and
+/// rejecting the root would empty every scoped walk.
+fn prefix_admits(root: &Path, prefix: &str, entry_path: &Path, is_dir: bool) -> bool {
+    let rel = match entry_path.strip_prefix(root) {
+        Ok(rel) => rel,
+        Err(_) => return true,
+    };
+    let rel_str = match to_forward_slash_path(rel) {
+        Some(s) => s,
+        None => return true,
+    };
+    if rel_str.is_empty() {
+        return true;
+    }
+    if path_within_prefix(&rel_str, prefix) {
+        return true;
+    }
+    is_dir && path_is_prefix_ancestor(&rel_str, prefix)
 }
 
 fn is_binary(path: &Path) -> Result<bool, std::io::Error> {
@@ -253,6 +291,8 @@ pub fn collect_files(
     // semantics including negation patterns. D-067: parents(false)
     // means ancestor ignore files are not consulted.
     let no_default_excludes = opts.no_default_excludes;
+    let kept_root = path.to_path_buf();
+    let kept_prefix = opts.prefix.clone();
     let kept_walker = WalkBuilder::new(path)
         .hidden(false)
         .require_git(false)
@@ -269,6 +309,12 @@ pub fn collect_files(
                 && DEFAULT_EXCLUDE_DIRS.iter().any(|d| name == OsStr::new(d))
             {
                 return false;
+            }
+            if let Some(prefix) = kept_prefix.as_deref() {
+                let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+                if !prefix_admits(&kept_root, prefix, entry.path(), is_dir) {
+                    return false;
+                }
             }
             true
         })
@@ -329,12 +375,25 @@ pub fn collect_files(
     // hierarchical filters (only .git is excluded unconditionally).
     // The difference between this set and the kept set identifies
     // files the kept walker excluded.
+    let full_root = path.to_path_buf();
+    let full_prefix = opts.prefix.clone();
     let full_walker = WalkBuilder::new(path)
         .hidden(false)
         .require_git(false)
         .parents(false)
         .standard_filters(false)
-        .filter_entry(|entry| entry.file_name() != OsStr::new(".git"))
+        .filter_entry(move |entry| {
+            if entry.file_name() == OsStr::new(".git") {
+                return false;
+            }
+            if let Some(prefix) = full_prefix.as_deref() {
+                let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+                if !prefix_admits(&full_root, prefix, entry.path(), is_dir) {
+                    return false;
+                }
+            }
+            true
+        })
         .build();
 
     let mut skipped: Vec<SkippedFile> = Vec::new();
@@ -934,6 +993,7 @@ mod tests {
             CollectOptions {
                 no_default_excludes: true,
                 debug: false,
+                prefix: None,
             },
         )
         .unwrap();
@@ -1004,5 +1064,134 @@ mod tests {
                  NOT B-bound (marker discovery)"
             );
         }
+    }
+
+    // ---- u255: prefix-confined collection --------------------------
+
+    /// A repository root holding `root-a.md`, `root-b.md` and
+    /// `sub/nested.md` — the tree SPEC u255 § Tests is written over.
+    fn scoped_tree() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("root-a.md"), "a").unwrap();
+        std::fs::write(dir.path().join("root-b.md"), "b").unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/nested.md"), "n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_prefixed_collection_keys_paths_relative_to_the_walk_root() {
+        let dir = scoped_tree();
+
+        let result = collect_files(
+            dir.path(),
+            &[],
+            CollectOptions {
+                prefix: Some("sub".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.files.keys().collect::<Vec<_>>(),
+            vec!["sub/nested.md"]
+        );
+    }
+
+    #[test]
+    fn a_prefixed_collection_counts_no_out_of_prefix_path_as_dropped() {
+        let dir = scoped_tree();
+        // A root-level ignore file that would drop `root-b.md` if the
+        // enumeration walk still visited it. Under `--strict` a single
+        // dropped file refuses the whole publication, so an
+        // out-of-prefix path leaking into `skipped` would make every
+        // scoped strict publication impossible.
+        std::fs::write(dir.path().join(".synsignore"), "root-b.md\n").unwrap();
+
+        let result = collect_files(
+            dir.path(),
+            &[],
+            CollectOptions {
+                prefix: Some("sub".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            result.skipped.is_empty(),
+            "skipped was {:?}",
+            result.skipped
+        );
+        assert_eq!(result.total_walked, 1);
+    }
+
+    #[test]
+    fn a_prefixed_collection_applies_the_walk_root_ignore_file() {
+        let dir = scoped_tree();
+        std::fs::write(dir.path().join(".synsignore"), "*.log\n").unwrap();
+        std::fs::write(dir.path().join("sub/drop.log"), "l").unwrap();
+
+        let result = collect_files(
+            dir.path(),
+            &[],
+            CollectOptions {
+                prefix: Some("sub".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(result.files.contains_key("sub/nested.md"));
+        assert!(
+            !result.files.keys().any(|p| p.ends_with(".log")),
+            "files were {:?}",
+            result.files.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_prefix_naming_one_file_collects_that_path_alone() {
+        let dir = scoped_tree();
+        std::fs::write(dir.path().join("sub/sibling.md"), "s").unwrap();
+
+        let result = collect_files(
+            dir.path(),
+            &[],
+            CollectOptions {
+                prefix: Some("sub/nested.md".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.files.keys().collect::<Vec<_>>(),
+            vec!["sub/nested.md"]
+        );
+        assert!(result.skipped.is_empty());
+    }
+
+    #[test]
+    fn a_prefix_admits_no_sibling_sharing_its_leading_string() {
+        let dir = scoped_tree();
+        std::fs::create_dir_all(dir.path().join("sub2")).unwrap();
+        std::fs::write(dir.path().join("sub2/other.md"), "o").unwrap();
+
+        let result = collect_files(
+            dir.path(),
+            &[],
+            CollectOptions {
+                prefix: Some("sub".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.files.keys().collect::<Vec<_>>(),
+            vec!["sub/nested.md"]
+        );
     }
 }
