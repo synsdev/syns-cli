@@ -224,18 +224,21 @@ fn upgrade_to_full(
 /// batch `k` where `1 ≤ k < n`, the chunker writes a manifest snapshot
 /// anchored to batch k's `commit_sha` and the cumulative `path → sha`
 /// map of every batch uploaded so far, laid over `record_base` — the
-/// record as it stood when the run began — with `deleted_paths` taken
-/// out. This honours SPEC u225 § 2's "manifest tracks the SHA of the
-/// LAST SUCCESSFUL batch" promise: if batches `1..k-1` succeed and
-/// batch `k` fails, the local manifest matches server HEAD = batch
-/// `k-1`'s commit, and the next push computes diffs from there.
+/// record as it stood when the run began. This honours SPEC u225 § 2's
+/// "manifest tracks the SHA of the LAST SUCCESSFUL batch" promise: if
+/// batches `1..k-1` succeed and batch `k` fails, the local manifest
+/// matches server HEAD = batch `k-1`'s commit, and the next push
+/// computes diffs from there.
 ///
 /// SPEC u255 `smart_push` 7 binds every record write a run makes,
 /// these intermediate snapshots included: seeding them from the
 /// published set alone dropped every out-of-scope path from a scoped
-/// publication large enough to chunk. The final batch's save is left
-/// to `smart_push` Phase 6, which lays the full `local_shas` map over
-/// the same base and takes the same deletion list out.
+/// publication large enough to chunk. What an intermediate snapshot
+/// does NOT do is take the run's deletions out — those ride on the
+/// final batch alone, so a run failing before it has deleted nothing.
+/// The final batch's save is left to `smart_push` Phase 6, which lays
+/// the full `local_shas` map over the same base and takes the
+/// deletion list out there.
 #[allow(clippy::too_many_arguments)]
 async fn chunked_push(
     client: &SynsClient,
@@ -248,7 +251,6 @@ async fn chunked_push(
     owner: &str,
     name: &str,
     record_base: &HashMap<String, String>,
-    deleted_paths: &[String],
 ) -> Result<(PushResponse, serde_json::Value), CliError> {
     // Step 1: materialise (every entry carries content after this).
     let mut entries = upgrade_to_full(&base_request.files, local_files)?;
@@ -328,8 +330,8 @@ async fn chunked_push(
     let mut last_completed: Option<(PushResponse, serde_json::Value)> = None;
     // Cumulative `path → sha` map of every entry uploaded so far. After
     // each successful batch, the per-batch manifest snapshot is
-    // `record_base − deleted_paths ∪ uploaded` — i.e., the record the
-    // run started from, carrying everything pushed in batches 1..k.
+    // `record_base ∪ uploaded` — i.e., the record the run started
+    // from, carrying everything pushed in batches 1..k.
     let mut uploaded: HashMap<String, String> = HashMap::new();
 
     for (k, batch) in batches.iter().enumerate() {
@@ -386,13 +388,16 @@ async fn chunked_push(
                 }
                 previous_commit_sha = Some(response.commit_sha.clone());
                 // Per-batch manifest save (HIGH-2): only for intermediate
-                // batches. The FINAL batch's save is owned by Phase 6 in
-                // smart_push, which lays the full local_shas map over the
-                // same `record_base` and takes the same `deleted_paths`
-                // out — the two writes now differ only in which published
-                // set they carry.
+                // batches, and taking NO deletion out. The deletions ride
+                // on the final batch alone, so a run that fails before it
+                // has not deleted anything yet; a snapshot that dropped
+                // them would leave the next run finding those paths in
+                // neither the record nor its walk, naming no deletion,
+                // and the server keeping them for good. The Phase 6 write
+                // in `smart_push` takes them out, its batch being the one
+                // that carried them.
                 if k1 < n {
-                    let cumulative = merged_record(record_base, deleted_paths, &uploaded);
+                    let cumulative = merged_record(record_base, &[], &uploaded);
                     let mut manifest = Manifest::default();
                     manifest.update(response.commit_sha.clone(), cumulative);
                     if let Err(e) = manifest.save(cache_dir, owner, name) {
@@ -491,13 +496,16 @@ pub async fn smart_push(
     let (owner, name) = split_repo_id(repo_id)?;
 
     // The identity marker is written only where NO `.syns.yaml` at or
-    // above `path` already names this repository (SPEC u255
-    // `smart_push` 1). The pre-u255 guard tested `path` alone, so a
-    // publication run from `repo/sub/` wrote `repo/sub/.syns.yaml` and
-    // permanently entrenched the subtree as a repository of its own —
-    // issue 119's most damaging symptom, because the next bare run
-    // then resolved to `sub/` however the content root was fixed.
-    if find_repo_root_for(path, owner, name)?.is_none() {
+    // above `path` already names this repository, AND no `.syns.yaml`
+    // stands in `path` itself. The walk-up test is what stops a
+    // publication run from `repo/sub/` writing `repo/sub/.syns.yaml`
+    // and entrenching the subtree as a repository of its own — issue
+    // 119's most damaging symptom. The exact-directory test beside it
+    // is what stops `syns push --name bob/other`, run where a marker
+    // names `alice/proj`, from overwriting that marker: the walk-up
+    // test answers `None` on the pair mismatch and would otherwise
+    // let the write through, re-identifying the whole tree.
+    if find_repo_root_for(path, owner, name)?.is_none() && !path.join(".syns.yaml").exists() {
         write_syns_yaml(path, owner, name)?;
     }
 
@@ -604,15 +612,32 @@ pub async fn smart_push(
         opts.prefix.as_deref(),
     )?;
 
-    // Phase 4b — Empty guard (SPEC u255 `smart_push` 5). A publication
-    // is refused only where it carries neither a file nor a deletion:
-    // a scoped publication whose whole subtree was removed from disk
-    // carries deletions and nothing else, and must reach the server
-    // rather than exiting as if it had nothing to say.
-    if entries.is_empty() && deletes.is_empty() && !opts.allow_empty {
+    // Phase 4b — Empty guard. A publication is refused where it
+    // carries neither a file nor a deletion, and ALSO where its walk
+    // collected nothing and no path argument scoped it.
+    //
+    // The second clause is not redundant. An unscoped walk that
+    // collected nothing names every path the reference set holds as a
+    // deletion, so the first clause alone lets a misconfigured root
+    // ignore file — or `--exclude '*'` — publish a body that empties
+    // the repository on the server. Only a SCOPED publication may
+    // carry deletions and no file: that is the delete-only run whose
+    // subtree was removed from disk, and its blast radius is the
+    // subtree the caller named.
+    let carries_nothing = entries.is_empty() && deletes.is_empty();
+    let unscoped_walk_found_nothing = local_files.is_empty() && opts.prefix.is_none();
+    if (carries_nothing || unscoped_walk_found_nothing) && !opts.allow_empty {
+        // CR1-5: name the directory the run addressed, not the content
+        // root it resolved — a run scoped to one subtree that reports
+        // the whole repository as empty sends its reader looking in
+        // the wrong place.
+        let addressed = match opts.prefix.as_deref() {
+            Some(prefix) => path.join(prefix),
+            None => path.to_path_buf(),
+        };
         let cause = skip_summary_cause(&skipped, path);
         return Err(CliError::PushEmpty {
-            path: path.display().to_string(),
+            path: addressed.display().to_string(),
             total_walked,
             cause,
         });
@@ -663,7 +688,6 @@ pub async fn smart_push(
             owner,
             name,
             &record_base,
-            &deleted_paths,
         )
         .await?
     } else {
@@ -701,7 +725,6 @@ pub async fn smart_push(
                         owner,
                         name,
                         &record_base,
-                        &deleted_paths,
                     )
                     .await?
                 } else {
@@ -724,7 +747,6 @@ pub async fn smart_push(
                     owner,
                     name,
                     &record_base,
-                    &deleted_paths,
                 )
                 .await?
             }

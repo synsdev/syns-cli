@@ -22,6 +22,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use syns_cli::commands::pull::cmd_pull;
 use syns_cli::commands::push::{PushArgs, cmd_push};
+use syns_cli::errors::CliError;
 use syns_cli::push::hash::blob_sha1;
 use syns_cli::push::manifest::Manifest;
 use wiremock::matchers::{method, path as path_matcher};
@@ -625,4 +626,137 @@ async fn pull_of_another_repository_writes_its_own_identity_file() {
     let marker = fs::read_to_string(root.join("sub/.syns.yaml")).expect("sub/.syns.yaml");
     assert!(marker.contains("other"), "{marker}");
     assert!(marker.contains("repo"), "{marker}");
+}
+
+// ---- round 2: the refusals the review found missing --------------------
+
+/// The unscoped refusal is the regression this round exists to prevent.
+/// A walk that collected nothing, with no path argument scoping it, must
+/// be refused as it was before this unit — a body naming every path the
+/// local record holds as a deletion empties the repository on the server.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn unscoped_push_collecting_nothing_is_refused_before_the_server() {
+    let ctx = setup().await;
+    seed_credentials(&ctx, "test-token", "alice");
+    let root = seed_tree(&ctx);
+    seed_record(&ctx);
+    fs::write(root.join(".gitignore"), "*\n").unwrap();
+    mount_push_mocks(&ctx, "alice/proj").await;
+
+    let result = {
+        let _cwd = CwdGuard::enter(&root);
+        cmd_push(&ctx.config, &ctx.output, &push_args(None)).await
+    };
+
+    assert!(
+        matches!(result, Err(CliError::PushEmpty { .. })),
+        "an unscoped publication collecting nothing was not refused: {result:?}"
+    );
+    let requests = ctx.mock_server.received_requests().await.unwrap();
+    assert!(
+        requests.iter().all(|r| r.method != reqwest::Method::PUT),
+        "a publication deleting the whole repository reached the server"
+    );
+}
+
+/// `--allow-empty` is the one way past the unscoped refusal, and stays so.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn allow_empty_still_carries_an_unscoped_publication_past_the_refusal() {
+    let ctx = setup().await;
+    seed_credentials(&ctx, "test-token", "alice");
+    let root = seed_tree(&ctx);
+    seed_record(&ctx);
+    fs::write(root.join(".gitignore"), "*\n").unwrap();
+    mount_push_mocks(&ctx, "alice/proj").await;
+
+    {
+        let _cwd = CwdGuard::enter(&root);
+        let mut args = push_args(None);
+        args.allow_empty = true;
+        cmd_push(&ctx.config, &ctx.output, &args).await.unwrap();
+    }
+
+    let requests = ctx.mock_server.received_requests().await.unwrap();
+    assert!(
+        requests.iter().any(|r| r.method == reqwest::Method::PUT),
+        "--allow-empty did not carry the publication to the server"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn push_naming_another_repository_leaves_a_standing_identity_file_alone() {
+    let ctx = setup().await;
+    seed_credentials(&ctx, "test-token", "alice");
+    let root = seed_tree(&ctx);
+    mount_push_mocks(&ctx, "bob/other").await;
+
+    let mut args = push_args(Some(root.clone()));
+    args.name = Some("bob/other".into());
+    cmd_push(&ctx.config, &ctx.output, &args).await.unwrap();
+
+    let marker = fs::read_to_string(root.join(".syns.yaml")).unwrap();
+    assert_eq!(
+        marker, "owner: alice\nname: proj\n",
+        "the publication overwrote the identity file standing at its content root"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn pull_into_a_relative_destination_writes_no_nested_identity_file() {
+    let ctx = setup().await;
+    seed_credentials(&ctx, "test-token", "alice");
+    let root = ctx.project_dir.path().to_path_buf();
+    fs::create_dir_all(root.join("sub")).unwrap();
+    fs::write(root.join(".syns.yaml"), "owner: alice\nname: proj\n").unwrap();
+    mount_pull_mocks(&ctx, "alice/proj", server_tree()).await;
+
+    {
+        let _cwd = CwdGuard::enter(&root.join("sub"));
+        cmd_pull(
+            &ctx.config,
+            &ctx.output,
+            Some("alice/proj".into()),
+            Some("dest".into()),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    }
+
+    assert!(
+        root.join("sub/dest/root-a.md").is_file(),
+        "the retrieval did not write into the relative destination"
+    );
+    assert!(
+        !root.join("sub/dest/.syns.yaml").exists(),
+        "a relative destination under an identity file naming this repository was entrenched"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_scoped_push_collecting_nothing_reports_the_scoped_directory() {
+    let ctx = setup().await;
+    seed_credentials(&ctx, "test-token", "alice");
+    let root = seed_tree(&ctx);
+    fs::create_dir_all(root.join("empty")).unwrap();
+    mount_push_mocks(&ctx, "alice/proj").await;
+
+    let result = {
+        let _cwd = CwdGuard::enter(&root);
+        cmd_push(&ctx.config, &ctx.output, &push_args(Some("empty".into()))).await
+    };
+
+    match result {
+        Err(CliError::PushEmpty { path, .. }) => assert!(
+            path.ends_with("empty"),
+            "the refusal named the repository root rather than the scoped directory: {path}"
+        ),
+        other => panic!("expected PushEmpty, got {other:?}"),
+    }
 }

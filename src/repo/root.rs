@@ -61,7 +61,16 @@ fn absolutize(path: &Path) -> Result<PathBuf, CliError> {
     })
 }
 
-fn to_forward_slash(path: &Path) -> Option<String> {
+/// The `/`-separated spelling of a relative path, or `None` where a
+/// component is not valid UTF-8.
+///
+/// The ONE conversion in the tree: `push_scope` builds a prefix with
+/// it and the collector keys every walked path with it, and the scope
+/// contract holds only while the two agree. A normalisation added to
+/// one copy alone — dropping a `.` component, folding case on a
+/// case-insensitive filesystem — would make a scoped publication
+/// collect nothing, and no test would fail.
+pub fn to_forward_slash(path: &Path) -> Option<String> {
     let parts: Option<Vec<&str>> = path.components().map(|c| c.as_os_str().to_str()).collect();
     parts.map(|p| p.join("/"))
 }
@@ -141,9 +150,14 @@ pub fn push_scope(
 /// `pull_root`).
 ///
 /// A retrieval's path argument names its *destination*, not a scope,
-/// so it is returned verbatim. Without one the walk answers the
-/// repository root, and the working directory where no identity file
-/// names this repository.
+/// so it is taken as given — but in absolute form. `cmd_pull` runs the
+/// nested-marker guard over what this returns, and that guard walks
+/// ancestors: a relative destination climbs to the empty component and
+/// stops, never reaching the identity file the run stands under, so
+/// the retrieval writes a marker the same run with an absolute
+/// destination would not. Without one the walk answers the repository
+/// root, and the working directory where no identity file names this
+/// repository.
 pub fn pull_root(
     explicit: Option<&Path>,
     cwd: &Path,
@@ -151,7 +165,12 @@ pub fn pull_root(
     name: &str,
 ) -> Result<PathBuf, CliError> {
     if let Some(path) = explicit {
-        return Ok(path.to_path_buf());
+        // `std::path::absolute` reads the process working directory
+        // only for a relative path, and unlike canonicalization it
+        // does not require the destination to exist yet.
+        return std::path::absolute(path).map_err(|err| CliError::Io {
+            message: format!("could not resolve path {}: {err}", path.display()),
+        });
     }
 
     Ok(find_repo_root_for(cwd, owner, name)?.unwrap_or_else(|| cwd.to_path_buf()))
@@ -161,6 +180,29 @@ pub fn pull_root(
 mod tests {
     use super::*;
     use std::fs;
+
+    /// Restores the process working directory on drop.
+    ///
+    /// The restore target falls back to the crate root because the
+    /// library test binary reaches this guard with the process working
+    /// directory already inside a dropped `TempDir` — CON1-1 — so
+    /// reading it is not something a test may rely on.
+    struct CwdGuard(PathBuf);
+
+    impl CwdGuard {
+        fn enter(dir: &Path) -> Self {
+            let previous = std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+            std::env::set_current_dir(dir).expect("set cwd");
+            CwdGuard(previous)
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
 
     fn tree() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -231,7 +273,23 @@ mod tests {
     }
 
     #[test]
-    fn pull_root_returns_the_path_argument_verbatim() {
+    #[serial_test::serial]
+    fn pull_root_makes_a_relative_path_argument_absolute() {
+        let (_guard, root, _deep) = tree();
+        let _cwd = CwdGuard::enter(&root);
+
+        let answered = pull_root(Some(Path::new("dest")), &root, "alice", "proj").unwrap();
+
+        assert!(answered.is_absolute(), "answered {}", answered.display());
+        assert!(
+            answered.ends_with("dest"),
+            "answered {}",
+            answered.display()
+        );
+    }
+
+    #[test]
+    fn pull_root_returns_an_absolute_path_argument_as_given() {
         let (_guard, root, deep) = tree();
 
         assert_eq!(

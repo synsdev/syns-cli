@@ -1,5 +1,5 @@
 use crate::errors::CliError;
-use crate::repo::root::{path_is_prefix_ancestor, path_within_prefix};
+use crate::repo::root::{path_is_prefix_ancestor, path_within_prefix, to_forward_slash};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::overrides::OverrideBuilder;
 use ignore::{Match, WalkBuilder};
@@ -102,11 +102,6 @@ pub struct CollectResult {
     pub total_walked: usize,
 }
 
-fn to_forward_slash_path(path: &Path) -> Option<String> {
-    let parts: Option<Vec<&str>> = path.components().map(|c| c.as_os_str().to_str()).collect();
-    parts.map(|p| p.join("/"))
-}
-
 /// Whether a walked entry is inside the scope `prefix` names, or is a
 /// directory the walk must descend through to reach it.
 ///
@@ -118,7 +113,7 @@ fn prefix_admits(root: &Path, prefix: &str, entry_path: &Path, is_dir: bool) -> 
         Ok(rel) => rel,
         Err(_) => return true,
     };
-    let rel_str = match to_forward_slash_path(rel) {
+    let rel_str = match to_forward_slash(rel) {
         Some(s) => s,
         None => return true,
     };
@@ -342,7 +337,7 @@ pub fn collect_files(
             Ok(p) => p.to_path_buf(),
             Err(_) => continue,
         };
-        let rel_path_str = match to_forward_slash_path(&rel_path_buf) {
+        let rel_path_str = match to_forward_slash(&rel_path_buf) {
             Some(p) => p,
             None => continue,
         };
@@ -419,7 +414,7 @@ pub fn collect_files(
             Ok(p) => p.to_path_buf(),
             Err(_) => continue,
         };
-        let rel_path_str = match to_forward_slash_path(&rel_path_buf) {
+        let rel_path_str = match to_forward_slash(&rel_path_buf) {
             Some(p) => p,
             None => continue,
         };
