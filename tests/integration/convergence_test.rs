@@ -1839,6 +1839,263 @@ async fn a_preparation_killed_after_recording_its_resolution_is_finished_before_
     assert_eq!(tree["a.md"], "one\nLOCAL and REMOTE two\nthree\n");
 }
 
+// ---- a kill between a folder file's truncation and its write --------------
+
+#[cfg(unix)]
+const TORN_WRITER_ENV: &str = "SYNS_U256_TORN_WRITER";
+
+/// The most bytes the torn writer may write to one file: above every state
+/// file its run writes, below the head's `c.md`.
+#[cfg(unix)]
+const TORN_WRITE_LIMIT: u64 = 16 * 1024;
+
+#[cfg(unix)]
+fn torn_remote() -> String {
+    "remote\n".repeat(TORN_WRITE_LIMIT as usize)
+}
+
+/// The writer half runs in a child process re-running the named test: it
+/// converges the folder against the parent's fake and returns true.
+#[cfg(unix)]
+async fn run_as_torn_writer() -> bool {
+    let Ok(spec) = std::env::var(TORN_WRITER_ENV) else {
+        return false;
+    };
+    let spec: Value = serde_json::from_str(&spec).unwrap();
+    let cache = PathBuf::from(spec["cache"].as_str().unwrap());
+    let dir = PathBuf::from(spec["dir"].as_str().unwrap());
+    let client = SynsClient::new(spec["uri"].as_str().unwrap()).unwrap();
+    let copy = WorkingCopy::open(&cache, "alice", "proj", &dir).unwrap();
+    let mode = if spec["publish"].as_bool().unwrap() {
+        ConvergeMode::Publish
+    } else {
+        ConvergeMode::Retrieve { overwrite: false }
+    };
+    let _ = converge(&client, Some(TOKEN), &copy, mode, opts_at(&cache)).await;
+    true
+}
+
+/// A base holding `a.md`, `b.md`, `c.md` and `d.md`, and a head changing
+/// all four, `c.md` past the torn writer's limit; `a.md` edited on disk
+/// where `edited`, so the preparation records a resolution first.
+#[cfg(unix)]
+fn seed_torn_write(e: &Env, copy: &WorkingCopy, edited: bool) -> String {
+    let h0 = e.fake.commit(&[
+        ("a.md", "one\ntwo\nthree\n"),
+        ("b.md", "base\n"),
+        ("c.md", "base\n"),
+        ("d.md", "base\n"),
+    ]);
+    checkout(&e.fake, copy, &h0);
+    if edited {
+        write_files(&copy.root, &[("a.md", "one\nLOCAL two\nthree\n")]);
+    }
+    let big = torn_remote();
+    e.fake.commit_changes(&[
+        ("a.md", Some("one\nREMOTE two\nthree\n")),
+        ("b.md", Some("remote\n")),
+        ("c.md", Some(big.as_str())),
+        ("d.md", Some("remote\n")),
+    ])
+}
+
+/// Run `converge` in a child process whose file size limit stops it with
+/// `SIGXFSZ` once its write of `c.md` passes the limit — after the target
+/// was opened for that write and before the write finished.
+#[cfg(unix)]
+async fn kill_mid_write(e: &Env, dir: &Path, test: &str, publish: bool) {
+    use std::os::unix::process::ExitStatusExt;
+    let spec = json!({
+        "uri": e.fake.uri,
+        "cache": e.config.cache_dir(),
+        "dir": dir,
+        "publish": publish,
+    })
+    .to_string();
+    let mut writer = tokio::process::Command::new(std::env::current_exe().unwrap());
+    writer
+        .args([
+            "--exact",
+            &format!("integration::convergence_test::{test}"),
+            "--test-threads=1",
+        ])
+        .env(TORN_WRITER_ENV, spec)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // SAFETY: `setrlimit` is async-signal-safe and changes the child alone.
+    unsafe {
+        writer.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: TORN_WRITE_LIMIT as libc::rlim_t,
+                rlim_max: TORN_WRITE_LIMIT as libc::rlim_t,
+            };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    let status = writer.status().await.unwrap();
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGXFSZ),
+        "the writer was not stopped part-way through a write: {status}"
+    );
+    assert_eq!(read(dir, "c.md"), "base\n");
+    assert_eq!(partial_writes(dir).len(), 1, "{:?}", partial_writes(dir));
+}
+
+/// The folder siblings a write interrupted part-way leaves behind.
+#[cfg(unix)]
+fn partial_writes(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with(".syns-partial-"))
+        .collect()
+}
+
+/// The re-run wrote every remote-only change, the one the kill tore
+/// included, and names `a.md` alone as a collision.
+#[cfg(unix)]
+fn assert_torn_write_finished(dir: &Path, rerun: &Resolution) {
+    let torn = read(dir, "c.md");
+    assert!(
+        torn == torn_remote(),
+        "c.md holds {} bytes opening {:?}, not the head's remote-only change",
+        torn.len(),
+        torn.lines().take(2).collect::<Vec<_>>()
+    );
+    assert_eq!(read(dir, "b.md"), "remote\n");
+    assert_eq!(read(dir, "d.md"), "remote\n");
+    assert_eq!(
+        rerun.collisions,
+        vec![("a.md".to_string(), CollisionKind::ModifyModify)]
+    );
+    assert!(rerun.local_paths.is_empty(), "{:?}", rerun.local_paths);
+    assert!(rerun.remote_paths.contains(&"c.md".to_string()));
+    assert!(read(dir, "a.md").lines().any(|l| l == "<<<<<<< local"));
+    assert!(partial_writes(dir).is_empty(), "{:?}", partial_writes(dir));
+}
+
+/// V3-08: a retrieval killed between `c.md`'s truncation and its write is
+/// re-run, and writes the head's `c.md` rather than merging what the kill
+/// left as a local edit.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_retrieval_killed_mid_write_writes_the_torn_file_on_its_rerun() {
+    if run_as_torn_writer().await {
+        return;
+    }
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    seed_torn_write(&e, &copy, true);
+    kill_mid_write(
+        &e,
+        &dir,
+        "a_retrieval_killed_mid_write_writes_the_torn_file_on_its_rerun",
+        false,
+    )
+    .await;
+    assert!(copy.resolution().unwrap().unwrap().pending_writes.is_some());
+
+    let retrieval = ConvergeMode::Retrieve { overwrite: false };
+    let rerun = expect_resolution(
+        converge(&e.fake.client(), Some(TOKEN), &copy, retrieval, e.opts())
+            .await
+            .unwrap(),
+    );
+
+    assert_torn_write_finished(&dir, &rerun);
+}
+
+/// V3-06: a sync killed between `c.md`'s truncation and its write is
+/// followed by the next sync, which writes the head's `c.md` and publishes
+/// nothing.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_sync_killed_mid_write_writes_the_torn_file_on_the_next_sync() {
+    if run_as_torn_writer().await {
+        return;
+    }
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    seed_torn_write(&e, &copy, true);
+    kill_mid_write(
+        &e,
+        &dir,
+        "a_sync_killed_mid_write_writes_the_torn_file_on_the_next_sync",
+        true,
+    )
+    .await;
+    assert!(copy.resolution().unwrap().unwrap().pending_writes.is_some());
+
+    let rerun = expect_resolution(
+        converge(
+            &e.fake.client(),
+            Some(TOKEN),
+            &copy,
+            ConvergeMode::Publish,
+            e.opts(),
+        )
+        .await
+        .unwrap(),
+    );
+
+    assert_torn_write_finished(&dir, &rerun);
+    assert!(e.fake.push_bodies().is_empty());
+}
+
+/// A retrieval with no local edit records no resolution before it writes;
+/// killed between `c.md`'s truncation and its write, its re-run still
+/// takes the head rather than reading the torn file as a local edit.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_retrieval_without_a_resolution_killed_mid_write_takes_the_head_on_its_rerun() {
+    if run_as_torn_writer().await {
+        return;
+    }
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let h1 = seed_torn_write(&e, &copy, false);
+    kill_mid_write(
+        &e,
+        &dir,
+        "a_retrieval_without_a_resolution_killed_mid_write_takes_the_head_on_its_rerun",
+        false,
+    )
+    .await;
+    assert!(copy.resolution().unwrap().is_none());
+
+    let retrieval = ConvergeMode::Retrieve { overwrite: false };
+    let outcome = converge(&e.fake.client(), Some(TOKEN), &copy, retrieval, e.opts())
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(outcome, SyncOutcome::Synced { .. }),
+        "{:?}",
+        match &outcome {
+            SyncOutcome::ResolutionRequired(r) => format!("resolution over {:?}", r.collisions),
+            other => format!("{other:?}"),
+        }
+    );
+    assert!(read(&dir, "c.md") == torn_remote());
+    assert_eq!(copy.base().unwrap().commit_sha(), Some(h1.as_str()));
+    assert!(
+        partial_writes(&dir).is_empty(),
+        "{:?}",
+        partial_writes(&dir)
+    );
+}
+
 const HOLDER_ENV: &str = "SYNS_U256_BASE_HOLDER";
 const HOLDING: &str = "u256-holder: holding";
 const HELD: &str = "u256-holder: read ";

@@ -8,6 +8,8 @@
 //! second take from the same process would wait on itself.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Component, Path};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -208,14 +210,25 @@ fn collect_folder(copy: &WorkingCopy, opts: &SmartPushOptions) -> Result<Folder,
             no_default_excludes: opts.no_default_excludes,
         });
     }
-    let hashes = collected
-        .files
+    // A write sibling standing at collection is a killed run's: every
+    // caller holds the state lock, so no live write owns it.
+    let mut files = collected.files;
+    for stray in files
+        .keys()
+        .filter(|path| is_partial_write(path))
+        .cloned()
+        .collect::<Vec<_>>()
+    {
+        remove_folder_file(copy, &stray)?;
+        files.remove(&stray);
+    }
+    let hashes = files
         .iter()
         .map(|(path, bytes)| (path.clone(), blob_sha1(bytes)))
         .collect();
     Ok(Folder {
         hashes,
-        bytes: collected.files,
+        bytes: files,
     })
 }
 
@@ -298,15 +311,62 @@ fn read_disk(copy: &WorkingCopy, path: &str) -> Result<Option<Vec<u8>>, CliError
     }
 }
 
+/// The file-name prefix of the sibling a folder write lands through.
+const PARTIAL_PREFIX: &str = ".syns-partial-";
+
+/// Whether a folder path names the sibling of a write a killed run left
+/// part-way through.
+fn is_partial_write(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .starts_with(PARTIAL_PREFIX)
+}
+
+/// Replace a folder file whole: write its sibling, then rename it over the
+/// target, so a run killed part-way leaves the target as it stood and at
+/// worst the sibling, which the next collection sweeps. A target this
+/// process may not write is refused, as an in-place write would be, and
+/// its permissions carry over.
 fn write_folder_file(copy: &WorkingCopy, path: &str, bytes: &[u8]) -> Result<(), CliError> {
     let target = copy.root.join(path);
     let io = |err: std::io::Error| CliError::Io {
         message: format!("could not write {path}: {err}"),
     };
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent).map_err(io)?;
+    let parent = target.parent().unwrap_or(&copy.root);
+    std::fs::create_dir_all(parent).map_err(io)?;
+    let file_name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let sibling = parent.join(format!(
+        "{PARTIAL_PREFIX}{}",
+        &blob_sha1(file_name.as_bytes())[..16]
+    ));
+
+    let written = (|| -> std::io::Result<()> {
+        let permissions = match OpenOptions::new().write(true).open(&target) {
+            Ok(file) => Some(file.metadata()?.permissions()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err),
+        };
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&sibling)?;
+        file.write_all(bytes)?;
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions)?;
+        }
+        drop(file);
+        std::fs::rename(&sibling, &target)
+    })();
+    if let Err(err) = written {
+        let _ = std::fs::remove_file(&sibling);
+        return Err(io(err));
     }
-    std::fs::write(&target, bytes).map_err(io)
+    Ok(())
 }
 
 fn remove_folder_file(copy: &WorkingCopy, path: &str) -> Result<(), CliError> {
@@ -1347,6 +1407,7 @@ pub async fn working_copy_state(
     let folder: BTreeMap<String, String> = collected
         .files
         .iter()
+        .filter(|(path, _)| !is_partial_write(path))
         .map(|(path, bytes)| (path.clone(), blob_sha1(bytes)))
         .collect();
     let excluded = excluded_on_disk(copy, &folder, base.files.keys().chain(head.files.keys()));
