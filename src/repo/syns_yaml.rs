@@ -113,6 +113,28 @@ pub fn write_syns_yaml(path: &Path, owner: &str, name: &str) -> Result<(), CliEr
     Ok(())
 }
 
+/// Write the identity file into `dir` only where no identity file at or
+/// above `dir` names `owner/name` and none stands in `dir` itself,
+/// answering whether it wrote — the one guard every writer of the file
+/// shares.
+///
+/// The walk-up clause keeps a run from `repo/sub/` from entrenching
+/// `sub/` as a repository of its own (issue 119). The exact-directory
+/// clause keeps a run naming another repository from overwriting the
+/// file standing where it runs, and with it the checks that file
+/// declares.
+pub fn write_syns_yaml_where_none_stands(
+    dir: &Path,
+    owner: &str,
+    name: &str,
+) -> Result<bool, CliError> {
+    if find_repo_root_for(dir, owner, name)?.is_some() || dir.join(SYNS_YAML_FILENAME).exists() {
+        return Ok(false);
+    }
+    write_syns_yaml(dir, owner, name)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,6 +291,26 @@ mod tests {
         fs::create_dir_all(&deep).unwrap();
 
         assert_eq!(find_repo_root_for(&deep, "alice", "proj").unwrap(), None);
+    }
+
+    #[test]
+    fn write_where_none_stands_refuses_both_a_standing_file_and_an_ancestor_naming_the_repository()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir_all(&sub).unwrap();
+
+        assert!(write_syns_yaml_where_none_stands(dir.path(), "alice", "proj").unwrap());
+        assert!(!write_syns_yaml_where_none_stands(&sub, "alice", "proj").unwrap());
+        assert!(!sub.join(".syns.yaml").exists());
+
+        let standing = "owner: bob\nname: other\nchecks:\n  - make lint\n";
+        fs::write(dir.path().join(".syns.yaml"), standing).unwrap();
+        assert!(!write_syns_yaml_where_none_stands(dir.path(), "alice", "proj").unwrap());
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".syns.yaml")).unwrap(),
+            standing
+        );
     }
 
     #[test]

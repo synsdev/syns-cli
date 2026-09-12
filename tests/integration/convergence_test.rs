@@ -128,13 +128,12 @@ fn empty_push_request() -> PushRequest {
     }
 }
 
-/// The classification a publication closed unanswered after its body
-/// left arrives as: a failure carrying no status the server answered,
-/// on a fresh connection and on a kept-alive one alike — never
-/// `SERVER_UNREACHABLE`, whose mapping reads only a refused connection
-/// or a timeout.
+/// A publication closed unanswered after its body left arrives as
+/// `SERVER_UNREACHABLE`, on a fresh connection and on a kept-alive one
+/// alike, although reqwest reports it as neither a connect nor a timeout
+/// failure.
 #[tokio::test(flavor = "multi_thread")]
-async fn dropped_push_connection_classifies_as_a_status_less_failure() {
+async fn dropped_push_connection_classifies_as_server_unreachable() {
     let uri = spawn_push_dropping_listener().await;
 
     let bare = reqwest::Client::new()
@@ -169,11 +168,11 @@ async fn dropped_push_connection_classifies_as_a_status_less_failure() {
 
     assert!(!bare.is_connect() && !bare.is_timeout() && bare.is_request());
     assert!(
-        matches!(fresh_err, CliError::Api { status: None, .. }),
+        matches!(fresh_err, CliError::ServerUnreachable { .. }),
         "fresh: {fresh_err:?}"
     );
     assert!(
-        matches!(kept_err, CliError::Api { status: None, .. }),
+        matches!(kept_err, CliError::ServerUnreachable { .. }),
         "kept-alive: {kept_err:?}"
     );
 }
@@ -1000,7 +999,7 @@ async fn interrupted_publication_reads_as_pending_then_completes() {
 
     let dropped = converge(&client, Some(TOKEN), &copy, ConvergeMode::Publish, e.opts()).await;
     assert!(
-        matches!(dropped, Err(CliError::Api { status: None, .. })),
+        matches!(dropped, Err(CliError::ServerUnreachable { .. })),
         "{dropped:?}"
     );
     assert_eq!(
@@ -1285,6 +1284,185 @@ async fn discard_restores_the_folder_before_the_resolution() {
     assert_eq!(read(&dir, "old.md"), "old\n");
     assert_eq!(copy.base().unwrap().commit_sha(), Some(h1.as_str()));
     assert!(copy.resolution().unwrap().is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn discard_after_a_dropped_continue_publishes_nothing_over_the_head() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let client = e.fake.client();
+    let (h1, _) = collided(&e, &dir, &copy).await;
+    write_files(&dir, &[("a.md", "a\nL and R\nc\n")]);
+    e.fake.drop_next_push();
+    let dropped = continue_resolution(&client, TOKEN, &copy, e.opts()).await;
+    assert!(
+        matches!(dropped, Err(CliError::ServerUnreachable { .. })),
+        "{dropped:?}"
+    );
+    assert!(copy.outbox().unwrap().is_some());
+
+    discard_resolution(&copy).unwrap();
+    let outcome = converge(&client, Some(TOKEN), &copy, ConvergeMode::Publish, e.opts())
+        .await
+        .unwrap();
+
+    expect_resolution(outcome);
+    assert!(copy.outbox().unwrap().is_none());
+    assert_eq!(e.fake.head().0, h1, "a publication landed over the head");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_write_after_a_dropped_continue_is_reviewed_again_then_published() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let client = e.fake.client();
+    collided(&e, &dir, &copy).await;
+    write_files(&dir, &[("a.md", "a\nL and R\nc\n")]);
+    e.fake.drop_next_push();
+    let dropped = continue_resolution(&client, TOKEN, &copy, e.opts()).await;
+    assert!(
+        matches!(dropped, Err(CliError::ServerUnreachable { .. })),
+        "{dropped:?}"
+    );
+    write_files(&dir, &[("late.md", "late\n")]);
+
+    let fresh = expect_resolution(
+        converge(&client, Some(TOKEN), &copy, ConvergeMode::Publish, e.opts())
+            .await
+            .unwrap(),
+    );
+    assert!(
+        fresh.local_paths.contains(&"late.md".to_string()),
+        "{fresh:?}"
+    );
+    assert!(copy.outbox().unwrap().is_none());
+
+    let outcome = continue_resolution(&client, TOKEN, &copy, e.opts())
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(
+            outcome,
+            SyncOutcome::Synced {
+                published: Some(_),
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    let (_, tree) = e.fake.head();
+    assert_eq!(tree["late.md"], "late\n");
+    assert_eq!(tree["a.md"], "a\nL and R\nc\n");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_failing_required_check_blocks_publication() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let client = e.fake.client();
+    let h0 = e.fake.commit(&[
+        (
+            ".syns.yaml",
+            "owner: alice\nname: proj\nchecks:\n  - exit 3\n",
+        ),
+        ("a.md", "a\nb\nc\n"),
+    ]);
+    checkout(&e.fake, &copy, &h0);
+    write_files(&dir, &[("a.md", "a\nL\nc\n")]);
+    e.fake.commit_changes(&[("a.md", Some("a\nR\nc\n"))]);
+    expect_resolution(
+        converge(&client, Some(TOKEN), &copy, ConvergeMode::Publish, e.opts())
+            .await
+            .unwrap(),
+    );
+    write_files(&dir, &[("a.md", "a\nL and R\nc\n")]);
+
+    let refused = continue_resolution(&client, TOKEN, &copy, e.opts())
+        .await
+        .unwrap();
+    expect_resolution(refused);
+    assert!(e.fake.push_bodies().is_empty());
+
+    write_files(
+        &dir,
+        &[(
+            ".syns.yaml",
+            "owner: alice\nname: proj\nchecks:\n  - exit 0\n",
+        )],
+    );
+    let passed = continue_resolution(&client, TOKEN, &copy, e.opts())
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            passed,
+            SyncOutcome::Synced {
+                published: Some(_),
+                ..
+            }
+        ),
+        "{passed:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn convergence_leaves_an_excluded_local_file_untouched() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let client = e.fake.client();
+    let h0 = e.fake.commit(&[(".gitignore", ".env\n"), ("a.md", "a0\n")]);
+    checkout(&e.fake, &copy, &h0);
+    write_files(&dir, &[(".env", "local secret\n")]);
+    e.fake
+        .commit_changes(&[(".env", Some("remote value\n")), ("b.md", Some("b1\n"))]);
+
+    let retrieved = converge(
+        &client,
+        Some(TOKEN),
+        &copy,
+        ConvergeMode::Retrieve { overwrite: false },
+        e.opts(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(retrieved, SyncOutcome::Synced { .. }),
+        "{retrieved:?}"
+    );
+    assert_eq!(read(&dir, ".env"), "local secret\n");
+    assert_eq!(read(&dir, "b.md"), "b1\n");
+
+    write_files(&dir, &[("a.md", "a1\n")]);
+    let published = converge(&client, Some(TOKEN), &copy, ConvergeMode::Publish, e.opts())
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(
+            published,
+            SyncOutcome::Synced {
+                published: Some(_),
+                ..
+            }
+        ),
+        "{published:?}"
+    );
+    let bodies = e.fake.push_bodies();
+    assert_eq!(bodies.len(), 1);
+    assert!(bodies[0].get("deletions").is_none(), "{}", bodies[0]);
+    assert_eq!(read(&dir, ".env"), "local secret\n");
+    let (_, tree) = e.fake.head();
+    assert_eq!(tree[".env"], "remote value\n");
+    assert_eq!(tree["a.md"], "a1\n");
 }
 
 const HOLDER_ENV: &str = "SYNS_U256_BASE_HOLDER";

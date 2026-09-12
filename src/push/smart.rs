@@ -12,7 +12,7 @@ use crate::push::collector::{
 use crate::push::hash::blob_sha1;
 use crate::push::manifest::Manifest;
 use crate::repo::root::path_within_prefix;
-use crate::repo::syns_yaml::{find_repo_root_for, write_syns_yaml};
+use crate::repo::syns_yaml::write_syns_yaml_where_none_stands;
 
 /// Knobs passed into `smart_push` from the CLI layer. Wraps the
 /// historical push options (force, message, author, excludes, …) plus
@@ -538,11 +538,8 @@ pub async fn smart_push(
     // written here would land after that record and be refused by the
     // `expected` guard below — the command handlers write it before the
     // convergence collects instead (SPEC u256).
-    if opts.reference.is_none()
-        && find_repo_root_for(path, owner, name)?.is_none()
-        && !path.join(".syns.yaml").exists()
-    {
-        write_syns_yaml(path, owner, name)?;
+    if opts.reference.is_none() {
+        write_syns_yaml_where_none_stands(path, owner, name)?;
     }
 
     // Phase 2a — Collect.

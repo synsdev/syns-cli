@@ -684,6 +684,13 @@ async fn unscoped_push_collecting_nothing_is_refused_before_the_server() {
     seed_record(&ctx);
     seed_converged_base(&ctx, &root).await;
     fs::write(root.join(".gitignore"), "*\n").unwrap();
+    // A convergence leaves out of its comparison every file an exclusion
+    // keeps out while it stands on disk, so the whole-tree deletion the
+    // guard exists for is the one a walk collecting nothing names over
+    // files actually gone from disk.
+    for gone in ["root-a.md", "root-b.md", "sub/nested.md"] {
+        fs::remove_file(root.join(gone)).unwrap();
+    }
     mount_push_mocks(&ctx, "alice/proj").await;
 
     let result = {
@@ -712,6 +719,13 @@ async fn allow_empty_still_carries_an_unscoped_publication_past_the_refusal() {
     seed_record(&ctx);
     seed_converged_base(&ctx, &root).await;
     fs::write(root.join(".gitignore"), "*\n").unwrap();
+    // A convergence leaves out of its comparison every file an exclusion
+    // keeps out while it stands on disk, so the whole-tree deletion the
+    // guard exists for is the one a walk collecting nothing names over
+    // files actually gone from disk.
+    for gone in ["root-a.md", "root-b.md", "sub/nested.md"] {
+        fs::remove_file(root.join(gone)).unwrap();
+    }
     mount_push_mocks(&ctx, "alice/proj").await;
 
     {
@@ -932,5 +946,36 @@ async fn a_mixed_case_identity_file_addresses_the_lower_cased_repository() {
             .iter()
             .any(|r| r.url.path() == "/api/v1/repos/alice/proj/push"),
         "the publication addressed a repository the server holds under another spelling"
+    );
+}
+
+/// u256: a retrieval into a folder whose own identity file names another
+/// repository leaves that file — and the checks it declares — as it stood.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn pull_of_another_repository_leaves_an_identity_file_at_the_write_root_alone() {
+    let ctx = setup().await;
+    seed_credentials(&ctx, "test-token", "alice");
+    let root = ctx.project_dir.path().to_path_buf();
+    let standing = "owner: bob\nname: other\nchecks:\n  - make lint\n";
+    fs::write(root.join(".syns.yaml"), standing).unwrap();
+    mount_pull_mocks(&ctx, "alice/proj", server_tree()).await;
+
+    cmd_pull(
+        &ctx.config,
+        &ctx.output,
+        Some("alice/proj".into()),
+        Some(root.to_string_lossy().into_owned()),
+        None,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert!(root.join("root-a.md").is_file());
+    assert_eq!(
+        fs::read_to_string(root.join(".syns.yaml")).unwrap(),
+        standing
     );
 }

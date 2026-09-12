@@ -8,22 +8,16 @@ use crate::push::converge::{ConvergeMode, SyncOutcome, converge};
 use crate::push::working_copy::WorkingCopy;
 use crate::repo::if_repo::resolve_full_or_skip;
 use crate::repo::root::{pull_root, resolve_start_path};
-use crate::repo::syns_yaml::{find_repo_root_for, write_syns_yaml};
+use crate::repo::syns_yaml::write_syns_yaml_where_none_stands;
 use console::style;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
+/// The `INV-30` test a server-named path passes before a retrieval
+/// writes it — the one a convergence applies, so both retrievals refuse
+/// the same paths.
 fn validate_entry_path(path: &str) -> Result<(), CliError> {
-    if path.is_empty()
-        || path.starts_with('/')
-        || path.contains('\0')
-        || path.split('/').any(|seg| seg == ".." || seg == ".git")
-    {
-        return Err(CliError::Io {
-            message: format!("refusing path outside target directory: {path}"),
-        });
-    }
-    Ok(())
+    crate::push::converge::check_server_path(path)
 }
 
 fn safe_join(target_dir: &Path, entry_path: &str) -> Result<PathBuf, CliError> {
@@ -53,11 +47,8 @@ fn write_identity_file(
     // of its own and every later publication from there resolves to it.
     // SPEC u256: nor over an identity file standing at the write root,
     // whose declared checks a rewrite would drop.
-    if repo_arg.is_some()
-        && find_repo_root_for(target_dir, owner, name)?.is_none()
-        && !target_dir.join(".syns.yaml").exists()
-    {
-        write_syns_yaml(target_dir, owner, name)?;
+    if repo_arg.is_some() {
+        write_syns_yaml_where_none_stands(target_dir, owner, name)?;
     }
     Ok(())
 }

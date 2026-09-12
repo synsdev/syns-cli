@@ -361,6 +361,36 @@ fn differing_paths(a: &BTreeMap<String, String>, b: &BTreeMap<String, String>) -
         .collect()
 }
 
+/// The paths among `names` the collection left out although a file stands
+/// there on disk — files an exclusion keeps out. A convergence writes over
+/// none of them, removes none of them and publishes a deletion of none of
+/// them, so each is dropped from both sides before they are compared.
+fn excluded_on_disk<'a>(
+    copy: &WorkingCopy,
+    collected: &BTreeMap<String, String>,
+    names: impl IntoIterator<Item = &'a String>,
+) -> BTreeSet<String> {
+    names
+        .into_iter()
+        .filter(|path| {
+            !collected.contains_key(*path)
+                && check_server_path(path).is_ok()
+                && copy.root.join(path).is_file()
+        })
+        .cloned()
+        .collect()
+}
+
+fn without(
+    map: &BTreeMap<String, String>,
+    excluded: &BTreeSet<String>,
+) -> BTreeMap<String, String> {
+    map.iter()
+        .filter(|(path, _)| !excluded.contains(*path))
+        .map(|(path, hash)| (path.clone(), hash.clone()))
+        .collect()
+}
+
 // ---- preparing a candidate (`converge` 10 to 12) ---------------------
 
 enum Prepared {
@@ -412,7 +442,16 @@ async fn prepare_candidate(
             Some(folder) => folder,
             None => collect_folder(copy, opts)?,
         };
-        let rec = reconcile(&candidate.base_files, &folder.hashes, &head.files);
+        let excluded = excluded_on_disk(
+            copy,
+            &folder.hashes,
+            candidate.base_files.keys().chain(head.files.keys()),
+        );
+        let rec = reconcile(
+            &without(&candidate.base_files, &excluded),
+            &folder.hashes,
+            &without(&head.files, &excluded),
+        );
         local_paths.extend(rec.local_only.iter().cloned());
         remote_paths.extend(rec.remote_only.iter().cloned());
         for (path, kind) in &rec.collisions {
@@ -634,8 +673,10 @@ async fn settle_outbox(
     let has_base = copy.base().is_some();
     let head = read_head(client, token, copy, reading_for(mode), has_base).await?;
 
+    let excluded = excluded_on_disk(copy, &outbox.tree, head.files.keys());
+    let head_files = without(&head.files, &excluded);
     if let Some(commit) = &head.commit
-        && head.files == outbox.tree
+        && head_files == outbox.tree
     {
         copy.record_base(commit, to_hash_map(&head.files))?;
         copy.remove_outbox()?;
@@ -652,9 +693,9 @@ async fn settle_outbox(
         Some(parent) => read_tree(client, token, copy, Some(parent)).await?.files,
         None => BTreeMap::new(),
     };
-    let resumable = differing_paths(&head.files, &parent_files)
+    let resumable = differing_paths(&head_files, &without(&parent_files, &excluded))
         .iter()
-        .all(|path| head.files.get(path) == outbox.tree.get(path));
+        .all(|path| head_files.get(path) == outbox.tree.get(path));
     if resumable {
         return Ok(OutboxStep::Resume(head.commit));
     }
@@ -724,17 +765,31 @@ async fn converge_from_resolution(
 
     // 6
     let folder = collect_folder(copy, &opts)?;
+    let excluded = excluded_on_disk(
+        copy,
+        &folder.hashes,
+        base.files.keys().chain(head.files.keys()),
+    );
+    let head_files = without(&head.files, &excluded);
 
     // 7
     if mode == (ConvergeMode::Retrieve { overwrite: true })
-        && (folder.hashes != head.files || resolution.is_some())
+        && (folder.hashes != head_files || resolution.is_some())
     {
-        return overwrite_with_head(client, token, copy, &head, &folder, resolution.is_some())
-            .await;
+        return overwrite_with_head(
+            client,
+            token,
+            copy,
+            &head,
+            &folder,
+            &excluded,
+            resolution.is_some(),
+        )
+        .await;
     }
 
     // 8
-    if folder.hashes == head.files {
+    if folder.hashes == head_files {
         return match &head.commit {
             Some(commit) if base.commit.as_deref() != Some(commit.as_str()) => {
                 copy.record_base(commit, to_hash_map(&head.files))?;
@@ -787,6 +842,7 @@ async fn overwrite_with_head(
     copy: &WorkingCopy,
     head: &Head,
     folder: &Folder,
+    excluded: &BTreeSet<String>,
     resolution_stands: bool,
 ) -> Result<SyncOutcome, CliError> {
     check_server_paths(head.files.keys())?;
@@ -794,7 +850,7 @@ async fn overwrite_with_head(
 
     let mut writes: Vec<(String, Vec<u8>)> = Vec::new();
     for (path, hash) in &head.files {
-        if folder.hashes.get(path) != Some(hash) {
+        if !excluded.contains(path) && folder.hashes.get(path) != Some(hash) {
             let content = read_content(client, token, copy, path, &head_commit).await?;
             writes.push((path.clone(), content.into_bytes()));
         }
@@ -922,16 +978,24 @@ async fn publish_reviewed(
         let mut resolution = copy.resolution()?;
         if let Some(standing) = resolution.as_mut() {
             match &standing.reviewed_tree {
+                // Either arm hands the resolution back for review, so a
+                // standing outbox — the dropped publication a resume came
+                // in on — is dropped with it: kept, it would resume ahead
+                // of every later continue and no review would publish.
                 Some(tree) if *tree != folder.hashes => {
                     let changed = differing_paths(tree, &folder.hashes);
                     standing.reviewed_tree = None;
                     union_sorted(&mut standing.local_paths, changed.iter().cloned());
                     union_sorted(&mut standing.combined_paths, changed);
                     copy.write_resolution(standing)?;
+                    copy.remove_outbox()?;
                     return Ok(SyncOutcome::ResolutionRequired(standing.clone()));
                 }
                 Some(_) => {}
-                None => return Ok(SyncOutcome::ResolutionRequired(standing.clone())),
+                None => {
+                    copy.remove_outbox()?;
+                    return Ok(SyncOutcome::ResolutionRequired(standing.clone()));
+                }
             }
 
             // 2
@@ -972,6 +1036,10 @@ async fn publish_reviewed(
             },
             None => BTreeMap::new(),
         };
+        let reference = without(
+            &reference,
+            &excluded_on_disk(copy, &folder.hashes, reference.keys()),
+        );
         let mut push_opts = opts.clone();
         push_opts.force = false;
         push_opts.author = None;
@@ -1135,6 +1203,11 @@ pub fn discard_resolution(copy: &WorkingCopy) -> Result<(), CliError> {
             None => remove_folder_file(copy, &path)?,
         }
     }
+    // A continued publication that may have landed leaves an outbox; kept,
+    // the next run would resume it and publish the restored folder over the
+    // head with no resolution standing. Where it did land, the next run
+    // finds the head past the base and prepares a candidate instead.
+    copy.remove_outbox()?;
     copy.remove_resolution()?;
     copy.remove_snapshots()
 }
@@ -1171,11 +1244,14 @@ pub async fn working_copy_state(
         .iter()
         .map(|(path, bytes)| (path.clone(), blob_sha1(bytes)))
         .collect();
-    if folder == head.files {
+    let excluded = excluded_on_disk(copy, &folder, base.files.keys().chain(head.files.keys()));
+    let head_files = without(&head.files, &excluded);
+    let base_files = without(&base.files, &excluded);
+    if folder == head_files {
         return Ok(WorkingCopyState::Converged);
     }
-    let local = folder != base.files;
-    let remote = head.commit != base.commit || head.files != base.files;
+    let local = folder != base_files;
+    let remote = head.commit != base.commit || head_files != base_files;
     Ok(match (local, remote) {
         (true, false) => WorkingCopyState::LocalChanges,
         (false, true) => WorkingCopyState::RemoteChanges,

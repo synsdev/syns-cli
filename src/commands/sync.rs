@@ -27,7 +27,7 @@ use crate::push::smart::SmartPushOptions;
 use crate::push::working_copy::{Resolution, WorkingCopy};
 use crate::repo::if_repo::resolve_full_or_skip;
 use crate::repo::root::push_scope;
-use crate::repo::syns_yaml::{find_repo_root_for, write_syns_yaml};
+use crate::repo::syns_yaml::write_syns_yaml_where_none_stands;
 
 /// The exit a resolution required renders with (Q-02).
 pub const EXIT_RESOLUTION_REQUIRED: i32 = 4;
@@ -93,10 +93,7 @@ pub fn convergence_options(config: &Config) -> SmartPushOptions {
 /// the folder is collected, so the set a convergence records is the set
 /// it sends.
 pub fn ensure_identity_file(root: &Path, owner: &str, name: &str) -> Result<(), CliError> {
-    if find_repo_root_for(root, owner, name)?.is_none() && !root.join(".syns.yaml").exists() {
-        write_syns_yaml(root, owner, name)?;
-    }
-    Ok(())
+    write_syns_yaml_where_none_stands(root, owner, name).map(|_| ())
 }
 
 // ---- the error classes a failure outcome follows ----------------------
@@ -149,15 +146,7 @@ fn error_class(err: &CliError) -> Option<ErrorClass> {
 
 /// The outcome a failure raised at any step of a run renders as
 /// (`cmd_sync` 4).
-///
-/// A failure carrying no status the server answered — a connection
-/// closed after the request left — renders as retryable rather than as
-/// attention required: it is how a dropped publication arrives, and the
-/// outbox it keeps is settled by the next run.
 pub fn outcome_for_error(err: CliError) -> SyncOutcome {
-    if matches!(err, CliError::Api { status: None, .. }) {
-        return SyncOutcome::RetryableFailure(err);
-    }
     match error_class(&err) {
         Some(ErrorClass::Transient) => SyncOutcome::RetryableFailure(err),
         Some(ErrorClass::Authentication | ErrorClass::Authorization | ErrorClass::NotFound) => {
@@ -694,10 +683,10 @@ mod tests {
             (
                 CliError::Api {
                     status: None,
-                    error: "error sending request".into(),
+                    error: "invalid response body".into(),
                     context: None,
                 },
-                "retryable",
+                "attention",
             ),
         ];
         for (err, expected) in cases {

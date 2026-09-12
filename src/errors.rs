@@ -247,10 +247,16 @@ impl From<crate::commands::upgrade::UpgradeError> for CliError {
 }
 
 // Note: This impl has branching logic (connect/timeout vs other) that cannot be unit-tested
-// locally because reqwest::Error constructors are private. Covered by integration tests (U59).
+// locally because reqwest::Error constructors are private. Covered by integration tests (U59),
+// and by `dropped_push_connection_classifies_as_server_unreachable` (u256).
+//
+// A request whose connection closed before any status came back — sent, and answered by
+// nothing — is `SERVER_UNREACHABLE` as a refused connection is: the retry the class invites
+// is the right move, and a convergence's outbox settles whether the dropped publication
+// landed (SPEC u256).
 impl From<reqwest::Error> for CliError {
     fn from(err: reqwest::Error) -> Self {
-        if err.is_connect() || err.is_timeout() {
+        if err.is_connect() || err.is_timeout() || (err.is_request() && err.status().is_none()) {
             CliError::ServerUnreachable {
                 url: err.url().map(|u| u.to_string()).unwrap_or_default(),
             }
