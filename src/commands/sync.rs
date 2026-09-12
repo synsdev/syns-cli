@@ -706,6 +706,7 @@ mod tests {
             collisions: vec![("docs/a.md".into(), CollisionKind::ModifyModify)],
             combined_paths: vec!["docs/a.md".into(), "notes.md".into()],
             reviewed_tree: None,
+            pending_writes: None,
         }
     }
 

@@ -451,26 +451,30 @@ impl Env {
     }
 
     fn opts(&self) -> SmartPushOptions {
-        SmartPushOptions {
-            force: false,
-            message: "push".into(),
-            author: None,
-            parent_sha: None,
-            excludes: vec![],
-            cache_dir: self.config.cache_dir().to_path_buf(),
-            description: None,
-            tags: None,
-            status: None,
-            visibility: None,
-            strict: false,
-            allow_empty: false,
-            debug: false,
-            no_default_excludes: false,
-            prefix: None,
-            reference: None,
-            expected: None,
-            provenance: None,
-        }
+        opts_at(self.config.cache_dir())
+    }
+}
+
+fn opts_at(cache_dir: &Path) -> SmartPushOptions {
+    SmartPushOptions {
+        force: false,
+        message: "push".into(),
+        author: None,
+        parent_sha: None,
+        excludes: vec![],
+        cache_dir: cache_dir.to_path_buf(),
+        description: None,
+        tags: None,
+        status: None,
+        visibility: None,
+        strict: false,
+        allow_empty: false,
+        debug: false,
+        no_default_excludes: false,
+        prefix: None,
+        reference: None,
+        expected: None,
+        provenance: None,
     }
 }
 
@@ -539,6 +543,7 @@ fn dummy_resolution(head: &str) -> Resolution {
         collisions: vec![],
         combined_paths: vec![],
         reviewed_tree: None,
+        pending_writes: None,
     }
 }
 
@@ -1463,6 +1468,250 @@ async fn convergence_leaves_an_excluded_local_file_untouched() {
     let (_, tree) = e.fake.head();
     assert_eq!(tree[".env"], "remote value\n");
     assert_eq!(tree["a.md"], "a1\n");
+}
+
+// ---- an interrupted preparation -------------------------------------------
+
+fn set_readonly(path: &Path, readonly: bool) {
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(readonly);
+    std::fs::set_permissions(path, permissions).unwrap();
+}
+
+/// A folder write refused after the resolution is recorded leaves the
+/// candidate half-written; a continue finishes the preparation instead of
+/// publishing the folder over the head's changes.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn continue_after_a_failed_preparation_write_publishes_nothing() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let client = e.fake.client();
+    let h0 = e.fake.commit(&[("a.md", "a\nb\nc\n"), ("r.md", "r0\n")]);
+    checkout(&e.fake, &copy, &h0);
+    write_files(&dir, &[("a.md", "a\nL\nc\n")]);
+    let h1 = e
+        .fake
+        .commit_changes(&[("a.md", Some("a\nR\nc\n")), ("r.md", Some("r1\n"))]);
+    set_readonly(&dir.join("r.md"), true);
+    if std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("r.md"))
+        .is_ok()
+    {
+        set_readonly(&dir.join("r.md"), false);
+        eprintln!("skipped: this process may write a read-only file");
+        return;
+    }
+
+    let failed = converge(&client, Some(TOKEN), &copy, ConvergeMode::Publish, e.opts()).await;
+    set_readonly(&dir.join("r.md"), false);
+    assert!(matches!(failed, Err(CliError::Io { .. })), "{failed:?}");
+    assert!(copy.resolution().unwrap().is_some());
+
+    let outcome = continue_resolution(&client, TOKEN, &copy, e.opts())
+        .await
+        .unwrap();
+
+    expect_resolution(outcome);
+    assert!(
+        e.fake.push_bodies().is_empty(),
+        "the continue published a half-prepared folder: {:?}",
+        e.fake.push_bodies()
+    );
+    assert_eq!(e.fake.head().0, h1);
+    assert_eq!(read(&dir, "r.md"), "r1\n");
+    assert!(read(&dir, "a.md").lines().any(|l| l == "<<<<<<< local"));
+}
+
+/// A re-run finishing a half-written preparation leaves a candidate that
+/// already landed as it stands, rather than merging its markers again.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_resumed_preparation_keeps_a_candidate_that_already_landed() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let client = e.fake.client();
+    let h0 = e
+        .fake
+        .commit(&[("a.md", "a\nb\nc\n"), ("b.md", "x\ny\nz\n")]);
+    checkout(&e.fake, &copy, &h0);
+    write_files(&dir, &[("a.md", "a\nL\nc\n"), ("b.md", "x\nL\nz\n")]);
+    e.fake
+        .commit_changes(&[("a.md", Some("a\nR\nc\n")), ("b.md", Some("x\nR\nz\n"))]);
+    set_readonly(&dir.join("b.md"), true);
+    if std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("b.md"))
+        .is_ok()
+    {
+        set_readonly(&dir.join("b.md"), false);
+        eprintln!("skipped: this process may write a read-only file");
+        return;
+    }
+    let failed = converge(&client, Some(TOKEN), &copy, ConvergeMode::Publish, e.opts()).await;
+    set_readonly(&dir.join("b.md"), false);
+    assert!(matches!(failed, Err(CliError::Io { .. })), "{failed:?}");
+    let landed = "a\n<<<<<<< local\nL\n||||||| base\nb\n=======\nR\n>>>>>>> remote\nc\n";
+    assert_eq!(read(&dir, "a.md"), landed);
+
+    let resumed = expect_resolution(
+        converge(&client, Some(TOKEN), &copy, ConvergeMode::Publish, e.opts())
+            .await
+            .unwrap(),
+    );
+
+    assert_eq!(read(&dir, "a.md"), landed);
+    assert_eq!(
+        read(&dir, "b.md"),
+        "x\n<<<<<<< local\nL\n||||||| base\ny\n=======\nR\n>>>>>>> remote\nz\n"
+    );
+    assert_eq!(
+        resumed.collisions,
+        vec![
+            ("a.md".to_string(), CollisionKind::ModifyModify),
+            ("b.md".to_string(), CollisionKind::ModifyModify),
+        ]
+    );
+    assert!(copy.resolution().unwrap().unwrap().pending_writes.is_none());
+    assert_eq!(
+        copy.local_snapshot().unwrap()["a.md"]
+            .clone()
+            .unwrap()
+            .into_bytes(),
+        b"a\nL\nc\n".to_vec()
+    );
+    assert!(e.fake.push_bodies().is_empty());
+}
+
+const PREPARER_ENV: &str = "SYNS_U256_PREPARER";
+const KILLED_FILES: usize = 2000;
+
+/// The preparer half runs in a child process re-running this test binary:
+/// it converges the folder as a retrieval against the parent's fake, and
+/// the parent kills it once the resolution is recorded — inside the
+/// window its remote-only writes are still landing in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_preparation_killed_after_recording_its_resolution_is_finished_before_publishing() {
+    if let Ok(spec) = std::env::var(PREPARER_ENV) {
+        let spec: Value = serde_json::from_str(&spec).unwrap();
+        let cache = PathBuf::from(spec["cache"].as_str().unwrap());
+        let dir = PathBuf::from(spec["dir"].as_str().unwrap());
+        let client = SynsClient::new(spec["uri"].as_str().unwrap()).unwrap();
+        let copy = WorkingCopy::open(&cache, "alice", "proj", &dir).unwrap();
+        let _ = converge(
+            &client,
+            Some(TOKEN),
+            &copy,
+            ConvergeMode::Retrieve { overwrite: false },
+            opts_at(&cache),
+        )
+        .await;
+        return;
+    }
+
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let client = e.fake.client();
+    let names: Vec<String> = (1..=KILLED_FILES).map(|i| format!("f{i:04}.md")).collect();
+    let mut h0_tree = vec![("a.md", "one\ntwo\nthree\n")];
+    h0_tree.extend(names.iter().map(|n| (n.as_str(), "base\n")));
+    let h0 = e.fake.commit(&h0_tree);
+    checkout(&e.fake, &copy, &h0);
+    write_files(&dir, &[("a.md", "one\nLOCAL two\nthree\n")]);
+    let mut changes = vec![("a.md", Some("one\nREMOTE two\nthree\n"))];
+    changes.extend(names.iter().map(|n| (n.as_str(), Some("remote\n"))));
+    e.fake.commit_changes(&changes);
+
+    let spec = json!({"uri": e.fake.uri, "cache": e.config.cache_dir(), "dir": dir}).to_string();
+    let mut preparer = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "integration::convergence_test::a_preparation_killed_after_recording_its_resolution_is_finished_before_publishing",
+            "--test-threads=1",
+        ])
+        .env(PREPARER_ENV, spec)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let recorded = copy.state_dir.join("resolution.json");
+    let started = std::time::Instant::now();
+    while !recorded.exists() {
+        if let Some(status) = preparer.try_wait().unwrap() {
+            panic!("the preparer exited {status} before recording a resolution");
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(120),
+            "the preparer recorded no resolution"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    let _ = preparer.kill();
+    preparer.wait().unwrap();
+    let landed = names.iter().filter(|n| read(&dir, n) == "remote\n").count();
+    println!("the kill landed with {landed} of {KILLED_FILES} remote-only writes taken");
+    let recovery_id = copy.resolution().unwrap().unwrap().recovery_id;
+
+    let rerun = expect_resolution(
+        converge(
+            &client,
+            Some(TOKEN),
+            &copy,
+            ConvergeMode::Retrieve { overwrite: false },
+            e.opts(),
+        )
+        .await
+        .unwrap(),
+    );
+
+    assert_eq!(rerun.recovery_id, recovery_id);
+    let unwritten: Vec<&String> = names
+        .iter()
+        .filter(|n| read(&dir, n) != "remote\n")
+        .collect();
+    assert!(
+        unwritten.is_empty(),
+        "the re-run left {} remote-only changes unwritten",
+        unwritten.len()
+    );
+    assert!(read(&dir, "a.md").lines().any(|l| l == "<<<<<<< local"));
+    assert_eq!(
+        copy.local_snapshot().unwrap()["a.md"]
+            .clone()
+            .unwrap()
+            .into_bytes(),
+        b"one\nLOCAL two\nthree\n".to_vec()
+    );
+
+    write_files(&dir, &[("a.md", "one\nLOCAL and REMOTE two\nthree\n")]);
+    let outcome = continue_resolution(&client, TOKEN, &copy, e.opts())
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(
+            outcome,
+            SyncOutcome::Synced {
+                published: Some(_),
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    let (_, tree) = e.fake.head();
+    let undone: Vec<&String> = names.iter().filter(|n| tree[*n] != "remote\n").collect();
+    assert!(
+        undone.is_empty(),
+        "the continue undid {} remote changes",
+        undone.len()
+    );
+    assert_eq!(tree["a.md"], "one\nLOCAL and REMOTE two\nthree\n");
 }
 
 const HOLDER_ENV: &str = "SYNS_U256_BASE_HOLDER";

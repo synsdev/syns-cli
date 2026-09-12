@@ -52,6 +52,13 @@ pub struct Resolution {
     pub collisions: Vec<(String, CollisionKind)>,
     pub combined_paths: Vec<String>,
     pub reviewed_tree: Option<BTreeMap<String, String>>,
+    /// Each folder path the candidate's preparation owes a write or a
+    /// removal, mapped to the hash it is to hold — none for a removal —
+    /// recorded before the first folder write and cleared after the last,
+    /// so a resolution carrying it is one a killed or failed run left
+    /// half-written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_writes: Option<BTreeMap<String, Option<String>>>,
 }
 
 /// A publication that may have landed without its commit recorded as

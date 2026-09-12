@@ -434,7 +434,28 @@ async fn prepare_candidate(
     let mut local_paths: BTreeSet<String> = BTreeSet::new();
     let mut remote_paths: BTreeSet<String> = BTreeSet::new();
     let mut collisions: BTreeMap<String, CollisionKind> = BTreeMap::new();
+    let mut resumed_combined: BTreeSet<String> = BTreeSet::new();
     let mut first_folder = first_folder;
+
+    // A preparation resumed over a resolution a killed or failed run left
+    // half-written keeps that run's summaries, and counts a path already
+    // holding the hash it recorded as a landed candidate rather than
+    // merging the candidate's markers again.
+    if let Some(standing) = candidate
+        .existing
+        .as_ref()
+        .filter(|r| r.pending_writes.is_some())
+    {
+        local_paths.extend(standing.local_paths.iter().cloned());
+        remote_paths.extend(standing.remote_paths.iter().cloned());
+        collisions.extend(standing.collisions.iter().cloned());
+        resumed_combined.extend(standing.combined_paths.iter().cloned());
+        for (path, hash) in standing.pending_writes.iter().flatten() {
+            if let Some(hash) = hash {
+                written_this_run.insert(path.clone(), hash.clone());
+            }
+        }
+    }
 
     for pass in 0..MAX_PASSES {
         // `converge` 6, again on every pass after the first.
@@ -560,12 +581,26 @@ async fn prepare_candidate(
             || candidate.publishing && !local_paths.is_empty();
         if needs_resolution {
             let mut combined: BTreeSet<String> = local_paths.clone();
+            combined.extend(resumed_combined.iter().cloned());
             for (path, hash) in &candidate_hashes {
                 if hash.as_ref() != head.files.get(path) {
                     combined.insert(path.clone());
                 }
             }
             let standing = resolution.take();
+            // Recorded before the first folder write, so a run ending
+            // before the last one leaves a resolution `converge` 4 finishes
+            // rather than one a continue would publish half-written.
+            let mut owed = standing
+                .as_ref()
+                .and_then(|r| r.pending_writes.clone())
+                .unwrap_or_default();
+            owed.extend(
+                writes
+                    .iter()
+                    .map(|(path, bytes)| (path.clone(), Some(blob_sha1(bytes)))),
+            );
+            owed.extend(removals.iter().map(|path| (path.clone(), None)));
             let next = Resolution {
                 recovery_id: standing
                     .as_ref()
@@ -579,6 +614,7 @@ async fn prepare_candidate(
                 collisions: collisions.iter().map(|(p, k)| (p.clone(), *k)).collect(),
                 combined_paths: combined.into_iter().collect(),
                 reviewed_tree: None,
+                pending_writes: (!owed.is_empty()).then_some(owed),
             };
             copy.write_resolution(&next)?;
             resolution = Some(next);
@@ -616,7 +652,12 @@ async fn prepare_candidate(
         if !left_untouched {
             // `converge` 12.
             return match resolution {
-                Some(resolution) => Ok(Prepared::Resolution(resolution)),
+                Some(mut resolution) => {
+                    if resolution.pending_writes.take().is_some() {
+                        copy.write_resolution(&resolution)?;
+                    }
+                    Ok(Prepared::Resolution(resolution))
+                }
                 None => {
                     if let Some(commit) = &head.commit {
                         copy.record_base(commit, to_hash_map(&head.files))?;
@@ -736,6 +777,10 @@ async fn converge_from_resolution(
     // 4
     let resolution = copy.resolution()?;
     if let Some(standing) = &resolution {
+        if standing.pending_writes.is_some() && mode != (ConvergeMode::Retrieve { overwrite: true })
+        {
+            return finish_preparation(client, token, copy, &opts, mode, standing.clone()).await;
+        }
         if standing.round > ROUND_BOUND {
             return Ok(SyncOutcome::AttentionRequired(resolution));
         }
@@ -832,6 +877,59 @@ async fn converge_from_resolution(
     )
     .await?;
     Ok(prepared_outcome(prepared))
+}
+
+/// `converge` 4 over a resolution whose preparation a killed or failed run
+/// left half-written: prepare the candidate again against the base and the
+/// head that resolution recorded, keeping its recovery id, round and first
+/// snapshot content, before the resolution is answered.
+async fn finish_preparation(
+    client: &SynsClient,
+    token: Option<&str>,
+    copy: &WorkingCopy,
+    opts: &SmartPushOptions,
+    mode: ConvergeMode,
+    standing: Resolution,
+) -> Result<SyncOutcome, CliError> {
+    let base = load_base(copy);
+    let base_files = match &standing.base_commit {
+        Some(commit) if base.commit.as_ref() == Some(commit) => base.files,
+        Some(commit) => read_tree(client, token, copy, Some(commit)).await?.files,
+        None => BTreeMap::new(),
+    };
+    let head = if standing.head_commit.is_empty() {
+        Head::default()
+    } else {
+        read_tree(client, token, copy, Some(&standing.head_commit)).await?
+    };
+    if head.truncated {
+        return Ok(SyncOutcome::AttentionRequired(Some(standing)));
+    }
+    let past_bound = standing.round > ROUND_BOUND;
+
+    let prepared = prepare_candidate(
+        client,
+        token,
+        copy,
+        opts,
+        Candidate {
+            base_commit: standing.base_commit.clone(),
+            base_files,
+            head: &head,
+            publishing: mode == ConvergeMode::Publish,
+            existing: Some(standing),
+            force_resolution: true,
+        },
+        None,
+    )
+    .await?;
+
+    Ok(match prepared {
+        Prepared::Resolution(resolution) if past_bound => {
+            SyncOutcome::AttentionRequired(Some(resolution))
+        }
+        other => prepared_outcome(other),
+    })
 }
 
 /// `converge` 7: make the folder hold the head, every rewritten or
@@ -1179,6 +1277,13 @@ pub async fn continue_resolution(
         return converge_from_resolution(client, Some(token), copy, ConvergeMode::Publish, opts)
             .await;
     };
+    // A half-written candidate is finished and handed back for review,
+    // never recorded as the reviewed tree: publishing it would name each
+    // head change still unwritten as a local revert.
+    if resolution.pending_writes.is_some() {
+        return converge_from_resolution(client, Some(token), copy, ConvergeMode::Publish, opts)
+            .await;
+    }
 
     // 3
     let folder = collect_folder(copy, &opts)?;
