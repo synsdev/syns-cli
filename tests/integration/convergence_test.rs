@@ -21,8 +21,8 @@ use syns_cli::errors::CliError;
 use syns_cli::output::Output;
 use syns_cli::push::collector::{CollectOptions, collect_files};
 use syns_cli::push::converge::{
-    ConvergeMode, SyncOutcome, WorkingCopyState, continue_resolution, converge, discard_resolution,
-    working_copy_state,
+    ConvergeMode, ROUND_BOUND, SyncOutcome, WorkingCopyState, continue_resolution, converge,
+    discard_resolution, working_copy_state,
 };
 use syns_cli::push::hash::blob_sha1;
 use syns_cli::push::reconcile::CollisionKind;
@@ -1479,6 +1479,47 @@ fn set_readonly(path: &Path, readonly: bool) {
     std::fs::set_permissions(path, permissions).unwrap();
 }
 
+/// Run `converge` in `mode` with `path` read-only, so its candidate write is
+/// refused after the resolution is recorded, then make it writable again;
+/// false where this process writes a read-only file anyway.
+async fn refuse_preparation_at(
+    e: &Env,
+    copy: &WorkingCopy,
+    path: &str,
+    mode: ConvergeMode,
+) -> bool {
+    let target = copy.root.join(path);
+    set_readonly(&target, true);
+    if std::fs::OpenOptions::new()
+        .write(true)
+        .open(&target)
+        .is_ok()
+    {
+        set_readonly(&target, false);
+        eprintln!("skipped: this process may write a read-only file");
+        return false;
+    }
+    let failed = converge(&e.fake.client(), Some(TOKEN), copy, mode, e.opts()).await;
+    set_readonly(&target, false);
+    assert!(matches!(failed, Err(CliError::Io { .. })), "{failed:?}");
+    assert!(copy.resolution().unwrap().unwrap().pending_writes.is_some());
+    true
+}
+
+/// A publication past a head changing `a.md` on both sides and `r.md`
+/// remotely, its write to `r.md` refused: the head, none where skipped.
+async fn half_written_publication(e: &Env, dir: &Path, copy: &WorkingCopy) -> Option<String> {
+    let h0 = e.fake.commit(&[("a.md", "a\nb\nc\n"), ("r.md", "r0\n")]);
+    checkout(&e.fake, copy, &h0);
+    write_files(dir, &[("a.md", "a\nL\nc\n")]);
+    let h1 = e
+        .fake
+        .commit_changes(&[("a.md", Some("a\nR\nc\n")), ("r.md", Some("r1\n"))]);
+    refuse_preparation_at(e, copy, "r.md", ConvergeMode::Publish)
+        .await
+        .then_some(h1)
+}
+
 /// A folder write refused after the resolution is recorded leaves the
 /// candidate half-written; a continue finishes the preparation instead of
 /// publishing the folder over the head's changes.
@@ -1489,27 +1530,9 @@ async fn continue_after_a_failed_preparation_write_publishes_nothing() {
     let dir = e.dir();
     let copy = e.copy(&dir);
     let client = e.fake.client();
-    let h0 = e.fake.commit(&[("a.md", "a\nb\nc\n"), ("r.md", "r0\n")]);
-    checkout(&e.fake, &copy, &h0);
-    write_files(&dir, &[("a.md", "a\nL\nc\n")]);
-    let h1 = e
-        .fake
-        .commit_changes(&[("a.md", Some("a\nR\nc\n")), ("r.md", Some("r1\n"))]);
-    set_readonly(&dir.join("r.md"), true);
-    if std::fs::OpenOptions::new()
-        .write(true)
-        .open(dir.join("r.md"))
-        .is_ok()
-    {
-        set_readonly(&dir.join("r.md"), false);
-        eprintln!("skipped: this process may write a read-only file");
+    let Some(h1) = half_written_publication(&e, &dir, &copy).await else {
         return;
-    }
-
-    let failed = converge(&client, Some(TOKEN), &copy, ConvergeMode::Publish, e.opts()).await;
-    set_readonly(&dir.join("r.md"), false);
-    assert!(matches!(failed, Err(CliError::Io { .. })), "{failed:?}");
-    assert!(copy.resolution().unwrap().is_some());
+    };
 
     let outcome = continue_resolution(&client, TOKEN, &copy, e.opts())
         .await
@@ -1542,19 +1565,9 @@ async fn a_resumed_preparation_keeps_a_candidate_that_already_landed() {
     write_files(&dir, &[("a.md", "a\nL\nc\n"), ("b.md", "x\nL\nz\n")]);
     e.fake
         .commit_changes(&[("a.md", Some("a\nR\nc\n")), ("b.md", Some("x\nR\nz\n"))]);
-    set_readonly(&dir.join("b.md"), true);
-    if std::fs::OpenOptions::new()
-        .write(true)
-        .open(dir.join("b.md"))
-        .is_ok()
-    {
-        set_readonly(&dir.join("b.md"), false);
-        eprintln!("skipped: this process may write a read-only file");
+    if !refuse_preparation_at(&e, &copy, "b.md", ConvergeMode::Publish).await {
         return;
     }
-    let failed = converge(&client, Some(TOKEN), &copy, ConvergeMode::Publish, e.opts()).await;
-    set_readonly(&dir.join("b.md"), false);
-    assert!(matches!(failed, Err(CliError::Io { .. })), "{failed:?}");
     let landed = "a\n<<<<<<< local\nL\n||||||| base\nb\n=======\nR\n>>>>>>> remote\nc\n";
     assert_eq!(read(&dir, "a.md"), landed);
 
@@ -1587,13 +1600,121 @@ async fn a_resumed_preparation_keeps_a_candidate_that_already_landed() {
     assert!(e.fake.push_bodies().is_empty());
 }
 
+/// A re-run finishing a half-written preparation keeps naming the
+/// delete/modify candidate and the remote-only change that landed before
+/// the refusal, although both now read as identical.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_resumed_preparation_keeps_the_summaries_of_its_landed_writes() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let h0 = e
+        .fake
+        .commit(&[("d.md", "d0\n"), ("r.md", "r0\n"), ("z.md", "a\nb\nc\n")]);
+    checkout(&e.fake, &copy, &h0);
+    std::fs::remove_file(dir.join("d.md")).unwrap();
+    write_files(&dir, &[("z.md", "a\nL\nc\n")]);
+    e.fake.commit_changes(&[
+        ("d.md", Some("d1\n")),
+        ("r.md", Some("r1\n")),
+        ("z.md", Some("a\nR\nc\n")),
+    ]);
+    let retrieval = ConvergeMode::Retrieve { overwrite: false };
+    if !refuse_preparation_at(&e, &copy, "z.md", retrieval).await {
+        return;
+    }
+    assert_eq!(read(&dir, "d.md"), "d1\n");
+    assert_eq!(read(&dir, "r.md"), "r1\n");
+
+    let resumed = expect_resolution(
+        converge(&e.fake.client(), Some(TOKEN), &copy, retrieval, e.opts())
+            .await
+            .unwrap(),
+    );
+
+    assert!(
+        resumed
+            .collisions
+            .contains(&("d.md".to_string(), CollisionKind::DeleteModify)),
+        "{resumed:?}"
+    );
+    assert!(
+        resumed.remote_paths.contains(&"r.md".to_string()),
+        "{resumed:?}"
+    );
+    assert!(read(&dir, "z.md").lines().any(|l| l == "<<<<<<< local"));
+}
+
+/// A retrieval asked to overwrite writes the head over a half-written
+/// candidate rather than finishing its preparation.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn overwrite_retrieval_replaces_a_half_written_candidate() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    if half_written_publication(&e, &dir, &copy).await.is_none() {
+        return;
+    }
+
+    let outcome = converge(
+        &e.fake.client(),
+        Some(TOKEN),
+        &copy,
+        ConvergeMode::Retrieve { overwrite: true },
+        e.opts(),
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(outcome, SyncOutcome::Synced { .. }), "{outcome:?}");
+    assert!(copy.resolution().unwrap().is_none());
+    assert_eq!(read(&dir, "a.md"), "a\nR\nc\n");
+    assert_eq!(read(&dir, "r.md"), "r1\n");
+}
+
+/// A half-written resolution past the round bound is finished and handed
+/// to a person, not answered as resolution required.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_half_written_resolution_past_the_round_bound_requires_attention() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    if half_written_publication(&e, &dir, &copy).await.is_none() {
+        return;
+    }
+    let mut standing = copy.resolution().unwrap().unwrap();
+    standing.round = ROUND_BOUND + 1;
+    copy.write_resolution(&standing).unwrap();
+
+    let outcome = converge(
+        &e.fake.client(),
+        Some(TOKEN),
+        &copy,
+        ConvergeMode::Publish,
+        e.opts(),
+    )
+    .await
+    .unwrap();
+
+    match outcome {
+        SyncOutcome::AttentionRequired(Some(resolution)) => {
+            assert!(resolution.pending_writes.is_none(), "{resolution:?}")
+        }
+        other => panic!("expected AttentionRequired, got {other:?}"),
+    }
+    assert_eq!(read(&dir, "r.md"), "r1\n");
+}
+
 const PREPARER_ENV: &str = "SYNS_U256_PREPARER";
 const KILLED_FILES: usize = 2000;
 
 /// The preparer half runs in a child process re-running this test binary:
 /// it converges the folder as a retrieval against the parent's fake, and
-/// the parent kills it once the resolution is recorded — inside the
-/// window its remote-only writes are still landing in.
+/// the parent kills it once the resolution is recorded, before the
+/// preparation clears the writes it still owes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn a_preparation_killed_after_recording_its_resolution_is_finished_before_publishing() {
@@ -1654,6 +1775,10 @@ async fn a_preparation_killed_after_recording_its_resolution_is_finished_before_
     }
     let _ = preparer.kill();
     preparer.wait().unwrap();
+    assert!(
+        copy.resolution().unwrap().unwrap().pending_writes.is_some(),
+        "the kill landed after the preparation finished, so nothing interrupted it"
+    );
     let landed = names.iter().filter(|n| read(&dir, n) == "remote\n").count();
     println!("the kill landed with {landed} of {KILLED_FILES} remote-only writes taken");
     let recovery_id = copy.resolution().unwrap().unwrap().recovery_id;
