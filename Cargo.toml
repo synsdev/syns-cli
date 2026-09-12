@@ -40,6 +40,10 @@ zip = "8"
 sha2 = "0.10"
 self-replace = "1.5"
 thiserror = "2"
+diffy = "=0.5.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.184"
 
 [dev-dependencies]
 serial_test = "3"

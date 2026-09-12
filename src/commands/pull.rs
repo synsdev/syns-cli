@@ -1,15 +1,16 @@
 use crate::auth::token::TokenStore;
 use crate::client::{EntryType, SynsClient};
+use crate::commands::sync::{convergence_options, render_outcome, render_transfer_lines};
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
-use crate::push::manifest::Manifest;
+use crate::push::converge::{ConvergeMode, SyncOutcome, converge};
+use crate::push::working_copy::WorkingCopy;
 use crate::repo::if_repo::resolve_full_or_skip;
 use crate::repo::root::{pull_root, resolve_start_path};
 use crate::repo::syns_yaml::{find_repo_root_for, write_syns_yaml};
 use console::style;
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 fn validate_entry_path(path: &str) -> Result<(), CliError> {
@@ -36,6 +37,32 @@ fn safe_join(target_dir: &Path, entry_path: &str) -> Result<PathBuf, CliError> {
     Ok(joined)
 }
 
+/// Write the identity file at the write root where the registered
+/// retrieval would, and only where no identity file stands there.
+fn write_identity_file(
+    repo_arg: &Option<String>,
+    target_dir: &Path,
+    owner: &str,
+    name: &str,
+) -> Result<(), CliError> {
+    // SPEC u255 `cmd_pull` 4: the marker is written after every
+    // fetched path stands and every reconciled removal is taken
+    // (`pull-write-then-delete`), and only where no `.syns.yaml` at or
+    // above the write root already names this repository — otherwise a
+    // retrieval run from `repo/sub/` entrenches `sub/` as a repository
+    // of its own and every later publication from there resolves to it.
+    // SPEC u256: nor over an identity file standing at the write root,
+    // whose declared checks a rewrite would drop.
+    if repo_arg.is_some()
+        && find_repo_root_for(target_dir, owner, name)?.is_none()
+        && !target_dir.join(".syns.yaml").exists()
+    {
+        write_syns_yaml(target_dir, owner, name)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn cmd_pull(
     config: &Config,
     output: &Output,
@@ -43,6 +70,7 @@ pub async fn cmd_pull(
     path_arg: Option<String>,
     version: Option<String>,
     if_repo: bool,
+    overwrite_local: bool,
 ) -> Result<(), CliError> {
     // The directory the identity walk starts at (SPEC u255 `cmd_pull`
     // 1), in ABSOLUTE form — see `resolve_start_path`. This is NOT yet
@@ -85,14 +113,99 @@ pub async fn cmd_pull(
         .flatten();
     let client = SynsClient::new(config.server_url())?;
 
-    let tree_response = if version.is_some() {
-        let (resp, _raw) = client
-            .get_tree(&repo_id, token.as_deref(), None, true, version.as_deref())
-            .await?;
-        resp
-    } else {
-        client.pull(&repo_id, token.as_deref()).await?
+    if let Some(version) = version {
+        return pull_snapshot(
+            output,
+            &client,
+            token.as_deref(),
+            &repo_id,
+            &repo_arg,
+            &target_dir,
+            &owner,
+            &name,
+            &version,
+        )
+        .await;
+    }
+
+    // SPEC u256 `cmd_pull` 3: a retrieval converges, leaving every local
+    // edit standing unless the overwrite option asks otherwise.
+    std::fs::create_dir_all(&target_dir).map_err(|e| CliError::Io {
+        message: format!("could not create target directory: {e}"),
+    })?;
+    let copy = WorkingCopy::open(config.cache_dir(), &owner, &name, &target_dir)?;
+    let outcome = converge(
+        &client,
+        token.as_deref(),
+        &copy,
+        ConvergeMode::Retrieve {
+            overwrite: overwrite_local,
+        },
+        convergence_options(config),
+    )
+    .await?;
+
+    // `cmd_pull` 4
+    write_identity_file(&repo_arg, &target_dir, &owner, &name)?;
+
+    let (written, removed) = match outcome {
+        SyncOutcome::Synced {
+            written, removed, ..
+        } => (written, removed),
+        SyncOutcome::NoChanges => (Vec::new(), Vec::new()),
+        other => return render_outcome(output, Some(&repo_id), other, None),
     };
+
+    if !output.is_json() {
+        render_transfer_lines(&written, &removed);
+    }
+
+    // The local record the registered forced or scoped publication reads
+    // follows the base the convergence recorded.
+    let base = copy.base();
+    if let Some(base) = &base {
+        base.save(config.cache_dir(), &owner, &name)?;
+    }
+    let commit_sha = base.as_ref().and_then(|b| b.commit_sha().map(String::from));
+    let head_count = base.as_ref().map(|b| b.file_paths().count()).unwrap_or(0);
+    let downloaded = written.len();
+    let unchanged = head_count.saturating_sub(downloaded);
+    let deleted = removed.len();
+
+    if output.is_json() {
+        output.json(&json!({
+            "repo": repo_id,
+            "commitSha": commit_sha,
+            "downloaded": downloaded,
+            "unchanged": unchanged,
+            "deleted": deleted,
+        }));
+    } else {
+        output.success(&format!(
+            "Pulled {repo_id}: {downloaded} downloaded, {unchanged} unchanged, {deleted} deleted"
+        ));
+    }
+
+    Ok(())
+}
+
+/// The registered snapshot retrieval at `--version`, unchanged: every
+/// file at that version written, nothing removed, no record kept.
+#[allow(clippy::too_many_arguments)]
+async fn pull_snapshot(
+    output: &Output,
+    client: &SynsClient,
+    token: Option<&str>,
+    repo_id: &str,
+    repo_arg: &Option<String>,
+    target_dir: &Path,
+    owner: &str,
+    name: &str,
+    version: &str,
+) -> Result<(), CliError> {
+    let (tree_response, _raw) = client
+        .get_tree(repo_id, token, None, true, Some(version))
+        .await?;
 
     let server_files: Vec<_> = tree_response
         .entries
@@ -100,46 +213,15 @@ pub async fn cmd_pull(
         .filter(|e| e.entry_type == EntryType::File)
         .collect();
 
-    let mut manifest = Manifest::load(config.cache_dir(), &owner, &name).unwrap_or_default();
-
-    let server_paths: HashSet<String> = server_files.iter().map(|e| e.path.clone()).collect();
-    let mut to_download = Vec::new();
-    let mut unchanged_count: usize = 0;
-
-    for entry in &server_files {
-        if version.is_none()
-            && let Some(server_sha) = &entry.sha
-            && let Some(local_sha) = manifest.file_sha(&entry.path)
-            && server_sha == local_sha
-        {
-            let file_path = safe_join(&target_dir, &entry.path)?;
-            if file_path.exists() {
-                unchanged_count += 1;
-                continue;
-            }
-        }
-        to_download.push(*entry);
-    }
-
-    let to_delete: Vec<String> = if version.is_none() {
-        manifest
-            .file_paths()
-            .filter(|p| !server_paths.contains(*p))
-            .map(|p| p.to_string())
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    std::fs::create_dir_all(&target_dir).map_err(|e| CliError::Io {
+    std::fs::create_dir_all(target_dir).map_err(|e| CliError::Io {
         message: format!("could not create target directory: {e}"),
     })?;
 
-    for entry in &to_download {
+    for entry in &server_files {
         let (response, _raw) = client
-            .get_file(&repo_id, token.as_deref(), &entry.path, version.as_deref())
+            .get_file(repo_id, token, &entry.path, Some(version))
             .await?;
-        let file_path = safe_join(&target_dir, &entry.path)?;
+        let file_path = safe_join(target_dir, &entry.path)?;
         if let Some(parent) = file_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| CliError::Io {
                 message: format!("could not write file {}: {e}", entry.path),
@@ -153,58 +235,21 @@ pub async fn cmd_pull(
         }
     }
 
-    for path in &to_delete {
-        let file_path = safe_join(&target_dir, path)?;
-        match std::fs::remove_file(&file_path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => eprintln!("  warning: could not delete {path}: {e}"),
-        }
-        if !output.is_json() {
-            eprintln!("  {}", style(format!("deleted: {path}")).red());
-        }
-    }
+    write_identity_file(repo_arg, target_dir, owner, name)?;
 
-    // SPEC u255 `cmd_pull` 4: the marker is written after every
-    // fetched path stands and every reconciled removal is taken
-    // (`pull-write-then-delete`), and only where no `.syns.yaml` at or
-    // above the write root already names this repository — otherwise a
-    // retrieval run from `repo/sub/` entrenches `sub/` as a repository
-    // of its own and every later publication from there resolves to it.
-    if repo_arg.is_some() && find_repo_root_for(&target_dir, &owner, &name)?.is_none() {
-        write_syns_yaml(&target_dir, &owner, &name)?;
-    }
-
-    if version.is_none() {
-        let files_map: HashMap<String, String> = server_files
-            .iter()
-            .map(|e| (e.path.clone(), e.sha.clone().unwrap_or_default()))
-            .collect();
-        manifest.update(tree_response.commit_sha.clone(), files_map);
-        manifest.save(config.cache_dir(), &owner, &name)?;
-    }
-
-    let downloaded = to_download.len();
-    let deleted = to_delete.len();
-
+    let downloaded = server_files.len();
     if output.is_json() {
-        let mut summary = json!({
+        output.json(&json!({
             "repo": repo_id,
             "commitSha": tree_response.commit_sha,
             "downloaded": downloaded,
-            "unchanged": unchanged_count,
-            "deleted": deleted,
-        });
-        if let Some(ref v) = version {
-            summary
-                .as_object_mut()
-                .unwrap()
-                .insert("version".into(), json!(v));
-        }
-        output.json(&summary);
+            "unchanged": 0,
+            "deleted": 0,
+            "version": version,
+        }));
     } else {
         output.success(&format!(
-            "Pulled {repo_id}: {downloaded} downloaded, {unchanged_count} unchanged, {deleted} deleted"
+            "Pulled {repo_id}: {downloaded} downloaded, 0 unchanged, 0 deleted"
         ));
     }
 
@@ -283,89 +328,11 @@ mod tests {
         assert!(validate_entry_path("...").is_ok());
     }
 
-    #[test]
-    fn pull_downloads_files_missing_from_disk_despite_manifest_match() {
-        let dir = tempfile::tempdir().unwrap();
-        // Target directory is empty — no files on disk
-
-        let mut manifest = Manifest::default();
-        let files_map: HashMap<String, String> = [
-            ("src/main.rs".to_string(), "abc123".to_string()),
-            ("README.md".to_string(), "def456".to_string()),
-        ]
-        .into_iter()
-        .collect();
-        manifest.update("commit1".to_string(), files_map);
-
-        // Simulated server entries with matching SHAs
-        let server_entries: Vec<(&str, &str)> =
-            vec![("src/main.rs", "abc123"), ("README.md", "def456")];
-
-        let mut to_download = Vec::new();
-        let mut unchanged_count: usize = 0;
-
-        for (path, server_sha) in &server_entries {
-            if let Some(local_sha) = manifest.file_sha(path)
-                && server_sha == &local_sha
-            {
-                let file_path = safe_join(dir.path(), path).unwrap();
-                if file_path.exists() {
-                    unchanged_count += 1;
-                    continue;
-                }
-            }
-            to_download.push(*path);
-        }
-
-        // All files should be in to_download because none exist on disk
-        assert_eq!(to_download.len(), 2);
-        assert_eq!(unchanged_count, 0);
-        assert!(to_download.contains(&"src/main.rs"));
-        assert!(to_download.contains(&"README.md"));
-    }
-
-    #[test]
-    fn pull_skips_files_present_on_disk_with_matching_sha() {
-        let dir = tempfile::tempdir().unwrap();
-        // Create the file on disk
-        std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
-
-        let mut manifest = Manifest::default();
-        let files_map: HashMap<String, String> =
-            [("src/main.rs".to_string(), "abc123".to_string())]
-                .into_iter()
-                .collect();
-        manifest.update("commit1".to_string(), files_map);
-
-        // Simulated server entry with matching SHA
-        let server_entries: Vec<(&str, &str)> = vec![("src/main.rs", "abc123")];
-
-        let mut to_download: Vec<&str> = Vec::new();
-        let mut unchanged_count: usize = 0;
-
-        for (path, server_sha) in &server_entries {
-            if let Some(local_sha) = manifest.file_sha(path)
-                && server_sha == &local_sha
-            {
-                let file_path = safe_join(dir.path(), path).unwrap();
-                if file_path.exists() {
-                    unchanged_count += 1;
-                    continue;
-                }
-            }
-            to_download.push(path);
-        }
-
-        // File exists and SHA matches — should be unchanged
-        assert_eq!(unchanged_count, 1);
-        assert!(to_download.is_empty());
-    }
-
     #[tokio::test]
     #[serial]
     async fn pull_with_if_repo_set_and_identity_resolved_runs_normally() {
         let dir = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(".syns.yaml"),
             "owner: alice\nname: my-project\n",
@@ -373,6 +340,7 @@ mod tests {
         .unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+        unsafe { std::env::set_var("SYNS_CACHE_DIR", cache.path()) };
 
         let mock_server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -393,10 +361,11 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_pull(&config, &output, None, None, None, true).await;
+        let result = cmd_pull(&config, &output, None, None, None, true, false).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+        unsafe { std::env::remove_var("SYNS_CACHE_DIR") };
 
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[tokio::test]
@@ -410,7 +379,7 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_pull(&config, &output, None, None, None, true).await;
+        let result = cmd_pull(&config, &output, None, None, None, true, false).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
@@ -433,9 +402,11 @@ mod tests {
     #[serial]
     async fn pull_with_if_repo_and_positional_owner_name_uses_positional_not_resolver() {
         let dir = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
         // No .syns.yaml — the resolver would miss if it were called.
         std::env::set_current_dir(dir.path()).unwrap();
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+        unsafe { std::env::set_var("SYNS_CACHE_DIR", cache.path()) };
 
         let mock_server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -462,9 +433,11 @@ mod tests {
             None,
             None,
             true,
+            false,
         )
         .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+        unsafe { std::env::remove_var("SYNS_CACHE_DIR") };
 
         assert!(result.is_ok(), "cmd_pull returned: {result:?}");
         let requests = mock_server.received_requests().await.unwrap();
@@ -503,7 +476,7 @@ mod tests {
         // repo_arg = None, path_arg = None, version = None, if_repo = true.
         // Reaches resolve_full_or_skip, which under u252 emits skip via the
         // narrowed resolve_or_skip and returns Ok(None).
-        let result = cmd_pull(&config, &output, None, None, None, true).await;
+        let result = cmd_pull(&config, &output, None, None, None, true, false).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         // AC7 representative: a pull from a directory whose only identity source

@@ -5,15 +5,21 @@ use clap::Args;
 use crate::auth::token::TokenStore;
 use crate::client::{PushResponse, SynsClient};
 use crate::commands::repo::{CliRepoStatus, CliVisibility};
+use crate::commands::sync::{
+    ensure_identity_file, provenance_from_env, render_outcome, render_transfer_lines,
+};
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
 use crate::push::collector::{SkippedFile, write_skip_summary};
+use crate::push::converge::{ConvergeMode, SyncOutcome, converge};
 use crate::push::smart::{PushPipelineMeta, SmartPushOptions, smart_push};
+use crate::push::working_copy::WorkingCopy;
 use crate::repo::if_repo::resolve_or_skip;
 use crate::repo::root::{push_scope, resolve_start_path};
 
-const DEFAULT_COMMIT_MESSAGE: &str = "push";
+/// The message a publication carries where the invocation names none.
+pub(crate) const DEFAULT_COMMIT_MESSAGE: &str = "push";
 const SHORT_SHA_LENGTH: usize = 8;
 
 #[derive(Args, Debug)]
@@ -131,12 +137,13 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
     let message = args
         .message
         .clone()
+        .filter(|message| !message.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_COMMIT_MESSAGE.to_string());
 
     let opts = SmartPushOptions {
         force: args.force,
         message,
-        author: owner.clone(),
+        author: Some(owner.clone()),
         parent_sha: None,
         excludes: args.exclude.clone(),
         cache_dir: config.cache_dir().to_path_buf(),
@@ -153,6 +160,9 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
         debug: args.debug,
         no_default_excludes: args.no_default_excludes,
         prefix: scope.prefix.clone(),
+        reference: None,
+        expected: None,
+        provenance: provenance_from_env(),
     };
 
     let client = match client {
@@ -160,18 +170,102 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
         None => SynsClient::new(config.server_url())?,
     };
 
-    // CODE_REVIEW M3 / H2: the per-category breakdown for
-    // `PushPartial` is now rendered inside `Display for
-    // CliError::PushPartial` (SPEC § 7 — headline-then-detail order
-    // structurally enforced). In `--json` mode, `Output::format_error`
-    // short-circuits through `CliError::json_value` to the structured
-    // wire form before any prose reaches the output stream — no
-    // separate intercept site needed.
-    let (response, raw, meta) = smart_push(&client, &token, &repo_id, &scope.root, opts).await?;
+    let copy = WorkingCopy::open(config.cache_dir(), &owner, &name, &scope.root)?;
 
-    format_response(output, &response, &raw, &repo_id, &meta);
+    if args.force || args.path.is_some() {
+        // SPEC u256 `cmd_push` 2: a forced or path-scoped publication
+        // would publish past a resolution nobody reviewed.
+        if let Some(resolution) = copy.resolution()? {
+            return render_outcome(
+                output,
+                Some(&repo_id),
+                SyncOutcome::ResolutionRequired(resolution),
+                None,
+            );
+        }
 
-    Ok(())
+        // `cmd_push` 3 — the registered publication, unchanged.
+        //
+        // CODE_REVIEW M3 / H2: the per-category breakdown for
+        // `PushPartial` is now rendered inside `Display for
+        // CliError::PushPartial` (SPEC § 7 — headline-then-detail order
+        // structurally enforced). In `--json` mode,
+        // `Output::format_error` short-circuits through
+        // `CliError::json_value` to the structured wire form before any
+        // prose reaches the output stream — no separate intercept site
+        // needed.
+        let (response, raw, meta) =
+            smart_push(&client, &token, &repo_id, &scope.root, opts).await?;
+        lay_publication_over_base(&copy, &response, &meta);
+        format_response(output, &response, &raw, &repo_id, &meta);
+        return Ok(());
+    }
+
+    // `cmd_push` 4 — a bare publication converges.
+    ensure_identity_file(&copy.root, &owner, &name)?;
+    let outcome = converge(&client, Some(&token), &copy, ConvergeMode::Publish, opts).await?;
+    match outcome {
+        SyncOutcome::Synced {
+            written,
+            removed,
+            published: Some((response, raw, meta)),
+        } => {
+            if !output.is_json() {
+                render_transfer_lines(&written, &removed);
+            }
+            format_response(output, &response, &raw, &repo_id, &meta);
+            Ok(())
+        }
+        outcome @ (SyncOutcome::Synced { .. } | SyncOutcome::NoChanges) if output.is_json() => {
+            render_outcome(output, Some(&repo_id), outcome, None)
+        }
+        SyncOutcome::Synced {
+            written, removed, ..
+        } => {
+            render_transfer_lines(&written, &removed);
+            output.success(&format!("No changes — {repo_id} is up to date"));
+            Ok(())
+        }
+        SyncOutcome::NoChanges => {
+            output.success(&format!("No changes — {repo_id} is up to date"));
+            Ok(())
+        }
+        other => render_outcome(output, Some(&repo_id), other, None),
+    }
+}
+
+/// SPEC u256 `cmd_push` 3: where the working copy's base names the
+/// parent a forced or scoped publication sent, record the acknowledged
+/// commit as the base with the collected set laid over it and the named
+/// deletions taken out, so the next bare publication does not read the
+/// copy's own commit as a moved head. A `--force` run sends no parent and
+/// leaves the base alone; a failed write leaves it as it stood.
+fn lay_publication_over_base(copy: &WorkingCopy, response: &PushResponse, meta: &PushPipelineMeta) {
+    if response.commit_sha.is_empty() {
+        return;
+    }
+    let Ok(_lock) = copy.lock() else {
+        return;
+    };
+    let Some(base) = copy.base() else {
+        return;
+    };
+    if base.commit_sha().is_none() || base.commit_sha() != meta.sent_parent.as_deref() {
+        return;
+    }
+    let mut files: std::collections::HashMap<String, String> = base
+        .file_paths()
+        .filter_map(|p| base.file_sha(p).map(|s| (p.to_string(), s.to_string())))
+        .collect();
+    for path in &meta.deleted {
+        files.remove(path);
+    }
+    for (path, sha) in &meta.collected {
+        files.insert(path.clone(), sha.clone());
+    }
+    if let Err(err) = copy.record_base(&response.commit_sha, files) {
+        eprintln!("warning: could not record the working copy base: {err}");
+    }
 }
 
 /// Build the JSON envelope for `--json` mode: the verbatim server
@@ -657,6 +751,7 @@ mod tests {
             tags: None,
             status: None,
             visibility: None,
+            provenance: None,
         };
         let (typed, raw) = client
             .push("alice/my-project", "test-token", &request)

@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::client::{
-    EntryType, PushDeleteEntry, PushFileEntry, PushRequest, PushResponse, RepoStatus, SynsClient,
-    TreeResponse, Visibility,
+    EntryType, PushDeleteEntry, PushFileEntry, PushProvenance, PushRequest, PushResponse,
+    RepoStatus, SynsClient, TreeResponse, Visibility,
 };
 use crate::errors::CliError;
 use crate::push::collector::{
@@ -19,10 +19,13 @@ use crate::repo::syns_yaml::{find_repo_root_for, write_syns_yaml};
 /// the four u213 push-feedback flags (`strict`, `allow_empty`,
 /// `debug`, `no_default_excludes`). See SPEC u213 § 3.2 for the
 /// per-flag semantics.
+#[derive(Clone)]
 pub struct SmartPushOptions {
     pub force: bool,
     pub message: String,
-    pub author: String,
+    /// The `author` key every request carries; `None` sends no key, so
+    /// the session's own user is the author (SPEC u256, `D-065`).
+    pub author: Option<String>,
     pub parent_sha: Option<String>,
     pub excludes: Vec<String>,
     pub cache_dir: PathBuf,
@@ -57,6 +60,21 @@ pub struct SmartPushOptions {
     /// confines two things and nothing else: what the collector walks,
     /// and which reference paths may be named as deletions.
     pub prefix: Option<String>,
+    /// The reference set a convergence hands the pipeline (SPEC u256
+    /// § Contract Surface). Where set it stands in for the local record
+    /// AND for the `EP-tree` read, as the reference set and as the
+    /// source of the parent alike: `parent_sha` alone names the parent,
+    /// deletions are named against this map alone, and the record
+    /// written afterwards is the collected set alone.
+    pub reference: Option<HashMap<String, String>>,
+    /// Where set, a collected set whose file hashes differ from this map
+    /// is refused with `CliError::CollectedSetChanged` before any request
+    /// leaves — what keeps a write landing after a review from being
+    /// published unreviewed.
+    pub expected: Option<HashMap<String, String>>,
+    /// The provenance block every request of this publication carries,
+    /// each chunk batch and the missing-blobs retry included.
+    pub provenance: Option<PushProvenance>,
 }
 
 /// Metadata threaded from `smart_push` to `format_response` so the
@@ -68,6 +86,12 @@ pub struct PushPipelineMeta {
     pub manifest_existed: bool,
     pub strict: bool,
     pub no_default_excludes: bool,
+    /// The parent the run's first request carried.
+    pub sent_parent: Option<String>,
+    /// The file hashes the run collected.
+    pub collected: HashMap<String, String>,
+    /// The paths the run named as deletions.
+    pub deleted: Vec<String>,
 }
 
 /// Per-batch JSON-body budget for the auto-chunker. Set to leave
@@ -96,7 +120,7 @@ fn split_repo_id(repo_id: &str) -> Result<(&str, &str), CliError> {
     })
 }
 
-fn tree_to_sha_map(tree: &TreeResponse) -> HashMap<String, String> {
+pub(crate) fn tree_to_sha_map(tree: &TreeResponse) -> HashMap<String, String> {
     tree.entries
         .iter()
         .filter(|e| e.entry_type == EntryType::File && e.sha.is_some())
@@ -275,6 +299,7 @@ async fn chunked_push(
             tags: base_request.tags.clone(),
             status: base_request.status.clone(),
             visibility: base_request.visibility.clone(),
+            provenance: base_request.provenance.clone(),
         };
         if estimate_body_bytes(&probe) > CHUNK_BUDGET_BYTES && batches.last().unwrap().len() > 1 {
             // Over budget — pop and seed a new batch with this entry.
@@ -310,6 +335,7 @@ async fn chunked_push(
             tags: base_request.tags.clone(),
             status: base_request.status.clone(),
             visibility: base_request.visibility.clone(),
+            provenance: base_request.provenance.clone(),
         };
         return match client.push(repo_id, token, &request).await {
             Ok(ok) => Ok(ok),
@@ -366,6 +392,7 @@ async fn chunked_push(
             tags: base_request.tags.clone(),
             status: base_request.status.clone(),
             visibility: base_request.visibility.clone(),
+            provenance: base_request.provenance.clone(),
         };
 
         // Progress line — matches existing smart.rs stderr-progress convention.
@@ -505,7 +532,16 @@ pub async fn smart_push(
     // names `alice/proj`, from overwriting that marker: the walk-up
     // test answers `None` on the pair mismatch and would otherwise
     // let the write through, re-identifying the whole tree.
-    if find_repo_root_for(path, owner, name)?.is_none() && !path.join(".syns.yaml").exists() {
+    //
+    // A convergence's publication (`reference` set) writes no marker: the
+    // folder it sends is the one its reviewer recorded, and a marker
+    // written here would land after that record and be refused by the
+    // `expected` guard below — the command handlers write it before the
+    // convergence collects instead (SPEC u256).
+    if opts.reference.is_none()
+        && find_repo_root_for(path, owner, name)?.is_none()
+        && !path.join(".syns.yaml").exists()
+    {
         write_syns_yaml(path, owner, name)?;
     }
 
@@ -543,48 +579,82 @@ pub async fn smart_push(
         .map(|(p, content)| (p.clone(), blob_sha1(content)))
         .collect();
 
-    // Phase 3b — Load manifest unconditionally (so `manifest_existed`
-    // is set even when --force bypasses the reference state from it).
-    let loaded_manifest = Manifest::load(&opts.cache_dir, owner, name);
-    let manifest_existed = loaded_manifest.is_some();
-    let record_from_manifest: Option<(HashMap<String, String>, Option<String>)> = loaded_manifest
-        .map(|manifest| {
-            let shas: HashMap<String, String> = manifest
-                .file_paths()
-                .filter_map(|p| {
-                    manifest
-                        .file_sha(p)
-                        .map(|sha| (p.to_string(), sha.to_string()))
-                })
-                .collect();
-            let parent = manifest.commit_sha().map(String::from);
-            (shas, parent)
-        });
+    // Phase 3a' — the expected-set guard (SPEC u256
+    // `SmartPushOptions.expected`). A convergence records the folder it
+    // reviewed; a write landing since is refused here, before any
+    // request, rather than published unreviewed.
+    if let Some(expected) = &opts.expected {
+        let mut differing: Vec<String> = local_shas
+            .iter()
+            .filter(|(path, sha)| expected.get(*path) != Some(*sha))
+            .map(|(path, _)| path.clone())
+            .chain(
+                expected
+                    .keys()
+                    .filter(|path| !local_shas.contains_key(*path))
+                    .cloned(),
+            )
+            .collect();
+        if !differing.is_empty() {
+            differing.sort();
+            return Err(CliError::CollectedSetChanged { paths: differing });
+        }
+    }
 
-    // Phase 3c — the record as it stood when the run began (SPEC u255
-    // `smart_push` 7). Phase 6 lays the collected set over THIS map,
-    // which is what keeps a scoped publication's record naming the
-    // whole tree rather than just its scope.
-    //
-    // Where no local record loads — a checkout that has never written
-    // one, or `--force` having discarded it — the remote path set
-    // through `EP-tree` is the base instead. The extra request on that
-    // path is deliberate: a `--force` scoped publication with no
-    // record on disk is the one corner that would otherwise rewrite
-    // the record from the scope alone and hand the NEXT bare
-    // publication a deletion for every out-of-scope path.
-    let (record_base, remote_parent_sha) = match &record_from_manifest {
-        Some((shas, parent)) => (shas.clone(), parent.clone()),
-        None => match client.pull(repo_id, Some(token)).await {
-            Ok(tree) => {
-                let parent = Some(tree.commit_sha.clone());
-                (tree_to_sha_map(&tree), parent)
-            }
-            Err(CliError::Api {
-                status: Some(404), ..
-            }) => (HashMap::new(), None),
-            Err(e) => return Err(e),
-        },
+    // Phase 3b / 3c — the record as it stood when the run began (SPEC
+    // u255 `smart_push` 7), and the parent it names. A convergence's
+    // `reference` stands in for both reads (SPEC u256), so neither the
+    // local record nor `EP-tree` is consulted and only `parent_sha`
+    // names a parent.
+    let (manifest_existed, record_base, remote_parent_sha) = match &opts.reference {
+        Some(reference) => (!reference.is_empty(), reference.clone(), None),
+        None => {
+            // Phase 3b — Load manifest unconditionally (so
+            // `manifest_existed` is set even when --force bypasses the
+            // reference state from it).
+            let loaded_manifest = Manifest::load(&opts.cache_dir, owner, name);
+            let manifest_existed = loaded_manifest.is_some();
+            let record_from_manifest: Option<(HashMap<String, String>, Option<String>)> =
+                loaded_manifest.map(|manifest| {
+                    let shas: HashMap<String, String> = manifest
+                        .file_paths()
+                        .filter_map(|p| {
+                            manifest
+                                .file_sha(p)
+                                .map(|sha| (p.to_string(), sha.to_string()))
+                        })
+                        .collect();
+                    let parent = manifest.commit_sha().map(String::from);
+                    (shas, parent)
+                });
+
+            // Phase 3c — Phase 6 lays the collected set over THIS map,
+            // which is what keeps a scoped publication's record naming
+            // the whole tree rather than just its scope.
+            //
+            // Where no local record loads — a checkout that has never
+            // written one, or `--force` having discarded it — the remote
+            // path set through `EP-tree` is the base instead. The extra
+            // request on that path is deliberate: a `--force` scoped
+            // publication with no record on disk is the one corner that
+            // would otherwise rewrite the record from the scope alone
+            // and hand the NEXT bare publication a deletion for every
+            // out-of-scope path.
+            let (record_base, remote_parent_sha) = match &record_from_manifest {
+                Some((shas, parent)) => (shas.clone(), parent.clone()),
+                None => match client.pull(repo_id, Some(token)).await {
+                    Ok(tree) => {
+                        let parent = Some(tree.commit_sha.clone());
+                        (tree_to_sha_map(&tree), parent)
+                    }
+                    Err(CliError::Api {
+                        status: Some(404), ..
+                    }) => (HashMap::new(), None),
+                    Err(e) => return Err(e),
+                },
+            };
+            (manifest_existed, record_base, remote_parent_sha)
+        }
     };
 
     // Phase 3d — Build reference state: the diff base the wire payload
@@ -658,13 +728,15 @@ pub async fn smart_push(
         files: entries,
         deletions,
         message: Some(opts.message.clone()),
-        author: Some(opts.author.clone()),
+        author: opts.author.clone(),
         parent_sha,
         description: opts.description.clone(),
         tags: opts.tags.clone(),
         status: opts.status.clone(),
         visibility: opts.visibility.clone(),
+        provenance: opts.provenance.clone(),
     };
+    let sent_parent = request.parent_sha.clone();
 
     // Phase 5 — Submit (with pre-flight chunker, 409 missing_blobs retry,
     // and 413 fallback chunker per SPEC u225 § 4).
@@ -712,6 +784,7 @@ pub async fn smart_push(
                     tags: request.tags.clone(),
                     status: request.status.clone(),
                     visibility: request.visibility.clone(),
+                    provenance: request.provenance.clone(),
                 };
                 if estimate_body_bytes(&retry_request) > CHUNK_BUDGET_BYTES {
                     chunked_push(
@@ -761,11 +834,13 @@ pub async fn smart_push(
              (this typically indicates that no files were uploaded — see `syns push --debug`)"
         );
     } else {
+        let record = if opts.reference.is_some() {
+            local_shas.clone()
+        } else {
+            merged_record(&record_base, &deleted_paths, &local_shas)
+        };
         let mut manifest = Manifest::default();
-        manifest.update(
-            response.commit_sha.clone(),
-            merged_record(&record_base, &deleted_paths, &local_shas),
-        );
+        manifest.update(response.commit_sha.clone(), record);
         if let Err(e) = manifest.save(&opts.cache_dir, owner, name) {
             eprintln!("warning: could not save manifest (next push will re-upload all files): {e}");
         }
@@ -780,6 +855,9 @@ pub async fn smart_push(
             manifest_existed,
             strict: opts.strict,
             no_default_excludes: opts.no_default_excludes,
+            sent_parent,
+            collected: local_shas,
+            deleted: deleted_paths,
         },
     ))
 }
@@ -831,7 +909,7 @@ mod tests {
             SmartPushOptions {
                 force: false,
                 message: "init".into(),
-                author: "alice".into(),
+                author: Some("alice".into()),
                 parent_sha: None,
                 excludes: vec![],
                 cache_dir: cache_dir.path().to_path_buf(),
@@ -844,6 +922,9 @@ mod tests {
                 debug: false,
                 no_default_excludes: false,
                 prefix: None,
+                reference: None,
+                expected: None,
+                provenance: None,
             },
         )
         .await;
@@ -931,7 +1012,7 @@ mod tests {
             SmartPushOptions {
                 force: false,
                 message: "update".into(),
-                author: "bob".into(),
+                author: Some("bob".into()),
                 parent_sha: None,
                 excludes: vec![],
                 cache_dir: cache_dir.path().to_path_buf(),
@@ -944,6 +1025,9 @@ mod tests {
                 debug: false,
                 no_default_excludes: false,
                 prefix: None,
+                reference: None,
+                expected: None,
+                provenance: None,
             },
         )
         .await;
@@ -1013,7 +1097,7 @@ mod tests {
             SmartPushOptions {
                 force: false,
                 message: "delete".into(),
-                author: "owner".into(),
+                author: Some("owner".into()),
                 parent_sha: None,
                 excludes: vec![],
                 cache_dir: cache_dir.path().to_path_buf(),
@@ -1026,6 +1110,9 @@ mod tests {
                 debug: false,
                 no_default_excludes: false,
                 prefix: None,
+                reference: None,
+                expected: None,
+                provenance: None,
             },
         )
         .await;
@@ -1114,7 +1201,7 @@ mod tests {
             SmartPushOptions {
                 force: false,
                 message: "retry".into(),
-                author: "owner".into(),
+                author: Some("owner".into()),
                 parent_sha: None,
                 excludes: vec![],
                 cache_dir: cache_dir.path().to_path_buf(),
@@ -1127,6 +1214,9 @@ mod tests {
                 debug: false,
                 no_default_excludes: false,
                 prefix: None,
+                reference: None,
+                expected: None,
+                provenance: None,
             },
         )
         .await;
@@ -1208,7 +1298,7 @@ mod tests {
             SmartPushOptions {
                 force: true,
                 message: "force".into(),
-                author: "owner".into(),
+                author: Some("owner".into()),
                 parent_sha: None,
                 excludes: vec![],
                 cache_dir: cache_dir.path().to_path_buf(),
@@ -1221,6 +1311,9 @@ mod tests {
                 debug: false,
                 no_default_excludes: false,
                 prefix: None,
+                reference: None,
+                expected: None,
+                provenance: None,
             },
         )
         .await;
@@ -1258,7 +1351,7 @@ mod tests {
         SmartPushOptions {
             force: false,
             message: "msg".into(),
-            author: "alice".into(),
+            author: Some("alice".into()),
             parent_sha: None,
             excludes: vec![],
             cache_dir: cache,
@@ -1271,6 +1364,9 @@ mod tests {
             debug: false,
             no_default_excludes: false,
             prefix: None,
+            reference: None,
+            expected: None,
+            provenance: None,
         }
     }
 
@@ -1625,7 +1721,7 @@ mod tests {
             SmartPushOptions {
                 force: false,
                 message: "init".into(),
-                author: "alice".into(),
+                author: Some("alice".into()),
                 parent_sha: None,
                 excludes: vec![],
                 cache_dir: cache_dir.path().to_path_buf(),
@@ -1638,6 +1734,9 @@ mod tests {
                 debug: false,
                 no_default_excludes: false,
                 prefix: None,
+                reference: None,
+                expected: None,
+                provenance: None,
             },
         )
         .await;
@@ -1747,7 +1846,7 @@ mod tests {
             SmartPushOptions {
                 force: false,
                 message: "init".into(),
-                author: "alice".into(),
+                author: Some("alice".into()),
                 parent_sha: None,
                 excludes: vec![".syns.yaml".into()],
                 cache_dir: cache_dir.path().to_path_buf(),
@@ -1760,6 +1859,9 @@ mod tests {
                 debug: false,
                 no_default_excludes: false,
                 prefix: None,
+                reference: None,
+                expected: None,
+                provenance: None,
             },
         )
         .await;
@@ -1876,7 +1978,7 @@ mod tests {
             SmartPushOptions {
                 force: false,
                 message: "retry-upgrade".into(),
-                author: "charlie".into(),
+                author: Some("charlie".into()),
                 parent_sha: None,
                 excludes: vec![".syns.yaml".into()],
                 cache_dir: cache_dir.path().to_path_buf(),
@@ -1889,6 +1991,9 @@ mod tests {
                 debug: false,
                 no_default_excludes: false,
                 prefix: None,
+                reference: None,
+                expected: None,
+                provenance: None,
             },
         )
         .await;
@@ -2010,7 +2115,7 @@ mod tests {
             SmartPushOptions {
                 force: false,
                 message: "partial-fail".into(),
-                author: "dave".into(),
+                author: Some("dave".into()),
                 parent_sha: None,
                 excludes: vec![".syns.yaml".into()],
                 cache_dir: cache_dir.path().to_path_buf(),
@@ -2023,6 +2128,9 @@ mod tests {
                 debug: false,
                 no_default_excludes: false,
                 prefix: None,
+                reference: None,
+                expected: None,
+                provenance: None,
             },
         )
         .await;
@@ -2100,6 +2208,203 @@ mod tests {
         let mut paths: Vec<&str> = deletes.iter().map(|d| d.path.as_str()).collect();
         paths.sort_unstable();
         assert_eq!(paths, vec!["root-a.md", "sub/nested.md"]);
+    }
+
+    // ---- u256: reference, expected, author, provenance --------------
+
+    async fn mount_ok_push(mock_server: &MockServer, repo: &str, sha: &str) {
+        Mock::given(method("PUT"))
+            .and(path(format!("/api/v1/repos/{repo}/push")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "commitSha": sha,
+                "version": 2,
+                "filesChanged": 1,
+                "created": false
+            })))
+            .mount(mock_server)
+            .await;
+    }
+
+    async fn put_bodies(mock_server: &MockServer) -> Vec<serde_json::Value> {
+        mock_server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method == reqwest::Method::PUT)
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn reference_names_the_parent_and_deletions_alone() {
+        let mock_server = MockServer::start().await;
+        mount_ok_push(&mock_server, "alice/repo", "new-sha").await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp_dir.path().join(".syns.yaml"),
+            "owner: alice\nname: repo\n",
+        )
+        .unwrap();
+        std::fs::write(temp_dir.path().join("a.txt"), "a").unwrap();
+
+        // A local record naming another parent and another deletion set,
+        // which a set reference must leave unread.
+        let cache_dir = tempfile::tempdir().unwrap();
+        let mut manifest = Manifest::default();
+        manifest.update(
+            "record-sha".into(),
+            HashMap::from([("record-only.txt".into(), "x".into())]),
+        );
+        manifest.save(cache_dir.path(), "alice", "repo").unwrap();
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let mut opts = opts_with(cache_dir.path().to_path_buf(), false, false);
+        opts.parent_sha = Some("parent-sha".into());
+        opts.reference = Some(HashMap::from([
+            ("a.txt".into(), blob_sha1(b"a")),
+            ("gone.txt".into(), "g".into()),
+        ]));
+        let (_response, _raw, meta) =
+            smart_push(&client, "t", "alice/repo", temp_dir.path(), opts.clone())
+                .await
+                .unwrap();
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert!(
+            requests.iter().all(|r| r.method == reqwest::Method::PUT),
+            "a set reference must stand in for the tree read"
+        );
+        let body = &put_bodies(&mock_server).await[0];
+        assert_eq!(body["parentSha"], "parent-sha");
+        let deletions: Vec<&str> = body["deletions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(deletions, vec!["gone.txt"]);
+        assert_eq!(meta.sent_parent.as_deref(), Some("parent-sha"));
+        assert_eq!(meta.deleted, vec!["gone.txt".to_string()]);
+        assert_eq!(meta.collected.get("a.txt"), Some(&blob_sha1(b"a")));
+
+        let record = Manifest::load(cache_dir.path(), "alice", "repo").unwrap();
+        assert_eq!(record.commit_sha(), Some("new-sha"));
+        assert!(record.file_sha("record-only.txt").is_none());
+        assert!(record.file_sha("gone.txt").is_none());
+        assert!(record.file_sha("a.txt").is_some());
+
+        // No parent named: none is sent, whatever the record held.
+        let second = MockServer::start().await;
+        mount_ok_push(&second, "alice/repo", "other-sha").await;
+        let client = SynsClient::new(&second.uri()).unwrap();
+        opts.parent_sha = None;
+        smart_push(&client, "t", "alice/repo", temp_dir.path(), opts)
+            .await
+            .unwrap();
+        let body = &put_bodies(&second).await[0];
+        assert!(body.get("parentSha").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn expected_mismatch_refuses_before_any_request() {
+        let mock_server = MockServer::start().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp_dir.path().join(".syns.yaml"),
+            "owner: alice\nname: repo\n",
+        )
+        .unwrap();
+        std::fs::write(temp_dir.path().join("a.txt"), "late write").unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+
+        let mut opts = opts_with(cache_dir.path().to_path_buf(), false, false);
+        opts.reference = Some(HashMap::new());
+        opts.expected = Some(HashMap::from([
+            (
+                ".syns.yaml".into(),
+                blob_sha1(b"owner: alice\nname: repo\n"),
+            ),
+            ("a.txt".into(), blob_sha1(b"reviewed")),
+            ("removed.txt".into(), "r".into()),
+        ]));
+        let result = smart_push(&client, "t", "alice/repo", temp_dir.path(), opts).await;
+
+        match result {
+            Err(CliError::CollectedSetChanged { paths }) => {
+                assert_eq!(paths, vec!["a.txt".to_string(), "removed.txt".to_string()]);
+            }
+            other => panic!("expected CollectedSetChanged, got {other:?}"),
+        }
+        assert!(mock_server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn absent_author_sends_no_author_key() {
+        let mock_server = MockServer::start().await;
+        mount_ok_push(&mock_server, "alice/repo", "sha").await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp_dir.path().join(".syns.yaml"),
+            "owner: alice\nname: repo\n",
+        )
+        .unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+
+        let mut opts = opts_with(cache_dir.path().to_path_buf(), false, false);
+        opts.author = None;
+        opts.reference = Some(HashMap::new());
+        smart_push(&client, "t", "alice/repo", temp_dir.path(), opts)
+            .await
+            .unwrap();
+
+        let body = &put_bodies(&mock_server).await[0];
+        assert!(body.get("author").is_none(), "{body}");
+        assert!(body.get("provenance").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn provenance_rides_every_chunked_batch() {
+        let mock_server = MockServer::start().await;
+        mount_ok_push(&mock_server, "alice/repo", "chunk-sha").await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp_dir.path().join("big1.txt"),
+            vec![b'a'; 14 * 1024 * 1024],
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir.path().join("big2.txt"),
+            vec![b'b'; 14 * 1024 * 1024],
+        )
+        .unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+
+        let mut opts = opts_with(cache_dir.path().to_path_buf(), false, false);
+        opts.excludes = vec![".syns.yaml".into()];
+        opts.reference = Some(HashMap::new());
+        opts.provenance = Some(PushProvenance {
+            integration: "codex".into(),
+            run: "run-7".into(),
+            trigger: "stop".into(),
+            task_ref: None,
+        });
+        smart_push(&client, "t", "alice/repo", temp_dir.path(), opts)
+            .await
+            .unwrap();
+
+        let bodies = put_bodies(&mock_server).await;
+        assert_eq!(bodies.len(), 2, "two batches expected");
+        for body in &bodies {
+            assert_eq!(
+                body["provenance"],
+                serde_json::json!({"integration": "codex", "run": "run-7", "trigger": "stop"})
+            );
+        }
     }
 
     #[test]

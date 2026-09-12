@@ -11,6 +11,21 @@ const SYNS_YAML_FILENAME: &str = ".syns.yaml";
 struct SynsYaml {
     owner: String,
     name: String,
+    /// The commands a reviewed publication must pass (SPEC u256 Q-04),
+    /// none where the file declares none. An older binary reads a file
+    /// carrying them unchanged, extra keys being tolerated.
+    #[serde(default)]
+    checks: Vec<String>,
+}
+
+/// The required checks the identity file standing at `root` declares,
+/// none where no identity file stands there or it declares none.
+pub fn read_required_checks(root: &Path) -> Result<Vec<String>, CliError> {
+    let file_path = root.join(SYNS_YAML_FILENAME);
+    if !file_path.is_file() {
+        return Ok(Vec::new());
+    }
+    Ok(parse_syns_yaml(&file_path)?.checks)
 }
 
 fn find_syns_yaml(path: &Path) -> Option<PathBuf> {
@@ -192,6 +207,33 @@ mod tests {
                 owner: Some("alice".into()),
                 name: "my-repo".into(),
             })
+        );
+    }
+
+    #[test]
+    fn read_required_checks_answers_the_declared_list_and_none_where_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_required_checks(dir.path()).unwrap().is_empty());
+
+        fs::write(dir.path().join(".syns.yaml"), "owner: alice\nname: proj\n").unwrap();
+        assert!(read_required_checks(dir.path()).unwrap().is_empty());
+
+        fs::write(
+            dir.path().join(".syns.yaml"),
+            "owner: alice\nname: proj\nchecks:\n  - make lint\n  - ./scripts/verify.sh --fast\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_required_checks(dir.path()).unwrap(),
+            vec![
+                "make lint".to_string(),
+                "./scripts/verify.sh --fast".to_string()
+            ]
+        );
+        assert_eq!(
+            read_syns_yaml(dir.path()).unwrap().unwrap().name,
+            "proj",
+            "an identity file carrying checks still resolves"
         );
     }
 

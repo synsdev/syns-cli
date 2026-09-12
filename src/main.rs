@@ -5,6 +5,7 @@ use syns_cli::commands::collaborators::CollaboratorsAction;
 use syns_cli::commands::push::PushArgs;
 use syns_cli::commands::repo::{CliRepoStatus, CliVisibility, RepoAction};
 use syns_cli::commands::repos::ReposArgs;
+use syns_cli::commands::sync::ResolutionAction;
 use syns_cli::commands::teams::TeamsAction;
 use syns_cli::commands::upgrade::UpgradeArgs;
 
@@ -45,6 +46,20 @@ enum Commands {
         /// Silently skip (exit 0) when no Syns repo identity resolves
         #[arg(long)]
         if_repo: bool,
+        /// Rewrite local edits with the repository head (a snapshot of each is kept)
+        #[arg(long)]
+        overwrite: bool,
+    },
+    /// Converge this working copy with the repository head, publishing reviewed local work
+    Sync {
+        /// Silently skip (exit 0) when no Syns repo identity resolves
+        #[arg(long)]
+        if_repo: bool,
+    },
+    /// Show, continue or discard a pending resolution
+    Resolution {
+        #[command(subcommand)]
+        action: ResolutionCommand,
     },
     /// List files in a repository
     Ls {
@@ -190,6 +205,28 @@ enum Commands {
     Whoami {},
 }
 
+#[derive(Subcommand)]
+enum ResolutionCommand {
+    /// Show the pending resolution: both commits, the changed paths, the markers left and the snapshots
+    Show {
+        /// Silently skip (exit 0) when no Syns repo identity resolves
+        #[arg(long)]
+        if_repo: bool,
+    },
+    /// Publish the folder as it stands as the reviewed resolution
+    Continue {
+        /// Silently skip (exit 0) when no Syns repo identity resolves
+        #[arg(long)]
+        if_repo: bool,
+    },
+    /// Put the folder back as it stood before the resolution rewrote it
+    Discard {
+        /// Silently skip (exit 0) when no Syns repo identity resolves
+        #[arg(long)]
+        if_repo: bool,
+    },
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -223,7 +260,20 @@ async fn run(
             path,
             version,
             if_repo,
-        } => commands::pull::cmd_pull(config, output, repo, path, version, if_repo).await?,
+            overwrite,
+        } => {
+            commands::pull::cmd_pull(config, output, repo, path, version, if_repo, overwrite)
+                .await?
+        }
+        Commands::Sync { if_repo } => commands::sync::cmd_sync(config, output, if_repo).await?,
+        Commands::Resolution { action } => {
+            let (action, if_repo) = match action {
+                ResolutionCommand::Show { if_repo } => (ResolutionAction::Show, if_repo),
+                ResolutionCommand::Continue { if_repo } => (ResolutionAction::Continue, if_repo),
+                ResolutionCommand::Discard { if_repo } => (ResolutionAction::Discard, if_repo),
+            };
+            commands::sync::cmd_resolution(config, output, action, if_repo).await?
+        }
         Commands::Ls { path, if_repo } => {
             commands::ls::cmd_ls(config, output, path, if_repo).await?
         }

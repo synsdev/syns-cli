@@ -111,6 +111,38 @@ pub struct PushRequest {
     pub status: Option<RepoStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub visibility: Option<Visibility>,
+    /// What the publication asserts about where it came from; absent
+    /// where nothing is asserted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<PushProvenance>,
+}
+
+/// The provenance block a publication asserts: all three required
+/// fields or no block at all, the task reference left out rather than
+/// sent as null.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PushProvenance {
+    pub integration: String,
+    pub run: String,
+    pub trigger: String,
+    #[serde(rename = "taskRef", skip_serializing_if = "Option::is_none", default)]
+    pub task_ref: Option<String>,
+}
+
+/// A commit's recorded provenance, as the version list and the file
+/// history answer it.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitProvenance {
+    pub publisher: String,
+    #[serde(default)]
+    pub integration: Option<String>,
+    #[serde(default)]
+    pub run: Option<String>,
+    #[serde(default)]
+    pub trigger: Option<String>,
+    #[serde(default)]
+    pub task_ref: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -238,6 +270,8 @@ pub struct FileVersionEntry {
     pub created_at: String,
     pub content: String,
     pub diff: Option<String>,
+    #[serde(default)]
+    pub provenance: Option<CommitProvenance>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -293,6 +327,8 @@ pub struct VersionEntry {
     pub author: String,
     pub created_at: String,
     pub files_changed: Vec<String>,
+    #[serde(default)]
+    pub provenance: Option<CommitProvenance>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -1930,5 +1966,75 @@ mod tests {
             ),
             "expected Err(PayloadTooLarge{{ rejecter: Server, .. }}), got: {result:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+
+    #[test]
+    fn provenance_serialises_only_what_is_asserted() {
+        let bare = PushRequest {
+            files: vec![],
+            deletions: None,
+            message: Some("push".into()),
+            author: None,
+            parent_sha: None,
+            description: None,
+            tags: None,
+            status: None,
+            visibility: None,
+            provenance: None,
+        };
+        let body = serde_json::to_value(&bare).unwrap();
+        assert!(body.get("provenance").is_none(), "{body}");
+
+        let block = PushProvenance {
+            integration: "claude-code".into(),
+            run: "session-1".into(),
+            trigger: "stop".into(),
+            task_ref: None,
+        };
+        let body = serde_json::to_value(&block).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"integration": "claude-code", "run": "session-1", "trigger": "stop"})
+        );
+        assert!(body.get("taskRef").is_none());
+
+        let with_task = PushProvenance {
+            task_ref: Some("T-1".into()),
+            ..block
+        };
+        assert_eq!(serde_json::to_value(&with_task).unwrap()["taskRef"], "T-1");
+    }
+
+    #[test]
+    fn version_entries_read_a_null_or_missing_provenance_as_none() {
+        let with_null: VersionEntry = serde_json::from_value(serde_json::json!({
+            "version": 1, "sha": "a", "message": "m", "author": "ana",
+            "createdAt": "2026-01-01T00:00:00Z", "filesChanged": [], "provenance": null
+        }))
+        .unwrap();
+        assert!(with_null.provenance.is_none());
+
+        let missing: FileVersionEntry = serde_json::from_value(serde_json::json!({
+            "version": 1, "sha": "a", "blobSha": "b", "message": "m", "author": "ana",
+            "createdAt": "2026-01-01T00:00:00Z", "content": "", "diff": null
+        }))
+        .unwrap();
+        assert!(missing.provenance.is_none());
+
+        let asserted: VersionEntry = serde_json::from_value(serde_json::json!({
+            "version": 1, "sha": "a", "message": "m", "author": "ana",
+            "createdAt": "2026-01-01T00:00:00Z", "filesChanged": [],
+            "provenance": {"publisher": "bo", "integration": "codex", "run": "r", "trigger": null, "taskRef": null}
+        }))
+        .unwrap();
+        let p = asserted.provenance.unwrap();
+        assert_eq!(p.publisher, "bo");
+        assert_eq!(p.integration.as_deref(), Some("codex"));
+        assert!(p.trigger.is_none() && p.task_ref.is_none());
     }
 }

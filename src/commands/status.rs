@@ -3,7 +3,25 @@ use crate::client::SynsClient;
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
+use crate::push::converge::{WorkingCopyState, working_copy_state};
+use crate::push::working_copy::WorkingCopy;
 use crate::repo::if_repo::resolve_full_or_skip;
+use crate::repo::root::push_scope;
+
+/// The machine-readable status document: the repository reply with the
+/// working copy's state laid over it (SPEC u256 Q-02).
+fn status_document(
+    response: &crate::client::RepoResponse,
+    state: WorkingCopyState,
+) -> Result<serde_json::Value, CliError> {
+    let mut document = serde_json::to_value(response).map_err(|e| CliError::Io {
+        message: format!("could not render the status document: {e}"),
+    })?;
+    if let Some(object) = document.as_object_mut() {
+        object.insert("workingCopyState".into(), state.as_key().into());
+    }
+    Ok(document)
+}
 
 pub async fn cmd_status(config: &Config, output: &Output, if_repo: bool) -> Result<(), CliError> {
     let current_dir = std::env::current_dir().map_err(|e| CliError::Io {
@@ -22,8 +40,14 @@ pub async fn cmd_status(config: &Config, output: &Output, if_repo: bool) -> Resu
 
     let response = client.get_repo(&repo_id, token.as_deref()).await?;
 
+    // SPEC u256 `cmd_status` 2: the working copy's state, against a head
+    // read in this same run.
+    let scope = push_scope(None, &current_dir, &owner, &name)?;
+    let copy = WorkingCopy::open(config.cache_dir(), &owner, &name, &scope.root)?;
+    let state = working_copy_state(&client, token.as_deref(), &copy).await?;
+
     if output.is_json() {
-        output.json(&response);
+        output.json(&status_document(&response, state)?);
     } else {
         let rows = vec![
             vec![
@@ -65,6 +89,7 @@ pub async fn cmd_status(config: &Config, output: &Output, if_repo: bool) -> Resu
             ],
             vec!["Created".into(), response.created_at],
             vec!["Updated".into(), response.updated_at],
+            vec!["Working copy".into(), state.label().to_string()],
         ];
         output.table(&["Property", "Value"], rows);
     }
@@ -78,6 +103,18 @@ mod tests {
     use serial_test::serial;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn mount_tree(mock_server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/my-project/tree"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "entries": [],
+                "commitSha": "abc12345def67890",
+                "truncated": false
+            })))
+            .mount(mock_server)
+            .await;
+    }
 
     #[tokio::test]
     #[serial]
@@ -111,6 +148,7 @@ mod tests {
             })))
             .mount(&mock_server)
             .await;
+        mount_tree(&mock_server).await;
 
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
@@ -118,7 +156,7 @@ mod tests {
         let result = cmd_status(&config, &output, false).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[tokio::test]
@@ -153,6 +191,7 @@ mod tests {
             })))
             .mount(&mock_server)
             .await;
+        mount_tree(&mock_server).await;
 
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(true);
@@ -160,7 +199,13 @@ mod tests {
         let result = cmd_status(&config, &output, false).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "{result:?}");
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let response = client.get_repo("alice/my-project", None).await.unwrap();
+        let document = status_document(&response, WorkingCopyState::LocalChanges).unwrap();
+        assert_eq!(document["workingCopyState"], "local_changes");
+        assert_eq!(document["name"], "my-project");
     }
 
     #[tokio::test]
@@ -195,6 +240,7 @@ mod tests {
             })))
             .mount(&mock_server)
             .await;
+        mount_tree(&mock_server).await;
 
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
@@ -202,7 +248,7 @@ mod tests {
         let result = cmd_status(&config, &output, true).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[tokio::test]

@@ -37,6 +37,20 @@ pub enum CliError {
         /// no-default-excludes hint line is gated correctly (SPEC § 7).
         no_default_excludes: bool,
     },
+    /// The refusal `SmartPushOptions.expected` raises before any request
+    /// leaves: the collected set's file hashes differ from the expected
+    /// ones at each named path (SPEC u256 § Contract Surface).
+    CollectedSetChanged {
+        paths: Vec<String>,
+    },
+    /// A convergence outcome that does not land, carried to `main` whole:
+    /// the one document machine-readable mode writes, the one line human
+    /// mode writes, and the exit the outcome registers.
+    SyncRefusal {
+        document: serde_json::Value,
+        line: String,
+        exit: i32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +73,7 @@ impl CliError {
             CliError::ServerUnreachable { .. } => 3,
             CliError::PushPartial { .. } => 3,
             CliError::PushEmpty { .. } => 6,
+            CliError::SyncRefusal { exit, .. } => *exit,
             CliError::Upgrade(e) => e.exit_code(),
             _ => 1,
         }
@@ -106,6 +121,7 @@ impl CliError {
                     "suggestion": "auto-chunked when feasible; otherwise split with --exclude PATTERN and re-run",
                 }))
             }
+            CliError::SyncRefusal { document, .. } => Some(document.clone()),
             _ => None,
         }
     }
@@ -212,6 +228,12 @@ impl std::fmt::Display for CliError {
                 }
                 Ok(())
             }
+            CliError::CollectedSetChanged { paths } => write!(
+                f,
+                "the folder changed while its publication was prepared: {}",
+                paths.join(", ")
+            ),
+            CliError::SyncRefusal { line, .. } => write!(f, "{line}"),
         }
     }
 }
@@ -311,6 +333,30 @@ mod tests {
             .exit_code(),
             6
         );
+    }
+
+    #[test]
+    fn collected_set_changed_exits_one_naming_each_path() {
+        let err = CliError::CollectedSetChanged {
+            paths: vec!["a.md".into(), "b/c.md".into()],
+        };
+        assert_eq!(err.exit_code(), 1);
+        assert!(err.json_value().is_none());
+        let text = err.to_string();
+        assert!(text.contains("a.md") && text.contains("b/c.md"), "{text}");
+    }
+
+    #[test]
+    fn sync_refusal_carries_its_document_line_and_exit() {
+        let document = serde_json::json!({"outcome": "resolution_required", "repo": "alice/proj"});
+        let err = CliError::SyncRefusal {
+            document: document.clone(),
+            line: "resolution required for alice/proj".into(),
+            exit: 4,
+        };
+        assert_eq!(err.exit_code(), 4);
+        assert_eq!(err.json_value(), Some(document));
+        assert_eq!(err.to_string(), "resolution required for alice/proj");
     }
 
     #[test]

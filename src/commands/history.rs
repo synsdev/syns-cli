@@ -1,9 +1,35 @@
 use crate::auth::token::TokenStore;
-use crate::client::SynsClient;
+use crate::client::{CommitProvenance, SynsClient};
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
 use crate::repo::if_repo::resolve_full_or_skip;
+
+/// A version row's provenance cell: the publisher and each asserted
+/// field under its label, where the commit recorded provenance and either
+/// asserted a field or was published by someone other than its author;
+/// empty otherwise.
+pub(crate) fn provenance_cell(provenance: Option<&CommitProvenance>, author: &str) -> String {
+    let Some(provenance) = provenance else {
+        return String::new();
+    };
+    let asserted = [
+        ("Integration", &provenance.integration),
+        ("Run", &provenance.run),
+        ("Trigger", &provenance.trigger),
+        ("Task", &provenance.task_ref),
+    ];
+    if asserted.iter().all(|(_, value)| value.is_none()) && provenance.publisher == author {
+        return String::new();
+    }
+    let mut lines = vec![format!("Published by: {}", provenance.publisher)];
+    for (label, value) in asserted {
+        if let Some(value) = value {
+            lines.push(format!("{label}: {value}"));
+        }
+    }
+    lines.join("\n")
+}
 
 pub async fn cmd_history(
     config: &Config,
@@ -43,10 +69,11 @@ pub async fn cmd_history(
                         entry.message.clone(),
                         entry.author.clone(),
                         entry.created_at.clone(),
+                        provenance_cell(entry.provenance.as_ref(), &entry.author),
                     ]
                 })
                 .collect();
-            output.table(&["SHA", "Message", "Author", "Date"], rows);
+            output.table(&["SHA", "Message", "Author", "Date", "Provenance"], rows);
         }
     } else {
         let (response, raw) = client
@@ -72,11 +99,20 @@ pub async fn cmd_history(
                         } else {
                             format!("{n} files")
                         },
+                        provenance_cell(entry.provenance.as_ref(), &entry.author),
                     ]
                 })
                 .collect();
             output.table(
-                &["Version", "SHA", "Message", "Author", "Date", "Files"],
+                &[
+                    "Version",
+                    "SHA",
+                    "Message",
+                    "Author",
+                    "Date",
+                    "Files",
+                    "Provenance",
+                ],
                 rows,
             );
         }
@@ -91,6 +127,36 @@ mod tests {
     use serial_test::serial;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn provenance_cell_names_what_the_commit_asserted() {
+        let asserted = CommitProvenance {
+            publisher: "ana".into(),
+            integration: Some("claude-code".into()),
+            run: Some("session-9".into()),
+            trigger: Some("stop".into()),
+            task_ref: None,
+        };
+        assert_eq!(
+            provenance_cell(Some(&asserted), "ana"),
+            "Published by: ana\nIntegration: claude-code\nRun: session-9\nTrigger: stop"
+        );
+
+        let other_publisher = CommitProvenance {
+            publisher: "bo".into(),
+            integration: None,
+            run: None,
+            trigger: None,
+            task_ref: None,
+        };
+        assert_eq!(
+            provenance_cell(Some(&other_publisher), "ana"),
+            "Published by: bo"
+        );
+
+        assert_eq!(provenance_cell(Some(&other_publisher), "bo"), "");
+        assert_eq!(provenance_cell(None, "ana"), "");
+    }
 
     #[tokio::test]
     #[serial]

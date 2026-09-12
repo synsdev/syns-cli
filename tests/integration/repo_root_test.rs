@@ -25,6 +25,7 @@ use syns_cli::commands::push::{PushArgs, cmd_push};
 use syns_cli::errors::CliError;
 use syns_cli::push::hash::blob_sha1;
 use syns_cli::push::manifest::Manifest;
+use syns_cli::push::working_copy::WorkingCopy;
 use wiremock::matchers::{method, path as path_matcher};
 use wiremock::{Mock, ResponseTemplate};
 
@@ -75,6 +76,39 @@ fn seed_record(ctx: &TestContext) {
     manifest
         .save(ctx.config.cache_dir(), "alice", "proj")
         .unwrap();
+}
+
+/// The working copy base and head a bare publication converges from:
+/// the fixture tree recorded at one commit, the head standing there too.
+/// A bare publication reads this base rather than the local record.
+async fn seed_converged_base(ctx: &TestContext, root: &Path) {
+    let files = HashMap::from([
+        (
+            ".syns.yaml".to_string(),
+            blob_sha1(b"owner: alice\nname: proj\n"),
+        ),
+        ("root-a.md".to_string(), blob_sha1(b"a")),
+        ("root-b.md".to_string(), blob_sha1(b"b")),
+        ("sub/nested.md".to_string(), blob_sha1(b"n")),
+    ]);
+    WorkingCopy::open(ctx.config.cache_dir(), "alice", "proj", root)
+        .unwrap()
+        .record_base("1111111111111111111111111111111111111111", files.clone())
+        .unwrap();
+    let entries: Vec<serde_json::Value> = files
+        .iter()
+        .map(|(p, s)| json!({"name": p, "path": p, "type": "file", "size": 1, "sha": s}))
+        .collect();
+    Mock::given(method("GET"))
+        .and(path_matcher("/api/v1/repos/alice/proj/tree"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "entries": entries,
+            "commitSha": "1111111111111111111111111111111111111111",
+            "truncated": false
+        })))
+        .with_priority(1)
+        .mount(&ctx.mock_server)
+        .await;
 }
 
 async fn mount_push_mocks(ctx: &TestContext, repo_id: &str) {
@@ -165,6 +199,11 @@ async fn bare_push_from_subdirectory_matches_a_push_from_the_root() {
             .unwrap();
         body_paths(&last_push_body(&ctx).await)
     };
+
+    // A bare publication converges: the first run recorded its commit as
+    // the working copy's base. Clearing that state makes the second run a
+    // first publication again, so the two bodies stay comparable.
+    fs::remove_dir_all(ctx.config.cache_dir().join("working-copies")).unwrap();
 
     let from_sub = {
         let _cwd = CwdGuard::enter(&root.join("sub"));
@@ -542,7 +581,7 @@ async fn bare_pull_from_subdirectory_writes_into_the_repository_root() {
 
     {
         let _cwd = CwdGuard::enter(&root.join("sub"));
-        cmd_pull(&ctx.config, &ctx.output, None, None, None, false)
+        cmd_pull(&ctx.config, &ctx.output, None, None, None, false, false)
             .await
             .unwrap();
     }
@@ -571,20 +610,21 @@ async fn bare_pull_from_subdirectory_reconciles_at_the_repository_root() {
     fs::write(root.join(".syns.yaml"), "owner: alice\nname: proj\n").unwrap();
     fs::write(root.join("root-b.md"), "b").unwrap();
 
-    let mut manifest = Manifest::default();
-    manifest.update(
-        "1111111111111111111111111111111111111111".to_string(),
-        HashMap::from([("root-b.md".to_string(), blob_sha1(b"b"))]),
-    );
-    manifest
-        .save(ctx.config.cache_dir(), "alice", "proj")
+    // A retrieval converges from the working copy's base, not the local
+    // record: the base names `root-b.md`, which the head no longer holds.
+    WorkingCopy::open(ctx.config.cache_dir(), "alice", "proj", &root)
+        .unwrap()
+        .record_base(
+            "1111111111111111111111111111111111111111",
+            HashMap::from([("root-b.md".to_string(), blob_sha1(b"b"))]),
+        )
         .unwrap();
 
     mount_pull_mocks(&ctx, "alice/proj", server_tree()).await;
 
     {
         let _cwd = CwdGuard::enter(&root.join("sub"));
-        cmd_pull(&ctx.config, &ctx.output, None, None, None, false)
+        cmd_pull(&ctx.config, &ctx.output, None, None, None, false, false)
             .await
             .unwrap();
     }
@@ -614,6 +654,7 @@ async fn pull_of_another_repository_writes_its_own_identity_file() {
             None,
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -641,6 +682,7 @@ async fn unscoped_push_collecting_nothing_is_refused_before_the_server() {
     seed_credentials(&ctx, "test-token", "alice");
     let root = seed_tree(&ctx);
     seed_record(&ctx);
+    seed_converged_base(&ctx, &root).await;
     fs::write(root.join(".gitignore"), "*\n").unwrap();
     mount_push_mocks(&ctx, "alice/proj").await;
 
@@ -668,6 +710,7 @@ async fn allow_empty_still_carries_an_unscoped_publication_past_the_refusal() {
     seed_credentials(&ctx, "test-token", "alice");
     let root = seed_tree(&ctx);
     seed_record(&ctx);
+    seed_converged_base(&ctx, &root).await;
     fs::write(root.join(".gitignore"), "*\n").unwrap();
     mount_push_mocks(&ctx, "alice/proj").await;
 
@@ -722,6 +765,7 @@ async fn pull_into_a_relative_destination_writes_no_nested_identity_file() {
             Some("alice/proj".into()),
             Some("dest".into()),
             None,
+            false,
             false,
         )
         .await
@@ -853,6 +897,7 @@ async fn pull_into_a_relative_destination_resolves_the_repository_above_it() {
             None,
             Some("dest".into()),
             None,
+            false,
             false,
         )
         .await
