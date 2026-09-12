@@ -1243,6 +1243,25 @@ async fn status_names_each_working_copy_state() {
     );
 }
 
+/// A write sibling a killed run left reads as no local change.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn status_ignores_a_partial_write_sibling() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let h0 = e.fake.commit(&[("a.md", "a\n"), ("b.md", "b0\n")]);
+    checkout(&e.fake, &copy, &h0);
+    e.fake.commit_changes(&[("b.md", Some("b1\n"))]);
+    write_files(&dir, &[(".syns-partial-0123456789abcdef", "torn")]);
+
+    let state = working_copy_state(&e.fake.client(), Some(TOKEN), &copy)
+        .await
+        .unwrap();
+
+    assert_eq!(state, WorkingCopyState::RemoteChanges);
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn discard_restores_the_folder_before_the_resolution() {
@@ -2094,6 +2113,51 @@ async fn a_retrieval_without_a_resolution_killed_mid_write_takes_the_head_on_its
         "{:?}",
         partial_writes(&dir)
     );
+}
+
+/// A retrieval with no local edit killed mid-write leaves its write sibling
+/// and no resolution; a forced publication then sends no sibling.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn forced_push_sends_no_partial_write_sibling() {
+    if run_as_torn_writer().await {
+        return;
+    }
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    seed_torn_write(&e, &copy, false);
+    kill_mid_write(
+        &e,
+        &dir,
+        "forced_push_sends_no_partial_write_sibling",
+        false,
+    )
+    .await;
+    write_files(&dir, &[(".syns.yaml", IDENTITY)]);
+
+    {
+        let _cwd = CwdGuard::enter(&dir);
+        let mut forced = push_args(None);
+        forced.force = true;
+        let _ = cmd_push(&e.config, &e.output, &forced).await;
+    }
+
+    let bodies = e.fake.push_bodies();
+    assert!(!bodies.is_empty(), "the forced publication sent nothing");
+    let sent: Vec<&str> = bodies
+        .iter()
+        .flat_map(|body| body["files"].as_array().unwrap())
+        .filter_map(|file| file["path"].as_str())
+        .filter(|path| {
+            path.rsplit('/')
+                .next()
+                .unwrap()
+                .starts_with(".syns-partial-")
+        })
+        .collect();
+    assert!(sent.is_empty(), "{sent:?}");
 }
 
 const HOLDER_ENV: &str = "SYNS_U256_BASE_HOLDER";

@@ -544,7 +544,7 @@ pub async fn smart_push(
 
     // Phase 2a — Collect.
     let CollectResult {
-        files: local_files,
+        files: mut local_files,
         skipped,
         total_walked,
     } = collect_files(
@@ -556,6 +556,9 @@ pub async fn smart_push(
             prefix: opts.prefix.clone(),
         },
     )?;
+    // A folder write sibling a killed convergence left is no repository
+    // file, whichever publication collects it (SPEC u256).
+    local_files.retain(|path, _| !crate::push::converge::is_partial_write(path));
 
     // Phase 2b — Strict guard (supersedes empty per SPEC D10).
     if opts.strict && !skipped.is_empty() {

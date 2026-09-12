@@ -315,12 +315,16 @@ fn read_disk(copy: &WorkingCopy, path: &str) -> Result<Option<Vec<u8>>, CliError
 const PARTIAL_PREFIX: &str = ".syns-partial-";
 
 /// Whether a folder path names the sibling of a write a killed run left
-/// part-way through.
-fn is_partial_write(path: &str) -> bool {
-    path.rsplit('/')
-        .next()
-        .unwrap_or(path)
-        .starts_with(PARTIAL_PREFIX)
+/// part-way through: `PARTIAL_PREFIX` and the 16 lowercase hex characters
+/// `write_folder_file` mints, and no other name.
+pub(crate) fn is_partial_write(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.strip_prefix(PARTIAL_PREFIX).is_some_and(|minted| {
+        minted.len() == 16
+            && minted
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
 }
 
 /// Replace a folder file whole: write its sibling, then rename it over the
@@ -1428,6 +1432,14 @@ pub async fn working_copy_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_partial_write_admits_only_the_minted_sibling_name() {
+        assert!(is_partial_write(".syns-partial-0123456789abcdef"));
+        assert!(is_partial_write("sub/.syns-partial-0123456789abcdef"));
+        assert!(!is_partial_write(".syns-partial-notes.md"));
+        assert!(!is_partial_write(".syns-partial-0123456789abcde"));
+    }
 
     #[test]
     fn check_server_path_admits_an_ordinary_path() {
