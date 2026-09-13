@@ -453,15 +453,18 @@ enum InTheWay {
     File(String),
 }
 
-/// Whether local work the candidate keeps — every path on disk but those in
-/// `removed` — stands where the head file `path` is to be written: a file at
-/// a folder above it, or a folder at it holding any file. A folder holding
-/// folders alone holds no work, and gives way to the file.
+/// Whether local work the candidate keeps — every `collected` path but those
+/// in `removed` — stands where the head file `path` is to be written: a file
+/// at a folder above it, or a folder at it holding any file. Only the
+/// collection decides: a file it leaves out is no work a publication could
+/// carry, so it withholds no head file, and the write refuses on it instead.
 fn local_work_in_the_way(
-    root: &Path,
     path: &str,
+    collected: &BTreeMap<String, String>,
     removed: &BTreeSet<String>,
-) -> Result<Option<InTheWay>, CliError> {
+) -> Option<InTheWay> {
+    let kept =
+        |candidate: &String| collected.contains_key(candidate) && !removed.contains(candidate);
     let mut above = String::new();
     let segments: Vec<&str> = path.split('/').collect();
     for segment in &segments[..segments.len().saturating_sub(1)] {
@@ -469,38 +472,20 @@ fn local_work_in_the_way(
             above.push('/');
         }
         above.push_str(segment);
-        let at = root.join(&above);
-        if std::fs::symlink_metadata(&at).is_ok() && !at.is_dir() {
-            return Ok((!removed.contains(&above)).then_some(InTheWay::File(above)));
+        if kept(&above) {
+            return Some(InTheWay::File(above));
         }
     }
 
-    let target = root.join(path);
-    if !std::fs::symlink_metadata(&target).is_ok_and(|meta| meta.is_dir()) {
-        return Ok(None);
-    }
-    let mut files = Vec::new();
-    files_under(&target, path, &mut files).map_err(|err| CliError::Io {
-        message: format!("could not read {path}: {err}"),
-    })?;
-    files.retain(|file| !removed.contains(file));
-    files.sort();
-    Ok((!files.is_empty()).then_some(InTheWay::Folder(files)))
-}
-
-/// Every entry under `dir` but a folder, named by its folder path under
-/// `prefix`; a link counts as a file and is not followed.
-fn files_under(dir: &Path, prefix: &str, into: &mut Vec<String>) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let relative = format!("{prefix}/{}", entry.file_name().to_string_lossy());
-        if entry.file_type()?.is_dir() {
-            files_under(&entry.path(), &relative, into)?;
-        } else {
-            into.push(relative);
-        }
-    }
-    Ok(())
+    let inside = format!("{path}/");
+    let files: Vec<String> = collected
+        .range(inside.clone()..)
+        .map(|(file, _)| file)
+        .take_while(|file| file.starts_with(&inside))
+        .filter(|file| kept(file))
+        .cloned()
+        .collect();
+    (!files.is_empty()).then_some(InTheWay::Folder(files))
 }
 
 /// Remove a folder file that clears the way for a write, and every folder
@@ -760,7 +745,7 @@ async fn prepare_candidate(
         let mut kept_writes: Vec<(String, Vec<u8>)> = Vec::with_capacity(writes.len());
         for (path, bytes) in writes {
             let (contested, kind, local_files) =
-                match local_work_in_the_way(&copy.root, &path, &removed_here)? {
+                match local_work_in_the_way(&path, &folder.hashes, &removed_here) {
                     None => {
                         kept_writes.push((path, bytes));
                         continue;

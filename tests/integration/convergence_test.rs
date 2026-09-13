@@ -957,13 +957,57 @@ async fn a_head_replacing_a_folder_holding_local_work_with_a_file_prepares_a_res
     }
 }
 
+/// A head swapping a folder and a file of one name over local work: its
+/// label, the tree before, the files written by hand, the tree after, and
+/// the collision kind the resolution document names.
+type SwapOverWork = (
+    &'static str,
+    &'static [(&'static str, &'static str)],
+    &'static [(&'static str, &'static str)],
+    &'static [(&'static str, &'static str)],
+    &'static str,
+);
+
+const SWAPS_OVER_WORK: [SwapOverWork; 4] = [
+    (
+        "a file added inside the folder",
+        &[("d/x.md", "x\n"), ("k.md", "k\n")],
+        &[("d/new.md", "new\n")],
+        &[("d", "file\n"), ("k.md", "k\n")],
+        "folder_file",
+    ),
+    (
+        "a file edited inside the folder",
+        &[("d/x.md", "x\n"), ("k.md", "k\n")],
+        &[("d/x.md", "x edited\n")],
+        &[("d", "file\n"), ("k.md", "k\n")],
+        "folder_file",
+    ),
+    (
+        "the file edited",
+        &[("d", "file\n"), ("k.md", "k\n")],
+        &[("d", "file edited\n")],
+        &[("d/x.md", "x\n"), ("k.md", "k\n")],
+        "file_folder",
+    ),
+    (
+        "a file added where the head adds a folder",
+        &[("k.md", "k\n")],
+        &[("d", "mine\n")],
+        &[("d/x.md", "x\n"), ("k.md", "k\n")],
+        "file_folder",
+    ),
+];
+
 /// V5-08 through the commands: `syns sync` and `syns pull` answer resolution
-/// required, exit 4, over a folder a head replaced with a file.
+/// required, exit 4, over local work a head swapped between a folder and a
+/// file, naming the collision kind and where the repository's side is held.
 #[tokio::test(flavor = "current_thread")]
 #[serial]
-async fn sync_and_pull_answer_resolution_required_over_a_folder_a_head_replaced_with_a_file() {
+async fn sync_and_pull_answer_resolution_required_over_local_work_a_head_swapped_between_folder_and_file()
+ {
     let e = env().await;
-    for (work_label, work, _) in FOLDER_WORK {
+    for (work_label, before, work, after, kind) in SWAPS_OVER_WORK {
         for command in ["sync", "pull"] {
             let label = format!("{work_label}, {command}");
             let fake = Fake::start().await;
@@ -971,10 +1015,15 @@ async fn sync_and_pull_answer_resolution_required_over_a_folder_a_head_replaced_
             let folder = tempfile::tempdir().unwrap();
             let dir = std::fs::canonicalize(folder.path()).unwrap();
             let copy = e.copy(&dir);
-            let h0 = fake.commit(&[(".syns.yaml", IDENTITY), ("d/x.md", "x\n"), ("k.md", "k\n")]);
+            let with_identity = |tree: &[(&'static str, &'static str)]| {
+                let mut tree = tree.to_vec();
+                tree.push((".syns.yaml", IDENTITY));
+                tree
+            };
+            let h0 = fake.commit(&with_identity(before));
             checkout(&fake, &copy, &h0);
             write_files(&dir, work);
-            fake.commit(&[(".syns.yaml", IDENTITY), ("d", "file\n"), ("k.md", "k\n")]);
+            fake.commit(&with_identity(after));
 
             let refused = match command {
                 "sync" => {
@@ -1005,7 +1054,7 @@ async fn sync_and_pull_answer_resolution_required_over_a_folder_a_head_replaced_
                 document["resolution"]["collisions"]
                     .as_array()
                     .unwrap()
-                    .contains(&json!({"path": "d", "kind": "folder_file"})),
+                    .contains(&json!({"path": "d", "kind": kind})),
                 "{label}: {document}"
             );
             assert!(
@@ -1164,6 +1213,85 @@ async fn a_head_file_takes_the_place_of_a_folder_holding_only_empty_folders() {
     );
     assert_eq!(read(&dir, "d"), "file\n");
     assert_eq!(copy.base().unwrap().commit_sha(), Some(h1.as_str()));
+}
+
+/// CR5-1: files the collection leaves out, alone inside a folder a head
+/// replaces with a file, withhold no head file — nothing publishes, no
+/// resolution stands, and those files keep their bytes.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_head_file_over_a_folder_holding_only_excluded_files_publishes_nothing() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let h0 = e.fake.commit(&[("d/x.md", "x\n"), ("k.md", "k\n")]);
+    checkout(&e.fake, &copy, &h0);
+    write_files(&dir, &[("d/node_modules/p.js", "p\n")]);
+    e.fake.commit(&[("d", "file\n"), ("k.md", "k\n")]);
+
+    let outcome = converge(
+        &e.fake.client(),
+        Some(TOKEN),
+        &copy,
+        ConvergeMode::Publish,
+        e.opts(),
+    )
+    .await;
+
+    assert!(matches!(outcome, Err(CliError::Io { .. })), "{outcome:?}");
+    assert!(copy.resolution().unwrap().is_none());
+    assert!(e.fake.push_bodies().is_empty());
+    assert_eq!(read(&dir, "d/node_modules/p.js"), "p\n");
+}
+
+/// CR5-2: a round a guard refusal recomputes over a newer head replacing a
+/// folder holding local work with a file names that folder's collision, and
+/// holds its work in the local snapshot, so a discard after the resolver
+/// took the repository's file puts the work back.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_recomputed_round_snapshots_folder_work_a_newer_head_replaced_with_a_file() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let client = e.fake.client();
+    let h0 = e
+        .fake
+        .commit(&[("a.md", "a\nb\nc\n"), ("d/x.md", "x\n"), ("z.md", "z\n")]);
+    checkout(&e.fake, &copy, &h0);
+    write_files(&dir, &[("a.md", "a\nL\nc\n"), ("d/x.md", "x edited\n")]);
+    e.fake.commit_changes(&[("a.md", Some("a\nR\nc\n"))]);
+    expect_resolution(
+        converge(&client, Some(TOKEN), &copy, ConvergeMode::Publish, e.opts())
+            .await
+            .unwrap(),
+    );
+    write_files(&dir, &[("a.md", "a\nL and R\nc\n")]);
+    e.fake
+        .commit_changes(&[("d/x.md", None), ("d", Some("file\n"))]);
+
+    let recomputed = expect_resolution(
+        continue_resolution(&client, TOKEN, &copy, e.opts())
+            .await
+            .unwrap(),
+    );
+
+    assert!(
+        recomputed
+            .collisions
+            .contains(&("d".to_string(), CollisionKind::FolderFile)),
+        "{:?}",
+        recomputed.collisions
+    );
+    assert!(
+        recomputed.combined_paths.contains(&"d".to_string()),
+        "{:?}",
+        recomputed.combined_paths
+    );
+    std::fs::remove_dir_all(dir.join("d")).unwrap();
+    write_files(&dir, &[("d", "file\n")]);
+    discard_resolution(&copy).unwrap();
+    assert_eq!(read(&dir, "d/x.md"), "x edited\n");
 }
 
 /// A head adding a file where an earlier convergence left an emptied folder
