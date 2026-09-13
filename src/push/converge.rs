@@ -357,10 +357,11 @@ pub(crate) fn replace_file_whole(root: &Path, path: &str, bytes: &[u8]) -> Resul
     ));
 
     let written = (|| -> std::io::Result<()> {
-        // An empty folder at the target — one an earlier removal emptied —
-        // gives way to the file; a folder holding anything refuses it.
+        // A folder at the target holding folders alone — one an earlier
+        // removal emptied — gives way to the file; one holding a file
+        // refuses it.
         if target.is_dir() && !target.is_symlink() {
-            std::fs::remove_dir(&target)?;
+            remove_empty_tree(&target)?;
         }
         let permissions = match OpenOptions::new().write(true).open(&target) {
             Ok(file) => Some(file.metadata()?.permissions()),
@@ -384,6 +385,18 @@ pub(crate) fn replace_file_whole(root: &Path, path: &str, bytes: &[u8]) -> Resul
         return Err(io(err));
     }
     Ok(())
+}
+
+/// Remove a folder holding folders alone, deepest first; a file anywhere
+/// under it refuses the removal of every folder above that file.
+fn remove_empty_tree(dir: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            remove_empty_tree(&entry.path())?;
+        }
+    }
+    std::fs::remove_dir(dir)
 }
 
 fn remove_folder_file(copy: &WorkingCopy, path: &str) -> Result<(), CliError> {
@@ -429,6 +442,65 @@ fn clearing_first<'a>(
             .iter()
             .any(|(written, _)| clears_way(removed, written))
     })
+}
+
+/// What holds the place of a head file a candidate is to write.
+enum InTheWay {
+    /// A folder at the file's path, holding these files the candidate
+    /// keeps, sorted.
+    Folder(Vec<String>),
+    /// A file the candidate keeps, at this folder above the file's path.
+    File(String),
+}
+
+/// Whether local work the candidate keeps — every path on disk but those in
+/// `removed` — stands where the head file `path` is to be written: a file at
+/// a folder above it, or a folder at it holding any file. A folder holding
+/// folders alone holds no work, and gives way to the file.
+fn local_work_in_the_way(
+    root: &Path,
+    path: &str,
+    removed: &BTreeSet<String>,
+) -> Result<Option<InTheWay>, CliError> {
+    let mut above = String::new();
+    let segments: Vec<&str> = path.split('/').collect();
+    for segment in &segments[..segments.len().saturating_sub(1)] {
+        if !above.is_empty() {
+            above.push('/');
+        }
+        above.push_str(segment);
+        let at = root.join(&above);
+        if std::fs::symlink_metadata(&at).is_ok() && !at.is_dir() {
+            return Ok((!removed.contains(&above)).then_some(InTheWay::File(above)));
+        }
+    }
+
+    let target = root.join(path);
+    if !std::fs::symlink_metadata(&target).is_ok_and(|meta| meta.is_dir()) {
+        return Ok(None);
+    }
+    let mut files = Vec::new();
+    files_under(&target, path, &mut files).map_err(|err| CliError::Io {
+        message: format!("could not read {path}: {err}"),
+    })?;
+    files.retain(|file| !removed.contains(file));
+    files.sort();
+    Ok((!files.is_empty()).then_some(InTheWay::Folder(files)))
+}
+
+/// Every entry under `dir` but a folder, named by its folder path under
+/// `prefix`; a link counts as a file and is not followed.
+fn files_under(dir: &Path, prefix: &str, into: &mut Vec<String>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let relative = format!("{prefix}/{}", entry.file_name().to_string_lossy());
+        if entry.file_type()?.is_dir() {
+            files_under(&entry.path(), &relative, into)?;
+        } else {
+            into.push(relative);
+        }
+    }
+    Ok(())
 }
 
 /// Remove a folder file that clears the way for a write, and every folder
@@ -672,8 +744,45 @@ async fn prepare_candidate(
                     candidate_hashes.insert(path.clone(), Some(blob_sha1(merged.as_bytes())));
                     writes.push((path.clone(), merged.into_bytes()));
                 }
+                // Found on disk below, never by `reconcile`.
+                CollisionKind::FolderFile | CollisionKind::FileFolder => {}
             }
         }
+
+        // A head file whose place local work holds — a folder holding a
+        // file the candidate keeps at its path, or a file the candidate
+        // keeps at a folder above it — is withheld rather than written: the
+        // local side stays in the folder and is snapshotted, the head's
+        // content goes to the remote snapshot, the withheld path is
+        // snapshotted as absent, and the path both sides hold is a collision.
+        let removed_here: BTreeSet<String> = removals.iter().cloned().collect();
+        let mut held: Vec<(String, Option<Vec<u8>>)> = Vec::new();
+        let mut kept_writes: Vec<(String, Vec<u8>)> = Vec::with_capacity(writes.len());
+        for (path, bytes) in writes {
+            let (contested, kind, local_files) =
+                match local_work_in_the_way(&copy.root, &path, &removed_here)? {
+                    None => {
+                        kept_writes.push((path, bytes));
+                        continue;
+                    }
+                    Some(InTheWay::Folder(files)) => {
+                        (path.clone(), CollisionKind::FolderFile, files)
+                    }
+                    Some(InTheWay::File(file)) => {
+                        (file.clone(), CollisionKind::FileFolder, vec![file])
+                    }
+                };
+            for file in local_files {
+                if let Some(local) = folder.bytes.get(&file) {
+                    held.push((file, Some(local.clone())));
+                }
+            }
+            collisions.insert(contested, kind);
+            held.push((path.clone(), None));
+            candidate_hashes.insert(path.clone(), None);
+            remote_snapshot.insert(path, Some(SnapshotContent::from_bytes(bytes)));
+        }
+        let writes = kept_writes;
 
         // `converge` 10 — the snapshots. Replaced whole where no
         // resolution stands; while one does — or once an earlier pass of
@@ -696,7 +805,12 @@ async fn prepare_candidate(
                 local_snapshot.insert(path.clone(), prior.map(SnapshotContent::from_bytes));
             }
         }
-        if !writes.is_empty() || !removals.is_empty() || !keep_first {
+        for (path, prior) in &held {
+            if !(keep_first && local_snapshot.contains_key(path)) {
+                local_snapshot.insert(path.clone(), prior.clone().map(SnapshotContent::from_bytes));
+            }
+        }
+        if !writes.is_empty() || !removals.is_empty() || !held.is_empty() || !keep_first {
             copy.write_local_snapshot(&local_snapshot)?;
         }
         if !remote_snapshot.is_empty() || !keep_first {

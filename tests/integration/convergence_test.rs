@@ -17,6 +17,7 @@ use serial_test::serial;
 use syns_cli::client::{PushRequest, SynsClient};
 use syns_cli::commands::pull::cmd_pull;
 use syns_cli::commands::push::{PushArgs, cmd_push};
+use syns_cli::commands::sync::cmd_sync;
 use syns_cli::config::Config;
 use syns_cli::errors::CliError;
 use syns_cli::output::Output;
@@ -784,9 +785,9 @@ async fn discard_restores_a_file_and_a_folder_a_candidate_swapped() {
     }
 }
 
-/// CR4-1: a head replacing a folder with a file while local work stands in
-/// that folder fails its write, and a discard still puts the folder back and
-/// clears the resolution.
+/// CR4-1 and V5-08: a discard after a head replaced a folder holding local
+/// work with a file puts the folder back and clears the resolution, even
+/// where the resolver took the repository's file in the folder's place.
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn discard_restores_a_folder_a_head_replaced_with_a_file_over_local_work() {
@@ -798,7 +799,7 @@ async fn discard_restores_a_folder_a_head_replaced_with_a_file_over_local_work()
     write_files(&dir, &[("d/new.md", "new\n")]);
     e.fake.commit(&[("d", "file\n"), ("k.md", "k\n")]);
 
-    let failed = converge(
+    let prepared = converge(
         &e.fake.client(),
         Some(TOKEN),
         &copy,
@@ -806,7 +807,12 @@ async fn discard_restores_a_folder_a_head_replaced_with_a_file_over_local_work()
         e.opts(),
     )
     .await;
-    assert!(matches!(failed, Err(CliError::Io { .. })), "{failed:?}");
+    assert!(
+        matches!(prepared, Ok(SyncOutcome::ResolutionRequired(_))),
+        "{prepared:?}"
+    );
+    std::fs::remove_dir_all(dir.join("d")).unwrap();
+    write_files(&dir, &[("d", "file\n")]);
 
     let discarded = discard_resolution(&copy);
 
@@ -814,6 +820,350 @@ async fn discard_restores_a_folder_a_head_replaced_with_a_file_over_local_work()
     assert!(copy.resolution().unwrap().is_none());
     assert_eq!(read(&dir, "d/x.md"), "x\n");
     assert_eq!(read(&dir, "d/new.md"), "new\n");
+}
+
+/// Local work standing inside the folder `d` a head replaces with a file:
+/// its label, the files written by hand, and the tree a continue publishes.
+type FolderWork = (
+    &'static str,
+    &'static [(&'static str, &'static str)],
+    &'static [(&'static str, &'static str)],
+);
+
+const FOLDER_WORK: [FolderWork; 2] = [
+    (
+        "a file added inside the folder",
+        &[("d/new.md", "new\n")],
+        &[("d/new.md", "new\n"), ("k.md", "k\n")],
+    ),
+    (
+        "a file edited inside the folder",
+        &[("d/x.md", "x edited\n")],
+        &[("d/x.md", "x edited\n"), ("k.md", "k\n")],
+    ),
+];
+
+fn snapshot_bytes(
+    snapshot: &syns_cli::push::working_copy::Snapshot,
+    path: &str,
+) -> Option<Vec<u8>> {
+    snapshot
+        .get(path)
+        .cloned()
+        .flatten()
+        .map(|c| c.into_bytes())
+}
+
+fn names_collision(resolution: &Resolution, path: &str, kind: &str) -> bool {
+    json!(resolution.collisions)
+        .as_array()
+        .unwrap()
+        .contains(&json!([path, kind]))
+}
+
+/// V5-08: a sync or a retrieval meeting a head that replaces a folder with a
+/// file while local work stands inside it prepares a resolution — the folder
+/// kept, the repository's file held in the remote snapshot — which status
+/// agrees with, a re-run answers again, and a continue publishes.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_head_replacing_a_folder_holding_local_work_with_a_file_prepares_a_resolution() {
+    let e = env().await;
+    for (work_label, work, published) in FOLDER_WORK {
+        for mode in [
+            ConvergeMode::Publish,
+            ConvergeMode::Retrieve { overwrite: false },
+        ] {
+            let label = format!("{work_label}, {mode:?}");
+            let fake = Fake::start().await;
+            let folder = tempfile::tempdir().unwrap();
+            let dir = folder.path();
+            let copy = e.copy(dir);
+            let client = fake.client();
+            let h0 = fake.commit(&[("d/x.md", "x\n"), ("k.md", "k\n")]);
+            checkout(&fake, &copy, &h0);
+            write_files(dir, work);
+            fake.commit(&[("d", "file\n"), ("k.md", "k\n")]);
+
+            let prepared = converge(&client, Some(TOKEN), &copy, mode, e.opts()).await;
+
+            let resolution = match prepared {
+                Ok(SyncOutcome::ResolutionRequired(resolution)) => resolution,
+                other => panic!("{label}: expected ResolutionRequired, got {other:?}"),
+            };
+            assert!(
+                names_collision(&resolution, "d", "folder_file"),
+                "{label}: {:?}",
+                resolution.collisions
+            );
+            assert!(dir.join("d").is_dir(), "{label}");
+            let local = copy.local_snapshot().unwrap();
+            for (path, content) in work {
+                assert_eq!(read(dir, path), *content, "{label}");
+                assert_eq!(
+                    snapshot_bytes(&local, path),
+                    Some(content.as_bytes().to_vec()),
+                    "{label}"
+                );
+            }
+            assert_eq!(local.get("d"), Some(&None), "{label}");
+            assert_eq!(
+                snapshot_bytes(&copy.remote_snapshot().unwrap(), "d"),
+                Some(b"file\n".to_vec()),
+                "{label}"
+            );
+            assert!(fake.push_bodies().is_empty(), "{label}");
+            assert_eq!(
+                working_copy_state(&client, Some(TOKEN), &copy)
+                    .await
+                    .unwrap(),
+                WorkingCopyState::ResolutionRequired,
+                "{label}"
+            );
+
+            let again = converge(&client, Some(TOKEN), &copy, mode, e.opts()).await;
+            match again {
+                Ok(SyncOutcome::ResolutionRequired(rerun)) => {
+                    assert_eq!(rerun.recovery_id, resolution.recovery_id, "{label}")
+                }
+                other => panic!("{label}: expected ResolutionRequired again, got {other:?}"),
+            }
+
+            let continued = continue_resolution(&client, TOKEN, &copy, e.opts()).await;
+
+            assert!(
+                matches!(
+                    continued,
+                    Ok(SyncOutcome::Synced {
+                        published: Some(_),
+                        ..
+                    })
+                ),
+                "{label}: {continued:?}"
+            );
+            let expected: BTreeMap<String, String> = published
+                .iter()
+                .map(|(path, content)| (path.to_string(), content.to_string()))
+                .collect();
+            assert_eq!(fake.head().1, expected, "{label}");
+            assert_eq!(
+                working_copy_state(&client, Some(TOKEN), &copy)
+                    .await
+                    .unwrap(),
+                WorkingCopyState::Converged,
+                "{label}"
+            );
+        }
+    }
+}
+
+/// V5-08 through the commands: `syns sync` and `syns pull` answer resolution
+/// required, exit 4, over a folder a head replaced with a file.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn sync_and_pull_answer_resolution_required_over_a_folder_a_head_replaced_with_a_file() {
+    let e = env().await;
+    for (work_label, work, _) in FOLDER_WORK {
+        for command in ["sync", "pull"] {
+            let label = format!("{work_label}, {command}");
+            let fake = Fake::start().await;
+            let config = Config::new(Some(&fake.uri)).unwrap();
+            let folder = tempfile::tempdir().unwrap();
+            let dir = std::fs::canonicalize(folder.path()).unwrap();
+            let copy = e.copy(&dir);
+            let h0 = fake.commit(&[(".syns.yaml", IDENTITY), ("d/x.md", "x\n"), ("k.md", "k\n")]);
+            checkout(&fake, &copy, &h0);
+            write_files(&dir, work);
+            fake.commit(&[(".syns.yaml", IDENTITY), ("d", "file\n"), ("k.md", "k\n")]);
+
+            let refused = match command {
+                "sync" => {
+                    let _cwd = CwdGuard::enter(&dir);
+                    cmd_sync(&config, &e.output, false).await
+                }
+                _ => {
+                    cmd_pull(
+                        &config,
+                        &e.output,
+                        Some("alice/proj".into()),
+                        Some(dir.display().to_string()),
+                        None,
+                        false,
+                        false,
+                    )
+                    .await
+                }
+            };
+
+            let document = match refused {
+                Err(CliError::SyncRefusal {
+                    document, exit: 4, ..
+                }) => document,
+                other => panic!("{label}: expected exit 4, got {other:?}"),
+            };
+            assert!(
+                document["resolution"]["collisions"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!({"path": "d", "kind": "folder_file"})),
+                "{label}: {document}"
+            );
+            assert!(
+                document["instruction"]
+                    .as_str()
+                    .unwrap()
+                    .contains("remote snapshot"),
+                "{label}: {document}"
+            );
+            for (path, content) in work {
+                assert_eq!(read(&dir, path), *content, "{label}");
+            }
+            assert!(fake.push_bodies().is_empty(), "{label}");
+            assert_eq!(
+                working_copy_state(&fake.client(), Some(TOKEN), &copy)
+                    .await
+                    .unwrap(),
+                WorkingCopyState::ResolutionRequired,
+                "{label}"
+            );
+        }
+    }
+}
+
+/// The mirror of V5-08: a head replacing a file with a folder while local
+/// work stands at that file prepares a resolution — the file kept, the
+/// repository's files under the folder held in the remote snapshot.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_head_replacing_a_file_holding_local_work_with_a_folder_prepares_a_resolution() {
+    let e = env().await;
+    type FileWork = (
+        &'static str,
+        &'static [(&'static str, &'static str)],
+        &'static str,
+    );
+    let cases: [FileWork; 2] = [
+        (
+            "the file edited",
+            &[("d", "file\n"), ("k.md", "k\n")],
+            "file edited\n",
+        ),
+        ("a file added", &[("k.md", "k\n")], "mine\n"),
+    ];
+    for (label, before, local) in cases {
+        let fake = Fake::start().await;
+        let folder = tempfile::tempdir().unwrap();
+        let dir = folder.path();
+        let copy = e.copy(dir);
+        let client = fake.client();
+        let h0 = fake.commit(before);
+        checkout(&fake, &copy, &h0);
+        write_files(dir, &[("d", local)]);
+        fake.commit(&[("d/x.md", "x\n"), ("k.md", "k\n")]);
+
+        let prepared = converge(&client, Some(TOKEN), &copy, ConvergeMode::Publish, e.opts()).await;
+
+        let resolution = match prepared {
+            Ok(SyncOutcome::ResolutionRequired(resolution)) => resolution,
+            other => panic!("{label}: expected ResolutionRequired, got {other:?}"),
+        };
+        assert!(
+            names_collision(&resolution, "d", "file_folder"),
+            "{label}: {:?}",
+            resolution.collisions
+        );
+        assert_eq!(read(dir, "d"), local, "{label}");
+        assert_eq!(
+            snapshot_bytes(&copy.remote_snapshot().unwrap(), "d/x.md"),
+            Some(b"x\n".to_vec()),
+            "{label}"
+        );
+
+        let continued = continue_resolution(&client, TOKEN, &copy, e.opts()).await;
+
+        assert!(
+            matches!(
+                continued,
+                Ok(SyncOutcome::Synced {
+                    published: Some(_),
+                    ..
+                })
+            ),
+            "{label}: {continued:?}"
+        );
+        let expected = BTreeMap::from([
+            ("d".to_string(), local.to_string()),
+            ("k.md".to_string(), "k\n".to_string()),
+        ]);
+        assert_eq!(fake.head().1, expected, "{label}");
+    }
+}
+
+/// A discard after a head replaced a file holding local work with a folder
+/// puts the file back, even where the resolver took the repository's folder.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn discard_restores_a_file_a_head_replaced_with_a_folder_over_local_work() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let h0 = e.fake.commit(&[("d", "file\n"), ("k.md", "k\n")]);
+    checkout(&e.fake, &copy, &h0);
+    write_files(&dir, &[("d", "file edited\n")]);
+    e.fake.commit(&[("d/x.md", "x\n"), ("k.md", "k\n")]);
+    let prepared = converge(
+        &e.fake.client(),
+        Some(TOKEN),
+        &copy,
+        ConvergeMode::Publish,
+        e.opts(),
+    )
+    .await;
+    assert!(
+        matches!(prepared, Ok(SyncOutcome::ResolutionRequired(_))),
+        "{prepared:?}"
+    );
+    std::fs::remove_file(dir.join("d")).unwrap();
+    write_files(&dir, &[("d/x.md", "x\n")]);
+
+    let discarded = discard_resolution(&copy);
+
+    assert!(discarded.is_ok(), "{discarded:?}");
+    assert!(copy.resolution().unwrap().is_none());
+    assert_eq!(read(&dir, "d"), "file edited\n");
+}
+
+/// A head file takes the place of a folder holding folders alone — files
+/// both sides deleted leaving them empty — rather than failing its write.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_head_file_takes_the_place_of_a_folder_holding_only_empty_folders() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let h0 = e
+        .fake
+        .commit(&[("d/x.md", "x\n"), ("d/sub/y.md", "y\n"), ("k.md", "k\n")]);
+    checkout(&e.fake, &copy, &h0);
+    std::fs::remove_file(dir.join("d/x.md")).unwrap();
+    std::fs::remove_file(dir.join("d/sub/y.md")).unwrap();
+    let h1 = e.fake.commit(&[("d", "file\n"), ("k.md", "k\n")]);
+
+    let outcome = converge(
+        &e.fake.client(),
+        Some(TOKEN),
+        &copy,
+        ConvergeMode::Retrieve { overwrite: false },
+        e.opts(),
+    )
+    .await;
+
+    assert!(
+        matches!(outcome, Ok(SyncOutcome::Synced { .. })),
+        "{outcome:?}"
+    );
+    assert_eq!(read(&dir, "d"), "file\n");
+    assert_eq!(copy.base().unwrap().commit_sha(), Some(h1.as_str()));
 }
 
 /// A head adding a file where an earlier convergence left an emptied folder

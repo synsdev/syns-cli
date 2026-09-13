@@ -167,6 +167,8 @@ fn collision_key(kind: CollisionKind) -> &'static str {
         CollisionKind::AddAdd => "add_add",
         CollisionKind::ModifyDelete => "modify_delete",
         CollisionKind::DeleteModify => "delete_modify",
+        CollisionKind::FolderFile => "folder_file",
+        CollisionKind::FileFolder => "file_folder",
     }
 }
 
@@ -176,6 +178,8 @@ fn collision_label(kind: CollisionKind) -> &'static str {
         CollisionKind::AddAdd => "added on both sides",
         CollisionKind::ModifyDelete => "changed locally, deleted in the repository",
         CollisionKind::DeleteModify => "deleted locally, changed in the repository",
+        CollisionKind::FolderFile => "a folder holding local work here, a file in the repository",
+        CollisionKind::FileFolder => "a file here, a folder in the repository",
     }
 }
 
@@ -265,6 +269,19 @@ fn render_resolution_instruction(repo_id: &str, resolution: &Resolution) -> Stri
          and duplication, and delete each marker block's `{}`, `{}`, `{}` and `{}` lines.",
         CONFLICT_MARKERS[0], CONFLICT_MARKERS[1], CONFLICT_MARKERS[2], CONFLICT_MARKERS[3]
     );
+    if resolution
+        .collisions
+        .iter()
+        .any(|(_, kind)| matches!(kind, CollisionKind::FolderFile | CollisionKind::FileFolder))
+    {
+        let _ = writeln!(
+            text,
+            "   Where a folder and a file of one name collide, the local work stays where it stood \
+             and the repository's side is held in the remote snapshot `syns resolution show` \
+             names: keep either side, or both under different names, and leave no folder and \
+             file of one name."
+        );
+    }
     let _ = writeln!(
         text,
         "4. Run the repository's required checks. Do not force a publication, and do not discard either side."

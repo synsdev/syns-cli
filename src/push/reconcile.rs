@@ -24,6 +24,13 @@ pub enum CollisionKind {
     AddAdd,
     ModifyDelete,
     DeleteModify,
+    /// A folder holding local work where the head puts a file. `reconcile`
+    /// never answers it: a candidate's preparation finds it on disk.
+    FolderFile,
+    /// A local file where the head puts a folder, the path naming that
+    /// file. `reconcile` never answers it: a candidate's preparation finds
+    /// it on disk.
+    FileFolder,
 }
 
 /// Every path either side changed, each in exactly one list, each list
