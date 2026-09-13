@@ -784,6 +784,69 @@ async fn discard_restores_a_file_and_a_folder_a_candidate_swapped() {
     }
 }
 
+/// CR4-1: a head replacing a folder with a file while local work stands in
+/// that folder fails its write, and a discard still puts the folder back and
+/// clears the resolution.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn discard_restores_a_folder_a_head_replaced_with_a_file_over_local_work() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let h0 = e.fake.commit(&[("d/x.md", "x\n"), ("k.md", "k\n")]);
+    checkout(&e.fake, &copy, &h0);
+    write_files(&dir, &[("d/new.md", "new\n")]);
+    e.fake.commit(&[("d", "file\n"), ("k.md", "k\n")]);
+
+    let failed = converge(
+        &e.fake.client(),
+        Some(TOKEN),
+        &copy,
+        ConvergeMode::Publish,
+        e.opts(),
+    )
+    .await;
+    assert!(matches!(failed, Err(CliError::Io { .. })), "{failed:?}");
+
+    let discarded = discard_resolution(&copy);
+
+    assert!(discarded.is_ok(), "{discarded:?}");
+    assert!(copy.resolution().unwrap().is_none());
+    assert_eq!(read(&dir, "d/x.md"), "x\n");
+    assert_eq!(read(&dir, "d/new.md"), "new\n");
+}
+
+/// A head adding a file where an earlier convergence left an emptied folder
+/// takes that folder's place.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn retrieval_writes_a_file_where_an_earlier_run_left_an_empty_folder() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let client = e.fake.client();
+    let retrieval = ConvergeMode::Retrieve { overwrite: false };
+    let h0 = e.fake.commit(&[("d/x.md", "x\n"), ("k.md", "k\n")]);
+    checkout(&e.fake, &copy, &h0);
+    e.fake.commit_changes(&[("d/x.md", None)]);
+    let emptied = converge(&client, Some(TOKEN), &copy, retrieval, e.opts()).await;
+    assert!(
+        matches!(emptied, Ok(SyncOutcome::Synced { .. })),
+        "{emptied:?}"
+    );
+    assert!(dir.join("d").is_dir());
+    let h2 = e.fake.commit_changes(&[("d", Some("file\n"))]);
+
+    let outcome = converge(&client, Some(TOKEN), &copy, retrieval, e.opts()).await;
+
+    assert!(
+        matches!(outcome, Ok(SyncOutcome::Synced { .. })),
+        "{outcome:?}"
+    );
+    assert_eq!(read(&dir, "d"), "file\n");
+    assert_eq!(copy.base().unwrap().commit_sha(), Some(h2.as_str()));
+}
+
 // ---- publication ------------------------------------------------------------
 
 #[tokio::test(flavor = "current_thread")]
@@ -1745,6 +1808,62 @@ async fn version_retrieval_leaves_an_excluded_local_file_untouched() {
     assert_eq!(read(&dir, ".env"), "local secret\n");
     assert_eq!(read(&dir, "a.md"), "a0\n");
     assert_eq!(read(&dir, "logs/run.log"), "remote log\n");
+}
+
+/// CR4-2: the binary's retrieval at a version names each path it leaves to
+/// an ignore rule in both output modes, and counts only what it wrote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn version_retrieval_names_each_excluded_path() {
+    let e = env().await;
+    let dir = e.dir();
+    let h0 = e.fake.commit(&[
+        (".gitignore", ".env\nlogs/\n"),
+        (".env", "remote value\n"),
+        ("logs/run.log", "remote log\n"),
+        ("a.md", "a0\n"),
+    ]);
+    write_files(
+        &dir,
+        &[(".gitignore", ".env\nlogs/\n"), (".env", "local secret\n")],
+    );
+    let syns = |json: bool| {
+        let uri = e.fake.uri.clone();
+        let target = dir.display().to_string();
+        let version = h0.clone();
+        let cwd = dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut args = vec!["pull", "alice/proj", target.as_str(), "--version", &version];
+            if json {
+                args.insert(0, "--json");
+            }
+            assert_cmd::Command::cargo_bin("syns")
+                .unwrap()
+                .env("SYNS_URL", uri)
+                .current_dir(cwd)
+                .args(args)
+                .output()
+                .unwrap()
+        })
+    };
+
+    let machine = syns(true).await.unwrap();
+    let human = syns(false).await.unwrap();
+
+    assert!(
+        machine.status.success(),
+        "{}",
+        String::from_utf8_lossy(&machine.stderr)
+    );
+    let document: Value = serde_json::from_slice(&machine.stdout).unwrap();
+    assert_eq!(document["excluded"], json!([".env"]), "{document}");
+    assert_eq!(document["downloaded"], 3, "{document}");
+    let diagnostics = String::from_utf8_lossy(&human.stderr);
+    assert!(human.status.success(), "{diagnostics}");
+    assert!(
+        diagnostics.lines().any(|l| l.trim() == "excluded: .env"),
+        "{diagnostics}"
+    );
 }
 
 // ---- an interrupted preparation -------------------------------------------

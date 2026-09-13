@@ -357,6 +357,11 @@ pub(crate) fn replace_file_whole(root: &Path, path: &str, bytes: &[u8]) -> Resul
     ));
 
     let written = (|| -> std::io::Result<()> {
+        // An empty folder at the target — one an earlier removal emptied —
+        // gives way to the file; a folder holding anything refuses it.
+        if target.is_dir() && !target.is_symlink() {
+            std::fs::remove_dir(&target)?;
+        }
         let permissions = match OpenOptions::new().write(true).open(&target) {
             Ok(file) => Some(file.metadata()?.permissions()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
@@ -382,9 +387,19 @@ pub(crate) fn replace_file_whole(root: &Path, path: &str, bytes: &[u8]) -> Resul
 }
 
 fn remove_folder_file(copy: &WorkingCopy, path: &str) -> Result<(), CliError> {
-    match std::fs::remove_file(copy.root.join(path)) {
+    let target = copy.root.join(path);
+    match std::fs::remove_file(&target) {
         Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        // A folder standing where the path names a file holds no file
+        // there, as `read_disk` reads it.
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) || target.is_dir() =>
+        {
+            Ok(())
+        }
         Err(err) => Err(CliError::Io {
             message: format!("could not remove {path}: {err}"),
         }),
