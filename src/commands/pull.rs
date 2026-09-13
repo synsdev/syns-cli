@@ -180,8 +180,10 @@ pub async fn cmd_pull(
     Ok(())
 }
 
-/// The registered snapshot retrieval at `--version`, unchanged: every
-/// file at that version written, nothing removed, no record kept.
+/// The registered snapshot retrieval at `--version`: every file at that
+/// version written, nothing removed, no record kept — but for a local file
+/// an ignore rule excludes, which is named and left untouched as a
+/// convergence leaves it.
 #[allow(clippy::too_many_arguments)]
 async fn pull_snapshot(
     output: &Output,
@@ -208,19 +210,36 @@ async fn pull_snapshot(
         message: format!("could not create target directory: {e}"),
     })?;
 
+    let collected = crate::push::collector::collect_files(
+        target_dir,
+        &[],
+        crate::push::collector::CollectOptions::default(),
+    )?;
+    let excluded = crate::push::converge::excluded_local_files(
+        target_dir,
+        |path| collected.files.contains_key(path),
+        server_files.iter().map(|e| &e.path),
+    );
+    drop(collected);
+
     for entry in &server_files {
+        if excluded.contains(&entry.path) {
+            if !output.is_json() {
+                eprintln!("  {}", style(format!("excluded: {}", entry.path)).yellow());
+            }
+            continue;
+        }
         let (response, _raw) = client
             .get_file(repo_id, token, &entry.path, Some(version))
             .await?;
-        let file_path = safe_join(target_dir, &entry.path)?;
-        if let Some(parent) = file_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| CliError::Io {
-                message: format!("could not write file {}: {e}", entry.path),
-            })?;
-        }
-        std::fs::write(&file_path, &response.content).map_err(|e| CliError::Io {
-            message: format!("could not write file {}: {e}", entry.path),
-        })?;
+        safe_join(target_dir, &entry.path)?;
+        // Replaced whole, so a run killed part-way leaves the file as it
+        // stood rather than torn.
+        crate::push::converge::replace_file_whole(
+            target_dir,
+            &entry.path,
+            response.content.as_bytes(),
+        )?;
         if !output.is_json() {
             eprintln!("  {}", style(format!("downloaded: {}", entry.path)).green());
         }
@@ -228,7 +247,7 @@ async fn pull_snapshot(
 
     write_identity_file(repo_arg, target_dir, owner, name)?;
 
-    let downloaded = server_files.len();
+    let downloaded = server_files.len() - excluded.len();
     if output.is_json() {
         output.json(&json!({
             "repo": repo_id,
@@ -236,6 +255,7 @@ async fn pull_snapshot(
             "downloaded": downloaded,
             "unchanged": 0,
             "deleted": 0,
+            "excluded": excluded,
             "version": version,
         }));
     } else {

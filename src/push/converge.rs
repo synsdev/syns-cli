@@ -295,13 +295,15 @@ fn check_server_paths<'a>(paths: impl IntoIterator<Item = &'a String>) -> Result
 }
 
 fn read_disk(copy: &WorkingCopy, path: &str) -> Result<Option<Vec<u8>>, CliError> {
-    match std::fs::read(copy.root.join(path)) {
+    let target = copy.root.join(path);
+    match std::fs::read(&target) {
         Ok(bytes) => Ok(Some(bytes)),
+        // A folder standing where the path names a file holds no file there.
         Err(err)
             if matches!(
                 err.kind(),
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            ) =>
+            ) || target.is_dir() =>
         {
             Ok(None)
         }
@@ -333,11 +335,17 @@ pub(crate) fn is_partial_write(path: &str) -> bool {
 /// process may not write is refused, as an in-place write would be, and
 /// its permissions carry over.
 fn write_folder_file(copy: &WorkingCopy, path: &str, bytes: &[u8]) -> Result<(), CliError> {
-    let target = copy.root.join(path);
+    replace_file_whole(&copy.root, path, bytes)
+}
+
+/// `write_folder_file` under any root, for a retrieval that opens no
+/// working copy.
+pub(crate) fn replace_file_whole(root: &Path, path: &str, bytes: &[u8]) -> Result<(), CliError> {
+    let target = root.join(path);
     let io = |err: std::io::Error| CliError::Io {
         message: format!("could not write {path}: {err}"),
     };
-    let parent = target.parent().unwrap_or(&copy.root);
+    let parent = target.parent().unwrap_or(root);
     std::fs::create_dir_all(parent).map_err(io)?;
     let file_name = target
         .file_name()
@@ -381,6 +389,44 @@ fn remove_folder_file(copy: &WorkingCopy, path: &str) -> Result<(), CliError> {
             message: format!("could not remove {path}: {err}"),
         }),
     }
+}
+
+/// Whether removing `removed` clears the way for writing `written`: a file
+/// standing where the write needs a folder, or a file inside a folder
+/// standing where the write puts a file.
+fn clears_way(removed: &str, written: &str) -> bool {
+    let inside = |inner: &str, outer: &str| {
+        inner
+            .strip_prefix(outer)
+            .is_some_and(|rest| rest.starts_with('/'))
+    };
+    inside(written, removed) || inside(removed, written)
+}
+
+/// Split a set of removals into those clearing the way for one of `writes`,
+/// taken before any write, and the rest, taken after every write.
+fn clearing_first<'a>(
+    writes: &[(String, Vec<u8>)],
+    removals: &'a [String],
+) -> (Vec<&'a String>, Vec<&'a String>) {
+    removals.iter().partition(|removed| {
+        writes
+            .iter()
+            .any(|(written, _)| clears_way(removed, written))
+    })
+}
+
+/// Remove a folder file that clears the way for a write, and every folder
+/// above it the removal leaves empty, so a file can take a folder's place.
+fn remove_clearing(copy: &WorkingCopy, path: &str) -> Result<(), CliError> {
+    remove_folder_file(copy, path)?;
+    let mut folder = copy.root.join(path);
+    while folder.pop() && folder != copy.root && folder.starts_with(&copy.root) {
+        if std::fs::remove_dir(&folder).is_err() {
+            break;
+        }
+    }
+    Ok(())
 }
 
 async fn read_content(
@@ -434,12 +480,21 @@ fn excluded_on_disk<'a>(
     collected: &BTreeMap<String, String>,
     names: impl IntoIterator<Item = &'a String>,
 ) -> BTreeSet<String> {
+    excluded_local_files(&copy.root, |path| collected.contains_key(path), names)
+}
+
+/// `excluded_on_disk` under any root, `collected` answering whether a
+/// collection there took a path — the test a retrieval at a version applies
+/// before it writes.
+pub(crate) fn excluded_local_files<'a>(
+    root: &Path,
+    collected: impl Fn(&str) -> bool,
+    names: impl IntoIterator<Item = &'a String>,
+) -> BTreeSet<String> {
     names
         .into_iter()
         .filter(|path| {
-            !collected.contains_key(*path)
-                && check_server_path(path).is_ok()
-                && copy.root.join(path).is_file()
+            !collected(path) && check_server_path(path).is_ok() && root.join(path).is_file()
         })
         .cloned()
         .collect()
@@ -684,18 +739,32 @@ async fn prepare_candidate(
             resolution = Some(next);
         }
 
-        // `converge` 11 — every write before any removal, each path
-        // hashed again immediately before it is touched.
+        // `converge` 11 — every write before any removal, but for a removal
+        // clearing the way for a write, each path hashed again immediately
+        // before it is touched.
         let expected_before = |path: &str| -> Option<String> {
             match folder.hashes.get(path) {
                 Some(hash) => Some(hash.clone()),
                 None => before.get(path).cloned().flatten(),
             }
         };
+        let unchanged = |path: &str| -> Result<bool, CliError> {
+            Ok(read_disk(copy, path)?.as_deref().map(blob_sha1) == expected_before(path))
+        };
+        let (clearing, later) = clearing_first(&writes, &removals);
         let mut left_untouched = false;
+        let mut blocked: Vec<&String> = Vec::new();
+        for path in clearing {
+            if !unchanged(path)? {
+                left_untouched = true;
+                blocked.push(path);
+                continue;
+            }
+            remove_clearing(copy, path)?;
+            removed.insert(path.clone());
+        }
         for (path, bytes) in &writes {
-            let now = read_disk(copy, path)?.as_deref().map(blob_sha1);
-            if now != expected_before(path) {
+            if blocked.iter().any(|removal| clears_way(removal, path)) || !unchanged(path)? {
                 left_untouched = true;
                 continue;
             }
@@ -703,9 +772,8 @@ async fn prepare_candidate(
             written_this_run.insert(path.clone(), blob_sha1(bytes));
             written.insert(path.clone());
         }
-        for path in &removals {
-            let now = read_disk(copy, path)?.as_deref().map(blob_sha1);
-            if now != expected_before(path) {
+        for path in later {
+            if !unchanged(path)? {
                 left_untouched = true;
                 continue;
             }
@@ -771,10 +839,10 @@ async fn settle_outbox(
     let Some(outbox) = copy.outbox()? else {
         return Ok(OutboxStep::CarryOn);
     };
-    if matches!(mode, ConvergeMode::Retrieve { .. }) && token.is_none() {
-        return Ok(OutboxStep::CarryOn);
-    }
 
+    // 2 sends nothing, so a retrieval holding no credential settles a
+    // landed publication too, before it compares anything against a base
+    // that publication left behind.
     let has_base = copy.base().is_some();
     let head = read_head(client, token, copy, reading_for(mode), has_base).await?;
 
@@ -784,14 +852,31 @@ async fn settle_outbox(
         && head_files == outbox.tree
     {
         copy.record_base(commit, to_hash_map(&head.files))?;
-        copy.remove_outbox()?;
+        // A resolution the landed publication did not carry — prepared
+        // after its outbox by a run that could not settle it — still asks
+        // for review: its candidate, markers included, stands in the folder.
+        let prepared_since = copy.resolution()?.is_some_and(|standing| {
+            standing.pending_writes.is_some()
+                || standing.reviewed_tree.as_ref() != Some(&outbox.tree)
+        });
+        if prepared_since {
+            copy.remove_outbox()?;
+            return Ok(OutboxStep::CarryOn);
+        }
+        // The outbox goes last, so a run killed part-way finds it again.
         copy.remove_resolution()?;
         copy.remove_snapshots()?;
+        copy.remove_outbox()?;
         return Ok(OutboxStep::Completed(SyncOutcome::Synced {
             written: Vec::new(),
             removed: Vec::new(),
             published: None,
         }));
+    }
+
+    // 3
+    if matches!(mode, ConvergeMode::Retrieve { .. }) && token.is_none() {
+        return Ok(OutboxStep::CarryOn);
     }
 
     let parent_files = match &outbox.parent_commit {
@@ -1041,10 +1126,14 @@ async fn overwrite_with_head(
     }
     copy.write_local_snapshot(&snapshot)?;
 
+    let (clearing, later) = clearing_first(&writes, &removals);
+    for path in clearing {
+        remove_clearing(copy, path)?;
+    }
     for (path, bytes) in &writes {
         write_folder_file(copy, path, bytes)?;
     }
-    for path in &removals {
+    for path in later {
         remove_folder_file(copy, path)?;
     }
 
@@ -1365,12 +1454,24 @@ pub fn discard_resolution(copy: &WorkingCopy) -> Result<(), CliError> {
     if copy.resolution()?.is_none() {
         return Ok(());
     }
+    let mut writes: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut removals: Vec<String> = Vec::new();
     for (path, content) in copy.local_snapshot()? {
         check_server_path(&path)?;
         match content {
-            Some(content) => write_folder_file(copy, &path, &content.into_bytes())?,
-            None => remove_folder_file(copy, &path)?,
+            Some(content) => writes.push((path, content.into_bytes())),
+            None => removals.push(path),
         }
+    }
+    let (clearing, later) = clearing_first(&writes, &removals);
+    for path in clearing {
+        remove_clearing(copy, path)?;
+    }
+    for (path, bytes) in &writes {
+        write_folder_file(copy, path, bytes)?;
+    }
+    for path in later {
+        remove_folder_file(copy, path)?;
     }
     // A continued publication that may have landed leaves an outbox; kept,
     // the next run would resume it and publish the restored folder over the

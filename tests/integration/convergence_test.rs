@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Value, json};
 use serial_test::serial;
 use syns_cli::client::{PushRequest, SynsClient};
+use syns_cli::commands::pull::cmd_pull;
 use syns_cli::commands::push::{PushArgs, cmd_push};
 use syns_cli::config::Config;
 use syns_cli::errors::CliError;
@@ -682,6 +683,107 @@ async fn retrieval_with_lost_base_prepares_every_differing_path() {
     );
 }
 
+/// A tree before and after a head swaps a file and a folder of one name.
+type Swap = (
+    &'static str,
+    &'static [(&'static str, &'static str)],
+    &'static [(&'static str, &'static str)],
+);
+
+const SWAPS: [Swap; 2] = [
+    (
+        "a file replaced by a folder",
+        &[("d", "file\n"), ("k.md", "k\n")],
+        &[("d/x.md", "x\n"), ("k.md", "k\n")],
+    ),
+    (
+        "a folder replaced by a file",
+        &[("d/x.md", "x\n"), ("d/sub/y.md", "y\n"), ("k.md", "k\n")],
+        &[("d", "file\n"), ("k.md", "k\n")],
+    ),
+];
+
+/// A head replacing a file with a folder of the same name, or a folder with
+/// a file, is taken by a retrieval with and without its overwrite option.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn retrieval_takes_a_head_swapping_a_file_and_a_folder() {
+    let e = env().await;
+    for (label, before, after) in SWAPS {
+        for overwrite in [false, true] {
+            let fake = Fake::start().await;
+            let folder = tempfile::tempdir().unwrap();
+            let copy = e.copy(folder.path());
+            let h0 = fake.commit(before);
+            checkout(&fake, &copy, &h0);
+            let h1 = fake.commit(after);
+
+            let outcome = converge(
+                &fake.client(),
+                Some(TOKEN),
+                &copy,
+                ConvergeMode::Retrieve { overwrite },
+                e.opts(),
+            )
+            .await;
+
+            assert!(
+                matches!(outcome, Ok(SyncOutcome::Synced { .. })),
+                "{label}, overwrite {overwrite}: {outcome:?}"
+            );
+            let expected: BTreeMap<String, String> =
+                hashes(&fake.tree_at(&h1)).into_iter().collect();
+            assert_eq!(
+                folder_hashes(folder.path()),
+                expected,
+                "{label}, overwrite {overwrite}"
+            );
+            assert_eq!(copy.base().unwrap().commit_sha(), Some(h1.as_str()));
+        }
+    }
+}
+
+/// A discard after a candidate swapped a file and a folder puts each back as
+/// it stood before the resolution.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn discard_restores_a_file_and_a_folder_a_candidate_swapped() {
+    let e = env().await;
+    for (label, before, after) in SWAPS {
+        let fake = Fake::start().await;
+        let folder = tempfile::tempdir().unwrap();
+        let copy = e.copy(folder.path());
+        let mut h0_tree = before.to_vec();
+        h0_tree.push(("a.md", "a\nb\nc\n"));
+        let h0 = fake.commit(&h0_tree);
+        checkout(&fake, &copy, &h0);
+        write_files(folder.path(), &[("a.md", "a\nL\nc\n")]);
+        let prior = folder_hashes(folder.path());
+        let mut h1_tree = after.to_vec();
+        h1_tree.push(("a.md", "a\nR\nc\n"));
+        fake.commit(&h1_tree);
+
+        let prepared = converge(
+            &fake.client(),
+            Some(TOKEN),
+            &copy,
+            ConvergeMode::Retrieve { overwrite: false },
+            e.opts(),
+        )
+        .await;
+        assert!(
+            matches!(prepared, Ok(SyncOutcome::ResolutionRequired(_))),
+            "{label}: {prepared:?}"
+        );
+
+        let discarded = discard_resolution(&copy);
+
+        assert!(discarded.is_ok(), "{label}: {discarded:?}");
+        assert_eq!(folder_hashes(folder.path()), prior, "{label}");
+        assert!(copy.resolution().unwrap().is_none(), "{label}");
+    }
+}
+
 // ---- publication ------------------------------------------------------------
 
 #[tokio::test(flavor = "current_thread")]
@@ -1063,6 +1165,120 @@ async fn acknowledged_publication_completes_without_a_second_commit() {
 
     assert!(e.fake.push_bodies().is_empty());
     assert_eq!(copy.base().unwrap().commit_sha(), Some(h1.as_str()));
+    assert!(copy.outbox().unwrap().is_none());
+}
+
+/// No publication the fake recorded carries a conflict marker line.
+fn assert_no_marker_published(e: &Env) {
+    for body in e.fake.push_bodies() {
+        for file in body["files"].as_array().unwrap() {
+            let content = file.get("content").and_then(Value::as_str).unwrap_or("");
+            assert!(
+                !content.lines().any(|l| l == "<<<<<<< local"),
+                "a candidate's markers were published in {}",
+                file["path"]
+            );
+        }
+    }
+}
+
+/// A publication of `a.md` landed unacknowledged on H1, its outbox standing,
+/// and `a.md` edited again since; answers H0 and H1.
+fn landed_unacknowledged(e: &Env, dir: &Path, copy: &WorkingCopy) -> (String, String) {
+    let h0 = e.fake.commit(&[("a.md", "a\nb\nc\n"), ("b.md", "b0\n")]);
+    checkout(&e.fake, copy, &h0);
+    write_files(dir, &[("a.md", "a\nP\nc\n")]);
+    copy.write_outbox(&Outbox {
+        parent_commit: Some(h0.clone()),
+        tree: folder_hashes(dir),
+    })
+    .unwrap();
+    let h1 = e.fake.commit_changes(&[("a.md", Some("a\nP\nc\n"))]);
+    write_files(dir, &[("a.md", "a\nQ\nc\n")]);
+    (h0, h1)
+}
+
+/// A retrieval holding no credential settles a publication that landed
+/// unacknowledged before it compares, so the edit made since reads as local
+/// work on the landed commit rather than a collision whose markers a later
+/// sync publishes.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_retrieval_without_a_credential_settles_a_landed_publication_first() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let client = e.fake.client();
+    let (_h0, h1) = landed_unacknowledged(&e, &dir, &copy);
+
+    let retrieved = converge(
+        &client,
+        None,
+        &copy,
+        ConvergeMode::Retrieve { overwrite: false },
+        e.opts(),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !matches!(retrieved, SyncOutcome::ResolutionRequired(_)),
+        "{retrieved:?}"
+    );
+    assert_eq!(read(&dir, "a.md"), "a\nQ\nc\n");
+    assert_eq!(copy.base().unwrap().commit_sha(), Some(h1.as_str()));
+    assert!(copy.outbox().unwrap().is_none());
+    for _ in 0..2 {
+        converge(&client, Some(TOKEN), &copy, ConvergeMode::Publish, e.opts())
+            .await
+            .unwrap();
+    }
+    assert_no_marker_published(&e);
+    assert_eq!(e.fake.head().1["a.md"], "a\nQ\nc\n");
+}
+
+/// A publication found landed once the head comes back to its tree keeps a
+/// resolution a run holding no credential prepared after it, rather than
+/// leaving that candidate's markers in the folder for the next sync to
+/// publish.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_landed_publication_keeps_a_resolution_prepared_after_it() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let client = e.fake.client();
+    landed_unacknowledged(&e, &dir, &copy);
+    e.fake.commit_changes(&[("b.md", Some("b2\n"))]);
+    let prepared = expect_resolution(
+        converge(
+            &client,
+            None,
+            &copy,
+            ConvergeMode::Retrieve { overwrite: false },
+            e.opts(),
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(read(&dir, "a.md").lines().any(|l| l == "<<<<<<< local"));
+    let h3 = e.fake.commit_changes(&[("b.md", Some("b0\n"))]);
+
+    for _ in 0..2 {
+        let outcome = converge(&client, Some(TOKEN), &copy, ConvergeMode::Publish, e.opts())
+            .await
+            .unwrap();
+        match outcome {
+            SyncOutcome::ResolutionRequired(r) => {
+                assert_eq!(r.recovery_id, prepared.recovery_id)
+            }
+            other => panic!("expected the prepared resolution, got {other:?}"),
+        }
+    }
+
+    assert_no_marker_published(&e);
+    assert!(e.fake.push_bodies().is_empty());
+    assert_eq!(copy.base().unwrap().commit_sha(), Some(h3.as_str()));
     assert!(copy.outbox().unwrap().is_none());
 }
 
@@ -1489,6 +1705,48 @@ async fn convergence_leaves_an_excluded_local_file_untouched() {
     assert_eq!(tree["a.md"], "a1\n");
 }
 
+/// Run `syns pull alice/proj <dir> --version <version>`.
+async fn pull_version(e: &Env, dir: &Path, version: &str) -> Result<(), CliError> {
+    cmd_pull(
+        &e.config,
+        &e.output,
+        Some("alice/proj".into()),
+        Some(dir.display().to_string()),
+        Some(version.into()),
+        false,
+        false,
+    )
+    .await
+}
+
+/// A retrieval at a version leaves a local file an ignore rule excludes
+/// untouched, as a convergence does, and writes an excluded path no local
+/// file stands at.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn version_retrieval_leaves_an_excluded_local_file_untouched() {
+    let e = env().await;
+    let dir = e.dir();
+    let h0 = e.fake.commit(&[
+        (".gitignore", ".env\nlogs/\n"),
+        (".env", "remote value\n"),
+        ("logs/run.log", "remote log\n"),
+        ("a.md", "a0\n"),
+    ]);
+    e.fake.commit_changes(&[("a.md", Some("a1\n"))]);
+    write_files(
+        &dir,
+        &[(".gitignore", ".env\nlogs/\n"), (".env", "local secret\n")],
+    );
+
+    let pulled = pull_version(&e, &dir, &h0).await;
+
+    assert!(pulled.is_ok(), "{pulled:?}");
+    assert_eq!(read(&dir, ".env"), "local secret\n");
+    assert_eq!(read(&dir, "a.md"), "a0\n");
+    assert_eq!(read(&dir, "logs/run.log"), "remote log\n");
+}
+
 // ---- an interrupted preparation -------------------------------------------
 
 fn set_readonly(path: &Path, readonly: bool) {
@@ -1883,6 +2141,20 @@ async fn run_as_torn_writer() -> bool {
     let spec: Value = serde_json::from_str(&spec).unwrap();
     let cache = PathBuf::from(spec["cache"].as_str().unwrap());
     let dir = PathBuf::from(spec["dir"].as_str().unwrap());
+    if let Some(version) = spec["version"].as_str() {
+        let config = Config::new(Some(spec["uri"].as_str().unwrap())).unwrap();
+        let _ = cmd_pull(
+            &config,
+            &Output::new(true),
+            Some("alice/proj".into()),
+            Some(dir.display().to_string()),
+            Some(version.into()),
+            false,
+            false,
+        )
+        .await;
+        return true;
+    }
     let client = SynsClient::new(spec["uri"].as_str().unwrap()).unwrap();
     let copy = WorkingCopy::open(&cache, "alice", "proj", &dir).unwrap();
     let mode = if spec["publish"].as_bool().unwrap() {
@@ -1923,14 +2195,61 @@ fn seed_torn_write(e: &Env, copy: &WorkingCopy, edited: bool) -> String {
 /// was opened for that write and before the write finished.
 #[cfg(unix)]
 async fn kill_mid_write(e: &Env, dir: &Path, test: &str, publish: bool) {
+    stop_writer_mid_write(e, dir, test, json!({"publish": publish})).await;
+}
+
+/// `kill_mid_write` over a retrieval at `version` rather than a convergence.
+#[cfg(unix)]
+async fn kill_mid_version_write(e: &Env, dir: &Path, test: &str, version: &str) {
+    stop_writer_mid_write(e, dir, test, json!({"version": version})).await;
+}
+
+/// A retrieval at a version killed part-way through writing `c.md` leaves
+/// `c.md` as it stood, and its re-run writes the version's `c.md` and leaves
+/// no write sibling.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_version_retrieval_killed_mid_write_leaves_the_file_as_it_stood() {
+    if run_as_torn_writer().await {
+        return;
+    }
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let h1 = seed_torn_write(&e, &copy, false);
+    kill_mid_version_write(
+        &e,
+        &dir,
+        "a_version_retrieval_killed_mid_write_leaves_the_file_as_it_stood",
+        &h1,
+    )
+    .await;
+
+    let rerun = pull_version(&e, &dir, &h1).await;
+
+    assert!(rerun.is_ok(), "{rerun:?}");
+    assert!(read(&dir, "c.md") == torn_remote());
+    assert!(
+        partial_writes(&dir).is_empty(),
+        "{:?}",
+        partial_writes(&dir)
+    );
+}
+
+#[cfg(unix)]
+async fn stop_writer_mid_write(e: &Env, dir: &Path, test: &str, run: Value) {
     use std::os::unix::process::ExitStatusExt;
-    let spec = json!({
+    let mut spec = json!({
         "uri": e.fake.uri,
         "cache": e.config.cache_dir(),
         "dir": dir,
-        "publish": publish,
-    })
-    .to_string();
+        "publish": false,
+    });
+    spec.as_object_mut()
+        .unwrap()
+        .extend(run.as_object().unwrap().clone());
+    let spec = spec.to_string();
     let mut writer = tokio::process::Command::new(std::env::current_exe().unwrap());
     writer
         .args([
