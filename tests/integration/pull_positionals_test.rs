@@ -103,6 +103,43 @@ impl Env {
     }
 }
 
+impl Env {
+    /// The tree and file mocks for a repository whose head holds `a.md`
+    /// and an identity file naming it.
+    fn mount_tree_with_a_md_and_identity(&self, owner: &str, name: &str) {
+        let repo_id = format!("{owner}/{name}");
+        let yaml = format!("owner: {owner}\nname: {name}\n");
+        self.runtime.block_on(async {
+            Mock::given(method("GET"))
+                .and(path(format!("/api/v1/repos/{repo_id}/tree")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "entries": [
+                        {"name": ".syns.yaml", "path": ".syns.yaml", "type": "file", "size": yaml.len(), "sha": blob_sha1(yaml.as_bytes())},
+                        {"name": "a.md", "path": "a.md", "type": "file", "size": 1, "sha": blob_sha1(b"a")}
+                    ],
+                    "commitSha": "5555555555555555555555555555555555555555",
+                    "truncated": false
+                })))
+                .mount(&self.server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/api/v1/repos/{repo_id}/files/.syns.yaml")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "content": yaml, "sha": blob_sha1(yaml.as_bytes()), "size": yaml.len()
+                })))
+                .mount(&self.server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/api/v1/repos/{repo_id}/files/a.md")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "content": "a", "sha": blob_sha1(b"a"), "size": 1
+                })))
+                .mount(&self.server)
+                .await;
+        });
+    }
+}
+
 fn identity(dir: &Path, owner: &str, name: &str) {
     fs::create_dir_all(dir).unwrap();
     fs::write(
@@ -361,6 +398,67 @@ fn positional_repository_wins_over_the_identity_file_at_the_path() {
         "{paths:?}"
     );
     assert!(!paths.iter().any(|p| p.contains("bob/other")), "{paths:?}");
+}
+
+/// V1-11 (u262 `VERIFICATION.md`): a positional repository whose head
+/// carries its own identity file, pulled into a path holding another
+/// repository's, collides on `.syns.yaml` added on both sides. The
+/// retrieval ends on the registered resolution refusal, never on a parse
+/// of the marker-carrying file the convergence left for review.
+#[test]
+#[serial]
+fn positional_repository_colliding_on_the_identity_file_at_the_path_ends_on_the_resolution_refusal()
+{
+    let env = Env::new();
+    identity(&env.w.join("target"), "bob", "other");
+    fs::create_dir_all(env.w.join("cwd")).unwrap();
+    env.mount_tree_with_a_md_and_identity("alice", "proj");
+
+    for args in [
+        &["pull", "alice/proj", "../target"][..],
+        &["--json", "pull", "alice/proj", "../target"][..],
+    ] {
+        let output = env.syns(&env.w.join("cwd"), args);
+
+        assert!(
+            !stderr(&output).contains("invalid .syns.yaml"),
+            "{}",
+            stderr(&output)
+        );
+        assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+        if args[0] == "--json" {
+            let document: serde_json::Value =
+                serde_json::from_str(stdout(&output).trim()).expect("one JSON document");
+            assert_eq!(document["outcome"], "resolution_required", "{document}");
+        }
+    }
+    assert!(
+        !env.w.join("cwd/.syns.yaml").exists(),
+        "the working directory gains no identity file"
+    );
+    let paths = env.request_paths();
+    assert!(!paths.iter().any(|p| p.contains("bob/other")), "{paths:?}");
+}
+
+/// A positional retrieval ending on the resolution refusal still leaves
+/// the identity file at its write root, so the resolution commands run
+/// there resolve the repository they must continue.
+#[test]
+#[serial]
+fn positional_repository_ending_on_the_resolution_refusal_writes_the_identity_file_at_the_path() {
+    let env = Env::new();
+    fs::create_dir_all(env.w.join("target")).unwrap();
+    fs::write(env.w.join("target/a.md"), "local").unwrap();
+    fs::create_dir_all(env.w.join("cwd")).unwrap();
+    env.mount_tree_with_a_md("alice/proj");
+
+    let output = env.syns(&env.w.join("cwd"), &["pull", "alice/proj", "../target"]);
+
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    assert_eq!(
+        fs::read_to_string(env.w.join("target/.syns.yaml")).unwrap(),
+        "owner: alice\nname: proj\n"
+    );
 }
 
 #[test]

@@ -123,12 +123,17 @@ pub fn write_syns_yaml(path: &Path, owner: &str, name: &str) -> Result<(), CliEr
 /// clause keeps a run naming another repository from overwriting the
 /// file standing where it runs, and with it the checks that file
 /// declares.
+///
+/// The exact-directory clause is tested first and reads no content: a
+/// convergence colliding on `.syns.yaml` itself leaves that file carrying
+/// markers for review, and parsing it here would replace the
+/// convergence's own refusal with a malformed-file error (u262 V1-11).
 pub fn write_syns_yaml_where_none_stands(
     dir: &Path,
     owner: &str,
     name: &str,
 ) -> Result<bool, CliError> {
-    if find_repo_root_for(dir, owner, name)?.is_some() || dir.join(SYNS_YAML_FILENAME).exists() {
+    if dir.join(SYNS_YAML_FILENAME).exists() || find_repo_root_for(dir, owner, name)?.is_some() {
         return Ok(false);
     }
     write_syns_yaml(dir, owner, name)?;
@@ -310,6 +315,19 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dir.path().join(".syns.yaml")).unwrap(),
             standing
+        );
+    }
+
+    #[test]
+    fn write_where_none_stands_leaves_a_marker_carrying_file_unread_and_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let markers = "<<<<<<< local\nowner: bob\nname: other\n||||||| base\n=======\nowner: alice\nname: proj\n>>>>>>> remote\n";
+        fs::write(dir.path().join(".syns.yaml"), markers).unwrap();
+
+        assert!(!write_syns_yaml_where_none_stands(dir.path(), "alice", "proj").unwrap());
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".syns.yaml")).unwrap(),
+            markers
         );
     }
 
