@@ -143,7 +143,10 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
     let opts = SmartPushOptions {
         force: args.force,
         message,
-        author: Some(owner.clone()),
+        // SPEC u258 `cmd_push` 2 (D-065): no author on any branch, so the
+        // server names the session's user — a non-owner writer publishing
+        // into the owner's repository is recorded as themselves.
+        author: None,
         parent_sha: None,
         excludes: args.exclude.clone(),
         cache_dir: config.cache_dir().to_path_buf(),
@@ -814,5 +817,233 @@ mod tests {
         let envelope = build_json_envelope(&raw, &[]);
         assert!(envelope.as_object().unwrap().get("skipped").is_none());
         assert_eq!(envelope, raw);
+    }
+
+    // u258: a forced or path-scoped publication names no author, so the
+    // server records the writer who pushed rather than the owner.
+
+    const NON_OWNER_PUSH_PATH: &str = "/api/v1/repos/alice/test-repo/push";
+
+    /// Isolated config and cache dirs for one test, removed on drop.
+    struct NonOwnerEnv {
+        config_dir: tempfile::TempDir,
+        cache_dir: tempfile::TempDir,
+    }
+
+    impl NonOwnerEnv {
+        fn new() -> Self {
+            let env = NonOwnerEnv {
+                config_dir: tempfile::tempdir().unwrap(),
+                cache_dir: tempfile::tempdir().unwrap(),
+            };
+            unsafe { std::env::set_var("SYNS_CONFIG_DIR", env.config_dir.path()) };
+            unsafe { std::env::set_var("SYNS_CACHE_DIR", env.cache_dir.path()) };
+            env
+        }
+    }
+
+    impl Drop for NonOwnerEnv {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+            unsafe { std::env::remove_var("SYNS_CACHE_DIR") };
+            let _ = std::env::set_current_dir(env!("CARGO_MANIFEST_DIR"));
+        }
+    }
+
+    fn store_bob_credential(config: &Config) {
+        TokenStore::new(config.credentials_path())
+            .write_with_username("test-token", Some("bob"))
+            .unwrap();
+    }
+
+    fn alice_identity_folder() -> tempfile::TempDir {
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(
+            folder.path().join(".syns.yaml"),
+            "owner: alice\nname: test-repo\n",
+        )
+        .unwrap();
+        std::fs::write(folder.path().join("README.md"), "edited by bob\n").unwrap();
+        folder
+    }
+
+    async fn mount_tree_not_found(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/test-repo/tree"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(serde_json::json!({"error": "not_found"})),
+            )
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_push_accepted(server: &MockServer, priority: u8) {
+        Mock::given(method("PUT"))
+            .and(path(NON_OWNER_PUSH_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "commitSha": "b0b12345b0b12345",
+                "version": 2,
+                "filesChanged": 1,
+                "created": false
+            })))
+            .with_priority(priority)
+            .mount(server)
+            .await;
+    }
+
+    /// Every `EP-push` body the mock recorded at `alice/test-repo`, in order.
+    async fn put_bodies(server: &MockServer) -> Vec<serde_json::Value> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method == reqwest::Method::PUT && r.url.path() == NON_OWNER_PUSH_PATH)
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect()
+    }
+
+    fn file_entry<'a>(body: &'a serde_json::Value, file: &str) -> &'a serde_json::Value {
+        body["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["path"] == file)
+            .unwrap_or_else(|| panic!("{file} missing from push body {body}"))
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn path_scoped_push_by_a_non_owner_sends_no_author() {
+        let server = MockServer::start().await;
+        mount_tree_not_found(&server).await;
+        mount_push_accepted(&server, 1).await;
+
+        let _env = NonOwnerEnv::new();
+        let folder = alice_identity_folder();
+        std::env::set_current_dir(folder.path()).unwrap();
+        let config = Config::new(Some(&server.uri())).unwrap();
+        store_bob_credential(&config);
+
+        let args = PushArgs {
+            path: Some(".".into()),
+            message: Some("bob edits via team write".into()),
+            ..default_push_args()
+        };
+        let result = cmd_push(&config, &Output::new(false), &args).await;
+        assert!(result.is_ok(), "{result:?}");
+
+        let bodies = put_bodies(&server).await;
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0]["message"], "bob edits via team write");
+        assert!(bodies[0].get("author").is_none(), "{}", bodies[0]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn forced_push_by_a_non_owner_sends_no_author() {
+        let server = MockServer::start().await;
+        mount_tree_not_found(&server).await;
+        mount_push_accepted(&server, 1).await;
+
+        let _env = NonOwnerEnv::new();
+        let folder = alice_identity_folder();
+        std::env::set_current_dir(folder.path()).unwrap();
+        let config = Config::new(Some(&server.uri())).unwrap();
+        store_bob_credential(&config);
+
+        let args = PushArgs {
+            force: true,
+            ..default_push_args()
+        };
+        let result = cmd_push(&config, &Output::new(false), &args).await;
+        assert!(result.is_ok(), "{result:?}");
+
+        let bodies = put_bodies(&server).await;
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].get("author").is_none(), "{}", bodies[0]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn push_naming_another_owner_on_the_command_line_sends_no_author() {
+        let server = MockServer::start().await;
+        mount_tree_not_found(&server).await;
+        mount_push_accepted(&server, 1).await;
+
+        let _env = NonOwnerEnv::new();
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(folder.path().join("notes.md"), "bob's notes\n").unwrap();
+        std::env::set_current_dir(folder.path()).unwrap();
+        let config = Config::new(Some(&server.uri())).unwrap();
+        store_bob_credential(&config);
+
+        let args = PushArgs {
+            name: Some("alice/test-repo".into()),
+            path: Some(".".into()),
+            ..default_push_args()
+        };
+        let result = cmd_push(&config, &Output::new(false), &args).await;
+        assert!(result.is_ok(), "{result:?}");
+
+        let bodies = put_bodies(&server).await;
+        assert_eq!(bodies.len(), 1);
+        file_entry(&bodies[0], "notes.md");
+        assert!(bodies[0].get("author").is_none(), "{}", bodies[0]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn missing_blobs_resend_by_a_non_owner_sends_no_author() {
+        let server = MockServer::start().await;
+        mount_tree_not_found(&server).await;
+        mount_push_accepted(&server, 2).await;
+        Mock::given(method("PUT"))
+            .and(path(NON_OWNER_PUSH_PATH))
+            .respond_with(
+                ResponseTemplate::new(409)
+                    .set_body_json(serde_json::json!({"error": "missing_blobs"})),
+            )
+            .with_priority(1)
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        let _env = NonOwnerEnv::new();
+        let folder = alice_identity_folder();
+        std::env::set_current_dir(folder.path()).unwrap();
+        let config = Config::new(Some(&server.uri())).unwrap();
+        store_bob_credential(&config);
+
+        let readme = std::fs::read(folder.path().join("README.md")).unwrap();
+        let mut record = crate::push::manifest::Manifest::default();
+        record.update(
+            "a11ce000a11ce000".into(),
+            std::collections::HashMap::from([(
+                "README.md".to_string(),
+                crate::push::hash::blob_sha1(&readme),
+            )]),
+        );
+        record
+            .save(config.cache_dir(), "alice", "test-repo")
+            .unwrap();
+
+        let args = PushArgs {
+            path: Some(".".into()),
+            ..default_push_args()
+        };
+        let result = cmd_push(&config, &Output::new(false), &args).await;
+        assert!(result.is_ok(), "{result:?}");
+
+        let bodies = put_bodies(&server).await;
+        assert_eq!(bodies.len(), 2);
+        assert!(file_entry(&bodies[0], "README.md")["content"].is_null());
+        assert_eq!(
+            file_entry(&bodies[1], "README.md")["content"].as_str(),
+            Some("edited by bob\n")
+        );
+        for body in &bodies {
+            assert!(body.get("author").is_none(), "{body}");
+        }
     }
 }
