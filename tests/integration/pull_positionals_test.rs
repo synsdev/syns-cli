@@ -211,6 +211,29 @@ fn positional_repository_under_if_repo_pulls_where_an_identity_file_stands_above
     assert!(env.w.join("a.md").is_file());
 }
 
+/// The filer's ruling of 2026-09-16 on u262 round 1's open question:
+/// `--if-repo` with a positional repository keeps refusing where the
+/// identity file above its starting directory is malformed.
+#[test]
+#[serial]
+fn positional_repository_under_if_repo_refuses_a_malformed_identity_file_above() {
+    let env = Env::new();
+    fs::write(env.w.join(".syns.yaml"), "owner: [alice\n").unwrap();
+    fs::create_dir_all(env.w.join("sub")).unwrap();
+    env.mount_tree_with_a_md("alice/proj");
+
+    let output = env.syns(&env.w.join("sub"), &["pull", "--if-repo", "alice/proj"]);
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).starts_with("error: invalid .syns.yaml: "),
+        "{}",
+        stderr(&output)
+    );
+    assert!(env.request_paths().is_empty());
+    assert!(!env.w.join("sub/a.md").exists());
+}
+
 #[test]
 #[serial]
 fn lone_relative_path_converges_that_path_from_its_identity_file() {

@@ -275,6 +275,22 @@ mod tests {
         }
     }
 
+    /// The filer's ruling of 2026-09-16 on u262 round 1's open question: a
+    /// `..` after a symbolic link climbs to the link's own parent.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_start_path_climbs_from_a_symbolic_link_to_its_own_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = std::fs::canonicalize(dir.path()).unwrap();
+        fs::create_dir_all(w.join("real/deep")).unwrap();
+        std::os::unix::fs::symlink(w.join("real/deep"), w.join("link")).unwrap();
+
+        assert_eq!(
+            resolve_start_path(Some(&w.join("link/../x"))).unwrap(),
+            w.join("x")
+        );
+    }
+
     fn tree() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
