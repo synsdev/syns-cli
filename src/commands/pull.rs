@@ -2,16 +2,92 @@ use crate::auth::token::TokenStore;
 use crate::client::{EntryType, SynsClient};
 use crate::commands::sync::{convergence_options, render_outcome, render_transfer_lines};
 use crate::config::Config;
-use crate::errors::CliError;
+use crate::errors::{CliError, IdentityRemedy};
 use crate::output::Output;
 use crate::push::converge::{ConvergeMode, SyncOutcome, converge};
 use crate::push::working_copy::WorkingCopy;
 use crate::repo::if_repo::resolve_full_or_skip;
 use crate::repo::root::{pull_root, resolve_start_path};
-use crate::repo::syns_yaml::write_syns_yaml_where_none_stands;
+use crate::repo::syns_yaml::{read_syns_yaml, write_syns_yaml_where_none_stands};
 use console::style;
 use serde_json::json;
 use std::path::{Path, PathBuf};
+
+/// Whether a positional is spelt as a repository: one `/` joining an owner
+/// of 1–39 ASCII letters, digits or `-` to a name of 1–100 ASCII letters,
+/// digits, `.`, `_` or `-` opening on a letter or digit, either letter
+/// case accepted (SPEC u262, `D-024`, `D-025`).
+pub fn is_repository_shape(value: &str) -> bool {
+    let Some((owner, name)) = value.split_once('/') else {
+        return false;
+    };
+    let owner_ok = (1..=39).contains(&owner.len())
+        && owner
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    let name_ok = (1..=100).contains(&name.len())
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    owner_ok && name_ok
+}
+
+/// The `syns pull` positionals as bound: `repository` holds the owner and
+/// the name, both lower-cased.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullPositionals {
+    pub repository: Option<(String, String)>,
+    pub path: Option<String>,
+}
+
+/// A first of two positionals lacking the repository shape, exactly as
+/// typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PositionalRefusal {
+    pub value: String,
+}
+
+/// Binds the `syns pull` positionals by spelling alone, reading no
+/// filesystem state, so one argument vector binds identically in every
+/// directory (SPEC u262 `bind_pull_positionals` 1–2).
+pub fn bind_pull_positionals(
+    first: Option<String>,
+    second: Option<String>,
+) -> Result<PullPositionals, PositionalRefusal> {
+    match (first, second) {
+        (Some(first), Some(second)) => match split_repository(&first) {
+            Some(repository) => Ok(PullPositionals {
+                repository: Some(repository),
+                path: Some(second),
+            }),
+            None => Err(PositionalRefusal { value: first }),
+        },
+        (Some(lone), None) | (None, Some(lone)) => Ok(match split_repository(&lone) {
+            Some(repository) => PullPositionals {
+                repository: Some(repository),
+                path: None,
+            },
+            None => PullPositionals {
+                repository: None,
+                path: Some(lone),
+            },
+        }),
+        (None, None) => Ok(PullPositionals {
+            repository: None,
+            path: None,
+        }),
+    }
+}
+
+/// The lower-cased owner and name of a value with the repository shape.
+fn split_repository(value: &str) -> Option<(String, String)> {
+    if !is_repository_shape(value) {
+        return None;
+    }
+    let (owner, name) = value.split_once('/')?;
+    Some((owner.to_ascii_lowercase(), name.to_ascii_lowercase()))
+}
 
 /// The `INV-30` test a server-named path passes before a retrieval
 /// writes it — the one a convergence applies, so both retrievals refuse
@@ -34,7 +110,7 @@ fn safe_join(target_dir: &Path, entry_path: &str) -> Result<PathBuf, CliError> {
 /// Write the identity file at the write root where the registered
 /// retrieval would, and only where no identity file stands there.
 fn write_identity_file(
-    repo_arg: &Option<String>,
+    repository: &Option<(String, String)>,
     target_dir: &Path,
     owner: &str,
     name: &str,
@@ -47,7 +123,7 @@ fn write_identity_file(
     // of its own and every later publication from there resolves to it.
     // SPEC u256: nor over an identity file standing at the write root,
     // whose declared checks a rewrite would drop.
-    if repo_arg.is_some() {
+    if repository.is_some() {
         write_syns_yaml_where_none_stands(target_dir, owner, name)?;
     }
     Ok(())
@@ -57,7 +133,7 @@ fn write_identity_file(
 pub async fn cmd_pull(
     config: &Config,
     output: &Output,
-    repo_arg: Option<String>,
+    repository: Option<(String, String)>,
     path_arg: Option<String>,
     version: Option<String>,
     if_repo: bool,
@@ -69,20 +145,29 @@ pub async fn cmd_pull(
     // whichever descendant of it the run started in.
     let start_dir = resolve_start_path(path_arg.as_deref().map(Path::new))?;
 
-    let (owner, name) = if let Some(ref arg) = repo_arg {
-        let mut parts = arg.splitn(2, '/');
-        let o = parts.next().unwrap_or("");
-        let n = parts.next().unwrap_or("");
-        if o.is_empty() || n.is_empty() {
-            return Err(CliError::Io {
-                message: "invalid repo identifier — expected OWNER/NAME format".into(),
-            });
-        }
-        (o.to_string(), n.to_string())
-    } else {
-        match resolve_full_or_skip(None, &start_dir, if_repo, output)? {
-            Some(pair) => pair,
-            None => return Ok(()),
+    // SPEC u262 `cmd_pull` 2: `--if-repo` skips wherever no identity file
+    // stands at or above the starting directory — a repository named on
+    // the command line included, so the option means one thing however
+    // the repository was given.
+    if if_repo && repository.is_some() && read_syns_yaml(&start_dir)?.is_none() {
+        output.skip();
+        return Ok(());
+    }
+
+    let (owner, name) = match &repository {
+        Some(pair) => pair.clone(),
+        None => {
+            // `syns pull` accepts the repository as a positional, so its
+            // refusal names that, and the directory a path argument named.
+            let remedy = IdentityRemedy::RepositoryPositional {
+                path: path_arg.as_ref().map(|_| start_dir.clone()),
+            };
+            match resolve_full_or_skip(None, &start_dir, if_repo, output)
+                .map_err(|err| err.with_identity_remedy(remedy))?
+            {
+                Some(pair) => pair,
+                None => return Ok(()),
+            }
         }
     };
 
@@ -110,7 +195,7 @@ pub async fn cmd_pull(
             &client,
             token.as_deref(),
             &repo_id,
-            &repo_arg,
+            &repository,
             &target_dir,
             &owner,
             &name,
@@ -137,7 +222,7 @@ pub async fn cmd_pull(
     .await?;
 
     // `cmd_pull` 4
-    write_identity_file(&repo_arg, &target_dir, &owner, &name)?;
+    write_identity_file(&repository, &target_dir, &owner, &name)?;
 
     let (written, removed) = match outcome {
         SyncOutcome::Synced {
@@ -190,7 +275,7 @@ async fn pull_snapshot(
     client: &SynsClient,
     token: Option<&str>,
     repo_id: &str,
-    repo_arg: &Option<String>,
+    repository: &Option<(String, String)>,
     target_dir: &Path,
     owner: &str,
     name: &str,
@@ -245,7 +330,7 @@ async fn pull_snapshot(
         }
     }
 
-    write_identity_file(repo_arg, target_dir, owner, name)?;
+    write_identity_file(repository, target_dir, owner, name)?;
 
     let downloaded = server_files.len() - excluded.len();
     if output.is_json() {
@@ -397,50 +482,27 @@ mod tests {
         assert!(mock_server.received_requests().await.unwrap().is_empty());
     }
 
-    /// CR Low-2 regression backstop. SPEC § 4 `cmd_pull` and § 9
-    /// `pull.rs` Invariants state: "when `repo_arg.is_some()`,
-    /// `if_repo` is structurally unreachable (the resolver is
-    /// bypassed); behavior is identical to today." This test
-    /// exercises that branch from an empty tempdir (no `.syns.yaml`)
-    /// with `if_repo: true` AND `repo_arg: Some("alice/my-project")`
-    /// — the positional MUST drive identity and `--if-repo` MUST NOT
-    /// short-circuit. A future refactor that moves the resolver call
-    /// before the `repo_arg` branch (or that suppresses the HTTP call
-    /// under `--if-repo` regardless of `repo_arg`) would cause this
-    /// test to fail by either (a) returning `Ok` with zero received
-    /// requests, or (b) returning an error from the resolver miss.
+    /// SPEC u262 `cmd_pull` 2, inverting the u252-era backstop that let a
+    /// positional repository bypass `--if-repo`: the option skips wherever
+    /// no identity file stands at or above the starting directory, a
+    /// repository named on the command line included.
     #[tokio::test]
     #[serial]
-    async fn pull_with_if_repo_and_positional_owner_name_uses_positional_not_resolver() {
+    async fn pull_with_if_repo_and_positional_owner_name_skips_where_no_identity_file_stands() {
         let dir = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
-        // No .syns.yaml — the resolver would miss if it were called.
         std::env::set_current_dir(dir.path()).unwrap();
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
         unsafe { std::env::set_var("SYNS_CACHE_DIR", cache.path()) };
 
         let mock_server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/api/v1/repos/alice/repo/tree"))
-            .and(wiremock::matchers::query_param("recursive", "true"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "entries": [],
-                    "commitSha": "abc123",
-                    "truncated": false
-                })),
-            )
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
         let result = cmd_pull(
             &config,
             &output,
-            Some("alice/repo".into()),
+            Some(("alice".into(), "repo".into())),
             None,
             None,
             true,
@@ -451,16 +513,68 @@ mod tests {
         unsafe { std::env::remove_var("SYNS_CACHE_DIR") };
 
         assert!(result.is_ok(), "cmd_pull returned: {result:?}");
-        let requests = mock_server.received_requests().await.unwrap();
-        assert!(
-            !requests.is_empty(),
-            "--if-repo short-circuited even though positional OWNER/NAME was provided"
+        assert!(mock_server.received_requests().await.unwrap().is_empty());
+        assert!(!dir.path().join(".syns.yaml").exists());
+    }
+
+    #[test]
+    fn bind_reads_a_lone_owner_and_name_as_the_repository() {
+        assert_eq!(
+            bind_pull_positionals(Some("Alice/Proj".into()), None),
+            Ok(PullPositionals {
+                repository: Some(("alice".into(), "proj".into())),
+                path: None,
+            })
         );
-        assert!(
-            requests.iter().any(|r| r.method == reqwest::Method::GET
-                && r.url.path() == "/api/v1/repos/alice/repo/tree"),
-            "positional did not drive the GET tree request: {requests:?}"
+    }
+
+    #[test]
+    fn bind_reads_lone_path_spellings_as_the_path() {
+        for value in ["/tmp/x", "./somewhere", "../target", ".", "docs", "a/b/c"] {
+            assert_eq!(
+                bind_pull_positionals(Some(value.into()), None),
+                Ok(PullPositionals {
+                    repository: None,
+                    path: Some(value.into()),
+                }),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn bind_takes_repository_and_path_from_two_values() {
+        assert_eq!(
+            bind_pull_positionals(Some("alice/proj".into()), Some("../x".into())),
+            Ok(PullPositionals {
+                repository: Some(("alice".into(), "proj".into())),
+                path: Some("../x".into()),
+            })
         );
+    }
+
+    #[test]
+    fn bind_refuses_a_first_of_two_lacking_the_repository_shape() {
+        assert_eq!(
+            bind_pull_positionals(Some("./a".into()), Some("./b".into())),
+            Err(PositionalRefusal {
+                value: "./a".into()
+            })
+        );
+    }
+
+    #[test]
+    fn repository_shape_holds_the_handle_and_name_bounds() {
+        let owner_39 = "o".repeat(39);
+        let owner_40 = "o".repeat(40);
+        let name_100 = "n".repeat(100);
+        let name_101 = "n".repeat(101);
+        assert!(is_repository_shape(&format!("{owner_39}/proj")));
+        assert!(!is_repository_shape(&format!("{owner_40}/proj")));
+        assert!(!is_repository_shape("al_ice/proj"));
+        assert!(is_repository_shape(&format!("alice/{name_100}")));
+        assert!(!is_repository_shape(&format!("alice/{name_101}")));
+        assert!(!is_repository_shape("alice/.proj"));
     }
 
     #[tokio::test]

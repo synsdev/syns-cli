@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::errors::CliError;
+use crate::errors::{CliError, IdentityRemedy};
 use crate::output::Output;
 use crate::repo::resolve::{IdentitySource, RepoIdentity, resolve_repo_identity};
 
@@ -34,7 +34,7 @@ pub fn resolve_or_skip(
             Ok(None)
         }
         Ok((identity, _source)) => Ok(Some(identity)),
-        Err(CliError::RepoIdentityUnknown) if if_repo => {
+        Err(CliError::RepoIdentityUnknown { .. }) if if_repo => {
             output.skip();
             Ok(None)
         }
@@ -74,7 +74,9 @@ pub fn resolve_full_or_skip(
                 output.skip();
                 Ok(None)
             }
-            None => Err(CliError::RepoIdentityUnknown),
+            None => Err(CliError::RepoIdentityUnknown {
+                remedy: IdentityRemedy::IdentityFile,
+            }),
         },
     }
 }
@@ -116,7 +118,12 @@ mod tests {
         let output = Output::new(false);
 
         let result = resolve_or_skip(None, dir.path(), false, &output);
-        assert!(matches!(result, Err(CliError::RepoIdentityUnknown)));
+        assert!(matches!(
+            result,
+            Err(CliError::RepoIdentityUnknown {
+                remedy: IdentityRemedy::IdentityFile
+            })
+        ));
     }
 
     #[test]
@@ -183,7 +190,12 @@ mod tests {
         let output = Output::new(false);
 
         let result = resolve_full_or_skip(None, dir.path(), false, &output);
-        assert!(matches!(result, Err(CliError::RepoIdentityUnknown)));
+        assert!(matches!(
+            result,
+            Err(CliError::RepoIdentityUnknown {
+                remedy: IdentityRemedy::IdentityFile
+            })
+        ));
     }
 
     #[test]

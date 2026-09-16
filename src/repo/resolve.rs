@@ -2,7 +2,7 @@ use std::path::Path;
 
 use super::remote::extract_from_git_remote;
 use super::syns_yaml::read_syns_yaml;
-use crate::errors::CliError;
+use crate::errors::{CliError, IdentityRemedy};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RepoIdentity {
@@ -71,7 +71,9 @@ pub fn resolve_repo_identity(
     // 5-7. Fall through to git remote extraction.
     match extract_from_git_remote(path) {
         Some(identity) => Ok((identity, IdentitySource::GitRemote)),
-        None => Err(CliError::RepoIdentityUnknown),
+        None => Err(CliError::RepoIdentityUnknown {
+            remedy: IdentityRemedy::IdentityFile,
+        }),
     }
 }
 
@@ -193,7 +195,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let result = resolve_repo_identity(None, dir.path());
-        assert!(matches!(result, Err(CliError::RepoIdentityUnknown)));
+        assert!(matches!(
+            result,
+            Err(CliError::RepoIdentityUnknown {
+                remedy: IdentityRemedy::IdentityFile
+            })
+        ));
     }
 
     #[test]

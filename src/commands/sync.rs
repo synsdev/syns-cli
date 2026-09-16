@@ -116,7 +116,7 @@ fn error_class(err: &CliError) -> Option<ErrorClass> {
     match err {
         CliError::ServerUnreachable { .. } => Some(ErrorClass::Transient),
         CliError::AuthRequired => Some(ErrorClass::Authentication),
-        CliError::RepoIdentityUnknown
+        CliError::RepoIdentityUnknown { .. }
         | CliError::PushEmpty { .. }
         | CliError::PushPartial { .. } => Some(ErrorClass::Local),
         CliError::PayloadTooLarge { .. } => Some(ErrorClass::Validation),
@@ -673,7 +673,12 @@ mod tests {
             (api(404, "repo_not_found"), "credential"),
             (api(422, "validation_error"), "validation"),
             (api(413, "payload_too_large"), "validation"),
-            (CliError::RepoIdentityUnknown, "validation"),
+            (
+                CliError::RepoIdentityUnknown {
+                    remedy: crate::errors::IdentityRemedy::IdentityFile,
+                },
+                "validation",
+            ),
             (
                 CliError::PushEmpty {
                     path: "p".into(),
@@ -773,7 +778,9 @@ mod tests {
         let (doc, exit) = refusal(render_outcome(
             &output,
             None,
-            SyncOutcome::ValidationFailure(CliError::RepoIdentityUnknown),
+            SyncOutcome::ValidationFailure(CliError::RepoIdentityUnknown {
+                remedy: crate::errors::IdentityRemedy::IdentityFile,
+            }),
             None,
         ));
         assert_eq!(

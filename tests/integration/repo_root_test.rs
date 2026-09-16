@@ -650,7 +650,7 @@ async fn pull_of_another_repository_writes_its_own_identity_file() {
         cmd_pull(
             &ctx.config,
             &ctx.output,
-            Some("other/repo".into()),
+            Some(("other".into(), "repo".into())),
             None,
             None,
             false,
@@ -776,7 +776,7 @@ async fn pull_into_a_relative_destination_writes_no_nested_identity_file() {
         cmd_pull(
             &ctx.config,
             &ctx.output,
-            Some("alice/proj".into()),
+            Some(("alice".into(), "proj".into())),
             Some("dest".into()),
             None,
             false,
@@ -964,7 +964,7 @@ async fn pull_of_another_repository_leaves_an_identity_file_at_the_write_root_al
     cmd_pull(
         &ctx.config,
         &ctx.output,
-        Some("alice/proj".into()),
+        Some(("alice".into(), "proj".into())),
         Some(root.to_string_lossy().into_owned()),
         None,
         false,

@@ -9,7 +9,11 @@ pub enum CliError {
         context: Option<ApiErrorContext>,
     },
     AuthRequired,
-    RepoIdentityUnknown,
+    /// No repository identity could be determined. The remedy names what
+    /// the invocation that raised it accepts, and so which line renders.
+    RepoIdentityUnknown {
+        remedy: IdentityRemedy,
+    },
     ServerUnreachable {
         url: String,
     },
@@ -53,6 +57,19 @@ pub enum CliError {
     },
 }
 
+/// Which remedies the invocation raising `RepoIdentityUnknown` accepts
+/// (SPEC u262 Contract Surface).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentityRemedy {
+    /// `syns push [PATH]`, which takes `--name`.
+    NameOption,
+    /// `syns pull`, which takes the repository as a positional; `path` is
+    /// the starting directory where a path positional was bound.
+    RepositoryPositional { path: Option<std::path::PathBuf> },
+    /// Every other invocation: only an identity file answers it.
+    IdentityFile,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiErrorContext {
     LsPath { path: String },
@@ -69,7 +86,7 @@ pub enum EdgeRejecter {
 impl CliError {
     pub fn exit_code(&self) -> i32 {
         match self {
-            CliError::RepoIdentityUnknown => 2,
+            CliError::RepoIdentityUnknown { .. } => 2,
             CliError::ServerUnreachable { .. } => 3,
             CliError::PushPartial { .. } => 3,
             CliError::PushEmpty { .. } => 6,
@@ -126,6 +143,15 @@ impl CliError {
         }
     }
 
+    /// Replaces the remedy on `RepoIdentityUnknown`; every other variant
+    /// passes through unchanged.
+    pub fn with_identity_remedy(self, remedy: IdentityRemedy) -> CliError {
+        match self {
+            CliError::RepoIdentityUnknown { .. } => CliError::RepoIdentityUnknown { remedy },
+            other => other,
+        }
+    }
+
     pub fn with_ls_path_context(self, path: String) -> CliError {
         match self {
             CliError::Api { status, error, .. } => CliError::Api {
@@ -175,10 +201,25 @@ impl std::fmt::Display for CliError {
             CliError::AuthRequired => {
                 write!(f, "authentication required \u{2014} run 'syns login' first")
             }
-            CliError::RepoIdentityUnknown => write!(
-                f,
-                "cannot determine repo identity \u{2014} provide --name or create .syns.yaml"
-            ),
+            CliError::RepoIdentityUnknown { remedy } => match remedy {
+                IdentityRemedy::NameOption => write!(
+                    f,
+                    "cannot determine repo identity \u{2014} provide --name or create .syns.yaml"
+                ),
+                IdentityRemedy::RepositoryPositional { path: None } => write!(
+                    f,
+                    "cannot determine repo identity \u{2014} name the repository as OWNER/NAME, or run inside a directory at or below one holding .syns.yaml"
+                ),
+                IdentityRemedy::RepositoryPositional { path: Some(path) } => write!(
+                    f,
+                    "cannot determine repo identity for {} \u{2014} name the repository as OWNER/NAME before the path, or create .syns.yaml in that directory or one above it",
+                    path.display()
+                ),
+                IdentityRemedy::IdentityFile => write!(
+                    f,
+                    "cannot determine repo identity \u{2014} run inside a directory at or below one holding .syns.yaml"
+                ),
+            },
             CliError::ServerUnreachable { url } => write!(f, "could not reach server at {url}"),
             CliError::Io { message } => write!(f, "{message}"),
             CliError::Config { message } => write!(f, "configuration error: {message}"),
@@ -276,7 +317,13 @@ mod tests {
 
     #[test]
     fn exit_codes() {
-        assert_eq!(CliError::RepoIdentityUnknown.exit_code(), 2);
+        assert_eq!(
+            CliError::RepoIdentityUnknown {
+                remedy: IdentityRemedy::IdentityFile
+            }
+            .exit_code(),
+            2
+        );
         assert_eq!(
             CliError::ServerUnreachable { url: "x".into() }.exit_code(),
             3
@@ -342,6 +389,52 @@ mod tests {
     }
 
     #[test]
+    fn each_remedy_renders_its_line() {
+        let cases = [
+            (
+                IdentityRemedy::NameOption,
+                "cannot determine repo identity \u{2014} provide --name or create .syns.yaml",
+            ),
+            (
+                IdentityRemedy::RepositoryPositional { path: None },
+                "cannot determine repo identity \u{2014} name the repository as OWNER/NAME, or run inside a directory at or below one holding .syns.yaml",
+            ),
+            (
+                IdentityRemedy::RepositoryPositional {
+                    path: Some(std::path::PathBuf::from("/w/x")),
+                },
+                "cannot determine repo identity for /w/x \u{2014} name the repository as OWNER/NAME before the path, or create .syns.yaml in that directory or one above it",
+            ),
+            (
+                IdentityRemedy::IdentityFile,
+                "cannot determine repo identity \u{2014} run inside a directory at or below one holding .syns.yaml",
+            ),
+        ];
+        for (remedy, line) in cases {
+            let err = CliError::RepoIdentityUnknown { remedy };
+            assert_eq!(err.to_string(), line);
+            assert_eq!(err.exit_code(), 2);
+        }
+    }
+
+    #[test]
+    fn with_identity_remedy_leaves_other_variants_unchanged() {
+        let err = CliError::ServerUnreachable { url: "u".into() }
+            .with_identity_remedy(IdentityRemedy::NameOption);
+        assert!(matches!(err, CliError::ServerUnreachable { ref url } if url == "u"));
+        let swapped = CliError::RepoIdentityUnknown {
+            remedy: IdentityRemedy::IdentityFile,
+        }
+        .with_identity_remedy(IdentityRemedy::NameOption);
+        assert!(matches!(
+            swapped,
+            CliError::RepoIdentityUnknown {
+                remedy: IdentityRemedy::NameOption
+            }
+        ));
+    }
+
+    #[test]
     fn collected_set_changed_exits_one_naming_each_path() {
         let err = CliError::CollectedSetChanged {
             paths: vec!["a.md".into(), "b/c.md".into()],
@@ -387,8 +480,11 @@ mod tests {
         );
 
         assert_eq!(
-            CliError::RepoIdentityUnknown.to_string(),
-            "cannot determine repo identity \u{2014} provide --name or create .syns.yaml"
+            CliError::RepoIdentityUnknown {
+                remedy: IdentityRemedy::IdentityFile
+            }
+            .to_string(),
+            "cannot determine repo identity \u{2014} run inside a directory at or below one holding .syns.yaml"
         );
 
         assert_eq!(

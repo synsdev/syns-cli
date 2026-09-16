@@ -1,6 +1,6 @@
 use syns_cli::{commands, config, errors, output};
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use syns_cli::commands::collaborators::CollaboratorsAction;
 use syns_cli::commands::push::PushArgs;
 use syns_cli::commands::repo::{CliRepoStatus, CliVisibility, RepoAction};
@@ -34,11 +34,11 @@ enum Commands {
     Push(PushArgs),
     /// Pull files from a repository
     Pull {
-        /// Repository in OWNER/NAME format
-        #[arg()]
+        /// Repository in OWNER/NAME format; a lone value not spelt that way is the PATH
+        #[arg(value_name = "OWNER/NAME")]
         repo: Option<String>,
         /// Target directory (defaults to current directory)
-        #[arg()]
+        #[arg(value_name = "PATH")]
         path: Option<String>,
         /// Pull files at a specific version (number or SHA)
         #[arg(long)]
@@ -262,8 +262,23 @@ async fn run(
             if_repo,
             overwrite,
         } => {
-            commands::pull::cmd_pull(config, output, repo, path, version, if_repo, overwrite)
-                .await?
+            // SPEC u262 `run` 1: the positionals bind by spelling before any
+            // identity or credential is read; a malformed first of two ends
+            // the process through the parser, never as a `CliError`.
+            let bound = match commands::pull::bind_pull_positionals(repo, path) {
+                Ok(bound) => bound,
+                Err(refusal) => refuse_pull_positionals(&refusal),
+            };
+            commands::pull::cmd_pull(
+                config,
+                output,
+                bound.repository,
+                bound.path,
+                version,
+                if_repo,
+                overwrite,
+            )
+            .await?
         }
         Commands::Sync { if_repo } => commands::sync::cmd_sync(config, output, if_repo).await?,
         Commands::Resolution { action } => {
@@ -358,4 +373,23 @@ async fn run(
         Commands::Whoami {} => commands::whoami::cmd_whoami(config, output).await?,
     }
     Ok(())
+}
+
+/// Ends the process with the parser's refusal of a first `syns pull`
+/// positional lacking the repository shape: the message and the `pull`
+/// usage block on the diagnostic stream, exit `2`, in both output modes.
+fn refuse_pull_positionals(refusal: &commands::pull::PositionalRefusal) -> ! {
+    let mut command = Cli::command();
+    command.build();
+    let pull = command
+        .find_subcommand_mut("pull")
+        .expect("the pull subcommand is declared");
+    pull.error(
+        clap::error::ErrorKind::ValueValidation,
+        format!(
+            "invalid value '{}' for '[OWNER/NAME]': expected OWNER/NAME, or a lone PATH",
+            refusal.value
+        ),
+    )
+    .exit()
 }

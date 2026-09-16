@@ -80,17 +80,45 @@ fn absolutize(path: &Path) -> Result<PathBuf, CliError> {
 /// addresses an absolute path must not depend on the process working
 /// directory resolving at all.
 ///
-/// `std::path::absolute` rather than canonicalization, because a
-/// retrieval's destination need not exist yet.
+/// The answer carries no `.` or `..` component (SPEC u262). Every `.` is
+/// dropped and every `..` removed together with the component before it,
+/// lexically and without reading the filesystem, so an ancestor walk from
+/// `cwd/../elsewhere` climbs `elsewhere`'s parents and never passes back
+/// through `cwd` — where an identity file naming another repository
+/// would otherwise answer for a directory the run never named.
+///
+/// Lexical rather than canonicalization, because a retrieval's
+/// destination need not exist yet.
 pub fn resolve_start_path(explicit: Option<&Path>) -> Result<PathBuf, CliError> {
-    match explicit {
+    let absolute = match explicit {
         Some(path) => std::path::absolute(path).map_err(|err| CliError::Io {
             message: format!("could not resolve path {}: {err}", path.display()),
-        }),
+        })?,
         None => std::env::current_dir().map_err(|err| CliError::Io {
             message: format!("could not determine current directory: {err}"),
-        }),
+        })?,
+    };
+    Ok(remove_dot_components(&absolute))
+}
+
+/// Drops each `.` component of an absolute path, and each `..` together
+/// with the component before it; a `..` at the root is dropped alone.
+fn remove_dot_components(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
     }
+    out
 }
 
 /// The `/`-separated spelling of a relative path, or `None` where a
@@ -228,6 +256,22 @@ mod tests {
     impl Drop for CwdGuard {
         fn drop(&mut self) {
             let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_start_path_removes_dot_and_dot_dot_lexically() {
+        for (given, expected) in [
+            ("/w/./a/../b", "/w/b"),
+            ("/../w", "/w"),
+            ("/w/a/../../..", "/"),
+        ] {
+            assert_eq!(
+                resolve_start_path(Some(Path::new(given))).unwrap(),
+                PathBuf::from(expected),
+                "{given}"
+            );
         }
     }
 

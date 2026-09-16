@@ -9,7 +9,7 @@ use crate::commands::sync::{
     ensure_identity_file, provenance_from_env, render_outcome, render_transfer_lines,
 };
 use crate::config::Config;
-use crate::errors::CliError;
+use crate::errors::{CliError, IdentityRemedy};
 use crate::output::Output;
 use crate::push::collector::{SkippedFile, write_skip_summary};
 use crate::push::converge::{ConvergeMode, SyncOutcome, converge};
@@ -101,7 +101,11 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
     // content root can never be resolved from two different places.
     let start_path = resolve_start_path(args.path.as_deref())?;
 
-    let identity = match resolve_or_skip(args.name.as_deref(), &start_path, args.if_repo, output)? {
+    // `syns push [PATH]` accepts `--name`, so its identity refusal names
+    // that option (SPEC u262 `cmd_push` 1).
+    let identity = match resolve_or_skip(args.name.as_deref(), &start_path, args.if_repo, output)
+        .map_err(|err| err.with_identity_remedy(IdentityRemedy::NameOption))?
+    {
         Some(id) => id,
         None => return Ok(()),
     };

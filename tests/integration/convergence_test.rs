@@ -1034,7 +1034,7 @@ async fn sync_and_pull_answer_resolution_required_over_local_work_a_head_swapped
                     cmd_pull(
                         &config,
                         &e.output,
-                        Some("alice/proj".into()),
+                        Some(("alice".into(), "proj".into())),
                         Some(dir.display().to_string()),
                         None,
                         false,
@@ -2251,7 +2251,7 @@ async fn pull_version(e: &Env, dir: &Path, version: &str) -> Result<(), CliError
     cmd_pull(
         &e.config,
         &e.output,
-        Some("alice/proj".into()),
+        Some(("alice".into(), "proj".into())),
         Some(dir.display().to_string()),
         Some(version.into()),
         false,
@@ -2743,7 +2743,7 @@ async fn run_as_torn_writer() -> bool {
         let _ = cmd_pull(
             &config,
             &Output::new(true),
-            Some("alice/proj".into()),
+            Some(("alice".into(), "proj".into())),
             Some(dir.display().to_string()),
             Some(version.into()),
             false,
