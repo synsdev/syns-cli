@@ -105,17 +105,61 @@ pub fn find_repo_root_for(
 }
 
 /// The owner and name the identity file standing in `dir` itself names,
-/// walking no ancestor; none where no such file stands there or it does not
-/// parse as one — a file a convergence left carrying markers included, so
-/// that a re-run over it ends where the convergence ended (CON3-1).
-pub fn identity_standing_in(dir: &Path) -> Option<(String, String)> {
+/// walking no ancestor, and none where no such file stands there.
+///
+/// A file a convergence left carrying collision markers is read as the
+/// side that stood there before the collision — the lines outside every
+/// marked block and those of each block's local side — so a re-run over a
+/// same-repository collision still reaches the convergence (CON4-1) while
+/// one over another repository's file is claimed by neither. A file that
+/// parses as no identity file either way raises the malformed-file error.
+pub fn identity_standing_in(dir: &Path) -> Result<Option<(String, String)>, CliError> {
     let file_path = dir.join(SYNS_YAML_FILENAME);
     if !file_path.is_file() {
-        return None;
+        return Ok(None);
     }
-    parse_syns_yaml(&file_path)
-        .ok()
-        .map(|yaml| (yaml.owner, yaml.name))
+    let yaml = match parse_syns_yaml(&file_path) {
+        Ok(yaml) => yaml,
+        Err(err) => {
+            let contents = std::fs::read_to_string(&file_path).map_err(|e| CliError::Io {
+                message: format!("could not read .syns.yaml: {e}"),
+            })?;
+            match local_side_of_collision(&contents) {
+                Some(local) => serde_yaml::from_str::<SynsYaml>(&local).map_err(|_| err)?,
+                None => return Err(err),
+            }
+        }
+    };
+    Ok(Some((yaml.owner, yaml.name)))
+}
+
+/// The text a marked file held on its local side before the collision,
+/// none where it carries no marked block.
+fn local_side_of_collision(contents: &str) -> Option<String> {
+    enum Side {
+        Outside,
+        Local,
+        Other,
+    }
+    let mut side = Side::Outside;
+    let mut marked = false;
+    let mut local = String::new();
+    for line in contents.lines() {
+        match (&side, line) {
+            (Side::Outside, l) if l.starts_with("<<<<<<< ") => {
+                marked = true;
+                side = Side::Local;
+            }
+            (Side::Local, l) if l.starts_with("||||||| ") || l == "=======" => side = Side::Other,
+            (Side::Local | Side::Other, l) if l.starts_with(">>>>>>> ") => side = Side::Outside,
+            (Side::Outside | Side::Local, l) => {
+                local.push_str(l);
+                local.push('\n');
+            }
+            (Side::Other, _) => {}
+        }
+    }
+    marked.then_some(local)
 }
 
 pub fn write_syns_yaml(path: &Path, owner: &str, name: &str) -> Result<(), CliError> {
@@ -339,18 +383,32 @@ mod tests {
         fs::create_dir_all(&sub).unwrap();
         write_syns_yaml(root.path(), "bob", "other").unwrap();
 
-        assert_eq!(identity_standing_in(&sub), None);
+        assert_eq!(identity_standing_in(&sub).unwrap(), None);
         assert_eq!(
-            identity_standing_in(root.path()),
+            identity_standing_in(root.path()).unwrap(),
+            Some(("bob".to_string(), "other".to_string()))
+        );
+    }
+
+    #[test]
+    fn identity_standing_in_reads_a_marked_file_as_its_local_side() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".syns.yaml"),
+            "owner: bob\n<<<<<<< local\nname: other\n||||||| base\nname: base\n=======\nname: proj\n>>>>>>> remote\n",
+        )
+        .unwrap();
+        assert_eq!(
+            identity_standing_in(dir.path()).unwrap(),
             Some(("bob".to_string(), "other".to_string()))
         );
 
         fs::write(
-            sub.join(".syns.yaml"),
+            dir.path().join(".syns.yaml"),
             "<<<<<<< local\nowner: bob\n=======\nowner: alice\n>>>>>>> remote\n",
         )
         .unwrap();
-        assert_eq!(identity_standing_in(&sub), None);
+        assert!(identity_standing_in(dir.path()).is_err());
     }
 
     #[test]

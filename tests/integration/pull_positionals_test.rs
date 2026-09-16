@@ -461,6 +461,52 @@ fn positional_repository_refuses_a_path_whose_identity_file_names_another_reposi
     assert_eq!(fs::read_dir(env.w.join("cwd")).unwrap().count(), 0);
 }
 
+/// CR4-1 (u262 `CODE_REVIEW_R4.md`): an identity file at the path carrying
+/// the markers an earlier collision left is judged by the side that stood
+/// there before it, and one that parses as no identity file at all refuses
+/// on the malformed-file error; neither reaches the server or writes.
+#[test]
+#[serial]
+fn positional_repository_refuses_a_path_whose_marked_or_malformed_identity_file_it_cannot_claim() {
+    let env = Env::new();
+    fs::create_dir_all(env.w.join("cwd")).unwrap();
+    env.mount_tree_with_a_md("alice/proj");
+    let target = env.w.join("target");
+    fs::create_dir_all(&target).unwrap();
+
+    fs::write(
+        target.join(".syns.yaml"),
+        "<<<<<<< local\nowner: bob\nname: other\n||||||| base\n=======\nowner: alice\nname: proj\n>>>>>>> remote\n",
+    )
+    .unwrap();
+    let output = env.syns(&env.w.join("cwd"), &["pull", "alice/proj", "../target"]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert_eq!(
+        stderr(&output),
+        format!(
+            "error: {} already belongs to bob/other \u{2014} pull alice/proj into another directory, or remove {}\n",
+            target.display(),
+            target.join(".syns.yaml").display()
+        )
+    );
+
+    fs::write(
+        target.join(".syns.yaml"),
+        "owner: bob\nname: other\nchecks: make test\n",
+    )
+    .unwrap();
+    let output = env.syns(&env.w.join("cwd"), &["pull", "alice/proj", "../target"]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).starts_with("error: invalid .syns.yaml: "),
+        "{}",
+        stderr(&output)
+    );
+
+    assert!(env.request_paths().is_empty(), "{:?}", env.request_paths());
+    assert!(!target.join("a.md").exists());
+}
+
 /// An identity file at the path naming the positional repository, in any
 /// letter case, is no refusal: the retrieval converges into it.
 #[test]

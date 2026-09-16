@@ -162,7 +162,7 @@ pub async fn cmd_pull(
             // whose own identity file names another repository is refused
             // before any request, so two repositories never mix there.
             if path_arg.is_some()
-                && let Some((standing_owner, standing_name)) = identity_standing_in(&start_dir)
+                && let Some((standing_owner, standing_name)) = identity_standing_in(&start_dir)?
                 && !(standing_owner.eq_ignore_ascii_case(owner)
                     && standing_name.eq_ignore_ascii_case(name))
             {
