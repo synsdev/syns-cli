@@ -2,6 +2,7 @@ mod auth_test;
 mod collaborators_add_json_test;
 mod common;
 mod convergence_test;
+mod history_file_test;
 mod if_repo_test;
 mod push_empty_test;
 mod push_manifest_stub_test;

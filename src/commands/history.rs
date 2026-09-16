@@ -64,9 +64,16 @@ pub async fn cmd_history(
                 .data
                 .iter()
                 .map(|entry| {
+                    // A removal entry — the commit that removed the path —
+                    // serves neither a blob hash nor content.
+                    let message = if entry.blob_sha.is_none() && entry.content.is_none() {
+                        format!("(removed) {}", entry.message)
+                    } else {
+                        entry.message.clone()
+                    };
                     vec![
                         entry.sha[..entry.sha.len().min(8)].to_string(),
-                        entry.message.clone(),
+                        message,
                         entry.author.clone(),
                         entry.created_at.clone(),
                         provenance_cell(entry.provenance.as_ref(), &entry.author),
@@ -397,5 +404,67 @@ mod tests {
         assert_eq!(typed.data[0].version, 3);
         let expected: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(raw, expected);
+    }
+
+    #[tokio::test]
+    async fn get_file_history_returns_a_page_holding_a_removal_entry() {
+        let mock_server = MockServer::start().await;
+        let body = serde_json::json!({
+            "data": [
+                {
+                    "version": 439,
+                    "sha": "739d8dc0c095de7ab390d685c0e2e8629d61db1f",
+                    "blobSha": "d54fa145810ef1ad6183d93229bb2982571cc3da",
+                    "message": "claude code session (part 3/3)",
+                    "author": "bartsoj",
+                    "createdAt": "2026-09-13T14:34:58Z",
+                    "content": "# syns",
+                    "diff": "--- /dev/null\n+++ b/CLAUDE.md\n@@ -0,0 +1 @@\n+# syns\n"
+                },
+                {
+                    "version": 436,
+                    "sha": "ff7f52cad5c73554fff96676478cd4b2a509fbdc",
+                    "blobSha": null,
+                    "message": "claude code session",
+                    "author": "bartsoj",
+                    "createdAt": "2026-09-13T14:31:20Z",
+                    "content": null,
+                    "diff": "--- a/CLAUDE.md\n+++ /dev/null\n@@ -1 +0,0 @@\n-# syns\n"
+                },
+                {
+                    "version": 435,
+                    "sha": "d1781077fe841cf6422624473c79f370ec24780c",
+                    "blobSha": "d54fa145810ef1ad6183d93229bb2982571cc3da",
+                    "message": "claude code session (part 3/3)",
+                    "author": "bartsoj",
+                    "createdAt": "2026-09-13T13:58:41Z",
+                    "content": "# syns",
+                    "diff": "--- /dev/null\n+++ b/CLAUDE.md\n@@ -0,0 +1 @@\n+# syns\n"
+                }
+            ],
+            "total": 50,
+            "limit": 3,
+            "offset": 0
+        });
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/repos/alice/my-project/files/CLAUDE.md/history",
+            ))
+            .and(query_param("limit", "3"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let (typed, raw) = client
+            .get_file_history("alice/my-project", None, "CLAUDE.md", 3)
+            .await
+            .unwrap();
+
+        let versions: Vec<u32> = typed.data.iter().map(|entry| entry.version).collect();
+        assert_eq!(versions, [439, 436, 435]);
+        assert!(typed.data[1].blob_sha.is_none());
+        assert!(typed.data[1].content.is_none());
+        assert_eq!(raw, body);
     }
 }

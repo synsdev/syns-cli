@@ -264,11 +264,13 @@ pub struct FileHistoryResponse {
 pub struct FileVersionEntry {
     pub version: u32,
     pub sha: String,
-    pub blob_sha: String,
+    /// `None` on the entry of a commit that removed the path.
+    pub blob_sha: Option<String>,
     pub message: String,
     pub author: String,
     pub created_at: String,
-    pub content: String,
+    /// `None` on the entry of a commit that removed the path.
+    pub content: Option<String>,
     pub diff: Option<String>,
     #[serde(default)]
     pub provenance: Option<CommitProvenance>,
@@ -2008,6 +2010,38 @@ mod provenance_tests {
             ..block
         };
         assert_eq!(serde_json::to_value(&with_task).unwrap()["taskRef"], "T-1");
+    }
+
+    #[test]
+    fn file_version_entry_reads_a_null_blob_sha_and_content_as_none() {
+        let diff = "--- a/CLAUDE.md\n+++ /dev/null\n@@ -1 +0,0 @@\n-# syns\n";
+        let entry: FileVersionEntry = serde_json::from_value(serde_json::json!({
+            "version": 436, "sha": "ff7f52cad5c73554fff96676478cd4b2a509fbdc",
+            "blobSha": null, "message": "claude code session", "author": "bartsoj",
+            "createdAt": "2026-09-13T14:31:20Z", "content": null, "diff": diff,
+            "provenance": null
+        }))
+        .unwrap();
+        assert!(entry.blob_sha.is_none());
+        assert!(entry.content.is_none());
+        assert_eq!(entry.diff.as_deref(), Some(diff));
+        assert_eq!(entry.version, 436);
+    }
+
+    #[test]
+    fn file_version_entry_keeps_a_served_blob_sha_and_content() {
+        let entry: FileVersionEntry = serde_json::from_value(serde_json::json!({
+            "version": 439, "sha": "739d8dc0c095de7ab390d685c0e2e8629d61db1f",
+            "blobSha": "d54fa145810ef1ad6183d93229bb2982571cc3da",
+            "message": "claude code session (part 3/3)", "author": "bartsoj",
+            "createdAt": "2026-09-13T14:34:58Z", "content": "# syns", "diff": null
+        }))
+        .unwrap();
+        assert_eq!(
+            entry.blob_sha.as_deref(),
+            Some("d54fa145810ef1ad6183d93229bb2982571cc3da")
+        );
+        assert_eq!(entry.content.as_deref(), Some("# syns"));
     }
 
     #[test]
