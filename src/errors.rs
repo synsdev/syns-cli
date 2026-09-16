@@ -14,9 +14,12 @@ pub enum CliError {
     RepoIdentityUnknown {
         remedy: IdentityRemedy,
     },
-    /// `syns pull OWNER/NAME PATH` aimed at a directory whose own identity
-    /// file names another repository, refused before any request (the
-    /// filer's ruling on u262 round 3's open question, 2026-09-16).
+    /// `syns pull OWNER/NAME [PATH]` where the identity file nearest the
+    /// starting directory, at or above it, names another repository — a
+    /// bare run, a path argument and a run from a sub-folder alike —
+    /// refused before any request (SPEC u263, issue 130). `path` is the
+    /// directory holding the identity file that decided, `standing` its
+    /// pair as spelt, `requested` the bound pair lower-cased.
     PathBelongsToAnotherRepository {
         path: std::path::PathBuf,
         standing: String,
@@ -437,15 +440,15 @@ mod tests {
     }
 
     #[test]
-    fn path_belonging_to_another_repository_renders_its_line_on_exit_2() {
+    fn path_belongs_line_names_the_deciding_directory() {
         let err = CliError::PathBelongsToAnotherRepository {
-            path: std::path::PathBuf::from("/w/target"),
+            path: std::path::PathBuf::from("/w/c"),
             standing: "bob/other".into(),
-            requested: "alice/proj".into(),
+            requested: "alice/notes".into(),
         };
         assert_eq!(
             err.to_string(),
-            "/w/target already belongs to bob/other \u{2014} pull alice/proj into another directory, or remove /w/target/.syns.yaml"
+            "/w/c already belongs to bob/other \u{2014} pull alice/notes into another directory, or remove /w/c/.syns.yaml"
         );
         assert_eq!(err.exit_code(), 2);
     }

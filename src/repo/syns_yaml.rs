@@ -104,33 +104,65 @@ pub fn find_repo_root_for(
     Ok(file_path.parent().map(Path::to_path_buf))
 }
 
-/// The owner and name the identity file standing in `dir` itself names,
-/// walking no ancestor, and none where no such file stands there.
+/// The identity file standing nearest a starting directory (SPEC u263
+/// § Contract Surface): `dir` is the absolute directory holding it, and
+/// `owner` and `name` are spelt as that file spells them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StandingIdentity {
+    pub dir: PathBuf,
+    pub owner: String,
+    pub name: String,
+}
+
+impl StandingIdentity {
+    /// Whether this identity names `owner/name`, ASCII letter case aside
+    /// on both segments (`D-025`).
+    pub fn names(&self, owner: &str, name: &str) -> bool {
+        self.owner.eq_ignore_ascii_case(owner) && self.name.eq_ignore_ascii_case(name)
+    }
+}
+
+/// The identity file nearest `start`, `start` itself included, and none
+/// where no identity file stands at or above it.
 ///
 /// A file a convergence left carrying collision markers is read as the
 /// side that stood there before the collision — the lines outside every
 /// marked block and those of each block's local side — so a re-run over a
-/// same-repository collision still reaches the convergence (CON4-1) while
-/// one over another repository's file is claimed by neither. A file that
-/// parses as no identity file either way raises the malformed-file error.
-pub fn identity_standing_in(dir: &Path) -> Result<Option<(String, String)>, CliError> {
-    let file_path = dir.join(SYNS_YAML_FILENAME);
-    if !file_path.is_file() {
+/// same-repository collision still reaches the convergence while one over
+/// another repository's file is claimed by neither. The nearest file that
+/// parses as no identity file either way raises the malformed-file error,
+/// and no farther file is consulted.
+pub fn nearest_identity(start: &Path) -> Result<Option<StandingIdentity>, CliError> {
+    let Some(file_path) = find_syns_yaml(start) else {
         return Ok(None);
-    }
-    let yaml = match parse_syns_yaml(&file_path) {
-        Ok(yaml) => yaml,
+    };
+    let yaml = read_identity_by_local_side(&file_path)?;
+    Ok(Some(StandingIdentity {
+        dir: file_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| start.to_path_buf()),
+        owner: yaml.owner,
+        name: yaml.name,
+    }))
+}
+
+/// The identity file at `file_path`, parsed raw, then by its local side
+/// where it carries collision markers, the raw parse error raised where
+/// both fail.
+fn read_identity_by_local_side(file_path: &Path) -> Result<SynsYaml, CliError> {
+    match parse_syns_yaml(file_path) {
+        Ok(yaml) => Ok(yaml),
         Err(err) => {
-            let contents = std::fs::read_to_string(&file_path).map_err(|e| CliError::Io {
+            let contents = std::fs::read_to_string(file_path).map_err(|e| CliError::Io {
                 message: format!("could not read .syns.yaml: {e}"),
             })?;
             match local_side_of_collision(&contents) {
-                Some(local) => serde_yaml::from_str::<SynsYaml>(&local).map_err(|_| err)?,
-                None => return Err(err),
+                Some(local) => serde_yaml::from_str::<SynsYaml>(&local).map_err(|_| err),
+                None => Err(err),
             }
         }
-    };
-    Ok(Some((yaml.owner, yaml.name)))
+    }
 }
 
 /// The text a marked file held on its local side before the collision,
@@ -171,8 +203,9 @@ pub fn write_syns_yaml(path: &Path, owner: &str, name: &str) -> Result<(), CliEr
     Ok(())
 }
 
-/// Write the identity file into `dir` only where no identity file at or
-/// above `dir` names `owner/name` and none stands in `dir` itself,
+/// Write the identity file into `dir` only where the nearest identity file
+/// at or above `dir`, read by its local side, does not name `owner/name`
+/// and none stands in `dir` itself,
 /// answering whether it wrote — the one guard every writer of the file
 /// shares.
 ///
@@ -191,7 +224,10 @@ pub fn write_syns_yaml_where_none_stands(
     owner: &str,
     name: &str,
 ) -> Result<bool, CliError> {
-    if dir.join(SYNS_YAML_FILENAME).exists() || find_repo_root_for(dir, owner, name)?.is_some() {
+    if dir.join(SYNS_YAML_FILENAME).exists() {
+        return Ok(false);
+    }
+    if nearest_identity(dir)?.is_some_and(|standing| standing.names(owner, name)) {
         return Ok(false);
     }
     write_syns_yaml(dir, owner, name)?;
@@ -377,30 +413,50 @@ mod tests {
     }
 
     #[test]
-    fn identity_standing_in_reads_the_directory_itself_alone() {
-        let root = tempfile::tempdir().unwrap();
-        let sub = root.path().join("sub");
-        fs::create_dir_all(&sub).unwrap();
-        write_syns_yaml(root.path(), "bob", "other").unwrap();
+    fn nearest_identity_reads_the_nearest_file_by_its_local_side() {
+        let r = tempfile::tempdir().unwrap();
+        let r = fs::canonicalize(r.path()).unwrap();
+        let deep = r.join("sub").join("deep");
+        fs::create_dir_all(&deep).unwrap();
+        write_syns_yaml(&r, "bob", "other").unwrap();
+        fs::write(
+            r.join("sub").join(".syns.yaml"),
+            "<<<<<<< local\nowner: alice\nname: proj\n=======\nowner: carol\nname: else\n>>>>>>> remote\n",
+        )
+        .unwrap();
+        let v = tempfile::tempdir().unwrap();
 
-        assert_eq!(identity_standing_in(&sub).unwrap(), None);
         assert_eq!(
-            identity_standing_in(root.path()).unwrap(),
-            Some(("bob".to_string(), "other".to_string()))
+            nearest_identity(&deep).unwrap(),
+            Some(StandingIdentity {
+                dir: r.join("sub"),
+                owner: "alice".into(),
+                name: "proj".into(),
+            })
         );
+        assert_eq!(
+            nearest_identity(&r).unwrap(),
+            Some(StandingIdentity {
+                dir: r.clone(),
+                owner: "bob".into(),
+                name: "other".into(),
+            })
+        );
+        assert_eq!(nearest_identity(v.path()).unwrap(), None);
     }
 
     #[test]
-    fn identity_standing_in_reads_a_marked_file_as_its_local_side() {
+    fn nearest_identity_reads_a_marked_file_as_its_local_side() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join(".syns.yaml"),
             "owner: bob\n<<<<<<< local\nname: other\n||||||| base\nname: base\n=======\nname: proj\n>>>>>>> remote\n",
         )
         .unwrap();
+        let standing = nearest_identity(dir.path()).unwrap().unwrap();
         assert_eq!(
-            identity_standing_in(dir.path()).unwrap(),
-            Some(("bob".to_string(), "other".to_string()))
+            (standing.owner.as_str(), standing.name.as_str()),
+            ("bob", "other")
         );
 
         fs::write(
@@ -408,7 +464,47 @@ mod tests {
             "<<<<<<< local\nowner: bob\n=======\nowner: alice\n>>>>>>> remote\n",
         )
         .unwrap();
-        assert!(identity_standing_in(dir.path()).is_err());
+        assert!(nearest_identity(dir.path()).is_err());
+    }
+
+    #[test]
+    fn nearest_identity_raises_the_malformed_file_error_without_consulting_a_farther_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        write_syns_yaml(dir.path(), "alice", "proj").unwrap();
+        fs::write(sub.join(".syns.yaml"), "owner: [alice").unwrap();
+
+        match nearest_identity(&sub) {
+            Err(CliError::Io { message }) => {
+                assert!(message.starts_with("invalid .syns.yaml: "), "{message}")
+            }
+            other => panic!("expected the malformed-file error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn standing_identity_names_its_pair_letter_case_aside() {
+        let standing = StandingIdentity {
+            dir: PathBuf::from("/w"),
+            owner: "Alice".into(),
+            name: "Notes".into(),
+        };
+        assert!(standing.names("alice", "notes"));
+        assert!(!standing.names("alice", "other"));
+        assert!(!standing.names("bob", "notes"));
+    }
+
+    #[test]
+    fn write_where_none_stands_writes_nothing_under_a_marked_ancestor_naming_the_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let marked = "<<<<<<< local\nowner: alice\nname: proj\n=======\nowner: alice\nname: proj\nchecks:\n  - make test\n>>>>>>> remote\n";
+        fs::write(dir.path().join(".syns.yaml"), marked).unwrap();
+
+        assert!(!write_syns_yaml_where_none_stands(&sub, "alice", "proj").unwrap());
+        assert!(!sub.join(".syns.yaml").exists());
     }
 
     #[test]

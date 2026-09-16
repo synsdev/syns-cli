@@ -527,22 +527,18 @@ fn positional_repository_pulls_into_a_path_whose_identity_file_names_it() {
     );
 }
 
-/// V1-11 (u262 `VERIFICATION.md`), as it still arises under the filer's
-/// ruling: the path's identity file names the positional repository but
-/// differs from the one the head carries, so the two collide on
-/// `.syns.yaml`. The retrieval ends on the registered resolution refusal,
-/// and a re-run over the marker-carrying file ends there again rather than
-/// on a parse of that file.
+/// u263, replacing the u262-era test that ended this setup on the
+/// resolution refusal: the path's identity file names the positional
+/// repository and differs from the one the head carries, and with no base
+/// recorded the retrieval keeps it as it stands — unmarked, its checks
+/// kept — on a first run and on a re-run alike.
 #[test]
 #[serial]
-fn positional_repository_colliding_on_its_own_identity_file_ends_on_the_resolution_refusal() {
+fn positional_repository_leaves_its_own_identity_file_standing() {
     let env = Env::new();
     fs::create_dir_all(env.w.join("target")).unwrap();
-    fs::write(
-        env.w.join("target/.syns.yaml"),
-        "owner: alice\nname: proj\nchecks:\n  - make test\n",
-    )
-    .unwrap();
+    let standing = "owner: alice\nname: proj\nchecks:\n  - make test\n";
+    fs::write(env.w.join("target/.syns.yaml"), standing).unwrap();
     fs::create_dir_all(env.w.join("cwd")).unwrap();
     env.mount_tree_with_a_md_and_identity("alice", "proj");
 
@@ -552,24 +548,17 @@ fn positional_repository_colliding_on_its_own_identity_file_ends_on_the_resoluti
     ] {
         let output = env.syns(&env.w.join("cwd"), args);
 
-        assert!(
-            !stderr(&output).contains("invalid .syns.yaml"),
-            "{}",
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{args:?}: {}",
             stderr(&output)
         );
-        assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
-        if args[0] == "--json" {
-            let document: serde_json::Value =
-                serde_json::from_str(stdout(&output).trim()).expect("one JSON document");
-            assert_eq!(document["outcome"], "resolution_required", "{document}");
-        }
     }
-    assert!(
-        fs::read_to_string(env.w.join("target/.syns.yaml"))
-            .unwrap()
-            .contains("<<<<<<<"),
-        "the collision leaves the identity file carrying markers"
-    );
+    assert_eq!(fs::read_to_string(env.w.join("target/a.md")).unwrap(), "a");
+    let kept = fs::read_to_string(env.w.join("target/.syns.yaml")).unwrap();
+    assert_eq!(kept, standing);
+    assert!(!kept.contains("<<<<<<<"));
     assert!(
         !env.w.join("cwd/.syns.yaml").exists(),
         "the working directory gains no identity file"

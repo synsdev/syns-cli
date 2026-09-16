@@ -649,6 +649,169 @@ async fn retrieval_keeps_local_edits_beside_remote_only_paths() {
     assert_eq!(copy.base().unwrap().commit_sha(), Some(h1.as_str()));
 }
 
+// ---- the root identity file (u263) ----------------------------------------
+
+/// The identity file a head edit declares a check in.
+const IDENTITY_WITH_CHECK: &str = "owner: alice\nname: proj\nchecks:\n  - exit 0\n";
+
+/// A retrieval over a folder holding the root identity file unedited takes
+/// the head's edit to it, snapshotting the file first.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn retrieval_takes_a_head_edit_to_an_unedited_identity_file() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let h0 = e.fake.commit(&[(".syns.yaml", IDENTITY), ("a.md", "a\n")]);
+    checkout(&e.fake, &copy, &h0);
+    let h1 = e
+        .fake
+        .commit_changes(&[(".syns.yaml", Some(IDENTITY_WITH_CHECK))]);
+
+    let outcome = converge(
+        &e.fake.client(),
+        Some(TOKEN),
+        &copy,
+        ConvergeMode::Retrieve { overwrite: false },
+        e.opts(),
+    )
+    .await
+    .unwrap();
+
+    match &outcome {
+        SyncOutcome::Synced { written, .. } => {
+            assert_eq!(written, &vec![".syns.yaml".to_string()], "{outcome:?}")
+        }
+        other => panic!("expected Synced, got {other:?}"),
+    }
+    assert_eq!(read(&dir, ".syns.yaml"), IDENTITY_WITH_CHECK);
+    assert_eq!(
+        snapshot_bytes(&copy.local_snapshot().unwrap(), ".syns.yaml"),
+        Some(IDENTITY.as_bytes().to_vec())
+    );
+    assert_eq!(copy.base().unwrap().commit_sha(), Some(h1.as_str()));
+}
+
+/// A retrieval keeps a locally edited root identity file over a head edit
+/// to it, with and without its overwrite option, marking nothing and
+/// recording the head as the base.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn retrieval_keeps_an_edited_identity_file_over_a_head_edit() {
+    let e = env().await;
+    let edited = "owner: alice\nname: proj\nchecks:\n  - make local\n";
+    for overwrite in [false, true] {
+        let fake = Fake::start().await;
+        let folder = tempfile::tempdir().unwrap();
+        let copy = e.copy(folder.path());
+        let h0 = fake.commit(&[(".syns.yaml", IDENTITY), ("a.md", "a\n")]);
+        checkout(&fake, &copy, &h0);
+        write_files(folder.path(), &[(".syns.yaml", edited)]);
+        let h1 = fake.commit_changes(&[(".syns.yaml", Some(IDENTITY_WITH_CHECK))]);
+
+        let outcome = converge(
+            &fake.client(),
+            Some(TOKEN),
+            &copy,
+            ConvergeMode::Retrieve { overwrite },
+            e.opts(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(outcome, SyncOutcome::Synced { .. }),
+            "overwrite {overwrite}: {outcome:?}"
+        );
+        assert!(
+            copy.resolution().unwrap().is_none(),
+            "overwrite {overwrite}"
+        );
+        let kept = read(folder.path(), ".syns.yaml");
+        assert_eq!(kept, edited, "overwrite {overwrite}");
+        assert!(!kept.contains("<<<<<<<"), "overwrite {overwrite}");
+        assert_eq!(
+            copy.base().unwrap().commit_sha(),
+            Some(h1.as_str()),
+            "overwrite {overwrite}"
+        );
+    }
+}
+
+/// A retrieval keeps the root identity file a moved head removed, with and
+/// without its overwrite option.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn retrieval_keeps_the_identity_file_a_moved_head_removed() {
+    let e = env().await;
+    for overwrite in [false, true] {
+        let fake = Fake::start().await;
+        let folder = tempfile::tempdir().unwrap();
+        let copy = e.copy(folder.path());
+        let h0 = fake.commit(&[(".syns.yaml", IDENTITY), ("a.md", "a\n")]);
+        checkout(&fake, &copy, &h0);
+        let h1 = fake.commit(&[("a.md", "a\n")]);
+
+        let outcome = converge(
+            &fake.client(),
+            Some(TOKEN),
+            &copy,
+            ConvergeMode::Retrieve { overwrite },
+            e.opts(),
+        )
+        .await
+        .unwrap();
+
+        match &outcome {
+            SyncOutcome::Synced { removed, .. } => {
+                assert!(removed.is_empty(), "overwrite {overwrite}: {outcome:?}")
+            }
+            other => panic!("overwrite {overwrite}: expected Synced, got {other:?}"),
+        }
+        assert_eq!(
+            read(folder.path(), ".syns.yaml"),
+            IDENTITY,
+            "overwrite {overwrite}"
+        );
+        assert_eq!(
+            copy.base().unwrap().commit_sha(),
+            Some(h1.as_str()),
+            "overwrite {overwrite}"
+        );
+    }
+}
+
+/// A publication carries a locally edited root identity file as it carries
+/// every other path.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn publication_carries_an_edited_identity_file() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let h0 = e.fake.commit(&[(".syns.yaml", IDENTITY), ("a.md", "a\n")]);
+    checkout(&e.fake, &copy, &h0);
+    write_files(&dir, &[(".syns.yaml", IDENTITY_WITH_CHECK)]);
+
+    let outcome = converge(
+        &e.fake.client(),
+        Some(TOKEN),
+        &copy,
+        ConvergeMode::Publish,
+        e.opts(),
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(outcome, SyncOutcome::Synced { .. }), "{outcome:?}");
+    let bodies = e.fake.push_bodies();
+    assert_eq!(bodies.len(), 1, "{bodies:?}");
+    assert_eq!(
+        body_content(&bodies[0], ".syns.yaml"),
+        Some(IDENTITY_WITH_CHECK)
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn retrieval_with_lost_base_prepares_every_differing_path() {

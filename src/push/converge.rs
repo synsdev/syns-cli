@@ -572,6 +572,39 @@ pub(crate) fn excluded_local_files<'a>(
         .collect()
 }
 
+/// The identity file standing directly at a working copy's root.
+const ROOT_IDENTITY: &str = ".syns.yaml";
+
+/// Whether a retrieval holds the root identity file out of every
+/// comparison, write and removal of its run (SPEC u263 `ConvergeMode`):
+/// only under `Retrieve`, only where the collected folder holds the file,
+/// and not where the folder holds it unedited against the base while the
+/// head carries other content — that head edit is taken like any other.
+fn holds_root_identity(
+    retrieving: bool,
+    base_files: &BTreeMap<String, String>,
+    folder: &Folder,
+    head: &Head,
+) -> bool {
+    let Some(local) = folder.hashes.get(ROOT_IDENTITY) else {
+        return false;
+    };
+    let head_edited_an_unedited_file = base_files.get(ROOT_IDENTITY) == Some(local)
+        && head
+            .files
+            .get(ROOT_IDENTITY)
+            .is_some_and(|remote| remote != local);
+    retrieving && !head_edited_an_unedited_file
+}
+
+/// Drop the root identity file from a collected folder, so the exclusion
+/// test that follows counts it as a file standing on disk that the
+/// comparison leaves alone.
+fn hold_root_identity(folder: &mut Folder) {
+    folder.hashes.remove(ROOT_IDENTITY);
+    folder.bytes.remove(ROOT_IDENTITY);
+}
+
 fn without(
     map: &BTreeMap<String, String>,
     excluded: &BTreeSet<String>,
@@ -603,6 +636,10 @@ struct Candidate<'a> {
     /// Write a resolution whatever the reconciliation finds
     /// (`publish_reviewed` 8).
     force_resolution: bool,
+    /// Whether this run holds the root identity file out (u263), decided
+    /// once and applied to every collection; `None` leaves the first pass
+    /// to decide it from its own collection.
+    hold_root_identity: Option<bool>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -627,6 +664,7 @@ async fn prepare_candidate(
     let mut collisions: BTreeMap<String, CollisionKind> = BTreeMap::new();
     let mut resumed_combined: BTreeSet<String> = BTreeSet::new();
     let mut first_folder = first_folder;
+    let mut hold = candidate.hold_root_identity;
 
     // A preparation resumed over a resolution a killed or failed run left
     // half-written keeps that run's summaries, and counts a path already
@@ -650,10 +688,15 @@ async fn prepare_candidate(
 
     for pass in 0..MAX_PASSES {
         // `converge` 6, again on every pass after the first.
-        let folder = match first_folder.take() {
+        let mut folder = match first_folder.take() {
             Some(folder) => folder,
             None => collect_folder(copy, opts)?,
         };
+        if *hold.get_or_insert_with(|| {
+            holds_root_identity(!candidate.publishing, &candidate.base_files, &folder, head)
+        }) {
+            hold_root_identity(&mut folder);
+        }
         let excluded = excluded_on_disk(
             copy,
             &folder.hashes,
@@ -1071,8 +1114,19 @@ async fn converge_from_resolution(
         return Ok(SyncOutcome::AttentionRequired(resolution));
     }
 
-    // 6
-    let folder = collect_folder(copy, &opts)?;
+    // 6 — a retrieval holding the root identity file out drops it from
+    // the folder here, and the exclusion test then drops it from the base
+    // and the head that steps 7 to 12 compare, write and remove from.
+    let mut folder = collect_folder(copy, &opts)?;
+    let hold = holds_root_identity(
+        matches!(mode, ConvergeMode::Retrieve { .. }),
+        &base.files,
+        &folder,
+        &head,
+    );
+    if hold {
+        hold_root_identity(&mut folder);
+    }
     let excluded = excluded_on_disk(
         copy,
         &folder.hashes,
@@ -1135,6 +1189,7 @@ async fn converge_from_resolution(
             publishing: mode == ConvergeMode::Publish,
             existing: None,
             force_resolution: false,
+            hold_root_identity: Some(hold),
         },
         Some(folder),
     )
@@ -1182,6 +1237,7 @@ async fn finish_preparation(
             publishing: mode == ConvergeMode::Publish,
             existing: Some(standing),
             force_resolution: true,
+            hold_root_identity: None,
         },
         None,
     )
@@ -1506,6 +1562,7 @@ async fn guard_refused(
             publishing: true,
             existing,
             force_resolution: true,
+            hold_root_identity: Some(false),
         },
         None,
     )

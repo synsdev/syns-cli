@@ -635,17 +635,21 @@ async fn bare_pull_from_subdirectory_reconciles_at_the_repository_root() {
     );
 }
 
+/// u263 (issue 130), inverting the u255-era retrieval that wrote a second
+/// identity file under `sub/`: a repository named on the command line is
+/// refused wherever the nearest identity file above the starting directory
+/// names another, naming the directory holding that file.
 #[tokio::test(flavor = "current_thread")]
 #[serial]
-async fn pull_of_another_repository_writes_its_own_identity_file() {
+async fn pull_of_another_repository_below_an_identity_file_refuses() {
     let ctx = setup().await;
     seed_credentials(&ctx, "test-token", "alice");
-    let root = ctx.project_dir.path().to_path_buf();
+    let root = fs::canonicalize(ctx.project_dir.path()).unwrap();
     fs::create_dir_all(root.join("sub")).unwrap();
     fs::write(root.join(".syns.yaml"), "owner: alice\nname: proj\n").unwrap();
     mount_pull_mocks(&ctx, "other/repo", server_tree()).await;
 
-    {
+    let result = {
         let _cwd = CwdGuard::enter(&root.join("sub"));
         cmd_pull(
             &ctx.config,
@@ -657,16 +661,32 @@ async fn pull_of_another_repository_writes_its_own_identity_file() {
             false,
         )
         .await
-        .unwrap();
-    }
+    };
 
+    match result {
+        Err(CliError::PathBelongsToAnotherRepository {
+            path,
+            standing,
+            requested,
+        }) => {
+            assert_eq!(path, root);
+            assert_eq!(standing, "alice/proj");
+            assert_eq!(requested, "other/repo");
+        }
+        other => panic!("expected the path-belongs refusal, got {other:?}"),
+    }
     assert!(
-        root.join("sub/root-a.md").is_file(),
-        "the retrieval did not write under sub/"
+        ctx.mock_server
+            .received_requests()
+            .await
+            .unwrap()
+            .is_empty()
     );
-    let marker = fs::read_to_string(root.join("sub/.syns.yaml")).expect("sub/.syns.yaml");
-    assert!(marker.contains("other"), "{marker}");
-    assert!(marker.contains("repo"), "{marker}");
+    assert_eq!(fs::read_dir(root.join("sub")).unwrap().count(), 0);
+    assert_eq!(
+        fs::read_to_string(root.join(".syns.yaml")).unwrap(),
+        "owner: alice\nname: proj\n"
+    );
 }
 
 // ---- round 2: the refusals the review found missing --------------------
@@ -949,21 +969,21 @@ async fn a_mixed_case_identity_file_addresses_the_lower_cased_repository() {
     );
 }
 
-/// u256: a retrieval into a folder whose own identity file names another
-/// repository leaves that file — and the checks it declares — as it stood.
-/// The folder is the working directory rather than a path argument, which
-/// u262 refuses before any request where that file names another repository.
+/// u263 (issue 130), inverting the u256-era retrieval that mixed a
+/// repository into the working directory whose own identity file names
+/// another: the run is refused before any request, and that file — with
+/// the checks it declares — stands at its bytes.
 #[tokio::test(flavor = "current_thread")]
 #[serial]
-async fn pull_of_another_repository_leaves_an_identity_file_at_the_write_root_alone() {
+async fn pull_of_another_repository_where_an_identity_file_stands_refuses() {
     let ctx = setup().await;
     seed_credentials(&ctx, "test-token", "alice");
-    let root = ctx.project_dir.path().to_path_buf();
+    let root = fs::canonicalize(ctx.project_dir.path()).unwrap();
     let standing = "owner: bob\nname: other\nchecks:\n  - make lint\n";
     fs::write(root.join(".syns.yaml"), standing).unwrap();
     mount_pull_mocks(&ctx, "alice/proj", server_tree()).await;
 
-    {
+    let result = {
         let _cwd = CwdGuard::enter(&root);
         cmd_pull(
             &ctx.config,
@@ -975,10 +995,23 @@ async fn pull_of_another_repository_leaves_an_identity_file_at_the_write_root_al
             false,
         )
         .await
-        .unwrap();
-    }
+    };
 
-    assert!(root.join("root-a.md").is_file());
+    assert!(
+        matches!(
+            &result,
+            Err(CliError::PathBelongsToAnotherRepository { path, .. }) if *path == root
+        ),
+        "{result:?}"
+    );
+    assert!(
+        ctx.mock_server
+            .received_requests()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!root.join("root-a.md").exists());
     assert_eq!(
         fs::read_to_string(root.join(".syns.yaml")).unwrap(),
         standing

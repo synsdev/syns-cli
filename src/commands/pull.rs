@@ -7,10 +7,8 @@ use crate::output::Output;
 use crate::push::converge::{ConvergeMode, SyncOutcome, converge};
 use crate::push::working_copy::WorkingCopy;
 use crate::repo::if_repo::resolve_full_or_skip;
-use crate::repo::root::{pull_root, resolve_start_path};
-use crate::repo::syns_yaml::{
-    identity_standing_in, read_syns_yaml, write_syns_yaml_where_none_stands,
-};
+use crate::repo::root::resolve_start_path;
+use crate::repo::syns_yaml::{nearest_identity, write_syns_yaml_where_none_stands};
 use console::style;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -141,39 +139,16 @@ pub async fn cmd_pull(
     if_repo: bool,
     overwrite_local: bool,
 ) -> Result<(), CliError> {
-    // The directory the identity walk starts at (SPEC u255 `cmd_pull`
-    // 1), in ABSOLUTE form — see `resolve_start_path`. This is NOT yet
-    // the write root: a bare retrieval writes into the repository root,
+    // SPEC u263 `cmd_pull` 1: the directory the identity walk starts at,
+    // in ABSOLUTE form — see `resolve_start_path`. This is NOT yet the
+    // write root: a bare retrieval writes into the repository root,
     // whichever descendant of it the run started in.
     let start_dir = resolve_start_path(path_arg.as_deref().map(Path::new))?;
 
-    // SPEC u262 `cmd_pull` 2: `--if-repo` skips wherever no identity file
-    // stands at or above the starting directory — a repository named on
-    // the command line included, so the option means one thing however
-    // the repository was given.
-    if if_repo && repository.is_some() && read_syns_yaml(&start_dir)?.is_none() {
-        output.skip();
-        return Ok(());
-    }
-
+    // `cmd_pull` 2: only a run naming no repository resolves one.
+    let bound = repository.is_some();
     let (owner, name) = match &repository {
-        Some((owner, name)) => {
-            // The filer's ruling on u262 round 3's open question: a path
-            // whose own identity file names another repository is refused
-            // before any request, so two repositories never mix there.
-            if path_arg.is_some()
-                && let Some((standing_owner, standing_name)) = identity_standing_in(&start_dir)?
-                && !(standing_owner.eq_ignore_ascii_case(owner)
-                    && standing_name.eq_ignore_ascii_case(name))
-            {
-                return Err(CliError::PathBelongsToAnotherRepository {
-                    path: start_dir,
-                    standing: format!("{standing_owner}/{standing_name}"),
-                    requested: format!("{owner}/{name}"),
-                });
-            }
-            (owner.clone(), name.clone())
-        }
+        Some(pair) => pair.clone(),
         None => {
             // `syns pull` accepts the repository as a positional, so its
             // refusal names that, and the directory a path argument named.
@@ -189,16 +164,43 @@ pub async fn cmd_pull(
         }
     };
 
-    // The retrieval's ONE write root (SPEC u255 `cmd_pull` 2): every
-    // fetched path is joined under it, every reconciled removal is
-    // taken from it, and the identity file is written into it. A path
-    // argument still names a destination rather than a scope.
-    let target_dir = pull_root(
-        path_arg.as_ref().map(|_| start_dir.as_path()),
-        &start_dir,
-        &owner,
-        &name,
-    )?;
+    // `cmd_pull` 3: the nearest identity file, read by its local side, is
+    // the one read every later decision of this run takes.
+    let standing = nearest_identity(&start_dir)?;
+
+    // `cmd_pull` 4: `--if-repo` skips wherever no identity file stands at
+    // or above the starting directory, a repository named on the command
+    // line included.
+    if bound && if_repo && standing.is_none() {
+        output.skip();
+        return Ok(());
+    }
+
+    // `cmd_pull` 5 (issue 130): a repository named on the command line is
+    // refused wherever the nearest identity file names another — a bare
+    // run, a path argument and a run from a sub-folder alike — before any
+    // request, credential read or directory creation, so two repositories
+    // never mix in one directory.
+    if bound
+        && let Some(standing) = &standing
+        && !standing.names(&owner, &name)
+    {
+        return Err(CliError::PathBelongsToAnotherRepository {
+            path: standing.dir.clone(),
+            standing: format!("{}/{}", standing.owner, standing.name),
+            requested: format!("{owner}/{name}"),
+        });
+    }
+
+    // `cmd_pull` 6: the retrieval's ONE write root. Every fetched path is
+    // joined under it, every reconciled removal is taken from it, and the
+    // identity file is written into it. A path argument still names a
+    // destination rather than a scope.
+    let target_dir = match (&path_arg, &standing) {
+        (Some(_), _) => start_dir.clone(),
+        (None, Some(standing)) if standing.names(&owner, &name) => standing.dir.clone(),
+        _ => start_dir.clone(),
+    };
 
     let repo_id = format!("{owner}/{name}");
     let token = TokenStore::new(config.credentials_path())
@@ -318,14 +320,27 @@ async fn pull_snapshot(
         &[],
         crate::push::collector::CollectOptions::default(),
     )?;
-    let excluded = crate::push::converge::excluded_local_files(
+    let mut excluded = crate::push::converge::excluded_local_files(
         target_dir,
         |path| collected.files.contains_key(path),
         server_files.iter().map(|e| &e.path),
     );
     drop(collected);
 
+    // SPEC u263 `cmd_pull` 7: an identity file already standing at the
+    // write root is kept as it stands, counted neither downloaded nor
+    // excluded.
+    let identity_stands = target_dir.join(".syns.yaml").is_file();
+    if identity_stands {
+        excluded.remove(".syns.yaml");
+    }
+    let mut kept = 0;
+
     for entry in &server_files {
+        if identity_stands && entry.path == ".syns.yaml" {
+            kept += 1;
+            continue;
+        }
         if excluded.contains(&entry.path) {
             if !output.is_json() {
                 eprintln!("  {}", style(format!("excluded: {}", entry.path)).yellow());
@@ -350,7 +365,7 @@ async fn pull_snapshot(
 
     write_identity_file(repository, target_dir, owner, name)?;
 
-    let downloaded = server_files.len() - excluded.len();
+    let downloaded = server_files.len() - excluded.len() - kept;
     if output.is_json() {
         output.json(&json!({
             "repo": repo_id,
