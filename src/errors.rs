@@ -14,6 +14,14 @@ pub enum CliError {
     RepoIdentityUnknown {
         remedy: IdentityRemedy,
     },
+    /// `syns pull OWNER/NAME PATH` aimed at a directory whose own identity
+    /// file names another repository, refused before any request (the
+    /// filer's ruling on u262 round 3's open question, 2026-09-16).
+    PathBelongsToAnotherRepository {
+        path: std::path::PathBuf,
+        standing: String,
+        requested: String,
+    },
     ServerUnreachable {
         url: String,
     },
@@ -87,6 +95,7 @@ impl CliError {
     pub fn exit_code(&self) -> i32 {
         match self {
             CliError::RepoIdentityUnknown { .. } => 2,
+            CliError::PathBelongsToAnotherRepository { .. } => 2,
             CliError::ServerUnreachable { .. } => 3,
             CliError::PushPartial { .. } => 3,
             CliError::PushEmpty { .. } => 6,
@@ -220,6 +229,16 @@ impl std::fmt::Display for CliError {
                     "cannot determine repo identity \u{2014} run inside a directory at or below one holding .syns.yaml"
                 ),
             },
+            CliError::PathBelongsToAnotherRepository {
+                path,
+                standing,
+                requested,
+            } => write!(
+                f,
+                "{} already belongs to {standing} \u{2014} pull {requested} into another directory, or remove {}",
+                path.display(),
+                path.join(".syns.yaml").display()
+            ),
             CliError::ServerUnreachable { url } => write!(f, "could not reach server at {url}"),
             CliError::Io { message } => write!(f, "{message}"),
             CliError::Config { message } => write!(f, "configuration error: {message}"),
@@ -415,6 +434,20 @@ mod tests {
             assert_eq!(err.to_string(), line);
             assert_eq!(err.exit_code(), 2);
         }
+    }
+
+    #[test]
+    fn path_belonging_to_another_repository_renders_its_line_on_exit_2() {
+        let err = CliError::PathBelongsToAnotherRepository {
+            path: std::path::PathBuf::from("/w/target"),
+            standing: "bob/other".into(),
+            requested: "alice/proj".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "/w/target already belongs to bob/other \u{2014} pull alice/proj into another directory, or remove /w/target/.syns.yaml"
+        );
+        assert_eq!(err.exit_code(), 2);
     }
 
     #[test]

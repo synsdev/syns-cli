@@ -951,6 +951,8 @@ async fn a_mixed_case_identity_file_addresses_the_lower_cased_repository() {
 
 /// u256: a retrieval into a folder whose own identity file names another
 /// repository leaves that file — and the checks it declares — as it stood.
+/// The folder is the working directory rather than a path argument, which
+/// u262 refuses before any request where that file names another repository.
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn pull_of_another_repository_leaves_an_identity_file_at_the_write_root_alone() {
@@ -961,17 +963,20 @@ async fn pull_of_another_repository_leaves_an_identity_file_at_the_write_root_al
     fs::write(root.join(".syns.yaml"), standing).unwrap();
     mount_pull_mocks(&ctx, "alice/proj", server_tree()).await;
 
-    cmd_pull(
-        &ctx.config,
-        &ctx.output,
-        Some(("alice".into(), "proj".into())),
-        Some(root.to_string_lossy().into_owned()),
-        None,
-        false,
-        false,
-    )
-    .await
-    .unwrap();
+    {
+        let _cwd = CwdGuard::enter(&root);
+        cmd_pull(
+            &ctx.config,
+            &ctx.output,
+            Some(("alice".into(), "proj".into())),
+            None,
+            None,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    }
 
     assert!(root.join("root-a.md").is_file());
     assert_eq!(

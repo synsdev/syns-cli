@@ -8,7 +8,9 @@ use crate::push::converge::{ConvergeMode, SyncOutcome, converge};
 use crate::push::working_copy::WorkingCopy;
 use crate::repo::if_repo::resolve_full_or_skip;
 use crate::repo::root::{pull_root, resolve_start_path};
-use crate::repo::syns_yaml::{read_syns_yaml, write_syns_yaml_where_none_stands};
+use crate::repo::syns_yaml::{
+    identity_standing_in, read_syns_yaml, write_syns_yaml_where_none_stands,
+};
 use console::style;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -155,7 +157,23 @@ pub async fn cmd_pull(
     }
 
     let (owner, name) = match &repository {
-        Some(pair) => pair.clone(),
+        Some((owner, name)) => {
+            // The filer's ruling on u262 round 3's open question: a path
+            // whose own identity file names another repository is refused
+            // before any request, so two repositories never mix there.
+            if path_arg.is_some()
+                && let Some((standing_owner, standing_name)) = identity_standing_in(&start_dir)
+                && !(standing_owner.eq_ignore_ascii_case(owner)
+                    && standing_name.eq_ignore_ascii_case(name))
+            {
+                return Err(CliError::PathBelongsToAnotherRepository {
+                    path: start_dir,
+                    standing: format!("{standing_owner}/{standing_name}"),
+                    requested: format!("{owner}/{name}"),
+                });
+            }
+            (owner.clone(), name.clone())
+        }
         None => {
             // `syns pull` accepts the repository as a positional, so its
             // refusal names that, and the directory a path argument named.

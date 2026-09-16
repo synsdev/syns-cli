@@ -381,36 +381,99 @@ fn malformed_first_of_two_refuses_at_the_parser() {
     assert!(!env.w.join("b").exists());
 }
 
+/// The filer's ruling on u262 round 3's open question (2026-09-16): a
+/// positional repository aimed at a path whose identity file names another
+/// repository is refused before any request, and nothing is written.
 #[test]
 #[serial]
-fn positional_repository_wins_over_the_identity_file_at_the_path() {
+fn positional_repository_refuses_a_path_whose_identity_file_names_another_repository() {
     let env = Env::new();
     identity(&env.w.join("target"), "bob", "other");
     fs::create_dir_all(env.w.join("cwd")).unwrap();
-    env.mount_tree_with_a_md("alice/proj");
-
-    let output = env.syns(&env.w.join("cwd"), &["pull", "Alice/Proj", "../target"]);
-
-    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    let paths = env.request_paths();
-    assert!(
-        paths.iter().any(|p| p == "/api/v1/repos/alice/proj/tree"),
-        "{paths:?}"
+    env.mount_tree_with_a_md_and_identity("alice", "proj");
+    let target = env.w.join("target");
+    let line = format!(
+        "{} already belongs to bob/other \u{2014} pull alice/proj into another directory, or remove {}",
+        target.display(),
+        target.join(".syns.yaml").display()
     );
-    assert!(!paths.iter().any(|p| p.contains("bob/other")), "{paths:?}");
+
+    for args in [
+        &["pull", "Alice/Proj", "../target"][..],
+        &["pull", "alice/proj", "../target", "--version", "1"][..],
+        &["pull", "--if-repo", "alice/proj", "../target"][..],
+    ] {
+        let output = env.syns(&env.w.join("cwd"), args);
+
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+        assert_eq!(stderr(&output), format!("error: {line}\n"), "{args:?}");
+        assert_eq!(stdout(&output), "", "{args:?}");
+    }
+
+    let output = env.syns(
+        &env.w.join("cwd"),
+        &["--json", "pull", "alice/proj", "../target"],
+    );
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    let document: serde_json::Value =
+        serde_json::from_str(stdout(&output).trim()).expect("one JSON document");
+    assert_eq!(document, json!({ "error": line }));
+
+    assert!(env.request_paths().is_empty(), "{:?}", env.request_paths());
+    let mut standing: Vec<_> = fs::read_dir(&target)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    standing.sort();
+    assert_eq!(standing, vec![std::ffi::OsString::from(".syns.yaml")]);
+    assert_eq!(
+        fs::read_to_string(target.join(".syns.yaml")).unwrap(),
+        "owner: bob\nname: other\n"
+    );
+    assert_eq!(fs::read_dir(env.w.join("cwd")).unwrap().count(), 0);
 }
 
-/// V1-11 (u262 `VERIFICATION.md`): a positional repository whose head
-/// carries its own identity file, pulled into a path holding another
-/// repository's, collides on `.syns.yaml` added on both sides. The
-/// retrieval ends on the registered resolution refusal, never on a parse
-/// of the marker-carrying file the convergence left for review.
+/// An identity file at the path naming the positional repository, in any
+/// letter case, is no refusal: the retrieval converges into it.
 #[test]
 #[serial]
-fn positional_repository_colliding_on_the_identity_file_at_the_path_ends_on_the_resolution_refusal()
-{
+fn positional_repository_pulls_into_a_path_whose_identity_file_names_it() {
     let env = Env::new();
-    identity(&env.w.join("target"), "bob", "other");
+    identity(&env.w.join("target"), "Alice", "Proj");
+    fs::create_dir_all(env.w.join("cwd")).unwrap();
+    env.mount_tree_with_a_md("alice/proj");
+
+    let output = env.syns(&env.w.join("cwd"), &["pull", "alice/proj", "../target"]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(fs::read_to_string(env.w.join("target/a.md")).unwrap(), "a");
+    assert_eq!(
+        fs::read_to_string(env.w.join("target/.syns.yaml")).unwrap(),
+        "owner: Alice\nname: Proj\n"
+    );
+}
+
+/// V1-11 (u262 `VERIFICATION.md`), as it still arises under the filer's
+/// ruling: the path's identity file names the positional repository but
+/// differs from the one the head carries, so the two collide on
+/// `.syns.yaml`. The retrieval ends on the registered resolution refusal,
+/// and a re-run over the marker-carrying file ends there again rather than
+/// on a parse of that file.
+#[test]
+#[serial]
+fn positional_repository_colliding_on_its_own_identity_file_ends_on_the_resolution_refusal() {
+    let env = Env::new();
+    fs::create_dir_all(env.w.join("target")).unwrap();
+    fs::write(
+        env.w.join("target/.syns.yaml"),
+        "owner: alice\nname: proj\nchecks:\n  - make test\n",
+    )
+    .unwrap();
     fs::create_dir_all(env.w.join("cwd")).unwrap();
     env.mount_tree_with_a_md_and_identity("alice", "proj");
 
@@ -433,11 +496,15 @@ fn positional_repository_colliding_on_the_identity_file_at_the_path_ends_on_the_
         }
     }
     assert!(
+        fs::read_to_string(env.w.join("target/.syns.yaml"))
+            .unwrap()
+            .contains("<<<<<<<"),
+        "the collision leaves the identity file carrying markers"
+    );
+    assert!(
         !env.w.join("cwd/.syns.yaml").exists(),
         "the working directory gains no identity file"
     );
-    let paths = env.request_paths();
-    assert!(!paths.iter().any(|p| p.contains("bob/other")), "{paths:?}");
 }
 
 /// A positional retrieval ending on the resolution refusal still leaves

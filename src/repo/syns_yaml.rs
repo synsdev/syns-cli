@@ -104,6 +104,20 @@ pub fn find_repo_root_for(
     Ok(file_path.parent().map(Path::to_path_buf))
 }
 
+/// The owner and name the identity file standing in `dir` itself names,
+/// walking no ancestor; none where no such file stands there or it does not
+/// parse as one — a file a convergence left carrying markers included, so
+/// that a re-run over it ends where the convergence ended (CON3-1).
+pub fn identity_standing_in(dir: &Path) -> Option<(String, String)> {
+    let file_path = dir.join(SYNS_YAML_FILENAME);
+    if !file_path.is_file() {
+        return None;
+    }
+    parse_syns_yaml(&file_path)
+        .ok()
+        .map(|yaml| (yaml.owner, yaml.name))
+}
+
 pub fn write_syns_yaml(path: &Path, owner: &str, name: &str) -> Result<(), CliError> {
     let file_path = path.join(SYNS_YAML_FILENAME);
     let content = format!("owner: {owner}\nname: {name}\n");
@@ -316,6 +330,27 @@ mod tests {
             fs::read_to_string(dir.path().join(".syns.yaml")).unwrap(),
             standing
         );
+    }
+
+    #[test]
+    fn identity_standing_in_reads_the_directory_itself_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        write_syns_yaml(root.path(), "bob", "other").unwrap();
+
+        assert_eq!(identity_standing_in(&sub), None);
+        assert_eq!(
+            identity_standing_in(root.path()),
+            Some(("bob".to_string(), "other".to_string()))
+        );
+
+        fs::write(
+            sub.join(".syns.yaml"),
+            "<<<<<<< local\nowner: bob\n=======\nowner: alice\n>>>>>>> remote\n",
+        )
+        .unwrap();
+        assert_eq!(identity_standing_in(&sub), None);
     }
 
     #[test]
