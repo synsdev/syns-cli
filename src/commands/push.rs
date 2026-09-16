@@ -998,16 +998,6 @@ mod tests {
         let server = MockServer::start().await;
         mount_tree_not_found(&server).await;
         mount_push_accepted(&server, 2).await;
-        Mock::given(method("PUT"))
-            .and(path(NON_OWNER_PUSH_PATH))
-            .respond_with(
-                ResponseTemplate::new(409)
-                    .set_body_json(serde_json::json!({"error": "missing_blobs"})),
-            )
-            .with_priority(1)
-            .up_to_n_times(1)
-            .mount(&server)
-            .await;
 
         let _env = NonOwnerEnv::new();
         let folder = alice_identity_folder();
@@ -1016,6 +1006,17 @@ mod tests {
         store_bob_credential(&config);
 
         let readme = std::fs::read(folder.path().join("README.md")).unwrap();
+        Mock::given(method("PUT"))
+            .and(path(NON_OWNER_PUSH_PATH))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "error": "missing_blobs",
+                "message": "some referenced blobs are missing on the server",
+                "missing": {"README.md": crate::push::hash::blob_sha1(&readme)}
+            })))
+            .with_priority(1)
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
         let mut record = crate::push::manifest::Manifest::default();
         record.update(
             "a11ce000a11ce000".into(),
