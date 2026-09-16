@@ -157,6 +157,25 @@ fn positional_repository_under_if_repo_skips_where_no_identity_file_reaches_the_
 
 #[test]
 #[serial]
+fn positional_repository_under_if_repo_pulls_where_an_identity_file_stands_above() {
+    let env = Env::new();
+    identity(&env.w, "alice", "proj");
+    fs::create_dir_all(env.w.join("sub")).unwrap();
+    env.mount_tree_with_a_md("alice/proj");
+
+    let output = env.syns(&env.w.join("sub"), &["pull", "--if-repo", "alice/proj"]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let paths = env.request_paths();
+    assert!(
+        paths.iter().any(|p| p == "/api/v1/repos/alice/proj/tree"),
+        "{paths:?}"
+    );
+    assert!(env.w.join("a.md").is_file());
+}
+
+#[test]
+#[serial]
 fn lone_relative_path_converges_that_path_from_its_identity_file() {
     let env = Env::new();
     identity(&env.w.join("target"), "alice", "proj");
