@@ -417,3 +417,27 @@ fn overwrite_leaves_a_standing_identity_file() {
         LETTER_CASE_IDENTITY
     );
 }
+
+#[test]
+#[serial]
+fn version_retrieval_counts_an_ignored_standing_identity_file_once() {
+    let env = Env::new();
+    let d = seed_d(&env);
+    fs::write(d.join(".synsignore"), "*.yaml\n").unwrap();
+    env.mount_notes(true);
+
+    let output = env.syns(
+        &env.w,
+        &["--json", "pull", "--version", "1", "alice/notes", "d"],
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let document: serde_json::Value =
+        serde_json::from_str(stdout(&output).trim()).expect("one JSON document");
+    assert_eq!(document["downloaded"], 1, "{document}");
+    assert_eq!(document["excluded"], json!([]), "{document}");
+    assert_eq!(
+        fs::read_to_string(d.join(".syns.yaml")).unwrap(),
+        LETTER_CASE_IDENTITY
+    );
+}

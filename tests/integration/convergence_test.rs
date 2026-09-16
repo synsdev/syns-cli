@@ -781,6 +781,53 @@ async fn retrieval_keeps_the_identity_file_a_moved_head_removed() {
     }
 }
 
+/// A retrieval finishing a preparation a killed run left half-written
+/// decides the root identity hold from its own collection, keeping a
+/// locally edited identity file over a head edit to it.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_half_written_retrieval_keeps_an_edited_identity_file() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let edited = "owner: alice\nname: proj\nchecks:\n  - make local\n";
+    let h0 = e.fake.commit(&[(".syns.yaml", IDENTITY), ("a.md", "a0\n")]);
+    checkout(&e.fake, &copy, &h0);
+    write_files(&dir, &[(".syns.yaml", edited)]);
+    let h1 = e.fake.commit_changes(&[
+        (".syns.yaml", Some(IDENTITY_WITH_CHECK)),
+        ("a.md", Some("a1\n")),
+    ]);
+    let mut half_written = dummy_resolution(&h1);
+    half_written.base_commit = Some(h0);
+    half_written.pending_writes = Some(BTreeMap::from([(
+        "a.md".to_string(),
+        Some(blob_sha1(b"a1\n")),
+    )]));
+    copy.write_resolution(&half_written).unwrap();
+
+    let outcome = converge(
+        &e.fake.client(),
+        Some(TOKEN),
+        &copy,
+        ConvergeMode::Retrieve { overwrite: false },
+        e.opts(),
+    )
+    .await
+    .unwrap();
+
+    let resolution = expect_resolution(outcome);
+    let kept = read(&dir, ".syns.yaml");
+    assert_eq!(kept, edited);
+    assert!(!kept.contains("<<<<<<<"));
+    assert!(
+        resolution.collisions.iter().all(|(p, _)| p != ".syns.yaml"),
+        "{:?}",
+        resolution.collisions
+    );
+    assert_eq!(read(&dir, "a.md"), "a1\n");
+}
+
 /// A publication carries a locally edited root identity file as it carries
 /// every other path.
 #[tokio::test(flavor = "current_thread")]
