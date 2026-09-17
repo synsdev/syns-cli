@@ -15,7 +15,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::client::{PushResponse, SynsClient};
-use crate::errors::CliError;
+use crate::errors::{ApiErrorContext, CliError};
 use crate::push::collector::{CollectOptions, collect_files};
 use crate::push::hash::blob_sha1;
 use crate::push::reconcile::{CollisionKind, holds_conflict_marker, merge_text, reconcile};
@@ -1488,10 +1488,13 @@ async fn publish_reviewed(
                 copy.remove_outbox()?;
                 continue;
             }
+            // A `conflict` naming no head is not a moved head — a first
+            // publication over an identity whose content store already
+            // holds commits — so no round is raised and it is refused below.
             Err(CliError::Api {
                 status: Some(409),
                 ref error,
-                ..
+                context: Some(ApiErrorContext::HeadMoved),
             }) if error == "conflict" => {
                 // 7
                 copy.remove_outbox()?;

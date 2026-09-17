@@ -188,6 +188,9 @@ struct FakeRepo {
     /// Every request received: method, target and body.
     requests: Vec<(String, String, Vec<u8>)>,
     drop_next_push: bool,
+    /// Refuse every publication as the server refuses a first push over a
+    /// content store already holding commits: `CONFLICT` naming no head.
+    identity_taken: bool,
 }
 
 fn error_body(code: &str) -> String {
@@ -220,6 +223,9 @@ impl FakeRepo {
                 if self.drop_next_push {
                     self.drop_next_push = false;
                     return None;
+                }
+                if self.identity_taken {
+                    return Some((409, error_body("conflict")));
                 }
                 Some(self.push(&req.body))
             }
@@ -276,7 +282,12 @@ impl FakeRepo {
         if let Some(parent) = body.get("parentSha").and_then(Value::as_str)
             && head.as_ref().map(|(sha, _)| sha.as_str()) != Some(parent)
         {
-            return (409, error_body("conflict"));
+            let current = head.as_ref().map(|(sha, _)| sha.as_str()).unwrap_or("");
+            return (
+                409,
+                json!({"error": "conflict", "message": "Head mismatch", "currentSha": current})
+                    .to_string(),
+            );
         }
         let known: HashMap<String, String> = self
             .commits
@@ -418,6 +429,10 @@ impl Fake {
 
     fn drop_next_push(&self) {
         self.repo.lock().unwrap().drop_next_push = true;
+    }
+
+    fn take_identity(&self) {
+        self.repo.lock().unwrap().identity_taken = true;
     }
 }
 
@@ -1812,6 +1827,36 @@ async fn bare_push_past_a_moved_head_converges_hand_edits() {
     let (_, published) = e.fake.head();
     assert_eq!(published["x.md"], "x1\n");
     assert_eq!(published["y.md"], "y by hand\n");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn first_push_refused_as_a_taken_identity_prepares_no_resolution() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    write_files(&dir, &[(".syns.yaml", IDENTITY), ("fresh.md", "fresh\n")]);
+    e.fake.take_identity();
+
+    let refused = {
+        let _cwd = CwdGuard::enter(&dir);
+        cmd_push(&e.config, &e.output, &push_args(None)).await
+    };
+
+    match &refused {
+        Err(
+            err @ CliError::Api {
+                status: Some(409),
+                error,
+                ..
+            },
+        ) if error == "conflict" => assert_eq!(err.exit_code(), 1),
+        other => panic!("expected the push refused as a conflict, got {other:?}"),
+    }
+    assert_eq!(e.fake.push_bodies().len(), 1);
+    assert!(copy.resolution().unwrap().is_none());
+    assert!(copy.outbox().unwrap().is_none());
+    assert_eq!(read(&dir, "fresh.md"), "fresh\n");
 }
 
 #[tokio::test(flavor = "current_thread")]

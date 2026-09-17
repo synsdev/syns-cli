@@ -83,8 +83,16 @@ pub enum IdentityRemedy {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiErrorContext {
-    LsPath { path: String },
-    CatPath { path: String },
+    LsPath {
+        path: String,
+    },
+    CatPath {
+        path: String,
+    },
+    /// A `409` `conflict` whose body names `currentSha`: the head moved
+    /// past the parent the publication claimed. A `conflict` naming no
+    /// head — an identity already taken — carries no such context.
+    HeadMoved,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

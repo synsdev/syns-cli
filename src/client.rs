@@ -3,7 +3,7 @@
 use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
 
-use crate::errors::{CliError, EdgeRejecter};
+use crate::errors::{ApiErrorContext, CliError, EdgeRejecter};
 
 // --- Domain Enums ---
 
@@ -607,14 +607,19 @@ async fn check_response(response: reqwest::Response) -> Result<reqwest::Response
     }
     if status.is_client_error() || status.is_server_error() {
         let code = status.as_u16();
-        let error = match response.json::<ApiErrorBody>().await {
-            Ok(body) => body.error,
-            Err(_) => "unknown error".to_string(),
+        let (error, head_moved) = match response.json::<serde_json::Value>().await {
+            Ok(body) => match serde_json::from_value::<ApiErrorBody>(body.clone()) {
+                Ok(parsed) => (parsed.error, body.get("currentSha").is_some()),
+                Err(_) => ("unknown error".to_string(), false),
+            },
+            Err(_) => ("unknown error".to_string(), false),
         };
+        let context = (code == 409 && error == "conflict" && head_moved)
+            .then_some(ApiErrorContext::HeadMoved);
         return Err(CliError::Api {
             status: Some(code),
             error,
-            context: None,
+            context,
         });
     }
     if !status.is_success() {
