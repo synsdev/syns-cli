@@ -1,40 +1,49 @@
-use crate::auth::token::TokenStore;
 use crate::client::{EntryType, SynsClient};
 use crate::config::Config;
-use crate::errors::CliError;
+use crate::errors::{CliError, partial_truncated_tree};
 use crate::output::Output;
-use crate::repo::if_repo::resolve_full_or_skip;
+use crate::read::{
+    ReadOptions, mark_partial, read_not_found, report_reference, resolve_read_target,
+    with_reference,
+};
 
+/// `syns ls [PATH]` — the listing's columns and its ordering stand as
+/// they stand, the resolved reference reaching the document and the
+/// diagnostic line and no listing column (SPEC u270).
 pub async fn cmd_ls(
     config: &Config,
     output: &Output,
     path: Option<String>,
-    if_repo: bool,
+    recursive: bool,
+    opts: ReadOptions,
 ) -> Result<(), CliError> {
-    let current_dir = std::env::current_dir().map_err(|e| CliError::Io {
-        message: format!("could not determine current directory: {e}"),
-    })?;
-    let (owner, name) = match resolve_full_or_skip(None, &current_dir, if_repo, output)? {
-        Some(pair) => pair,
-        None => return Ok(()),
+    // 1 — resolve the target.
+    let Some(target) = resolve_read_target(config, output, &opts).await? else {
+        return Ok(());
     };
-    let repo_id = format!("{owner}/{name}");
-    let token = TokenStore::new(config.credentials_path())
-        .read()
-        .ok()
-        .flatten();
     let client = SynsClient::new(config.server_url())?;
 
+    // 2 — read the tree at that reference under the path positional.
+    let version_ref = target.version_ref();
     let (mut response, raw) = match client
-        .get_tree(&repo_id, token.as_deref(), path.as_deref(), false, None)
+        .get_tree(
+            &target.repo_id,
+            target.token.as_deref(),
+            path.as_deref(),
+            recursive,
+            Some(&version_ref),
+        )
         .await
     {
         Ok(tuple) => tuple,
         Err(e) => {
-            if !output.is_json()
-                && let Some(p) = path.as_ref()
-            {
-                return Err(e.with_ls_path_context(p.clone()));
+            if let Some(p) = path.as_ref() {
+                if opts.version.is_some() {
+                    return Err(read_not_found(e, &opts, &target.reference, p));
+                }
+                if !output.is_json() {
+                    return Err(e.with_ls_path_context(p.clone()));
+                }
             }
             return Err(e);
         }
@@ -51,9 +60,11 @@ pub async fn cmd_ls(
             .then_with(|| a.name.cmp(&b.name))
     });
 
-    if output.is_json() {
-        output.json(&raw);
-    } else {
+    // 3 — render the listing, or the served body carrying the reference
+    // and, where the tree arrived truncated, the partial mark.
+    let truncated = response.truncated;
+    let body = with_reference(raw, &target.reference);
+    if !output.is_json() {
         let rows: Vec<Vec<String>> = response
             .entries
             .iter()
@@ -74,6 +85,18 @@ pub async fn cmd_ls(
             })
             .collect();
         output.table(&["Name", "Type", "Size"], rows);
+        // 4 — report the reference.
+        report_reference(output, &target.reference);
+    } else if !truncated {
+        output.json(&body);
+    }
+
+    if truncated {
+        let refusal = partial_truncated_tree(target.reference.version);
+        return Err(CliError::PartialAnswer {
+            document: mark_partial(body, &refusal),
+            line: refusal,
+        });
     }
 
     Ok(())
@@ -85,6 +108,44 @@ mod tests {
     use serial_test::serial;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const HEAD_SHA: &str = "def4560000000000000000000000000000000000";
+
+    /// Mounts the two addresses every read verb resolves through before
+    /// it asks for any content (SPEC u270 `resolve_read_target`).
+    async fn mount_reference(server: &MockServer, repo_id: &str) {
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/repos/{repo_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "owner": "alice", "name": "my-project", "description": null,
+                "commitSha": HEAD_SHA, "status": "active", "author": null, "tags": [],
+                "visibility": "public", "forkedFrom": null, "forkCount": 0,
+                "fileCount": 1, "role": null,
+                "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/repos/{repo_id}/versions/{HEAD_SHA}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "version": 7, "sha": HEAD_SHA, "parentSha": null, "message": "m",
+                "messageBody": null, "author": "alice",
+                "createdAt": "2026-01-01T00:00:00Z", "filesChanged": ["a.md"],
+            })))
+            .mount(server)
+            .await;
+    }
+
+    fn here() -> ReadOptions {
+        ReadOptions::default()
+    }
+
+    fn here_if_repo() -> ReadOptions {
+        ReadOptions {
+            if_repo: true,
+            ..ReadOptions::default()
+        }
+    }
 
     #[tokio::test]
     #[serial]
@@ -99,6 +160,7 @@ mod tests {
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
 
         let mock_server = MockServer::start().await;
+        mount_reference(&mock_server, "alice/my-project").await;
 
         Mock::given(method("GET"))
             .and(path("/api/v1/repos/alice/my-project/tree"))
@@ -116,7 +178,7 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_ls(&config, &output, None, false).await;
+        let result = cmd_ls(&config, &output, None, false, here()).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
@@ -135,6 +197,7 @@ mod tests {
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
 
         let mock_server = MockServer::start().await;
+        mount_reference(&mock_server, "alice/my-project").await;
 
         Mock::given(method("GET"))
             .and(path("/api/v1/repos/alice/my-project/tree"))
@@ -152,7 +215,7 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(true);
 
-        let result = cmd_ls(&config, &output, None, false).await;
+        let result = cmd_ls(&config, &output, None, false, here()).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
@@ -171,6 +234,7 @@ mod tests {
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
 
         let mock_server = MockServer::start().await;
+        mount_reference(&mock_server, "alice/my-project").await;
 
         Mock::given(method("GET"))
             .and(path("/api/v1/repos/alice/my-project/tree/does/not/exist"))
@@ -184,7 +248,14 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_ls(&config, &output, Some("does/not/exist".to_string()), false).await;
+        let result = cmd_ls(
+            &config,
+            &output,
+            Some("does/not/exist".to_string()),
+            false,
+            here(),
+        )
+        .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         let err = result.unwrap_err();
@@ -205,6 +276,7 @@ mod tests {
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
 
         let mock_server = MockServer::start().await;
+        mount_reference(&mock_server, "alice/my-project").await;
 
         Mock::given(method("GET"))
             .and(path("/api/v1/repos/alice/my-project/tree/some/path"))
@@ -218,7 +290,14 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_ls(&config, &output, Some("some/path".to_string()), false).await;
+        let result = cmd_ls(
+            &config,
+            &output,
+            Some("some/path".to_string()),
+            false,
+            here(),
+        )
+        .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         let err = result.unwrap_err();
@@ -239,6 +318,7 @@ mod tests {
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
 
         let mock_server = MockServer::start().await;
+        mount_reference(&mock_server, "alice/my-project").await;
 
         Mock::given(method("GET"))
             .and(path("/api/v1/repos/alice/my-project/tree/does/not/exist"))
@@ -252,7 +332,14 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(true);
 
-        let result = cmd_ls(&config, &output, Some("does/not/exist".to_string()), false).await;
+        let result = cmd_ls(
+            &config,
+            &output,
+            Some("does/not/exist".to_string()),
+            false,
+            here(),
+        )
+        .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         let err = result.unwrap_err();
@@ -273,6 +360,7 @@ mod tests {
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
 
         let mock_server = MockServer::start().await;
+        mount_reference(&mock_server, "alice/my-project").await;
 
         Mock::given(method("GET"))
             .and(path("/api/v1/repos/alice/my-project/tree"))
@@ -289,7 +377,7 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_ls(&config, &output, None, true).await;
+        let result = cmd_ls(&config, &output, None, false, here_if_repo()).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
@@ -330,7 +418,7 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_ls(&config, &output, None, true).await;
+        let result = cmd_ls(&config, &output, None, false, here_if_repo()).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());

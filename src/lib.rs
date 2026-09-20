@@ -10,4 +10,5 @@ pub mod install_detect;
 pub mod output;
 pub mod prompts;
 pub mod push;
+pub mod read;
 pub mod repo;

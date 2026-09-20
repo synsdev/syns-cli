@@ -66,6 +66,35 @@ pub enum CliError {
         line: String,
         exit: i32,
     },
+    /// SPEC u270: a reading run whose answer is partial — the tree
+    /// arrived truncated, or content at some path was not read. `D-080`
+    /// puts it at exit `1` under a code of the binary's own: `line` is
+    /// the diagnostic line outside machine-readable mode and `document`
+    /// the one document inside it, the result standing beside `error`
+    /// rather than replaced by it.
+    PartialAnswer {
+        document: serde_json::Value,
+        line: String,
+    },
+    /// SPEC u270: `syns read PATH` over a content that is not text.
+    /// Raised on the numbered read alone — `syns cat PATH` keeps passing
+    /// those bytes through (`D-080`).
+    NotText {
+        path: String,
+    },
+}
+
+/// The partial-answer refusal's truncated-tree arm (SPEC u270 Contract
+/// Surface, the partial-answer refusal).
+pub fn partial_truncated_tree(version: u32) -> String {
+    format!("partial answer: the tree at version {version} arrived truncated")
+}
+
+/// The partial-answer refusal's refused-content arm. `unread` counts the
+/// paths that were not read, `total` the paths the fan-out took up, and
+/// `first` is the first of the unread ones in ascending path order.
+pub fn partial_unread_paths(unread: usize, total: usize, first: &str) -> String {
+    format!("partial answer: {unread} of {total} paths were not read, the first {first}")
 }
 
 /// Which remedies the invocation raising `RepoIdentityUnknown` accepts
@@ -88,6 +117,14 @@ pub enum ApiErrorContext {
     },
     CatPath {
         path: String,
+    },
+    /// SPEC u270: the refusal line a read verb chose because the run
+    /// resolved its reference from a `--version` the caller gave — the
+    /// version-not-found refusal or the path-not-found refusal, both
+    /// spelt in `crate::read`. It stands in place of the registered
+    /// not-found line on a `404` `not_found` and nowhere else.
+    VersionedRead {
+        line: String,
     },
     /// A `409` `conflict` whose body names `currentSha`: the head moved
     /// past the parent the publication claimed. A `conflict` naming no
@@ -159,6 +196,7 @@ impl CliError {
                 }))
             }
             CliError::SyncRefusal { document, .. } => Some(document.clone()),
+            CliError::PartialAnswer { document, .. } => Some(document.clone()),
             _ => None,
         }
     }
@@ -183,6 +221,21 @@ impl CliError {
         }
     }
 
+    /// Puts a `crate::read` refusal line on an `Api` error, so a `404`
+    /// `not_found` renders it in place of the registered not-found line
+    /// (SPEC u270 Contract Surface, the path-not-found refusal). Every
+    /// other variant, and every other status, passes through unchanged.
+    pub fn with_versioned_read_context(self, line: String) -> CliError {
+        match self {
+            CliError::Api { status, error, .. } => CliError::Api {
+                status,
+                error,
+                context: Some(ApiErrorContext::VersionedRead { line }),
+            },
+            other => other,
+        }
+    }
+
     pub fn with_cat_path_context(self, path: String) -> CliError {
         match self {
             CliError::Api { status, error, .. } => CliError::Api {
@@ -198,6 +251,11 @@ impl CliError {
 impl std::fmt::Display for CliError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            CliError::Api {
+                status: Some(404),
+                error,
+                context: Some(ApiErrorContext::VersionedRead { line }),
+            } if error == "not_found" => write!(f, "{line}"),
             CliError::Api {
                 status: Some(404),
                 error,
@@ -305,6 +363,11 @@ impl std::fmt::Display for CliError {
                 paths.join(", ")
             ),
             CliError::SyncRefusal { line, .. } => write!(f, "{line}"),
+            CliError::PartialAnswer { line, .. } => write!(f, "{line}"),
+            CliError::NotText { path } => write!(
+                f,
+                "cannot number content that is not text: {path} \u{2014} read it with syns cat {path}"
+            ),
         }
     }
 }
@@ -344,6 +407,83 @@ impl From<reqwest::Error> for CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // SPEC u270 Contract Surface, the partial-answer refusal: its one
+    // string is the diagnostic line outside machine-readable mode and the
+    // document's own `error` inside it, at exit `1`.
+    #[test]
+    fn partial_answer_refusal_carries_its_line_its_document_and_exit_one() {
+        let truncated = partial_truncated_tree(58);
+        assert_eq!(
+            truncated,
+            "partial answer: the tree at version 58 arrived truncated"
+        );
+        let unread = partial_unread_paths(2, 7, "src/a.ts");
+        assert_eq!(
+            unread,
+            "partial answer: 2 of 7 paths were not read, the first src/a.ts"
+        );
+
+        let err = CliError::PartialAnswer {
+            document: serde_json::json!({
+                "version": 58,
+                "matches": [],
+                "error": unread.clone(),
+            }),
+            line: unread.clone(),
+        };
+        assert_eq!(err.to_string(), unread);
+        assert_eq!(err.exit_code(), 1);
+        let doc = err.json_value().expect("the refusal carries a document");
+        assert_eq!(doc["error"], serde_json::json!(unread));
+        assert_eq!(doc["version"], serde_json::json!(58));
+        assert!(
+            doc.get("matches").is_some(),
+            "the result stands beside `error`"
+        );
+    }
+
+    // SPEC u270 Contract Surface, the not-text refusal: raised on the
+    // numbered read alone, naming the path and the verb that passes the
+    // bytes through.
+    #[test]
+    fn not_text_refusal_names_the_path_and_cat_at_exit_one() {
+        let err = CliError::NotText {
+            path: "assets/logo.png".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "cannot number content that is not text: assets/logo.png \u{2014} read it with syns cat assets/logo.png"
+        );
+        assert_eq!(err.exit_code(), 1);
+        assert!(
+            err.json_value().is_none(),
+            "the not-text refusal takes the generic envelope"
+        );
+    }
+
+    // SPEC u270 Contract Surface, the path-not-found refusal: it stands
+    // in place of the registered not-found line on a `404` `not_found`,
+    // and nowhere else.
+    #[test]
+    fn a_versioned_read_line_replaces_the_registered_not_found_line() {
+        let err = CliError::Api {
+            status: Some(404),
+            error: "not_found".to_string(),
+            context: None,
+        }
+        .with_versioned_read_context("path not found at version 58: a.md".to_string());
+        assert_eq!(err.to_string(), "path not found at version 58: a.md");
+        assert_eq!(err.exit_code(), 1);
+
+        let other = CliError::Api {
+            status: Some(500),
+            error: "internal_error".to_string(),
+            context: None,
+        }
+        .with_versioned_read_context("path not found at version 58: a.md".to_string());
+        assert_eq!(other.to_string(), "server error (500): internal_error");
+    }
 
     #[test]
     fn exit_codes() {

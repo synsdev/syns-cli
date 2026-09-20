@@ -850,6 +850,33 @@ impl SynsClient {
         process_response_raw(response).await
     }
 
+    /// Reads one version of a repository (`EP-get-version`).
+    ///
+    /// SPEC u270 Contract Surface, `get_version`: the reference is the
+    /// address's own last segment and nothing is sent as a query, so the
+    /// server's reference form — a decimal ordinal or a hex prefix — is
+    /// what decides, and a branch name is refused by the server rather
+    /// than by the client (`issues/006`).
+    pub async fn get_version(
+        &self,
+        repo_id: &str,
+        token: Option<&str>,
+        reference: &str,
+    ) -> Result<(VersionEntry, serde_json::Value), CliError> {
+        let url = format!(
+            "{}/api/v1/repos/{}/versions/{}",
+            self.base_url,
+            repo_id,
+            encode_path_segments(reference)
+        );
+        let mut req = self.client.get(&url);
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        let response = req.send().await?;
+        process_response_raw(response).await
+    }
+
     pub async fn get_file_history(
         &self,
         repo_id: &str,
@@ -1340,6 +1367,72 @@ mod tests {
     use super::*;
     use wiremock::matchers::{header, method, path, query_param, query_param_is_missing};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn version_body(version: u32, sha: &str) -> serde_json::Value {
+        serde_json::json!({
+            "version": version,
+            "sha": sha,
+            "parentSha": null,
+            "message": "m",
+            "messageBody": null,
+            "author": "alice",
+            "createdAt": "2026-01-01T00:00:00Z",
+            "filesChanged": ["a.md"],
+        })
+    }
+
+    // SPEC u270 Contract Surface, `get_version`: "sends the reference as
+    // the address's own last segment and nothing as a query".
+    #[tokio::test]
+    async fn get_version_puts_the_reference_in_the_address_and_sends_no_query() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/notes/versions/2"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(version_body(2, &"b".repeat(40))),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let (typed, raw) = client.get_version("alice/notes", None, "2").await.unwrap();
+
+        assert_eq!(typed.version, 2);
+        assert_eq!(typed.sha, "b".repeat(40));
+        assert_eq!(raw["sha"], serde_json::json!("b".repeat(40)));
+
+        let received = mock_server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        let url = &received[0].url;
+        assert!(
+            url.path().ends_with("/versions/2"),
+            "expected the reference as the last segment, got {}",
+            url.path()
+        );
+        assert_eq!(url.query(), None, "no query is sent");
+    }
+
+    // A full content hash reaches the same address as its own last
+    // segment — the one resolution a run makes before it pins an ordinal.
+    #[tokio::test]
+    async fn get_version_sends_a_content_hash_as_the_last_segment() {
+        let mock_server = MockServer::start().await;
+        let sha = "b".repeat(40);
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/repos/alice/notes/versions/{sha}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(version_body(2, &sha)))
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let (typed, _raw) = client.get_version("alice/notes", None, &sha).await.unwrap();
+        assert_eq!(typed.version, 2);
+
+        let received = mock_server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        assert!(received[0].url.path().ends_with(&sha));
+        assert_eq!(received[0].url.query(), None);
+    }
 
     #[test]
     fn new_accepts_https() {

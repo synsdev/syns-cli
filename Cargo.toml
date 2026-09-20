@@ -41,6 +41,9 @@ sha2 = "0.10"
 self-replace = "1.5"
 thiserror = "2"
 diffy = "=0.5.2"
+globset = "0.4"
+grep-regex = "0.1"
+grep-searcher = "0.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.184"

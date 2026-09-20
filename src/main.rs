@@ -1,7 +1,8 @@
-use syns_cli::{commands, config, errors, output};
+use syns_cli::{commands, config, errors, output, read};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use syns_cli::commands::collaborators::CollaboratorsAction;
+use syns_cli::commands::grep::{GrepArgs, GrepOutput};
 use syns_cli::commands::push::PushArgs;
 use syns_cli::commands::repo::{CliRepoStatus, CliVisibility, RepoAction};
 use syns_cli::commands::repos::ReposArgs;
@@ -26,6 +27,31 @@ struct Cli {
 
     #[command(subcommand)]
     command: Commands,
+}
+
+/// The three options every read verb carries, spelt and bound
+/// identically on each (SPEC u270 Contract Surface, `ReadOptions`).
+#[derive(clap::Args, Clone)]
+struct ReadOpts {
+    /// Read another repository, as OWNER/NAME
+    #[arg(long, value_name = "OWNER/NAME", value_parser = read::parse_repo_id)]
+    repo: Option<String>,
+    /// Read at a specific version (number or SHA)
+    #[arg(long)]
+    version: Option<String>,
+    /// Silently skip (exit 0) when no Syns repo identity resolves
+    #[arg(long)]
+    if_repo: bool,
+}
+
+impl From<ReadOpts> for read::ReadOptions {
+    fn from(opts: ReadOpts) -> read::ReadOptions {
+        read::ReadOptions {
+            repo: opts.repo,
+            version: opts.version,
+            if_repo: opts.if_repo,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -66,18 +92,79 @@ enum Commands {
         /// Subdirectory path to list
         #[arg()]
         path: Option<String>,
-        /// Silently skip (exit 0) when no Syns repo identity resolves
+        /// List the whole subtree rather than one directory
         #[arg(long)]
-        if_repo: bool,
+        recursive: bool,
+        #[command(flatten)]
+        read: ReadOpts,
     },
     /// View a file's content
     Cat {
         /// File path to display
         #[arg()]
         path: String,
-        /// Silently skip (exit 0) when no Syns repo identity resolves
+        #[command(flatten)]
+        read: ReadOpts,
+    },
+    /// Print a file's numbered lines over a window
+    Read {
+        /// File path to read
+        #[arg()]
+        path: String,
+        /// First line to print, counting from 1
+        #[arg(long, default_value_t = commands::read::DEFAULT_OFFSET)]
+        offset: u32,
+        /// How many lines to print
+        #[arg(long, default_value_t = commands::read::DEFAULT_LIMIT)]
+        limit: u32,
+        #[command(flatten)]
+        read: ReadOpts,
+    },
+    /// Match a repository's paths against a pattern
+    Glob {
+        /// Glob pattern, matched against each whole repository-relative path
+        #[arg(value_name = "PATTERN")]
+        pattern: String,
+        /// Narrow the tree read to a subdirectory
         #[arg(long)]
-        if_repo: bool,
+        path: Option<String>,
+        #[command(flatten)]
+        read: ReadOpts,
+    },
+    /// Search a repository's file contents
+    Grep {
+        /// Regular expression to search for
+        #[arg(value_name = "PATTERN")]
+        pattern: String,
+        /// Narrow the tree read to a subdirectory
+        #[arg(long)]
+        path: Option<String>,
+        /// Only search paths matching this glob (repeatable)
+        #[arg(long)]
+        glob: Vec<String>,
+        /// Match case-insensitively
+        #[arg(long, short = 'i')]
+        ignore_case: bool,
+        /// Show line numbers
+        #[arg(long, short = 'n')]
+        line_number: bool,
+        /// Lines to show after each match
+        #[arg(long, short = 'A', value_name = "NUM")]
+        after_context: Option<u32>,
+        /// Lines to show before each match
+        #[arg(long, short = 'B', value_name = "NUM")]
+        before_context: Option<u32>,
+        /// Lines to show either side of each match
+        #[arg(long, short = 'C', value_name = "NUM")]
+        context: Option<u32>,
+        /// What the search answers with
+        #[arg(long, value_enum, default_value = "content")]
+        output: GrepOutput,
+        /// Carry at most this many rows
+        #[arg(long, value_name = "NUM")]
+        head_limit: Option<u32>,
+        #[command(flatten)]
+        read: ReadOpts,
     },
     /// Show repository status
     Status {
@@ -118,7 +205,7 @@ enum Commands {
         #[arg(long)]
         to: String,
         /// Custom commit message
-        #[arg(long)]
+        #[arg(long, short = 'm')]
         message: Option<String>,
         /// Silently skip (exit 0) when no Syns repo identity resolves
         #[arg(long)]
@@ -136,7 +223,7 @@ enum Commands {
         #[arg(long)]
         visibility: Option<CliVisibility>,
         /// Set repository tags (replaces existing)
-        #[arg(long)]
+        #[arg(long, short = 't')]
         tag: Vec<String>,
         /// Silently skip (exit 0) when no Syns repo identity resolves
         #[arg(long)]
@@ -169,7 +256,7 @@ enum Commands {
         #[arg(long, short = 'q')]
         query: Option<String>,
         /// Filter by tag (repeatable)
-        #[arg(long)]
+        #[arg(long, short = 't')]
         tag: Vec<String>,
         /// Filter by status
         #[arg(long)]
@@ -187,7 +274,7 @@ enum Commands {
         #[arg(value_name = "REPO")]
         repo: String,
         /// Custom name for the forked repository
-        #[arg(long)]
+        #[arg(long, short = 'n')]
         name: Option<String>,
     },
     /// Manage teams
@@ -289,11 +376,50 @@ async fn run(
             };
             commands::sync::cmd_resolution(config, output, action, if_repo).await?
         }
-        Commands::Ls { path, if_repo } => {
-            commands::ls::cmd_ls(config, output, path, if_repo).await?
+        Commands::Ls {
+            path,
+            recursive,
+            read,
+        } => commands::ls::cmd_ls(config, output, path, recursive, read.into()).await?,
+        Commands::Cat { path, read } => {
+            commands::cat::cmd_cat(config, output, path, read.into()).await?
         }
-        Commands::Cat { path, if_repo } => {
-            commands::cat::cmd_cat(config, output, path, if_repo).await?
+        Commands::Read {
+            path,
+            offset,
+            limit,
+            read,
+        } => commands::read::cmd_read(config, output, path, offset, limit, read.into()).await?,
+        Commands::Glob {
+            pattern,
+            path,
+            read,
+        } => commands::glob::cmd_glob(config, output, pattern, path, read.into()).await?,
+        Commands::Grep {
+            pattern,
+            path,
+            glob,
+            ignore_case,
+            line_number,
+            after_context,
+            before_context,
+            context,
+            output: mode,
+            head_limit,
+            read,
+        } => {
+            let args = GrepArgs {
+                path,
+                glob,
+                ignore_case,
+                line_number,
+                after: after_context,
+                before: before_context,
+                context,
+                output: mode,
+                head_limit,
+            };
+            commands::grep::cmd_grep(config, output, pattern, args, read.into()).await?
         }
         Commands::Status { if_repo } => {
             commands::status::cmd_status(config, output, if_repo).await?

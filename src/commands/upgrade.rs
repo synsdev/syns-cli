@@ -102,7 +102,9 @@ pub struct UpgradeArgs {
     pub check_only: bool,
 
     /// Replace the binary even if it is at-or-newer than the latest release.
-    #[arg(long)]
+    // SPEC u270 Contract Surface, the force alias: `-f` parses to the value
+    // `--force` parses to (issues/144).
+    #[arg(long, short = 'f')]
     pub force: bool,
 
     /// Include prereleases when selecting the upgrade target.
