@@ -118,6 +118,14 @@ pub fn refuse_option_combination(args: &GrepArgs) -> Result<(), CliError> {
                 .to_string(),
         });
     }
+    // A row bound of `0` carries no row and would still open the
+    // fan-out's first batch, so it is refused where the window options
+    // of the numbered read are (u270 CR1-3).
+    if args.head_limit == Some(0) {
+        return Err(CliError::Config {
+            message: "--head-limit must be \u{2265} 1".to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -389,16 +397,29 @@ pub async fn cmd_grep(
         };
     }
 
+    // A refusal outside the registered classes ends the run at its own
+    // exit code, but only once the eviction pass has been taken — the
+    // cap is a guarantee over every run that wrote to the store, the
+    // refused ones among them (u270 CR1-5).
+    let mut fatal: Option<CliError> = None;
     fill!();
     while let Some(joined) = set.join_next().await {
-        let (index, outcome) = joined.map_err(|e| CliError::Io {
+        let joined = joined.map_err(|e| CliError::Io {
             message: format!("a content fetch did not complete: {e}"),
-        })?;
-        // A refusal outside the registered classes ends the run at its
-        // own exit code.
-        let outcome = outcome?;
-        carried += rows_of(&outcome, args.output);
-        results[index] = Some(outcome);
+        });
+        let outcome = match joined {
+            Ok((index, Ok(outcome))) => {
+                carried += rows_of(&outcome, args.output);
+                results[index] = Some(outcome);
+                Ok(())
+            }
+            Ok((_, Err(e))) => Err(e),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = outcome {
+            fatal = Some(e);
+            break;
+        }
         if let Some(limit) = args.head_limit
             && carried >= limit as usize
         {
@@ -411,7 +432,12 @@ pub async fn cmd_grep(
     let attempted = issued;
 
     // The one eviction pass of the run, after its last fetch has landed.
-    cache.sweep()?;
+    set.shutdown().await;
+    let swept = cache.sweep();
+    if let Some(e) = fatal {
+        return Err(e);
+    }
+    swept?;
 
     // Assemble in ascending path order — the pool is sorted, so the
     // index order is the path order.

@@ -71,18 +71,42 @@ impl Deployment {
     }
 
     fn run(&self, args: &[&str]) -> std::process::Output {
-        AssertCommand::cargo_bin("syns")
-            .expect("syns binary")
+        self.run_capped(None, args)
+    }
+
+    /// The same run with the cache cap's environment name bound, so a
+    /// test can watch the eviction pass over a store its own run
+    /// oversized (u270 CR1-5).
+    fn run_capped(&self, cap: Option<&str>, args: &[&str]) -> std::process::Output {
+        let mut command = AssertCommand::cargo_bin("syns").expect("syns binary");
+        command
             .current_dir(self.work.path())
             .env("SYNS_CONFIG_DIR", self.home.path())
             .env("SYNS_CACHE_DIR", self.cache.path())
-            .env_remove("SYNS_URL")
-            .env_remove("SYNS_CACHE_MAX_BYTES")
+            .env_remove("SYNS_URL");
+        match cap {
+            Some(value) => command.env("SYNS_CACHE_MAX_BYTES", value),
+            None => command.env_remove("SYNS_CACHE_MAX_BYTES"),
+        };
+        command
             .arg("--server")
             .arg(self.server.uri())
             .args(args)
             .output()
             .expect("run syns")
+    }
+
+    /// The bytes the `blobs` directory holds, which the cap bounds.
+    fn blob_bytes(&self) -> u64 {
+        let blobs = self.cache.path().join("blobs");
+        let Ok(dir) = std::fs::read_dir(&blobs) else {
+            return 0;
+        };
+        dir.flatten()
+            .filter_map(|e| e.metadata().ok())
+            .filter(|m| m.is_file())
+            .map(|m| m.len())
+            .sum()
     }
 }
 
@@ -1088,4 +1112,272 @@ fn registered_short_aliases_parse() {
             args.join(" ")
         );
     }
+}
+
+// -------------------------------------------- the findings of round 1
+
+#[test]
+#[serial]
+fn recursive_listing_names_each_entry_by_its_path() {
+    let d = Deployment::new();
+    mount_head(&d);
+    mount_tree(
+        &d,
+        None,
+        vec![
+            file_entry("src/deep/a.ts", "deep", true),
+            file_entry("src/a.ts", "shallow", true),
+        ],
+        false,
+    );
+
+    let output = d.run(&["ls", "--repo", REPO, "--recursive"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains("src/a.ts") && stdout.contains("src/deep/a.ts"),
+        "each entry stands under its own path: {stdout}"
+    );
+    let shallow = stdout.find("src/a.ts").expect("the shallow path");
+    let deep = stdout.find("src/deep/a.ts").expect("the deep path");
+    assert!(shallow < deep, "the subtree is ordered by path: {stdout}");
+}
+
+#[test]
+#[serial]
+fn a_flat_listing_names_each_entry_by_its_base_name() {
+    let d = Deployment::new();
+    mount_head(&d);
+    mount_tree(
+        &d,
+        Some("src"),
+        vec![file_entry("src/a.ts", "x", true)],
+        false,
+    );
+
+    let output = d.run(&["ls", "src", "--repo", REPO]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
+    let stdout = stdout_of(&output);
+    assert!(
+        !stdout.contains("src/a.ts"),
+        "the standing listing's Name column is unchanged: {stdout}"
+    );
+    assert!(stdout.contains("a.ts"), "stdout: {stdout}");
+}
+
+#[test]
+#[serial]
+fn read_at_a_version_sends_the_pinned_ordinal() {
+    let d = Deployment::new();
+    mount_version(&d, "2", 2, OLD_SHA);
+    mount_file(&d, "a.md", "one\ntwo\n");
+
+    let output = d.run(&["read", "a.md", "--repo", REPO, "--version", "2"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
+    let requests = d.requests();
+    let file = requests
+        .iter()
+        .find(|r| r.url.path().contains("/files/"))
+        .expect("a file request");
+    assert_eq!(query_of(file, "ref").as_deref(), Some("2"));
+}
+
+#[test]
+#[serial]
+fn glob_at_a_version_sends_the_pinned_ordinal() {
+    let d = Deployment::new();
+    mount_version(&d, "2", 2, OLD_SHA);
+    mount_tree(&d, None, vec![file_entry("src/a.ts", "x", true)], false);
+
+    let output = d.run(&["glob", "**/*.ts", "--repo", REPO, "--version", "2"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
+    assert_eq!(stdout_of(&output), "src/a.ts\n");
+    let requests = d.requests();
+    let tree = requests
+        .iter()
+        .find(|r| r.url.path().ends_with("/tree"))
+        .expect("a tree request");
+    assert_eq!(query_of(tree, "ref").as_deref(), Some("2"));
+}
+
+#[test]
+#[serial]
+fn grep_at_a_version_sends_the_pinned_ordinal() {
+    let d = Deployment::new();
+    mount_version(&d, "2", 2, OLD_SHA);
+    mount_tree(&d, None, vec![file_entry("src/a.ts", A_TS, true)], false);
+    mount_file(&d, "src/a.ts", A_TS);
+
+    let output = d.run(&["grep", "fn ", "--repo", REPO, "--version", "2"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
+    let requests = d.requests();
+    let tree = requests
+        .iter()
+        .find(|r| r.url.path().ends_with("/tree"))
+        .expect("a tree request");
+    assert_eq!(query_of(tree, "ref").as_deref(), Some("2"));
+    let file = requests
+        .iter()
+        .find(|r| r.url.path().contains("/files/"))
+        .expect("a file request");
+    assert_eq!(query_of(file, "ref").as_deref(), Some("2"));
+}
+
+#[test]
+#[serial]
+fn path_narrows_the_tree_read_of_both_search_verbs() {
+    let d = Deployment::new();
+    mount_head(&d);
+    mount_tree(&d, None, vec![file_entry("README.md", "x", true)], false);
+    mount_tree(
+        &d,
+        Some("src"),
+        vec![file_entry("src/a.ts", A_TS, true)],
+        false,
+    );
+    mount_file(&d, "src/a.ts", A_TS);
+
+    let globbed = d.run(&["glob", "**/*.ts", "--repo", REPO, "--path", "src"]);
+    assert_eq!(globbed.status.code(), Some(0), "{}", stderr_of(&globbed));
+    assert_eq!(stdout_of(&globbed), "src/a.ts\n");
+
+    let searched = d.run(&["grep", "fn ", "--repo", REPO, "--path", "src"]);
+    assert_eq!(searched.status.code(), Some(0), "{}", stderr_of(&searched));
+    assert!(
+        stdout_of(&searched).contains("src/a.ts"),
+        "stdout: {}",
+        stdout_of(&searched)
+    );
+
+    let narrowed = d
+        .paths()
+        .into_iter()
+        .filter(|p| p.ends_with("/tree/src"))
+        .count();
+    assert_eq!(narrowed, 2, "both verbs read the tree under --path");
+    assert!(
+        !d.paths().iter().any(|p| p.ends_with("/tree")),
+        "neither verb read the whole tree: {:?}",
+        d.paths()
+    );
+}
+
+#[test]
+#[serial]
+fn a_subtree_absent_at_the_pinned_version_names_that_version() {
+    let d = Deployment::new();
+    mount_version(&d, "2", 2, OLD_SHA);
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path_matcher(format!("/api/v1/repos/{REPO}/tree/nope")))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": "not_found",
+            }))),
+    );
+
+    for args in [
+        vec![
+            "glob",
+            "*",
+            "--repo",
+            REPO,
+            "--path",
+            "nope",
+            "--version",
+            "2",
+        ],
+        vec![
+            "grep",
+            "fn ",
+            "--repo",
+            REPO,
+            "--path",
+            "nope",
+            "--version",
+            "2",
+        ],
+    ] {
+        let output = d.run(&args);
+        assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+        assert!(
+            stderr_of(&output).contains("path not found at version 2: nope"),
+            "`syns {}` printed: {}",
+            args.join(" "),
+            stderr_of(&output)
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn head_limit_of_zero_is_refused_before_any_request() {
+    let d = Deployment::new();
+    mount_search_tree(&d, true);
+
+    let output = d.run(&["grep", "fn ", "--repo", REPO, "--head-limit", "0"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr_of(&output).contains("--head-limit must be \u{2265} 1"),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+    assert!(d.requests().is_empty(), "no request left: {:?}", d.paths());
+}
+
+#[test]
+#[serial]
+fn a_repo_value_outside_the_registered_spelling_is_refused_at_parse() {
+    let d = Deployment::new();
+    mount_head(&d);
+
+    for value in ["alice/..", "alice/.", "alice/no tes", "al ice/notes"] {
+        let output = d.run(&["ls", "--repo", value]);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "`--repo {value}` printed: {}",
+            stderr_of(&output)
+        );
+    }
+    assert!(d.requests().is_empty(), "no request left: {:?}", d.paths());
+}
+
+#[test]
+#[serial]
+fn a_fatal_refusal_still_takes_the_eviction_pass() {
+    let d = Deployment::new();
+    mount_head(&d);
+    mount_tree(
+        &d,
+        None,
+        vec![
+            file_entry("src/a.ts", A_TS, true),
+            file_entry("src/b.ts", B_TS, true),
+            file_entry("src/locked.txt", "z", true),
+        ],
+        false,
+    );
+    mount_file(&d, "src/a.ts", A_TS);
+    mount_file(&d, "src/b.ts", B_TS);
+    mount_file_status(
+        &d,
+        "src/locked.txt",
+        401,
+        json!({ "error": "unauthorized" }),
+    );
+
+    // A first search narrowed past the refusing path fills the store.
+    let filled = d.run(&["grep", "fn ", "--repo", REPO, "--glob", "*.ts"]);
+    assert_eq!(filled.status.code(), Some(0), "{}", stderr_of(&filled));
+    assert!(d.blob_bytes() > 1, "the store holds the two contents");
+
+    // A second search reaches the refusing path and ends at its exit
+    // code — with the one eviction pass taken.
+    let refused = d.run_capped(Some("1"), &["grep", "fn ", "--repo", REPO]);
+    assert_ne!(refused.status.code(), Some(0), "the refusal ends the run");
+    assert!(
+        d.blob_bytes() <= 1,
+        "the store is at or under the cap: {} bytes",
+        d.blob_bytes()
+    );
 }

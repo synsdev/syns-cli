@@ -11,6 +11,7 @@ pub mod cache;
 
 use crate::auth::token::TokenStore;
 use crate::client::SynsClient;
+use crate::commands::pull::is_repository_shape;
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
@@ -81,15 +82,16 @@ pub fn read_not_found(
 }
 
 /// The `--repo OWNER/NAME` value parser. A value lacking exactly one
-/// `/`, or carrying an empty side, ends the run through the argument
-/// parser at exit `2` (SPEC u270 Behaviour, `resolve_read_target` 1).
+/// `/`, or carrying a side outside the registered repository spelling
+/// `D-025` fixes, ends the run through the argument parser at exit `2`
+/// (SPEC u270 Behaviour, `resolve_read_target` 1). The registered
+/// spelling is what keeps a value such as `alice/..` from normalising
+/// the address out of the repository namespace (u270 CR1-4).
 pub fn parse_repo_id(value: &str) -> Result<String, String> {
-    let mut parts = value.split('/');
-    match (parts.next(), parts.next(), parts.next()) {
-        (Some(owner), Some(name), None) if !owner.is_empty() && !name.is_empty() => {
-            Ok(value.to_string())
-        }
-        _ => Err("expected OWNER/NAME".to_string()),
+    if is_repository_shape(value) {
+        Ok(value.to_string())
+    } else {
+        Err("expected OWNER/NAME".to_string())
     }
 }
 

@@ -57,7 +57,13 @@ pub async fn cmd_ls(
         };
         type_order(&a.entry_type)
             .cmp(&type_order(&b.entry_type))
-            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| {
+                if recursive {
+                    a.path.cmp(&b.path)
+                } else {
+                    a.name.cmp(&b.name)
+                }
+            })
     });
 
     // 3 — render the listing, or the served body carrying the reference
@@ -70,7 +76,14 @@ pub async fn cmd_ls(
             .iter()
             .map(|e| {
                 vec![
-                    e.name.clone(),
+                    // A recursive listing tells its entries apart by
+                    // path alone: two subtrees can hold one base name
+                    // (u270 CR1-1).
+                    if recursive {
+                        e.path.clone()
+                    } else {
+                        e.name.clone()
+                    },
                     match e.entry_type {
                         EntryType::File => "file",
                         EntryType::Dir => "dir",
