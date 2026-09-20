@@ -205,6 +205,20 @@ fn mount_tree(d: &Deployment, subpath: Option<&str>, entries: Vec<Value>, trunca
     );
 }
 
+/// Answers the recursive tree address with exactly these bytes, so a
+/// case can serve a body the deployment itself wrote rather than one
+/// this file composed (u270 V2-16).
+fn mount_tree_verbatim(d: &Deployment, body: &str) {
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path_matcher(format!("/api/v1/repos/{REPO}/tree")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(body.as_bytes().to_vec(), "application/json"),
+            ),
+    );
+}
+
 /// The tree two of the search rows share: `src/a.ts` holding `fn one` on
 /// line 2 and `src/b.ts` holding `fn two` on lines 1 and 3.
 const A_TS: &str = "plain\nfn one\ntail\n";
@@ -1405,5 +1419,128 @@ fn a_fatal_refusal_still_takes_the_eviction_pass() {
         d.blob_bytes() <= 1,
         "the store is at or under the cap: {} bytes",
         d.blob_bytes()
+    );
+}
+
+// ------------------------------------- the truncated-tree arm, u270 V2-16
+
+/// The refusal both verbs raise where the tree arrives truncated, at
+/// the version `mount_head` resolves (SPEC u270 Contract Surface, the
+/// partial-answer refusal).
+const TRUNCATED_REFUSAL: &str = "partial answer: the tree at version 7 arrived truncated";
+
+/// The bytes the deployment itself answered a recursive tree read with,
+/// recorded through a forward proxy relaying `https://syns.dev`
+/// untouched. `truncated` reads `false` here because every public tree
+/// handler writes that literal, which is why no run against the
+/// deployment reaches the arm below (u270 V2-16).
+const SERVED_TREE: &str = r#"{"entries":[{"name":".syns.yaml","path":".syns.yaml","type":"file","size":43,"sha":"1e51eaa611e1e8040fb0d7e0069d127f991e92c8"},{"name":"CLAUDE.md","path":"CLAUDE.md","type":"file","size":2888,"sha":"174e5d666d0c12f42c49710f282f16283d37e503"},{"name":"DECISIONS.md","path":"DECISIONS.md","type":"file","size":29075,"sha":"242223859d18e348a1d9ad365ae023e51e058662"},{"name":"README.md","path":"README.md","type":"file","size":4623,"sha":"0da0c0444bab6b5d6f44488386764bf40df2f4b8"},{"name":"RESEARCH.md","path":"RESEARCH.md","type":"file","size":4865,"sha":"9b7865f3ad84a7a37ce6837f8ed0aa3c79cac103"},{"name":"SPEC.md","path":"SPEC.md","type":"file","size":44633,"sha":"e12bdb2670ce437787dfbfb1c84110f16776918a"},{"name":"STATUS.md","path":"STATUS.md","type":"file","size":20604,"sha":"69285fe9f0bf8f97b353131a97a08cef2a8f4f77"}],"commitSha":"67e51139a0cb18998e6734c679466d1afc990443","truncated":false}"#;
+
+/// The same bytes with that one key flipped — the only edit the arm
+/// needs, and the only one made.
+fn served_tree_truncated() -> String {
+    let flipped = SERVED_TREE.replace(r#""truncated":false"#, r#""truncated":true"#);
+    assert_ne!(flipped, SERVED_TREE, "the served body carries the key");
+    flipped
+}
+
+#[test]
+#[serial]
+fn a_served_tree_reaches_the_refusal_on_its_truncated_key_alone() {
+    let whole = Deployment::new();
+    mount_head(&whole);
+    mount_tree_verbatim(&whole, SERVED_TREE);
+    let served = whole.run(&["--json", "ls", "--repo", REPO, "--recursive"]);
+    assert_eq!(served.status.code(), Some(0), "{}", stderr_of(&served));
+    let mut whole_document = document(&served);
+
+    let partial = Deployment::new();
+    mount_head(&partial);
+    mount_tree_verbatim(&partial, &served_tree_truncated());
+    let refused = partial.run(&["--json", "ls", "--repo", REPO, "--recursive"]);
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr_of(&refused));
+    let partial_document = document(&refused);
+
+    assert_eq!(partial_document["truncated"], json!(true));
+    assert_eq!(partial_document["error"], json!(TRUNCATED_REFUSAL));
+    assert_eq!(
+        partial_document["entries"], whole_document["entries"],
+        "the whole listing stands beside the refusal"
+    );
+
+    // The two documents differ in the flipped key and the refusal it
+    // raised, and in nothing else.
+    whole_document["truncated"] = json!(true);
+    whole_document["error"] = json!(TRUNCATED_REFUSAL);
+    assert_eq!(partial_document, whole_document);
+}
+
+#[test]
+#[serial]
+fn glob_over_a_truncated_tree_refuses() {
+    let d = Deployment::new();
+    mount_head(&d);
+    mount_tree(
+        &d,
+        None,
+        vec![
+            file_entry("src/a.ts", A_TS, true),
+            file_entry("src/deep/b.ts", B_TS, true),
+        ],
+        true,
+    );
+
+    let output = d.run(&["--json", "glob", "**/*.ts", "--repo", REPO]);
+    assert_eq!(output.status.code(), Some(1));
+    let body = document(&output);
+    let paths: Vec<&str> = body["matches"]
+        .as_array()
+        .expect("matches")
+        .iter()
+        .map(|m| m["path"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(paths, vec!["src/a.ts", "src/deep/b.ts"]);
+    assert_eq!(body["truncated"], json!(true));
+    assert_eq!(body["error"], json!(TRUNCATED_REFUSAL));
+}
+
+#[test]
+#[serial]
+fn a_truncated_tree_names_its_refusal_on_the_diagnostic_stream_alone() {
+    let listing = Deployment::new();
+    mount_head(&listing);
+    mount_tree_verbatim(&listing, &served_tree_truncated());
+    let listed = listing.run(&["ls", "--repo", REPO, "--recursive"]);
+    assert_eq!(listed.status.code(), Some(1));
+    let rows = stdout_of(&listed);
+    for path in ["CLAUDE.md", "README.md", "STATUS.md"] {
+        assert!(rows.contains(path), "the listing still stands: {rows}");
+    }
+    assert!(!rows.contains("partial answer"), "stdout: {rows}");
+    assert!(
+        stderr_of(&listed).contains(&format!("error: {TRUNCATED_REFUSAL}")),
+        "stderr: {}",
+        stderr_of(&listed)
+    );
+
+    let globbing = Deployment::new();
+    mount_head(&globbing);
+    mount_tree_verbatim(&globbing, &served_tree_truncated());
+    let globbed = globbing.run(&["glob", "*.md", "--repo", REPO]);
+    assert_eq!(globbed.status.code(), Some(1));
+    assert_eq!(
+        stdout_of(&globbed)
+            .lines()
+            .collect::<Vec<&str>>()
+            .first()
+            .copied(),
+        Some("CLAUDE.md"),
+        "stdout: {}",
+        stdout_of(&globbed)
+    );
+    assert!(
+        stderr_of(&globbed).contains(&format!("error: {TRUNCATED_REFUSAL}")),
+        "stderr: {}",
+        stderr_of(&globbed)
     );
 }
