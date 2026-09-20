@@ -507,7 +507,7 @@ pub async fn cmd_grep(
                     .collect(),
             );
             if !output.is_json() {
-                render_content(&flat, args.line_number);
+                render_content(&flat, args.line_number, before > 0 || after > 0);
             }
         }
         GrepOutput::Files => {
@@ -585,16 +585,22 @@ pub async fn cmd_grep(
 
 /// The content render: `{path}:{line}:{text}` where `--line-number`
 /// stands and `{path}:{text}` where it does not, each context line the
-/// same with `-` for each `:`, and a line holding `--` between groups
-/// that are not adjacent.
-fn render_content(flat: &[(String, MatchRow)], line_number: bool) {
-    for line in content_lines(flat, line_number) {
+/// same with `-` for each `:`, and — where a context option stands —
+/// a line holding `--` between groups that are not adjacent.
+fn render_content(flat: &[(String, MatchRow)], line_number: bool, context_stands: bool) {
+    for line in content_lines(flat, line_number, context_stands) {
         println!("{line}");
     }
 }
 
-/// The content render's lines, in order, separators included.
-pub fn content_lines(flat: &[(String, MatchRow)], line_number: bool) -> Vec<String> {
+/// The content render's lines, in order, separators included where
+/// `context_stands`. A render carrying no context line groups nothing,
+/// so no separator divides one match from the next.
+pub fn content_lines(
+    flat: &[(String, MatchRow)],
+    line_number: bool,
+    context_stands: bool,
+) -> Vec<String> {
     // Merge each path's matches and context into one ordered run: the
     // line number, whether that line matched, and its text.
     type Run = BTreeMap<u64, (bool, String)>;
@@ -623,7 +629,7 @@ pub fn content_lines(flat: &[(String, MatchRow)], line_number: bool) -> Vec<Stri
                 &previous,
                 Some((prev_path, prev_line)) if prev_path == path && *number == prev_line + 1
             );
-            if previous.is_some() && !adjacent {
+            if context_stands && previous.is_some() && !adjacent {
                 rendered.push("--".to_string());
             }
             let separator = if *is_match { ':' } else { '-' };
@@ -940,7 +946,7 @@ mod tests {
             .chain(b.into_iter().map(|row| ("src/b.ts".to_string(), row)))
             .collect();
 
-        let lines = content_lines(&flat, true);
+        let lines = content_lines(&flat, true, true);
         assert_eq!(
             lines,
             vec![
@@ -963,20 +969,39 @@ mod tests {
             .into_iter()
             .map(|row| ("a.ts".to_string(), row))
             .collect();
-        assert_eq!(content_lines(&flat, false), vec!["a.ts:fn one"]);
+        assert_eq!(content_lines(&flat, false, false), vec!["a.ts:fn one"]);
     }
 
     #[test]
     fn a_separator_stands_between_two_non_adjacent_groups_of_one_path() {
         let matcher = build_matcher("fn ", false).unwrap();
-        let rows = search_text(&matcher, "fn one\nx\ny\nz\nfn two\n", 0, 0).unwrap();
+        let rows = search_text(&matcher, "fn one\nx\ny\nz\nfn two\n", 0, 1).unwrap();
         let flat: Vec<(String, MatchRow)> = rows
             .into_iter()
             .map(|row| ("a.ts".to_string(), row))
             .collect();
         assert_eq!(
-            content_lines(&flat, true),
-            vec!["a.ts:1:fn one", "--", "a.ts:5:fn two"]
+            content_lines(&flat, true, true),
+            vec!["a.ts:1:fn one", "a.ts-2-x", "--", "a.ts:5:fn two",]
+        );
+    }
+
+    // u270 V1-05: `rg` writes no separator where no context option
+    // stands, whatever the gap between two matches and whether they sit
+    // in one path or in two, so neither does the render that mirrors it.
+    #[test]
+    fn no_separator_stands_where_no_context_option_does() {
+        let matcher = build_matcher("fn ", false).unwrap();
+        let a = search_text(&matcher, "fn one\nx\ny\nz\nfn two\n", 0, 0).unwrap();
+        let b = search_text(&matcher, "fn three\n", 0, 0).unwrap();
+        let flat: Vec<(String, MatchRow)> = a
+            .into_iter()
+            .map(|row| ("a.ts".to_string(), row))
+            .chain(b.into_iter().map(|row| ("b.ts".to_string(), row)))
+            .collect();
+        assert_eq!(
+            content_lines(&flat, true, false),
+            vec!["a.ts:1:fn one", "a.ts:5:fn two", "b.ts:1:fn three"]
         );
     }
 
