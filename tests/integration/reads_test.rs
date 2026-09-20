@@ -1544,3 +1544,21 @@ fn a_truncated_tree_names_its_refusal_on_the_diagnostic_stream_alone() {
         stderr_of(&globbed)
     );
 }
+
+#[test]
+#[serial]
+fn grep_over_a_truncated_tree_refuses() {
+    let d = Deployment::new();
+    mount_head(&d);
+    mount_tree(&d, None, vec![file_entry("src/a.ts", A_TS, true)], true);
+    mount_file(&d, "src/a.ts", A_TS);
+
+    let output = d.run(&["--json", "grep", "fn ", "--repo", REPO]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+    let body = document(&output);
+    assert_eq!(body["truncated"], json!(true));
+    assert_eq!(body["error"], json!(TRUNCATED_REFUSAL));
+    let matches = body["matches"].as_array().expect("matches");
+    assert_eq!(matches.len(), 1, "the readable match stands: {body}");
+    assert_eq!(matches[0]["path"], json!("src/a.ts"));
+}
