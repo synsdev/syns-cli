@@ -1042,6 +1042,32 @@ fn grep_content_render_pipes_line_for_line() {
     );
 }
 
+// u270 V1-05, CR2-1: `rg` writes no `--` where no context option
+// stands, so the render that mirrors it writes none either — across the
+// gap inside `src/b.ts` and across the boundary between the two paths
+// alike. Driven through the binary, so the call deriving the render's
+// separator rule from the context window is what the case pins.
+#[test]
+#[serial]
+fn grep_content_render_holds_no_separator_without_a_context_option() {
+    let d = Deployment::new();
+    mount_search_tree(&d, true);
+
+    let output = d.run(&["grep", "fn ", "--repo", REPO, "-n"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
+    let stdout = stdout_of(&output);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            "src/a.ts:2:fn one",
+            "src/b.ts:1:fn two",
+            "src/b.ts:3:fn two"
+        ],
+        "stdout: {stdout}"
+    );
+}
+
 // ------------------------------------------------------------ aliases
 
 #[test]
