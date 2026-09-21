@@ -98,7 +98,7 @@ pub fn parse_repo_id(value: &str) -> Result<String, String> {
 /// `configuration error: version must be ≥ 1` for an all-digit value
 /// below `1`, raised before any request leaves. Every other spelling
 /// reaches the server unchecked.
-fn refuse_version_below_one(value: &str) -> Result<(), CliError> {
+pub(crate) fn refuse_version_below_one(value: &str) -> Result<(), CliError> {
     let all_digits = !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
     if all_digits && value.parse::<u64>().unwrap_or(u64::MAX) < 1 {
         return Err(CliError::Config {
@@ -180,6 +180,65 @@ pub async fn resolve_read_target(
             commit_sha: entry.sha,
         },
     }))
+}
+
+/// The two options the repository-scoped verbs this unit adds carry,
+/// spelt and bound as the read verbs spell and bind them (SPEC u272
+/// Contract Surface, `RepoScopeArgs`). There is no `--version` beside
+/// them: neither verb reads at a pinned reference.
+#[derive(clap::Args, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RepoScopeArgs {
+    /// Address another repository, as OWNER/NAME
+    #[arg(long, value_name = "OWNER/NAME", value_parser = parse_repo_id)]
+    pub repo: Option<String>,
+    /// Silently skip (exit 0) when no Syns repo identity resolves
+    #[arg(long)]
+    pub if_repo: bool,
+}
+
+/// The run's one repository scope: the bound identity and the stored
+/// credential, or none where the machine holds none the reader can use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoScope {
+    pub repo_id: String,
+    pub token: Option<String>,
+}
+
+/// Binds the repository and reads the stored credential, pinning the
+/// pair as the run's one scope (SPEC u272 Behaviour, `resolve_repo_scope`).
+///
+/// Unlike `resolve_read_target` it reads no head and resolves no
+/// reference, so a verb built on it pays for no request it never needed.
+/// Answers `None` only where the skip envelope was written.
+pub async fn resolve_repo_scope(
+    config: &Config,
+    output: &Output,
+    args: &RepoScopeArgs,
+) -> Result<Option<RepoScope>, CliError> {
+    // 1 — bind the repository.
+    let repo_id = match args.repo.as_deref() {
+        Some(named) => named.to_ascii_lowercase(),
+        None => {
+            let current_dir = std::env::current_dir().map_err(|e| CliError::Io {
+                message: format!("could not determine current directory: {e}"),
+            })?;
+            match resolve_full_or_skip(None, &current_dir, args.if_repo, output)? {
+                Some((owner, name)) => format!("{owner}/{name}"),
+                None => return Ok(None),
+            }
+        }
+    };
+
+    // 2 — the stored credential, carried as none where none stands or
+    // where the stored form does not parse. The entries these verbs
+    // reach admit an unidentified caller.
+    let token = TokenStore::new(config.credentials_path())
+        .read()
+        .ok()
+        .flatten();
+
+    // 3 — pin the pair.
+    Ok(Some(RepoScope { repo_id, token }))
 }
 
 /// Writes the reference on the diagnostic stream outside
@@ -373,6 +432,171 @@ mod tests {
         assert_eq!(marked["error"], serde_json::json!("partial answer: x"));
         assert_eq!(marked["version"], serde_json::json!(2));
         assert_eq!(marked["matches"].as_array().unwrap().len(), 1);
+    }
+
+    // SPEC u272 Behaviour, `resolve_repo_scope` 1 and 3: a `--repo`
+    // value is bound outright, folded to lower case, and no head and no
+    // version is read for it.
+    #[tokio::test]
+    #[serial]
+    async fn a_named_repository_scope_is_folded_and_costs_no_request() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+        let server = MockServer::start().await;
+        let config = Config::new(Some(&server.uri())).unwrap();
+        let output = Output::new(false);
+
+        let scope = resolve_repo_scope(
+            &config,
+            &output,
+            &RepoScopeArgs {
+                repo: Some("Alice/Notes".into()),
+                if_repo: true,
+            },
+        )
+        .await
+        .unwrap();
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        let scope = scope.expect("a named repository never skips");
+        assert_eq!(scope.repo_id, "alice/notes");
+        assert_eq!(scope.token, None);
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    // SPEC u272 Behaviour, `resolve_repo_scope` 1: the skip envelope
+    // where the ladder reaches no identity and `--if-repo` stands.
+    #[tokio::test]
+    #[serial]
+    async fn a_scope_under_if_repo_skips_where_no_identity_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+        let server = MockServer::start().await;
+        let config = Config::new(Some(&server.uri())).unwrap();
+        let output = Output::new(true);
+
+        let scope = resolve_repo_scope(
+            &config,
+            &output,
+            &RepoScopeArgs {
+                repo: None,
+                if_repo: true,
+            },
+        )
+        .await
+        .unwrap();
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        assert!(scope.is_none());
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    // SPEC u272 Behaviour, `resolve_repo_scope` 1: without `--if-repo`
+    // the same directory ends the run at exit `2`.
+    #[tokio::test]
+    #[serial]
+    async fn a_scope_without_if_repo_refuses_where_no_identity_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+        let server = MockServer::start().await;
+        let config = Config::new(Some(&server.uri())).unwrap();
+        let output = Output::new(false);
+
+        let err = resolve_repo_scope(&config, &output, &RepoScopeArgs::default())
+            .await
+            .unwrap_err();
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        assert!(matches!(err, CliError::RepoIdentityUnknown { .. }));
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    // SPEC u272 Behaviour, `resolve_repo_scope` 2: a stored credential
+    // whose form does not parse is carried as none rather than raised.
+    #[tokio::test]
+    #[serial]
+    async fn a_credential_whose_form_does_not_parse_is_carried_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        std::fs::write(dir.path().join("credentials.json"), "not json {").unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+        let server = MockServer::start().await;
+        let config = Config::new(Some(&server.uri())).unwrap();
+        let output = Output::new(false);
+
+        let scope = resolve_repo_scope(
+            &config,
+            &output,
+            &RepoScopeArgs {
+                repo: Some("alice/notes".into()),
+                if_repo: false,
+            },
+        )
+        .await
+        .unwrap();
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        let scope = scope.expect("a named repository never skips");
+        assert_eq!(scope.token, None);
+    }
+
+    // SPEC u272 Behaviour, `resolve_repo_scope` 2 and 3: the stored
+    // credential rides on the scope where one stands.
+    #[tokio::test]
+    #[serial]
+    async fn a_stored_credential_rides_on_the_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        crate::auth::token::TokenStore::new(dir.path().join("credentials.json"))
+            .write("u272-token")
+            .unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+        let server = MockServer::start().await;
+        let config = Config::new(Some(&server.uri())).unwrap();
+        let output = Output::new(false);
+
+        let scope = resolve_repo_scope(
+            &config,
+            &output,
+            &RepoScopeArgs {
+                repo: Some("alice/notes".into()),
+                if_repo: false,
+            },
+        )
+        .await
+        .unwrap()
+        .expect("a named repository never skips");
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        assert_eq!(scope.token.as_deref(), Some("u272-token"));
+    }
+
+    // SPEC u272 Behaviour, `resolve_repo_scope` 1: the identity file in
+    // the working directory binds the scope where no `--repo` stands.
+    #[tokio::test]
+    #[serial]
+    async fn the_identity_ladder_binds_the_scope_where_no_repo_stands() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".syns.yaml"), "owner: Alice\nname: Notes\n").unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+        let server = MockServer::start().await;
+        let config = Config::new(Some(&server.uri())).unwrap();
+        let output = Output::new(false);
+
+        let scope = resolve_repo_scope(&config, &output, &RepoScopeArgs::default())
+            .await
+            .unwrap()
+            .expect("an identity file resolves");
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        // The ladder folds the identity file's own spelling, so the
+        // scope reads the same either way in (`src/repo/resolve.rs`).
+        assert_eq!(scope.repo_id, "alice/notes");
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[test]

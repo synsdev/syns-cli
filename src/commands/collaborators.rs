@@ -1,5 +1,9 @@
 use crate::auth::token::TokenStore;
-use crate::client::{AddCollaboratorRequest, CollaboratorRole, SynsClient};
+use crate::client::{
+    AddCollaboratorRequest, Collaborator, CollaboratorRole, SynsClient,
+    UpdateCollaboratorRoleRequest,
+};
+use crate::commands::repos::{LIMIT_MAX, LIMIT_MIN, refuse_limit_outside};
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
@@ -49,6 +53,18 @@ pub enum CollaboratorsAction {
         #[arg(long)]
         if_repo: bool,
     },
+    /// Change a standing collaborator's role
+    Role {
+        /// User ID of the collaborator whose role changes
+        #[arg(value_name = "USER_ID")]
+        user_id: String,
+        /// Role to assign
+        #[arg(long)]
+        role: AssignableRole,
+        /// Silently skip (exit 0) when no Syns repo identity resolves
+        #[arg(long)]
+        if_repo: bool,
+    },
     /// Remove a collaborator from the repository
     Remove {
         /// User ID of the collaborator to remove
@@ -63,7 +79,11 @@ pub enum CollaboratorsAction {
     },
 }
 
-const DEFAULT_COLLABORATOR_LIMIT: u32 = 100;
+/// The window the collaborator listing sends where the caller names
+/// neither half — the one it has always sent (SPEC u272 Contract
+/// Surface, the collaborators page options).
+pub const DEFAULT_COLLABORATOR_LIMIT: u32 = 100;
+pub const DEFAULT_COLLABORATOR_OFFSET: u32 = 0;
 
 fn confirm_remove(user_id: &str, repo_id: &str, yes: bool) -> Result<bool, CliError> {
     let prompt = format!(
@@ -79,11 +99,73 @@ fn confirm_remove(user_id: &str, repo_id: &str, yes: bool) -> Result<bool, CliEr
     }
 }
 
+/// The collaborator block, which the listing and the role change draw
+/// alike (SPEC u272 Behaviour, `cmd_collaborators_role` 4).
+pub(crate) fn collaborator_row(collaborator: &Collaborator) -> Vec<String> {
+    vec![
+        collaborator.user.id.clone(),
+        collaborator.user.name.clone(),
+        collaborator.user.email.clone(),
+        format!("{:?}", collaborator.role).to_lowercase(),
+    ]
+}
+
+const COLLABORATOR_HEADERS: [&str; 4] = ["User ID", "Name", "Email", "Role"];
+
+/// Changes one standing grant (SPEC u272 Behaviour,
+/// `cmd_collaborators_role`). The repository is the run's own, as it is
+/// for every other arm of the noun, and the role set is the one
+/// `syns collaborators add TARGET` already admits — the top role never
+/// among them.
+pub async fn cmd_collaborators_role(
+    config: &Config,
+    output: &Output,
+    user_id: String,
+    role: AssignableRole,
+    if_repo: bool,
+) -> Result<(), CliError> {
+    // 1 — bind the repository from the working directory.
+    let current_dir = std::env::current_dir().map_err(|e| CliError::Io {
+        message: format!("could not determine current directory: {e}"),
+    })?;
+    let (owner, name) = match resolve_full_or_skip(None, &current_dir, if_repo, output)? {
+        Some(pair) => pair,
+        None => return Ok(()),
+    };
+    let repo_id = format!("{owner}/{name}");
+
+    // 2 — require a stored credential, before any request.
+    let token = TokenStore::new(config.credentials_path())
+        .read()?
+        .ok_or(CliError::AuthRequired)?;
+
+    // 3 — send the role change for the identifier the positional names.
+    let client = SynsClient::new(config.server_url())?;
+    let (collaborator, raw) = client
+        .update_collaborator_role(
+            &repo_id,
+            &token,
+            &user_id,
+            &UpdateCollaboratorRoleRequest { role: role.into() },
+        )
+        .await?;
+
+    // 4 — render the collaborator the answer carried.
+    if output.is_json() {
+        output.json(&raw);
+    } else {
+        output.table(&COLLABORATOR_HEADERS, vec![collaborator_row(&collaborator)]);
+    }
+    Ok(())
+}
+
 pub async fn cmd_collaborators(
     config: &Config,
     output: &Output,
     action: Option<CollaboratorsAction>,
     if_repo: bool,
+    limit: u32,
+    offset: u32,
 ) -> Result<(), CliError> {
     let current_dir = std::env::current_dir().map_err(|e| CliError::Io {
         message: format!("could not determine current directory: {e}"),
@@ -97,29 +179,21 @@ pub async fn cmd_collaborators(
 
     match action {
         None => {
+            // The page window the caller named, refused outside the
+            // paged-listing bound before any request leaves.
+            refuse_limit_outside(limit, LIMIT_MIN, LIMIT_MAX)?;
             let token = TokenStore::new(config.credentials_path())
                 .read()
                 .ok()
                 .flatten();
             let (response, raw) = client
-                .list_collaborators(&repo_id, token.as_deref(), DEFAULT_COLLABORATOR_LIMIT, 0)
+                .list_collaborators(&repo_id, token.as_deref(), limit, offset)
                 .await?;
             if output.is_json() {
                 output.json(&raw);
             } else {
-                let rows = response
-                    .data
-                    .iter()
-                    .map(|c| {
-                        vec![
-                            c.user.id.clone(),
-                            c.user.name.clone(),
-                            c.user.email.clone(),
-                            format!("{:?}", c.role).to_lowercase(),
-                        ]
-                    })
-                    .collect();
-                output.table(&["User ID", "Name", "Email", "Role"], rows);
+                let rows = response.data.iter().map(collaborator_row).collect();
+                output.table(&COLLABORATOR_HEADERS, rows);
                 if response.total as usize > response.data.len() {
                     eprintln!(
                         "Showing {} of {} collaborators.",
@@ -189,6 +263,12 @@ pub async fn cmd_collaborators(
                 Err(e) => return Err(e),
             }
         }
+        // The role change binds the repository itself, so `src/main.rs`
+        // routes that arm straight to `cmd_collaborators_role` and this
+        // match never sees it.
+        Some(CollaboratorsAction::Role { user_id, role, .. }) => {
+            return cmd_collaborators_role(config, output, user_id, role, if_repo).await;
+        }
         Some(CollaboratorsAction::Remove { user_id, yes, .. }) => {
             let token = TokenStore::new(config.credentials_path())
                 .read()?
@@ -257,6 +337,8 @@ mod tests {
                 if_repo: false,
             }),
             false,
+            DEFAULT_COLLABORATOR_LIMIT,
+            DEFAULT_COLLABORATOR_OFFSET,
         )
         .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
@@ -311,6 +393,8 @@ mod tests {
                 if_repo: false,
             }),
             false,
+            DEFAULT_COLLABORATOR_LIMIT,
+            DEFAULT_COLLABORATOR_OFFSET,
         )
         .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
@@ -357,6 +441,8 @@ mod tests {
                 if_repo: false,
             }),
             false,
+            DEFAULT_COLLABORATOR_LIMIT,
+            DEFAULT_COLLABORATOR_OFFSET,
         )
         .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
@@ -410,6 +496,8 @@ mod tests {
                 if_repo: false,
             }),
             false,
+            DEFAULT_COLLABORATOR_LIMIT,
+            DEFAULT_COLLABORATOR_OFFSET,
         )
         .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
@@ -474,6 +562,8 @@ mod tests {
                 if_repo: false,
             }),
             false,
+            DEFAULT_COLLABORATOR_LIMIT,
+            DEFAULT_COLLABORATOR_OFFSET,
         )
         .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
@@ -536,6 +626,8 @@ mod tests {
                 if_repo: false,
             }),
             false,
+            DEFAULT_COLLABORATOR_LIMIT,
+            DEFAULT_COLLABORATOR_OFFSET,
         )
         .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
@@ -599,6 +691,8 @@ mod tests {
                 if_repo: false,
             }),
             false,
+            DEFAULT_COLLABORATOR_LIMIT,
+            DEFAULT_COLLABORATOR_OFFSET,
         )
         .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
@@ -677,6 +771,8 @@ mod tests {
                 if_repo: false,
             }),
             false,
+            DEFAULT_COLLABORATOR_LIMIT,
+            DEFAULT_COLLABORATOR_OFFSET,
         )
         .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
@@ -751,6 +847,8 @@ mod tests {
                 if_repo: false,
             }),
             false,
+            DEFAULT_COLLABORATOR_LIMIT,
+            DEFAULT_COLLABORATOR_OFFSET,
         )
         .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
@@ -798,6 +896,8 @@ mod tests {
                 if_repo: false,
             }),
             false,
+            DEFAULT_COLLABORATOR_LIMIT,
+            DEFAULT_COLLABORATOR_OFFSET,
         )
         .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
@@ -830,7 +930,15 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_collaborators(&config, &output, None, true).await;
+        let result = cmd_collaborators(
+            &config,
+            &output,
+            None,
+            true,
+            DEFAULT_COLLABORATOR_LIMIT,
+            DEFAULT_COLLABORATOR_OFFSET,
+        )
+        .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
@@ -847,7 +955,15 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_collaborators(&config, &output, None, true).await;
+        let result = cmd_collaborators(
+            &config,
+            &output,
+            None,
+            true,
+            DEFAULT_COLLABORATOR_LIMIT,
+            DEFAULT_COLLABORATOR_OFFSET,
+        )
+        .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
@@ -888,6 +1004,8 @@ mod tests {
                 if_repo: true,
             }),
             true,
+            DEFAULT_COLLABORATOR_LIMIT,
+            DEFAULT_COLLABORATOR_OFFSET,
         )
         .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
@@ -915,6 +1033,8 @@ mod tests {
                 if_repo: true,
             }),
             true,
+            DEFAULT_COLLABORATOR_LIMIT,
+            DEFAULT_COLLABORATOR_OFFSET,
         )
         .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
@@ -957,6 +1077,8 @@ mod tests {
                 if_repo: true,
             }),
             true,
+            DEFAULT_COLLABORATOR_LIMIT,
+            DEFAULT_COLLABORATOR_OFFSET,
         )
         .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
@@ -984,6 +1106,8 @@ mod tests {
                 if_repo: true,
             }),
             true,
+            DEFAULT_COLLABORATOR_LIMIT,
+            DEFAULT_COLLABORATOR_OFFSET,
         )
         .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
@@ -1023,5 +1147,206 @@ mod tests {
         assert!(raw.get("offset").is_some());
         let expected: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(raw, expected);
+    }
+
+    // --- `syns collaborators role USER_ID --role R` and the page
+    //     options on the standing listing (SPEC u272) ---
+
+    use crate::client::u272_bodies as B;
+
+    fn seed_repo(dir: &std::path::Path, token: Option<&str>) {
+        std::fs::write(
+            dir.join(".syns.yaml"),
+            "owner: u272alice\nname: u272-parent\n",
+        )
+        .unwrap();
+        if let Some(token) = token {
+            TokenStore::new(dir.join("credentials.json"))
+                .write(token)
+                .unwrap();
+        }
+        std::env::set_current_dir(dir).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir) };
+    }
+
+    // SPEC u272 Behaviour, `cmd_collaborators_role` 3 and 4: the role
+    // change renders the collaborator the entry served.
+    #[tokio::test]
+    #[serial]
+    async fn the_role_change_renders_the_served_collaborator() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_repo(dir.path(), Some("u272-token"));
+        let mock_server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/api/v1/repos/u272alice/u272-parent/collaborators/u272user1111111111111111111111111",
+            ))
+            .and(body_json(serde_json::json!({"role": "write"})))
+            .respond_with(ResponseTemplate::new(200).set_body_string(B::ROLE_LOCAL))
+            .mount(&mock_server)
+            .await;
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(false);
+
+        let result = cmd_collaborators_role(
+            &config,
+            &output,
+            "u272user1111111111111111111111111".to_string(),
+            AssignableRole::Write,
+            false,
+        )
+        .await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        assert!(result.is_ok(), "got {:?}", result.err());
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
+
+        let collaborator: Collaborator = serde_json::from_str(B::ROLE_LOCAL).unwrap();
+        assert_eq!(
+            collaborator_row(&collaborator),
+            vec![
+                "u272user1111111111111111111111111",
+                "U272 Bob",
+                "u272bob@example.test",
+                "write",
+            ]
+        );
+    }
+
+    // SPEC u272 Behaviour, `cmd_collaborators_role` 2: no credential
+    // refuses before any request.
+    #[tokio::test]
+    #[serial]
+    async fn the_role_change_requires_a_credential_before_any_request() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_repo(dir.path(), None);
+        let mock_server = MockServer::start().await;
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(false);
+
+        let err = cmd_collaborators_role(
+            &config,
+            &output,
+            "u-bob".to_string(),
+            AssignableRole::Read,
+            false,
+        )
+        .await
+        .unwrap_err();
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        assert!(matches!(err, CliError::AuthRequired));
+        assert!(mock_server.received_requests().await.unwrap().is_empty());
+    }
+
+    // SPEC u272 Behaviour, `cmd_collaborators_role` 1: the skip
+    // envelope where no identity resolves and `--if-repo` stands.
+    #[tokio::test]
+    #[serial]
+    async fn the_role_change_skips_where_no_identity_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+        let mock_server = MockServer::start().await;
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(true);
+
+        let result = cmd_collaborators_role(
+            &config,
+            &output,
+            "u-bob".to_string(),
+            AssignableRole::Read,
+            true,
+        )
+        .await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        assert!(result.is_ok());
+        assert!(mock_server.received_requests().await.unwrap().is_empty());
+    }
+
+    // SPEC u272 Contract Surface, the collaborators page options: the
+    // window the caller named reaches the entry.
+    #[tokio::test]
+    #[serial]
+    async fn the_listing_sends_the_window_the_caller_named() {
+        use wiremock::matchers::query_param;
+
+        let dir = tempfile::tempdir().unwrap();
+        seed_repo(dir.path(), None);
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/u272alice/u272-parent/collaborators"))
+            .and(query_param("limit", "2"))
+            .and(query_param("offset", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(B::COLLABORATORS_LOCAL))
+            .mount(&mock_server)
+            .await;
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(false);
+
+        let result = cmd_collaborators(&config, &output, None, false, 2, 1).await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        assert!(result.is_ok(), "got {:?}", result.err());
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
+    }
+
+    // SPEC u272 Contract Surface: the window the verb sends today is
+    // what a caller naming neither still gets.
+    #[tokio::test]
+    #[serial]
+    async fn a_caller_naming_neither_half_still_gets_the_shipped_window() {
+        use wiremock::matchers::query_param;
+
+        let dir = tempfile::tempdir().unwrap();
+        seed_repo(dir.path(), None);
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/u272alice/u272-parent/collaborators"))
+            .and(query_param("limit", "100"))
+            .and(query_param("offset", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(B::COLLABORATORS_LOCAL))
+            .mount(&mock_server)
+            .await;
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(false);
+
+        let result = cmd_collaborators(
+            &config,
+            &output,
+            None,
+            false,
+            DEFAULT_COLLABORATOR_LIMIT,
+            DEFAULT_COLLABORATOR_OFFSET,
+        )
+        .await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        assert!(result.is_ok(), "got {:?}", result.err());
+    }
+
+    // The page options take the refusal and the exit `cmd_forks` 2
+    // takes, before any request leaves.
+    #[tokio::test]
+    #[serial]
+    async fn a_listing_page_size_of_zero_is_refused_with_no_request_made() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_repo(dir.path(), None);
+        let mock_server = MockServer::start().await;
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(false);
+
+        let err = cmd_collaborators(&config, &output, None, false, 0, 0)
+            .await
+            .unwrap_err();
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        assert_eq!(
+            err.to_string(),
+            "configuration error: --limit must be between 1 and 100 (got 0)"
+        );
+        assert_eq!(err.exit_code(), 1);
+        assert!(mock_server.received_requests().await.unwrap().is_empty());
     }
 }

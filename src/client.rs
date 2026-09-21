@@ -201,6 +201,51 @@ pub struct UpdateCollaboratorRoleRequest {
     pub role: CollaboratorRole,
 }
 
+/// `EP-create-repo`'s body (SPEC u272 Contract Surface, `create_repo`):
+/// a field the caller left unset is left out rather than sent as null,
+/// so the entry's own default stands.
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateRepoRequest {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<Visibility>,
+}
+
+/// `EP-create-user-link`'s body.
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateUserLinkRequest {
+    pub kind: String,
+    pub value: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// `EP-update-user-link`'s body: at least one member present, an
+/// omitted one leaving what the entry holds rather than clearing it.
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateUserLinkRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_order: Option<u32>,
+}
+
+/// `EP-reorder-user-links`' body.
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ReorderUserLinksRequest {
+    pub order: Vec<String>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RevertFileRequest {
@@ -325,7 +370,16 @@ pub struct VersionListResponse {
 pub struct VersionEntry {
     pub version: u32,
     pub sha: String,
+    /// `None` on the initial commit (`INV-26`). The version listing this
+    /// model also decodes carries the key too; `default` keeps a body
+    /// serving neither key decoding as it did before u272.
+    #[serde(default)]
+    pub parent_sha: Option<String>,
     pub message: String,
+    /// Everything past the caption's first line, `None` where the commit
+    /// carried nothing but a caption.
+    #[serde(default)]
+    pub message_body: Option<String>,
     pub author: String,
     pub created_at: String,
     pub files_changed: Vec<String>,
@@ -408,6 +462,56 @@ pub struct UserSummary {
     pub name: String,
     pub email: Option<String>,
     pub image: Option<String>,
+}
+
+/// One link on a profile (`UserLink`). `kind` is left as the string the
+/// entry served rather than folded into the value set the argument
+/// parser admits, so a kind the boundary registers after this build
+/// renders rather than refusing the whole answer.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct UserLink {
+    pub id: String,
+    pub kind: String,
+    pub value: String,
+    pub label: Option<String>,
+    pub sort_order: u32,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A person's public profile (`UserProfile`). `repo_count` is what the
+/// entry counted for the caller that asked, which differs by viewer.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct UserProfile {
+    pub id: String,
+    pub username: String,
+    pub name: String,
+    pub image: Option<String>,
+    pub bio: Option<String>,
+    pub location: Option<String>,
+    pub pronouns: Option<String>,
+    pub company: Option<String>,
+    pub time_zone: Option<String>,
+    pub links: Vec<UserLink>,
+    pub created_at: String,
+    pub repo_count: u32,
+}
+
+/// `EP-users-search`'s answer: the `Collection<UserSummary>` envelope
+/// the entry serves, never a bare vector — the bare form refuses the
+/// served body outright (`PROTOTYPE.md` Constraints).
+#[derive(Deserialize, Debug)]
+pub struct UserSearchResponse {
+    pub data: Vec<UserSummary>,
+}
+
+/// What all four link entries answer: the caller's whole ordered list
+/// under `links`, never a bare vector (`PROTOTYPE.md` Constraints).
+#[derive(Deserialize, Debug)]
+pub struct UserLinksResponse {
+    pub links: Vec<UserLink>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -694,6 +798,28 @@ async fn process_response_raw<T: serde::de::DeserializeOwned>(
 async fn process_empty_response(response: reqwest::Response) -> Result<(), CliError> {
     check_response(response).await?;
     Ok(())
+}
+
+/// The bodies `units/cli/u272/prototype/bodies/` captured from the
+/// deployment and from the origin this run stood up on a scratch
+/// database, one literal per model the added entries answer.
+#[cfg(test)]
+pub(crate) mod u272_bodies {
+    pub const SEARCH_BART: &str = r##"{"data":[{"id":"eyXhkCLfkB0dZKGhsqF4rJxVYbXGl0Kp","username":"bartosz-sojka","name":"Bartosz Sójka","image":"https://lh3.googleusercontent.com/a/ACg8ocL4FWyOjIFB0ypTBmxLTIltsOv8F1GiGee3cNQaBRdX-Y6pBQk=s96-c"}]}"##;
+    pub const SEARCH_LOCAL: &str = r##"{"data":[{"id":"u272user1111111111111111111111111","username":"u272bob","name":"U272 Bob","image":null}]}"##;
+    pub const PROFILE_SELF: &str = r##"{"id":"6A2PNdiQIutnYqnn3macdtuqgxrg7Yvv","username":"bartsoj","name":"Bartosz","image":"https://avatars.githubusercontent.com/u/42448881?v=4","bio":"By the end of 2027, software will be written entirely by AI agents. Software builders will be needed more than ever. The key is the specification. With the right context and enough iterations, any software can be built. This is no longer a model limitation. It is an engineering problem.","location":"Amsterdam","pronouns":null,"company":"JetBrains","timeZone":null,"links":[{"id":"6efbd0a9-e09d-459d-9277-98838c854b5b","kind":"linkedin","value":"https://www.linkedin.com/in/bartsoj/","label":null,"sortOrder":0,"createdAt":"2026-05-26T11:29:05.737Z","updatedAt":"2026-09-21T04:41:06.239Z"},{"id":"21474465-4502-4150-adf0-aa0b6a0cc4d5","kind":"github","value":"https://github.com/BartSoj","label":null,"sortOrder":1,"createdAt":"2026-05-26T11:28:51.635Z","updatedAt":"2026-09-21T04:41:06.252Z"}],"createdAt":"2026-05-02T16:05:18.608Z","repoCount":49}"##;
+    pub const PROFILE_LOCAL: &str = r##"{"id":"u272user1111111111111111111111111","username":"u272bob","name":"U272 Bob","image":null,"bio":null,"location":null,"pronouns":null,"company":null,"timeZone":null,"links":[],"createdAt":"2026-09-21T04:43:40.637Z","repoCount":1}"##;
+    pub const LINKS_CREATE: &str = r##"{"links":[{"id":"6efbd0a9-e09d-459d-9277-98838c854b5b","kind":"linkedin","value":"https://www.linkedin.com/in/bartsoj/","label":null,"sortOrder":0,"createdAt":"2026-05-26T11:29:05.737Z","updatedAt":"2026-05-26T11:29:33.124Z"},{"id":"21474465-4502-4150-adf0-aa0b6a0cc4d5","kind":"github","value":"https://github.com/BartSoj","label":null,"sortOrder":1,"createdAt":"2026-05-26T11:28:51.635Z","updatedAt":"2026-05-26T11:29:40.643Z"},{"id":"c3927ea2-a953-498b-8e83-86c870887758","kind":"generic","value":"https://u272.example.test/probe","label":"u272 probe","sortOrder":2,"createdAt":"2026-09-21T04:41:05.688Z","updatedAt":"2026-09-21T04:41:05.688Z"}]}"##;
+    pub const LINKS_UPDATE: &str = r##"{"links":[{"id":"6efbd0a9-e09d-459d-9277-98838c854b5b","kind":"linkedin","value":"https://www.linkedin.com/in/bartsoj/","label":null,"sortOrder":0,"createdAt":"2026-05-26T11:29:05.737Z","updatedAt":"2026-05-26T11:29:33.124Z"},{"id":"21474465-4502-4150-adf0-aa0b6a0cc4d5","kind":"github","value":"https://github.com/BartSoj","label":null,"sortOrder":1,"createdAt":"2026-05-26T11:28:51.635Z","updatedAt":"2026-05-26T11:29:40.643Z"},{"id":"c3927ea2-a953-498b-8e83-86c870887758","kind":"generic","value":"https://u272.example.test/probe","label":"u272 probe updated","sortOrder":2,"createdAt":"2026-09-21T04:41:05.688Z","updatedAt":"2026-09-21T04:41:05.854Z"}]}"##;
+    pub const LINKS_REORDER: &str = r##"{"links":[{"id":"c3927ea2-a953-498b-8e83-86c870887758","kind":"generic","value":"https://u272.example.test/probe","label":"u272 probe updated","sortOrder":0,"createdAt":"2026-09-21T04:41:05.688Z","updatedAt":"2026-09-21T04:41:06.038Z"},{"id":"21474465-4502-4150-adf0-aa0b6a0cc4d5","kind":"github","value":"https://github.com/BartSoj","label":null,"sortOrder":1,"createdAt":"2026-05-26T11:28:51.635Z","updatedAt":"2026-09-21T04:41:06.050Z"},{"id":"6efbd0a9-e09d-459d-9277-98838c854b5b","kind":"linkedin","value":"https://www.linkedin.com/in/bartsoj/","label":null,"sortOrder":2,"createdAt":"2026-05-26T11:29:05.737Z","updatedAt":"2026-09-21T04:41:06.062Z"}]}"##;
+    pub const LINKS_DELETE: &str = r##"{"links":[{"id":"6efbd0a9-e09d-459d-9277-98838c854b5b","kind":"linkedin","value":"https://www.linkedin.com/in/bartsoj/","label":null,"sortOrder":0,"createdAt":"2026-05-26T11:29:05.737Z","updatedAt":"2026-09-21T04:41:06.239Z"},{"id":"21474465-4502-4150-adf0-aa0b6a0cc4d5","kind":"github","value":"https://github.com/BartSoj","label":null,"sortOrder":1,"createdAt":"2026-05-26T11:28:51.635Z","updatedAt":"2026-09-21T04:41:06.252Z"}]}"##;
+    pub const VERSION_HEAD: &str = r##"{"version":596,"sha":"7618bcff37fa4dc19f976c9e29019d56d6aeed68","parentSha":"686ee7156c28aca8f7d9411c3f1a50631257d59d","message":"claude code session","messageBody":null,"author":"bartsoj","createdAt":"2026-09-20T13:55:04Z","filesChanged":["decisions/D-080-partial-and-not-text-reads/DECISION.md","decisions/_NEXT_DECISION_ID","issues/144-cli-short-aliases-absent-from-clap-tree/ISSUE.md","issues/148-ref-by-content-hash-resolved-by-scanning-every-commit/ISSUE.md","issues/149-versions-paging-cost-rises-with-offset/ISSUE.md","issues/_NEXT_TRIGGER_ID","roadmap/028-cli-time-travel-reads/ROADMAP.md","roadmap/213-cli-repository-reads/ROADMAP.md","roadmap/214-cli-grep-file-type-filter-and-multiline/ROADMAP.md","roadmap/_NEXT_TRIGGER_ID","units/_NEXT_UNIT_ID","units/_PHASES/PH-decide","units/cli/u270/PROTOTYPE.md","units/cli/u270/SPEC.md","units/cli/u270/SPEC_REVIEW.md","units/cli/u270/SPEC_REVIEW_R2.md","units/cli/u270/_PHASES/PH-pickup"],"provenance":{"publisher":"bartsoj","integration":null,"run":null,"trigger":null,"taskRef":null}}"##;
+    pub const FORKS_LOCAL: &str = r##"{"data":[{"owner":"u272bob","name":"u272-fork","description":"the fork","commitSha":null,"status":"active","author":null,"tags":[],"visibility":"public","forkedFrom":{"owner":"u272alice","name":"u272-parent"},"forkCount":0,"fileCount":3,"role":null,"createdAt":"2026-09-21T04:43:40.644Z","updatedAt":"2026-09-21T04:43:40.644Z"}],"total":1,"limit":20,"offset":0}"##;
+    pub const FORKS_EMPTY: &str = r##"{"data":[],"total":0,"limit":20,"offset":0}"##;
+    pub const ROLE_LOCAL: &str = r##"{"user":{"id":"u272user1111111111111111111111111","name":"U272 Bob","username":"u272bob","email":"u272bob@example.test","emailVerified":true,"image":null,"createdAt":"2026-09-21T04:43:40.637Z","updatedAt":"2026-09-21T04:43:40.637Z"},"role":"write","addedBy":"u272alice","createdAt":"2026-09-21T04:43:40.645Z"}"##;
+    pub const CREATED_REPO: &str = r##"{"owner":"bartsoj","name":"u272-parity-probe","description":"u272 prototype probe","commitSha":null,"status":"draft","author":null,"tags":[],"visibility":"private","forkedFrom":null,"forkCount":0,"fileCount":0,"role":"owner","createdAt":"2026-09-21T04:42:46.167Z","updatedAt":"2026-09-21T04:42:46.167Z"}"##;
+    pub const SEARCH_429: &str = r##"{"error":"rate_limited","message":"Too many requests"}"##;
+    pub const COLLABORATORS_LOCAL: &str = r##"{"data":[{"user":{"id":"u272user1111111111111111111111111","name":"U272 Bob","username":"u272bob","email":"u272bob@example.test","emailVerified":true,"image":null,"createdAt":"2026-09-21T04:43:40.637Z","updatedAt":"2026-09-21T04:43:40.637Z"},"role":"read","addedBy":"u272alice","createdAt":"2026-09-21T04:43:40.645Z"}],"total":1,"limit":100,"offset":0}"##;
 }
 
 // --- SynsClient ---
@@ -1029,13 +1155,20 @@ impl SynsClient {
         process_empty_response(response).await
     }
 
+    /// Changes one standing grant (`EP-set-collaborator-role`).
+    ///
+    /// SPEC u272 Contract Surface, `update_collaborator_role`: the entry
+    /// answers the collaborator it changed, so the pair carries the
+    /// render's typed member beside the body the machine-readable mode
+    /// writes — the four user keys `CollaboratorUser` leaves unread
+    /// standing in that raw member.
     pub async fn update_collaborator_role(
         &self,
         repo_id: &str,
         token: &str,
         user_id: &str,
         request: &UpdateCollaboratorRoleRequest,
-    ) -> Result<(), CliError> {
+    ) -> Result<(Collaborator, serde_json::Value), CliError> {
         let url = format!(
             "{}/api/v1/repos/{}/collaborators/{}",
             self.base_url,
@@ -1049,7 +1182,7 @@ impl SynsClient {
             .json(request)
             .send()
             .await?;
-        process_empty_response(response).await
+        process_response_raw(response).await
     }
 
     pub async fn explore(
@@ -1155,6 +1288,154 @@ impl SynsClient {
             .post(&url)
             .bearer_auth(token)
             .json(request)
+            .send()
+            .await?;
+        process_response_raw(response).await
+    }
+
+    /// Lists a repository's forks (`EP-list-forks`).
+    ///
+    /// SPEC u272 Contract Surface, `list_forks`: the page window the
+    /// caller named reaches the entry unchanged, so the `limit` and
+    /// `offset` the answer carries are the ones the invocation asked for.
+    pub async fn list_forks(
+        &self,
+        repo_id: &str,
+        token: Option<&str>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(RepoListResponse, serde_json::Value), CliError> {
+        let url = format!("{}/api/v1/repos/{}/forks", self.base_url, repo_id);
+        let mut req = self
+            .client
+            .get(&url)
+            .query(&[("limit", limit.to_string()), ("offset", offset.to_string())]);
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        let response = req.send().await?;
+        process_response_raw(response).await
+    }
+
+    /// Searches people by handle or display name (`EP-users-search`).
+    ///
+    /// SPEC u272 Contract Surface, `search_users`: the typed member
+    /// holds the answer's own order, which no local sort replaces.
+    pub async fn search_users(
+        &self,
+        token: &str,
+        q: &str,
+        limit: u32,
+    ) -> Result<(UserSearchResponse, serde_json::Value), CliError> {
+        let url = format!("{}/api/v1/users", self.base_url);
+        let response = self
+            .client
+            .get(&url)
+            .query(&[("q", q.to_string()), ("limit", limit.to_string())])
+            .bearer_auth(token)
+            .send()
+            .await?;
+        process_response_raw(response).await
+    }
+
+    /// Reads one person's profile (`EP-user-profile`).
+    ///
+    /// SPEC u272 Contract Surface, `get_user_profile`: the stored
+    /// credential rides where one stands and nothing rides where none
+    /// does, so the entry decides which repository count it answers.
+    pub async fn get_user_profile(
+        &self,
+        username: &str,
+        token: Option<&str>,
+    ) -> Result<(UserProfile, serde_json::Value), CliError> {
+        let url = format!(
+            "{}/api/v1/users/{}",
+            self.base_url,
+            urlencoding::encode(username)
+        );
+        let mut req = self.client.get(&url);
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        let response = req.send().await?;
+        process_response_raw(response).await
+    }
+
+    /// The four profile-link entries behind one function
+    /// (`EP-create-user-link`, `EP-update-user-link`,
+    /// `EP-delete-user-link`, `EP-reorder-user-links`).
+    ///
+    /// SPEC u272 Contract Surface, `user_links`: each arm answers the
+    /// whole ordered list the entry served.
+    pub async fn user_links(
+        &self,
+        token: &str,
+        action: &crate::commands::links::LinksAction,
+    ) -> Result<(UserLinksResponse, serde_json::Value), CliError> {
+        use crate::commands::links::LinksAction;
+        let base = format!("{}/api/v1/me/links", self.base_url);
+        let request = match action {
+            LinksAction::Add { kind, value, label } => {
+                self.client.post(&base).json(&CreateUserLinkRequest {
+                    kind: kind.as_wire_str().to_string(),
+                    value: value.clone(),
+                    label: label.clone(),
+                })
+            }
+            LinksAction::Update {
+                id,
+                kind,
+                value,
+                label,
+                sort_order,
+            } => self
+                .client
+                .patch(format!("{}/{}", base, urlencoding::encode(id)))
+                .json(&UpdateUserLinkRequest {
+                    kind: kind.map(|k| k.as_wire_str().to_string()),
+                    value: value.clone(),
+                    label: label.clone(),
+                    sort_order: *sort_order,
+                }),
+            LinksAction::Remove { id } => {
+                self.client
+                    .delete(format!("{}/{}", base, urlencoding::encode(id)))
+            }
+            LinksAction::Reorder { order } => {
+                self.client
+                    .post(format!("{base}/reorder"))
+                    .json(&ReorderUserLinksRequest {
+                        order: order.clone(),
+                    })
+            }
+        };
+        let response = request.bearer_auth(token).send().await?;
+        process_response_raw(response).await
+    }
+
+    /// Creates an empty repository under the caller (`EP-create-repo`).
+    ///
+    /// SPEC u272 Contract Surface, `create_repo`: only the fields the
+    /// caller gave are sent, an omitted one leaving the entry's own
+    /// default to stand.
+    pub async fn create_repo(
+        &self,
+        token: &str,
+        name: &str,
+        description: Option<&str>,
+        visibility: Option<&Visibility>,
+    ) -> Result<(RepoResponse, serde_json::Value), CliError> {
+        let url = format!("{}/api/v1/repos", self.base_url);
+        let request = CreateRepoRequest {
+            name: name.to_string(),
+            description: description.map(str::to_string),
+            visibility: visibility.cloned(),
+        };
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(token)
+            .json(&request)
             .send()
             .await?;
         process_response_raw(response).await
@@ -2266,5 +2547,538 @@ mod head_moved_tests {
 
         assert!(matches!(err, CliError::Api { context: None, .. }));
         assert_eq!(err.exit_code(), 1);
+    }
+}
+
+#[cfg(test)]
+mod u272_model_tests {
+    use super::u272_bodies as B;
+    use super::*;
+
+    fn value(raw: &str) -> serde_json::Value {
+        serde_json::from_str(raw).expect("the captured body parses")
+    }
+
+    // SPEC u272 Contract Surface, the added response models — and
+    // `PROTOTYPE.md`'s first Constraints row: the search answer is the
+    // `{ data: … }` envelope, which the bare vector refuses.
+    #[test]
+    fn the_search_answer_decodes_under_its_envelope_and_not_as_a_bare_vector() {
+        for raw in [B::SEARCH_BART, B::SEARCH_LOCAL] {
+            let body = value(raw);
+            let typed: UserSearchResponse =
+                serde_json::from_value(body.clone()).expect("the envelope decodes");
+            assert_eq!(typed.data.len(), 1);
+            assert!(
+                serde_json::from_value::<Vec<UserSummary>>(body).is_err(),
+                "the bare vector must refuse the served envelope"
+            );
+        }
+        let typed: UserSearchResponse = serde_json::from_value(value(B::SEARCH_BART)).unwrap();
+        assert_eq!(typed.data[0].username, "bartosz-sojka");
+        assert_eq!(typed.data[0].email, None);
+    }
+
+    // The same for all four link entries.
+    #[test]
+    fn every_link_answer_decodes_under_its_envelope_and_not_as_a_bare_vector() {
+        for raw in [
+            B::LINKS_CREATE,
+            B::LINKS_UPDATE,
+            B::LINKS_REORDER,
+            B::LINKS_DELETE,
+        ] {
+            let body = value(raw);
+            let typed: UserLinksResponse =
+                serde_json::from_value(body.clone()).expect("the envelope decodes");
+            assert!(!typed.links.is_empty());
+            assert!(
+                serde_json::from_value::<Vec<UserLink>>(body).is_err(),
+                "the bare vector must refuse the served envelope"
+            );
+        }
+        let reordered: UserLinksResponse = serde_json::from_value(value(B::LINKS_REORDER)).unwrap();
+        let order: Vec<u32> = reordered.links.iter().map(|l| l.sort_order).collect();
+        assert_eq!(order, vec![0, 1, 2]);
+        assert_eq!(reordered.links[0].kind, "generic");
+        assert_eq!(
+            reordered.links[0].label.as_deref(),
+            Some("u272 probe updated")
+        );
+        assert_eq!(reordered.links[1].label, None);
+    }
+
+    // SPEC u272 Contract Surface, `UserProfile`.
+    #[test]
+    fn the_profile_decodes_every_field_its_entry_serves() {
+        let full: UserProfile = serde_json::from_value(value(B::PROFILE_SELF)).unwrap();
+        assert_eq!(full.username, "bartsoj");
+        assert_eq!(full.company.as_deref(), Some("JetBrains"));
+        assert_eq!(full.location.as_deref(), Some("Amsterdam"));
+        assert_eq!(full.pronouns, None);
+        assert_eq!(full.time_zone, None);
+        assert_eq!(full.repo_count, 49);
+        assert_eq!(full.links.len(), 2);
+        assert_eq!(full.links[0].kind, "linkedin");
+
+        let sparse: UserProfile = serde_json::from_value(value(B::PROFILE_LOCAL)).unwrap();
+        assert!(sparse.links.is_empty());
+        assert_eq!(sparse.bio, None);
+        assert_eq!(sparse.repo_count, 1);
+    }
+
+    // SPEC u272 Contract Surface: `VersionEntry` widened with the two
+    // keys the served version carries and the shipped model dropped.
+    #[test]
+    fn the_version_entry_reaches_the_parent_and_the_message_body() {
+        let entry: VersionEntry = serde_json::from_value(value(B::VERSION_HEAD)).unwrap();
+        assert_eq!(entry.version, 596);
+        assert_eq!(
+            entry.parent_sha.as_deref(),
+            Some("686ee7156c28aca8f7d9411c3f1a50631257d59d")
+        );
+        assert_eq!(entry.message_body, None);
+        assert_eq!(entry.files_changed.len(), 17);
+        assert_eq!(entry.provenance.unwrap().publisher, "bartsoj");
+    }
+
+    // The version listing serves neither key on a body captured before
+    // u272; the widened model must still decode it.
+    #[test]
+    fn a_version_body_serving_neither_added_key_still_decodes() {
+        let entry: VersionEntry = serde_json::from_value(serde_json::json!({
+            "version": 1, "sha": "a".repeat(40), "message": "m", "author": "alice",
+            "createdAt": "2026-01-01T00:00:00Z", "filesChanged": ["a.md"],
+        }))
+        .unwrap();
+        assert_eq!(entry.parent_sha, None);
+        assert_eq!(entry.message_body, None);
+    }
+
+    // SPEC u272 Bindings, `Page<Repository>`: the fork page is the same
+    // page shape the repository listing already decodes.
+    #[test]
+    fn the_fork_page_decodes_as_the_registered_page() {
+        let empty: RepoListResponse = serde_json::from_value(value(B::FORKS_EMPTY)).unwrap();
+        assert_eq!(empty.total, 0);
+        assert_eq!(empty.limit, 20);
+
+        let full: RepoListResponse = serde_json::from_value(value(B::FORKS_LOCAL)).unwrap();
+        assert_eq!(full.data.len(), 1);
+        assert_eq!(full.data[0].name, "u272-fork");
+        assert_eq!(
+            full.data[0].forked_from.as_ref().unwrap().owner,
+            "u272alice"
+        );
+    }
+
+    // SPEC u272 Bindings, `Collaborator` and `Repository`.
+    #[test]
+    fn the_role_change_and_the_created_repository_decode() {
+        let collaborator: Collaborator = serde_json::from_value(value(B::ROLE_LOCAL)).unwrap();
+        assert_eq!(collaborator.role, CollaboratorRole::Write);
+        assert_eq!(collaborator.user.username, "u272bob");
+
+        let created: RepoResponse = serde_json::from_value(value(B::CREATED_REPO)).unwrap();
+        assert_eq!(created.status, RepoStatus::Draft);
+        assert_eq!(created.visibility, Visibility::Private);
+        assert_eq!(created.role, Some(CollaboratorRole::Owner));
+        assert_eq!(created.commit_sha, None);
+    }
+
+    // SPEC u272 Contract Surface, `create_repo`: only the fields the
+    // caller gave reach the wire.
+    #[test]
+    fn the_create_body_carries_only_what_the_caller_gave() {
+        let bare = serde_json::to_value(&CreateRepoRequest {
+            name: "notes".into(),
+            description: None,
+            visibility: None,
+        })
+        .unwrap();
+        assert_eq!(bare, serde_json::json!({"name": "notes"}));
+
+        let whole = serde_json::to_value(&CreateRepoRequest {
+            name: "notes".into(),
+            description: Some("d".into()),
+            visibility: Some(Visibility::Public),
+        })
+        .unwrap();
+        assert_eq!(
+            whole,
+            serde_json::json!({"name": "notes", "description": "d", "visibility": "public"})
+        );
+    }
+
+    // SPEC u272 Contract Surface, `LinksAction`: an omitted `--label`
+    // on an update leaves the label the entry holds.
+    #[test]
+    fn the_link_write_bodies_leave_out_what_the_caller_omitted() {
+        let add = serde_json::to_value(&CreateUserLinkRequest {
+            kind: "github".into(),
+            value: "https://example.test/a".into(),
+            label: None,
+        })
+        .unwrap();
+        assert_eq!(
+            add,
+            serde_json::json!({"kind": "github", "value": "https://example.test/a"})
+        );
+
+        let update = serde_json::to_value(&UpdateUserLinkRequest {
+            kind: None,
+            value: None,
+            label: None,
+            sort_order: Some(2),
+        })
+        .unwrap();
+        assert_eq!(update, serde_json::json!({"sortOrder": 2}));
+
+        let reorder = serde_json::to_value(&ReorderUserLinksRequest {
+            order: vec!["a".into(), "b".into()],
+        })
+        .unwrap();
+        assert_eq!(reorder, serde_json::json!({"order": ["a", "b"]}));
+    }
+
+    // The collaborator page the listing answers, as the widened options
+    // will send it (`LOCAL-EP-list-collaborators`).
+    #[test]
+    fn the_collaborator_page_decodes_with_its_window() {
+        let page: CollaboratorListResponse =
+            serde_json::from_value(value(B::COLLABORATORS_LOCAL)).unwrap();
+        assert_eq!(page.limit, 100);
+        assert_eq!(page.offset, 0);
+        assert_eq!(page.data[0].role, CollaboratorRole::Read);
+    }
+}
+
+#[cfg(test)]
+mod u272_entry_tests {
+    use super::u272_bodies as B;
+    use super::*;
+    use crate::commands::links::{LinkKind, LinksAction};
+    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn served(raw: &str) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_string(raw)
+    }
+
+    fn expected(raw: &str) -> serde_json::Value {
+        serde_json::from_str(raw).unwrap()
+    }
+
+    // SPEC u272 Contract Surface, `list_forks`: the caller's window
+    // reaches the entry, and the raw member is the served bytes.
+    #[tokio::test]
+    async fn list_forks_sends_the_window_and_answers_the_served_page() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/u272alice/u272-parent/forks"))
+            .and(query_param("limit", "7"))
+            .and(query_param("offset", "3"))
+            .and(header("authorization", "Bearer u272-token"))
+            .respond_with(served(B::FORKS_LOCAL))
+            .mount(&server)
+            .await;
+
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let (typed, raw) = client
+            .list_forks("u272alice/u272-parent", Some("u272-token"), 7, 3)
+            .await
+            .unwrap();
+
+        assert_eq!(raw, expected(B::FORKS_LOCAL));
+        assert_eq!(typed.data.len(), 1);
+    }
+
+    // SPEC u272 Behaviour, `resolve_repo_scope` 2: nothing rides where
+    // no credential stands.
+    #[tokio::test]
+    async fn list_forks_carries_no_credential_where_none_stands() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/notes/forks"))
+            .respond_with(served(B::FORKS_EMPTY))
+            .mount(&server)
+            .await;
+
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let (_typed, raw) = client.list_forks("alice/notes", None, 20, 0).await.unwrap();
+
+        assert_eq!(raw, expected(B::FORKS_EMPTY));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].headers.get("authorization").is_none());
+    }
+
+    // SPEC u272 Contract Surface, `search_users`.
+    #[tokio::test]
+    async fn search_users_sends_the_query_under_the_credential() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/users"))
+            .and(query_param("q", "bart"))
+            .and(query_param("limit", "20"))
+            .and(header("authorization", "Bearer u272-token"))
+            .respond_with(served(B::SEARCH_BART))
+            .mount(&server)
+            .await;
+
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let (typed, raw) = client.search_users("u272-token", "bart", 20).await.unwrap();
+
+        assert_eq!(raw, expected(B::SEARCH_BART));
+        assert_eq!(typed.data[0].username, "bartosz-sojka");
+    }
+
+    // SPEC u272 Contract Surface, `get_user_profile`: the credential
+    // rides where one stands and nothing rides where none does.
+    #[tokio::test]
+    async fn get_user_profile_rides_the_credential_only_where_one_stands() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/users/bartsoj"))
+            .respond_with(served(B::PROFILE_SELF))
+            .mount(&server)
+            .await;
+
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let (_typed, raw) = client
+            .get_user_profile("bartsoj", Some("u272-token"))
+            .await
+            .unwrap();
+        assert_eq!(raw, expected(B::PROFILE_SELF));
+        client.get_user_profile("bartsoj", None).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].headers.get("authorization").unwrap(),
+            "Bearer u272-token"
+        );
+        assert!(requests[1].headers.get("authorization").is_none());
+    }
+
+    // SPEC u272 Contract Surface, `user_links`: one function, four
+    // entries, each answering the whole ordered list.
+    #[tokio::test]
+    async fn the_add_arm_posts_the_link_and_answers_the_whole_list() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/me/links"))
+            .and(header("authorization", "Bearer u272-token"))
+            .respond_with(ResponseTemplate::new(201).set_body_string(B::LINKS_CREATE))
+            .mount(&server)
+            .await;
+
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let (typed, raw) = client
+            .user_links(
+                "u272-token",
+                &LinksAction::Add {
+                    kind: LinkKind::Generic,
+                    value: "https://u272.example.test/probe".into(),
+                    label: Some("u272 probe".into()),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(raw, expected(B::LINKS_CREATE));
+        assert_eq!(typed.links.len(), 3);
+        let sent: serde_json::Value =
+            serde_json::from_slice(&server.received_requests().await.unwrap()[0].body).unwrap();
+        assert_eq!(
+            sent,
+            serde_json::json!({
+                "kind": "generic",
+                "value": "https://u272.example.test/probe",
+                "label": "u272 probe",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn the_update_arm_patches_the_identifier_it_was_given() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/api/v1/me/links/c3927ea2-a953-498b-8e83-86c870887758",
+            ))
+            .respond_with(served(B::LINKS_UPDATE))
+            .mount(&server)
+            .await;
+
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let (_typed, raw) = client
+            .user_links(
+                "u272-token",
+                &LinksAction::Update {
+                    id: "c3927ea2-a953-498b-8e83-86c870887758".into(),
+                    kind: None,
+                    value: None,
+                    label: Some("u272 probe updated".into()),
+                    sort_order: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(raw, expected(B::LINKS_UPDATE));
+        let sent: serde_json::Value =
+            serde_json::from_slice(&server.received_requests().await.unwrap()[0].body).unwrap();
+        assert_eq!(sent, serde_json::json!({"label": "u272 probe updated"}));
+    }
+
+    #[tokio::test]
+    async fn the_remove_arm_deletes_the_identifier_it_was_given() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path(
+                "/api/v1/me/links/c3927ea2-a953-498b-8e83-86c870887758",
+            ))
+            .respond_with(served(B::LINKS_DELETE))
+            .mount(&server)
+            .await;
+
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let (typed, raw) = client
+            .user_links(
+                "u272-token",
+                &LinksAction::Remove {
+                    id: "c3927ea2-a953-498b-8e83-86c870887758".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(raw, expected(B::LINKS_DELETE));
+        assert_eq!(typed.links.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_reorder_arm_sends_the_order_it_was_typed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/me/links/reorder"))
+            .respond_with(served(B::LINKS_REORDER))
+            .mount(&server)
+            .await;
+
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let order = vec![
+            "c3927ea2-a953-498b-8e83-86c870887758".to_string(),
+            "21474465-4502-4150-adf0-aa0b6a0cc4d5".to_string(),
+            "6efbd0a9-e09d-459d-9277-98838c854b5b".to_string(),
+        ];
+        let (_typed, raw) = client
+            .user_links(
+                "u272-token",
+                &LinksAction::Reorder {
+                    order: order.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(raw, expected(B::LINKS_REORDER));
+        let sent: serde_json::Value =
+            serde_json::from_slice(&server.received_requests().await.unwrap()[0].body).unwrap();
+        assert_eq!(sent, serde_json::json!({ "order": order }));
+    }
+
+    // SPEC u272 Contract Surface, `create_repo`.
+    #[tokio::test]
+    async fn create_repo_sends_only_the_fields_the_caller_gave() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/repos"))
+            .and(header("authorization", "Bearer u272-token"))
+            .respond_with(ResponseTemplate::new(201).set_body_string(B::CREATED_REPO))
+            .mount(&server)
+            .await;
+
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let (typed, raw) = client
+            .create_repo("u272-token", "u272-parity-probe", None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(raw, expected(B::CREATED_REPO));
+        assert_eq!(typed.name, "u272-parity-probe");
+        let sent: serde_json::Value =
+            serde_json::from_slice(&server.received_requests().await.unwrap()[0].body).unwrap();
+        assert_eq!(sent, serde_json::json!({"name": "u272-parity-probe"}));
+    }
+
+    // SPEC u272 Contract Surface, `update_collaborator_role`: the raw
+    // member carries the four user keys the typed model leaves unread.
+    #[tokio::test]
+    async fn the_role_change_answers_the_collaborator_the_entry_served() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/api/v1/repos/u272alice/u272-parent/collaborators/u272user1111111111111111111111111",
+            ))
+            .and(header("authorization", "Bearer u272-token"))
+            .respond_with(served(B::ROLE_LOCAL))
+            .mount(&server)
+            .await;
+
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let (typed, raw) = client
+            .update_collaborator_role(
+                "u272alice/u272-parent",
+                "u272-token",
+                "u272user1111111111111111111111111",
+                &UpdateCollaboratorRoleRequest {
+                    role: CollaboratorRole::Write,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(raw, expected(B::ROLE_LOCAL));
+        assert_eq!(typed.role, CollaboratorRole::Write);
+        for key in ["createdAt", "emailVerified", "image", "updatedAt"] {
+            assert!(
+                raw["user"].get(key).is_some(),
+                "the served body keeps {key}"
+            );
+        }
+        let sent: serde_json::Value =
+            serde_json::from_slice(&server.received_requests().await.unwrap()[0].body).unwrap();
+        assert_eq!(sent, serde_json::json!({"role": "write"}));
+    }
+
+    // SPEC u272 Behaviour, `cmd_users` 2: the rate refusal the entry
+    // answers carries neither an interval nor a remaining budget.
+    #[tokio::test]
+    async fn the_rate_refusal_reaches_the_caller_as_the_entry_wrote_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/users"))
+            .respond_with(ResponseTemplate::new(429).set_body_string(B::SEARCH_429))
+            .mount(&server)
+            .await;
+
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let err = client
+            .search_users("u272-token", "bart", 20)
+            .await
+            .unwrap_err();
+
+        match err {
+            CliError::Api {
+                status: Some(429),
+                ref error,
+                ..
+            } => assert_eq!(error, "rate_limited"),
+            other => panic!("expected the rate refusal, got {other:?}"),
+        }
+        assert_eq!(err.exit_code(), 1);
+        assert_eq!(err.to_string(), "server error (429): rate_limited");
     }
 }

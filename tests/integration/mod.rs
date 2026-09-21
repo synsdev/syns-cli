@@ -1,3 +1,4 @@
+mod api_parity_test;
 mod auth_test;
 mod collaborators_add_json_test;
 mod common;

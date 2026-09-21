@@ -7,8 +7,24 @@ use crate::output::Output;
 use clap::{Args, ValueEnum};
 use console::style;
 
-const LIMIT_MIN: u32 = 1;
-const LIMIT_MAX: u32 = 100;
+pub(crate) const LIMIT_MIN: u32 = 1;
+pub(crate) const LIMIT_MAX: u32 = 100;
+
+/// The paged-listing refusal, in the wording the repository listing
+/// already refuses in (SPEC u272 Behaviour, `cmd_forks` 2). `max` is
+/// `LIMIT_MAX` but on the user-search entry, whose own ceiling is lower.
+///
+/// The `Page<T>` rule bounds `offset` at "0 or more", which every `u32`
+/// already satisfies, so the window's second half has no value left to
+/// refuse here and a negative one ends the run at the argument parser.
+pub(crate) fn refuse_limit_outside(limit: u32, min: u32, max: u32) -> Result<(), CliError> {
+    if limit < min || limit > max {
+        return Err(CliError::Config {
+            message: format!("--limit must be between {min} and {max} (got {limit})"),
+        });
+    }
+    Ok(())
+}
 
 #[derive(Args, Debug)]
 pub struct ReposArgs {
@@ -62,14 +78,7 @@ pub async fn cmd_repos(config: &Config, output: &Output, args: &ReposArgs) -> Re
     // 1. Client-side pagination validation (avoid a wire round-trip for an
     //    out-of-range --limit). Bounds match the server's
     //    paginationFields.limit schema (.min(1).max(100)).
-    if args.limit < LIMIT_MIN || args.limit > LIMIT_MAX {
-        return Err(CliError::Config {
-            message: format!(
-                "--limit must be between {LIMIT_MIN} and {LIMIT_MAX} (got {})",
-                args.limit
-            ),
-        });
-    }
+    refuse_limit_outside(args.limit, LIMIT_MIN, LIMIT_MAX)?;
 
     // 2. Load cached bearer token; silently fall back to anonymous on read
     //    failure (matches u23's read-command convention).

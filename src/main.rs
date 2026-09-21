@@ -3,12 +3,15 @@ use syns_cli::{commands, config, errors, output, read, write};
 use clap::{CommandFactory, Parser, Subcommand};
 use syns_cli::commands::collaborators::CollaboratorsAction;
 use syns_cli::commands::grep::{GrepArgs, GrepOutput};
+use syns_cli::commands::history::HistoryAction;
+use syns_cli::commands::links::LinksAction;
 use syns_cli::commands::push::PushArgs;
 use syns_cli::commands::repo::{CliRepoStatus, CliVisibility, RepoAction};
 use syns_cli::commands::repos::ReposArgs;
 use syns_cli::commands::sync::ResolutionAction;
 use syns_cli::commands::teams::TeamsAction;
 use syns_cli::commands::upgrade::UpgradeArgs;
+use syns_cli::read::RepoScopeArgs;
 
 #[derive(Parser)]
 #[command(
@@ -266,6 +269,8 @@ enum Commands {
         /// Silently skip (exit 0) when no Syns repo identity resolves
         #[arg(long)]
         if_repo: bool,
+        #[command(subcommand)]
+        action: Option<HistoryAction>,
     },
     /// Show changes between versions
     Diff {
@@ -320,6 +325,12 @@ enum Commands {
     Collaborators {
         #[command(subcommand)]
         action: Option<CollaboratorsAction>,
+        /// Maximum number of collaborators to list
+        #[arg(long, default_value_t = commands::collaborators::DEFAULT_COLLABORATOR_LIMIT)]
+        limit: u32,
+        /// Number of collaborators to skip
+        #[arg(long, default_value_t = commands::collaborators::DEFAULT_COLLABORATOR_OFFSET)]
+        offset: u32,
         /// Silently skip (exit 0) when no Syns repo identity resolves
         #[arg(long)]
         if_repo: bool,
@@ -359,6 +370,37 @@ enum Commands {
         /// Custom name for the forked repository
         #[arg(long, short = 'n')]
         name: Option<String>,
+    },
+    /// List the repositories copied from a repository
+    Forks {
+        /// Maximum number of forks to show
+        #[arg(long, default_value_t = commands::forks::DEFAULT_LIMIT)]
+        limit: u32,
+        /// Number of forks to skip
+        #[arg(long, default_value_t = commands::forks::DEFAULT_OFFSET)]
+        offset: u32,
+        #[command(flatten)]
+        scope: RepoScopeArgs,
+    },
+    /// Search people by handle or display name
+    Users {
+        /// What to match against a handle or a display name
+        #[arg(value_name = "QUERY")]
+        query: String,
+        /// Maximum number of matches to show
+        #[arg(long, default_value_t = commands::users::DEFAULT_SEARCH_LIMIT)]
+        limit: u32,
+    },
+    /// Show a person's profile, the caller's own where none is named
+    User {
+        /// The handle to show; the caller's own where it is absent
+        #[arg(value_name = "USERNAME")]
+        username: Option<String>,
+    },
+    /// Manage the links on the caller's own profile
+    Links {
+        #[command(subcommand)]
+        action: LinksAction,
     },
     /// Manage teams
     Teams {
@@ -561,7 +603,13 @@ async fn run(
             file,
             limit,
             if_repo,
-        } => commands::history::cmd_history(config, output, file, limit, if_repo).await?,
+            action,
+        } => match action {
+            Some(HistoryAction::Show { reference, scope }) => {
+                commands::history::cmd_history_show(config, output, reference, scope).await?
+            }
+            None => commands::history::cmd_history(config, output, file, limit, if_repo).await?,
+        },
         Commands::Diff { from, to, if_repo } => {
             commands::diff::cmd_diff(config, output, from, to, if_repo).await?
         }
@@ -594,20 +642,34 @@ async fn run(
         Commands::Repos(args) => commands::repos::cmd_repos(config, output, &args).await?,
         Commands::Collaborators {
             action,
+            limit,
+            offset,
             if_repo: parent_if_repo,
         } => {
             let action_if_repo = match &action {
                 Some(CollaboratorsAction::Add { if_repo, .. }) => *if_repo,
+                Some(CollaboratorsAction::Role { if_repo, .. }) => *if_repo,
                 Some(CollaboratorsAction::Remove { if_repo, .. }) => *if_repo,
                 None => false,
             };
-            commands::collaborators::cmd_collaborators(
-                config,
-                output,
-                action,
-                parent_if_repo || action_if_repo,
-            )
-            .await?
+            let if_repo = parent_if_repo || action_if_repo;
+            // The role change binds the repository itself, so it is
+            // routed straight rather than through the noun's listing
+            // path (SPEC u272 Behaviour, `cmd_collaborators_role` 1).
+            match action {
+                Some(CollaboratorsAction::Role { user_id, role, .. }) => {
+                    commands::collaborators::cmd_collaborators_role(
+                        config, output, user_id, role, if_repo,
+                    )
+                    .await?
+                }
+                action => {
+                    commands::collaborators::cmd_collaborators(
+                        config, output, action, if_repo, limit, offset,
+                    )
+                    .await?
+                }
+            }
         }
         Commands::Delete { yes, if_repo } => {
             commands::delete::cmd_delete(config, output, yes, if_repo).await?
@@ -625,6 +687,16 @@ async fn run(
         Commands::Fork { repo, name } => {
             commands::fork::cmd_fork(config, output, repo, name).await?
         }
+        Commands::Forks {
+            limit,
+            offset,
+            scope,
+        } => commands::forks::cmd_forks(config, output, limit, offset, scope).await?,
+        Commands::Users { query, limit } => {
+            commands::users::cmd_users(config, output, query, limit).await?
+        }
+        Commands::User { username } => commands::users::cmd_user(config, output, username).await?,
+        Commands::Links { action } => commands::links::cmd_links(config, output, action).await?,
         Commands::Teams { action } => commands::teams::cmd_teams(config, output, action).await?,
         Commands::Upgrade(args) => commands::upgrade::run(args, output).await?,
         Commands::Login {} => commands::login::cmd_login(config, output).await?,

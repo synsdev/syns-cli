@@ -44,6 +44,54 @@ impl From<CliVisibility> for Visibility {
 pub enum RepoAction {
     /// List the caller's repositories
     List(ReposArgs),
+    /// Create an empty repository under the caller
+    Create {
+        /// The repository's name, unqualified and owned by the caller
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// The repository's description
+        #[arg(long)]
+        description: Option<String>,
+        /// Whether the repository is reachable without a grant
+        #[arg(long)]
+        visibility: Option<CliVisibility>,
+    },
+}
+
+/// Creates an empty repository under the caller (SPEC u272 Behaviour,
+/// `cmd_repo_create`).
+///
+/// No file in the run's directory is written, read or repointed,
+/// whatever the run answers: the name is taken as an unqualified one
+/// owned by the caller, and no identity file follows the creation.
+pub async fn cmd_repo_create(
+    config: &Config,
+    output: &Output,
+    name: String,
+    description: Option<String>,
+    visibility: Option<CliVisibility>,
+) -> Result<(), CliError> {
+    // 1 — require a stored credential, before any request.
+    let token = TokenStore::new(config.credentials_path())
+        .read()?
+        .ok_or(CliError::AuthRequired)?;
+
+    // 2 and 3 — the positional as typed, and the create carrying only
+    //           the fields the caller gave.
+    let visibility: Option<Visibility> = visibility.map(Visibility::from);
+    let client = SynsClient::new(config.server_url())?;
+    let (created, raw) = client
+        .create_repo(&token, &name, description.as_deref(), visibility.as_ref())
+        .await?;
+
+    // 4 — render the repository the answer carried, or write the served
+    //     body. Nothing on disk is touched either way.
+    if output.is_json() {
+        output.json(&raw);
+    } else {
+        display_repo(output, &created);
+    }
+    Ok(())
 }
 
 fn display_repo(output: &Output, response: &RepoResponse) {
@@ -106,8 +154,20 @@ pub async fn cmd_repo(
     if_repo: bool,
     action: Option<RepoAction>,
 ) -> Result<(), CliError> {
-    if let Some(RepoAction::List(repos_args)) = action {
-        return crate::commands::repos::cmd_repos(config, output, &repos_args).await;
+    match action {
+        Some(RepoAction::List(repos_args)) => {
+            return crate::commands::repos::cmd_repos(config, output, &repos_args).await;
+        }
+        // The create returns from the same early branch, so no identity
+        // and no working directory is reached.
+        Some(RepoAction::Create {
+            name,
+            description,
+            visibility,
+        }) => {
+            return cmd_repo_create(config, output, name, description, visibility).await;
+        }
+        None => {}
     }
 
     let is_update =
@@ -309,5 +369,161 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(mock_server.received_requests().await.unwrap().is_empty());
+    }
+
+    // --- `syns repo create NAME` (SPEC u272) ---
+
+    use crate::client::u272_bodies as B;
+
+    // SPEC u272 Behaviour, `cmd_repo_create` 3 and 4: only the fields
+    // the caller gave are sent, and the run's directory holds no file
+    // afterwards.
+    #[tokio::test]
+    #[serial]
+    async fn a_create_sends_only_what_was_given_and_writes_no_file() {
+        use wiremock::matchers::body_json;
+
+        let dir = tempfile::tempdir().unwrap();
+        TokenStore::new(dir.path().join("credentials.json"))
+            .write("u272-token")
+            .unwrap();
+        let work = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(work.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/repos"))
+            .and(body_json(serde_json::json!({"name": "u272-parity-probe"})))
+            .respond_with(ResponseTemplate::new(201).set_body_string(B::CREATED_REPO))
+            .mount(&mock_server)
+            .await;
+
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(true);
+
+        let result = cmd_repo_create(
+            &config,
+            &output,
+            "u272-parity-probe".to_string(),
+            None,
+            None,
+        )
+        .await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        assert!(result.is_ok(), "got {:?}", result.err());
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(
+            std::fs::read_dir(work.path()).unwrap().count(),
+            0,
+            "the run's directory holds no file afterwards"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_create_naming_both_fields_sends_both() {
+        use wiremock::matchers::body_json;
+
+        let dir = tempfile::tempdir().unwrap();
+        TokenStore::new(dir.path().join("credentials.json"))
+            .write("u272-token")
+            .unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/repos"))
+            .and(body_json(serde_json::json!({
+                "name": "notes",
+                "description": "u272 probe",
+                "visibility": "public",
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_string(B::CREATED_REPO))
+            .mount(&mock_server)
+            .await;
+
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(false);
+
+        let result = cmd_repo_create(
+            &config,
+            &output,
+            "notes".to_string(),
+            Some("u272 probe".to_string()),
+            Some(CliVisibility::Public),
+        )
+        .await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        assert!(result.is_ok(), "got {:?}", result.err());
+    }
+
+    // SPEC u272 Behaviour, `cmd_repo_create` 1: no credential refuses
+    // before any request.
+    #[tokio::test]
+    #[serial]
+    async fn a_create_with_no_credential_refuses_before_any_request() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+
+        let mock_server = MockServer::start().await;
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(false);
+
+        let err = cmd_repo_create(&config, &output, "notes".to_string(), None, None)
+            .await
+            .unwrap_err();
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        assert!(matches!(err, CliError::AuthRequired));
+        assert!(mock_server.received_requests().await.unwrap().is_empty());
+    }
+
+    // The create branch returns before any identity is reached, so a
+    // working directory no identity file touches is no obstacle.
+    #[tokio::test]
+    #[serial]
+    async fn the_create_arm_reaches_no_identity_ladder() {
+        let dir = tempfile::tempdir().unwrap();
+        TokenStore::new(dir.path().join("credentials.json"))
+            .write("u272-token")
+            .unwrap();
+        let work = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(work.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/repos"))
+            .respond_with(ResponseTemplate::new(201).set_body_string(B::CREATED_REPO))
+            .mount(&mock_server)
+            .await;
+
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(true);
+
+        let result = cmd_repo(
+            &config,
+            &output,
+            None,
+            None,
+            None,
+            vec![],
+            false,
+            Some(RepoAction::Create {
+                name: "u272-parity-probe".to_string(),
+                description: None,
+                visibility: None,
+            }),
+        )
+        .await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        assert!(result.is_ok(), "got {:?}", result.err());
+        assert_eq!(std::fs::read_dir(work.path()).unwrap().count(), 0);
     }
 }
