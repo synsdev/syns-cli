@@ -59,9 +59,13 @@ pub enum RepoAction {
 }
 
 /// The refusal a run naming one of the noun's update options beside
-/// `create` takes, raised before any request (CR1-2).
-pub const CREATE_TAKES_ITS_OWN_OPTIONS: &str =
-    "--description, --status, --visibility and --tag belong after create";
+/// `create` takes, raised before any request (CR1-2). Only two of the
+/// four have a position after `create` — `RepoAction::Create` declares
+/// `--description` and `--visibility` and no more — so the refusal
+/// names the move for those and states that the other two reach the
+/// creation nowhere, rather than directing every caller to a position
+/// the argument tree rejects at exit `2` (CR2-1).
+pub const CREATE_TAKES_ITS_OWN_OPTIONS: &str = "--description and --visibility belong after create; --status and --tag change a standing repository and reach the create nowhere";
 
 /// Creates an empty repository under the caller (SPEC u272 Behaviour,
 /// `cmd_repo_create`).
@@ -159,6 +163,13 @@ pub async fn cmd_repo(
     if_repo: bool,
     action: Option<RepoAction>,
 ) -> Result<(), CliError> {
+    // The noun's four update options, tested once: the create's
+    // refusal below and the update branch further down read the same
+    // binding, so a fifth option added to the noun reaches both or
+    // neither rather than leaving the refusal blind to it (CR2-2).
+    let names_update_options =
+        description.is_some() || status.is_some() || visibility.is_some() || !tags.is_empty();
+
     match action {
         Some(RepoAction::List(repos_args)) => {
             return crate::commands::repos::cmd_repos(config, output, &repos_args).await;
@@ -175,8 +186,7 @@ pub async fn cmd_repo(
             // `create` is refused before any request rather than
             // dropped (CR1-2) — a creation at the entry's own defaults
             // is what `INV-12` then answers `CONFLICT` on the repeat.
-            if description.is_some() || status.is_some() || visibility.is_some() || !tags.is_empty()
-            {
+            if names_update_options {
                 return Err(CliError::Config {
                     message: CREATE_TAKES_ITS_OWN_OPTIONS.to_string(),
                 });
@@ -186,9 +196,6 @@ pub async fn cmd_repo(
         }
         None => {}
     }
-
-    let is_update =
-        description.is_some() || status.is_some() || visibility.is_some() || !tags.is_empty();
 
     let current_dir = std::env::current_dir().map_err(|e| CliError::Io {
         message: format!("could not determine current directory: {e}"),
@@ -200,7 +207,7 @@ pub async fn cmd_repo(
     let repo_id = format!("{owner}/{name}");
     let client = SynsClient::new(config.server_url())?;
 
-    if is_update {
+    if names_update_options {
         let token = TokenStore::new(config.credentials_path())
             .read()?
             .ok_or(CliError::AuthRequired)?;

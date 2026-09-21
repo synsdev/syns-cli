@@ -679,9 +679,22 @@ fn repo_create_refuses_the_nouns_update_options() {
         assert_eq!(
             document(&output)["error"],
             json!(
-                "configuration error: --description, --status, --visibility and --tag belong after create"
+                "configuration error: --description and --visibility belong after create; --status and --tag change a standing repository and reach the create nowhere"
             )
         );
+    }
+
+    // CR2-1: the move that refusal names exists for two of the four.
+    // `RepoAction::Create` declares `--description` and `--visibility`
+    // alone, so a caller who moved `--status` or `--tag` after the
+    // subcommand word would meet the argument parser at exit `2`, which
+    // is why the refusal tells those two they reach the create nowhere.
+    for option in [vec!["--status", "active"], vec!["--tag", "t"]] {
+        let mut args = vec!["repo", "create", "notes"];
+        args.extend(option.iter());
+        let output = deployment.run(&args);
+
+        assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
     }
     assert!(deployment.paths().is_empty(), "no request was made");
 }
