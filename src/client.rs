@@ -607,15 +607,28 @@ async fn check_response(response: reqwest::Response) -> Result<reqwest::Response
     }
     if status.is_client_error() || status.is_server_error() {
         let code = status.as_u16();
-        let (error, head_moved) = match response.json::<serde_json::Value>().await {
+        // SPEC u271: the moved head's hash is carried out of the answer
+        // rather than reduced to its presence — the conflict refusal
+        // renders it and its document carries it, and nothing downstream
+        // can read the body again once this fold has consumed it.
+        let (error, current_sha) = match response.json::<serde_json::Value>().await {
             Ok(body) => match serde_json::from_value::<ApiErrorBody>(body.clone()) {
-                Ok(parsed) => (parsed.error, body.get("currentSha").is_some()),
-                Err(_) => ("unknown error".to_string(), false),
+                Ok(parsed) => (
+                    parsed.error,
+                    body.get("currentSha")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                ),
+                Err(_) => ("unknown error".to_string(), None),
             },
-            Err(_) => ("unknown error".to_string(), false),
+            Err(_) => ("unknown error".to_string(), None),
         };
-        let context = (code == 409 && error == "conflict" && head_moved)
-            .then_some(ApiErrorContext::HeadMoved);
+        let context = match current_sha {
+            Some(current_sha) if code == 409 && error == "conflict" => {
+                Some(ApiErrorContext::HeadMoved { current_sha })
+            }
+            _ => None,
+        };
         return Err(CliError::Api {
             status: Some(code),
             error,
@@ -2168,5 +2181,90 @@ mod provenance_tests {
         assert_eq!(p.publisher, "bo");
         assert_eq!(p.integration.as_deref(), Some("codex"));
         assert!(p.trigger.is_none() && p.task_ref.is_none());
+    }
+}
+
+#[cfg(test)]
+mod head_moved_tests {
+    use super::*;
+    use crate::errors::ApiErrorContext;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn push_request() -> PushRequest {
+        PushRequest {
+            files: vec![PushFileEntry {
+                path: "a.md".into(),
+                sha: "0".repeat(40),
+                content: Some("keep two".into()),
+            }],
+            deletions: None,
+            message: Some("edit a.md".into()),
+            author: None,
+            parent_sha: Some("a".repeat(40)),
+            description: None,
+            tags: None,
+            status: None,
+            visibility: None,
+            provenance: None,
+        }
+    }
+
+    /// SPEC u271, `src/client.rs`: the `409` fold carries the refused
+    /// answer's `currentSha` out rather than reducing it to a presence
+    /// test — nothing downstream can read the body a second time.
+    #[tokio::test]
+    async fn a_conflict_bodys_current_sha_survives_the_client_error_fold() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/repos/alice/notes/push"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "error": "conflict",
+                "message": "Head mismatch",
+                "currentSha": "c".repeat(40),
+            })))
+            .mount(&server)
+            .await;
+
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let err = client
+            .push("alice/notes", "t", &push_request())
+            .await
+            .unwrap_err();
+
+        match err {
+            CliError::Api {
+                status: Some(409),
+                error,
+                context: Some(ApiErrorContext::HeadMoved { current_sha }),
+            } => {
+                assert_eq!(error, "conflict");
+                assert_eq!(current_sha, "c".repeat(40));
+            }
+            other => panic!("expected a moved head, got {other:?}"),
+        }
+    }
+
+    /// A `conflict` naming no head — an identity already taken — carries
+    /// no such context, so the run keeps exit `1`.
+    #[tokio::test]
+    async fn a_conflict_naming_no_head_carries_no_context() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/repos/alice/notes/push"))
+            .respond_with(
+                ResponseTemplate::new(409).set_body_json(serde_json::json!({"error": "conflict"})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let err = client
+            .push("alice/notes", "t", &push_request())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, CliError::Api { context: None, .. }));
+        assert_eq!(err.exit_code(), 1);
     }
 }

@@ -88,6 +88,13 @@ pub struct PushPipelineMeta {
     pub no_default_excludes: bool,
     /// The parent the run's first request carried.
     pub sent_parent: Option<String>,
+    /// SPEC u271: the parent the run held and the body it sent claimed
+    /// none of — `--force` drops the record's own parent so the head
+    /// check does not run, and `issues/118` is closed by saying so
+    /// rather than by changing what the flag sends. `None` on every
+    /// unforced run, and on a forced one into an identity holding no
+    /// commit.
+    pub unclaimed_parent: Option<String>,
     /// The file hashes the run collected.
     pub collected: HashMap<String, String>,
     /// The paths the run named as deletions.
@@ -660,10 +667,13 @@ pub async fn smart_push(
     // Phase 3d — Build reference state: the diff base the wire payload
     // is computed against. `--force` empties it so every collected
     // file rides with content and nothing is named as a deletion.
-    let (reference_shas, base_parent_sha) = if opts.force {
-        (HashMap::new(), None)
+    let (reference_shas, base_parent_sha, unclaimed_parent) = if opts.force {
+        // SPEC u271: the parent `--force` drops rides out on the meta so
+        // the command layer can name it — the flag keeps all three of
+        // its shipped effects and the run says so (`D-007`).
+        (HashMap::new(), None, remote_parent_sha)
     } else {
-        (record_base.clone(), remote_parent_sha)
+        (record_base.clone(), remote_parent_sha, None)
     };
 
     let parent_sha = if opts.parent_sha.is_some() {
@@ -856,6 +866,7 @@ pub async fn smart_push(
             strict: opts.strict,
             no_default_excludes: opts.no_default_excludes,
             sent_parent,
+            unclaimed_parent,
             collected: local_shas,
             deleted: deleted_paths,
         },
@@ -2421,5 +2432,166 @@ mod tests {
         let mut paths: Vec<&str> = merged.keys().map(String::as_str).collect();
         paths.sort_unstable();
         assert_eq!(paths, vec!["root-a.md", "root-b.md", "sub/added.md"]);
+    }
+}
+
+#[cfg(test)]
+mod unclaimed_parent_tests {
+    use super::*;
+    use crate::push::hash::blob_sha1;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const RECORDED: &str = "aa11bb22cc33dd44ee55ff6600778899001122bb";
+
+    fn opts(cache_dir: &std::path::Path, force: bool) -> SmartPushOptions {
+        SmartPushOptions {
+            force,
+            message: "push".to_string(),
+            author: None,
+            parent_sha: None,
+            excludes: vec![],
+            cache_dir: cache_dir.to_path_buf(),
+            description: None,
+            tags: None,
+            status: None,
+            visibility: None,
+            strict: false,
+            allow_empty: false,
+            debug: false,
+            no_default_excludes: false,
+            prefix: None,
+            reference: None,
+            expected: None,
+            provenance: None,
+        }
+    }
+
+    async fn mount_push(server: &MockServer) {
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/repos/alice/notes/push"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "commitSha": "b".repeat(40), "version": 2,
+                "filesChanged": 1, "created": false,
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// SPEC u271, `src/push/smart.rs`: the parent the forced branch
+    /// dropped rides out on the meta beside the parent it sent, which
+    /// reads none on every forced run.
+    #[tokio::test]
+    async fn a_forced_run_names_the_parent_its_body_did_not_claim() {
+        let server = MockServer::start().await;
+        mount_push(&server).await;
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(folder.path().join("a.md"), "keep one").unwrap();
+        let cache = tempfile::tempdir().unwrap();
+
+        let mut manifest = Manifest::default();
+        manifest.update(
+            RECORDED.to_string(),
+            HashMap::from([("a.md".to_string(), blob_sha1(b"was one"))]),
+        );
+        manifest.save(cache.path(), "alice", "notes").unwrap();
+
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let (_response, _raw, meta) = smart_push(
+            &client,
+            "t",
+            "alice/notes",
+            folder.path(),
+            opts(cache.path(), true),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.sent_parent, None, "a forced body claims no parent");
+        assert_eq!(meta.unclaimed_parent.as_deref(), Some(RECORDED));
+
+        let body: serde_json::Value = server.received_requests().await.unwrap()[0]
+            .body_json()
+            .unwrap();
+        assert!(
+            body.get("parentSha").is_none(),
+            "the flag ships unchanged: it claims no parent"
+        );
+        let files = body["files"].as_array().unwrap();
+        let sent: Vec<&str> = files.iter().map(|f| f["path"].as_str().unwrap()).collect();
+        assert!(
+            sent.contains(&"a.md"),
+            "every collected file rides: {sent:?}"
+        );
+        let a = files.iter().find(|f| f["path"] == "a.md").unwrap();
+        assert_eq!(a["content"], serde_json::json!("keep one"));
+        assert!(
+            body.get("deletions").is_none(),
+            "the flag names no deletion"
+        );
+    }
+
+    /// An unforced run claims the record's parent, so there is nothing
+    /// unclaimed to name.
+    #[tokio::test]
+    async fn an_unforced_run_claims_its_parent_and_names_none_unclaimed() {
+        let server = MockServer::start().await;
+        mount_push(&server).await;
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(folder.path().join("a.md"), "keep one").unwrap();
+        let cache = tempfile::tempdir().unwrap();
+
+        let mut manifest = Manifest::default();
+        manifest.update(
+            RECORDED.to_string(),
+            HashMap::from([("a.md".to_string(), blob_sha1(b"was one"))]),
+        );
+        manifest.save(cache.path(), "alice", "notes").unwrap();
+
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let (_response, _raw, meta) = smart_push(
+            &client,
+            "t",
+            "alice/notes",
+            folder.path(),
+            opts(cache.path(), false),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.sent_parent.as_deref(), Some(RECORDED));
+        assert_eq!(meta.unclaimed_parent, None);
+    }
+
+    /// A forced publication into an identity holding no commit held no
+    /// parent either, so it names none.
+    #[tokio::test]
+    async fn a_forced_run_into_an_identity_holding_no_commit_names_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/notes/tree"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(serde_json::json!({"error":"not_found"})),
+            )
+            .mount(&server)
+            .await;
+        mount_push(&server).await;
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(folder.path().join("a.md"), "keep one").unwrap();
+        let cache = tempfile::tempdir().unwrap();
+
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let (_response, _raw, meta) = smart_push(
+            &client,
+            "t",
+            "alice/notes",
+            folder.path(),
+            opts(cache.path(), true),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.sent_parent, None);
+        assert_eq!(meta.unclaimed_parent, None);
     }
 }

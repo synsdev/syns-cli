@@ -76,12 +76,38 @@ pub enum CliError {
         document: serde_json::Value,
         line: String,
     },
-    /// SPEC u270: `syns read PATH` over a content that is not text.
-    /// Raised on the numbered read alone — `syns cat PATH` keeps passing
-    /// those bytes through (`D-080`).
+    /// SPEC u270: `syns read PATH` over a content that is not text, and
+    /// SPEC u271: a write verb handed one. `surface` picks the wording —
+    /// `syns cat PATH` keeps passing those bytes through (`D-080`), and a
+    /// write is refused because the repository holds UTF-8 text alone.
     NotText {
         path: String,
+        surface: NotTextSurface,
     },
+    /// SPEC u271: a write refused because the repository moved past the
+    /// parent it claimed, the refused answer naming `currentSha`. It
+    /// stands at exit `7`, an exit no other outcome of the binary takes,
+    /// and its document carries the hash beside `error`.
+    WriteConflict {
+        parent: String,
+        current_sha: String,
+    },
+    /// SPEC u271: `syns commit` over a changeset naming neither a file
+    /// nor a deletion, at exit `6` before any request. Its document is
+    /// `error` alone — none of the three keys a collected publication's
+    /// own emptiness document carries.
+    ChangesetEmpty,
+}
+
+/// Which of the two not-text wordings a refused content takes (SPEC
+/// u271 Contract Surface, the not-text refusal): the wire form is the
+/// same code the numbered read already raises, and only the line differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotTextSurface {
+    /// `syns read PATH` (SPEC u270).
+    NumberedRead,
+    /// `syns edit`, `syns write` and `syns commit` (SPEC u271).
+    Write,
 }
 
 /// The partial-answer refusal's truncated-tree arm (SPEC u270 Contract
@@ -127,9 +153,12 @@ pub enum ApiErrorContext {
         line: String,
     },
     /// A `409` `conflict` whose body names `currentSha`: the head moved
-    /// past the parent the publication claimed. A `conflict` naming no
-    /// head — an identity already taken — carries no such context.
-    HeadMoved,
+    /// past the parent the publication claimed, and `current_sha` is the
+    /// hash that answer named. A `conflict` naming no head — an identity
+    /// already taken — carries no such context.
+    HeadMoved {
+        current_sha: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +176,14 @@ impl CliError {
             CliError::ServerUnreachable { .. } => 3,
             CliError::PushPartial { .. } => 3,
             CliError::PushEmpty { .. } => 6,
+            // SPEC u271: the empty-changeset refusal reads to a caller as
+            // "nothing left this machine" exactly as a folder
+            // publication's own emptiness does.
+            CliError::ChangesetEmpty => 6,
+            // SPEC u271: the one exit no other outcome of the binary
+            // takes, reached only by a write whose answer named
+            // `currentSha`.
+            CliError::WriteConflict { .. } => 7,
             CliError::SyncRefusal { exit, .. } => *exit,
             CliError::Upgrade(e) => e.exit_code(),
             _ => 1,
@@ -197,6 +234,13 @@ impl CliError {
             }
             CliError::SyncRefusal { document, .. } => Some(document.clone()),
             CliError::PartialAnswer { document, .. } => Some(document.clone()),
+            // SPEC u271, the conflict refusal: the moved head stands
+            // beside `error` rather than inside its one string alone, so
+            // a caller reading the document never parses the line.
+            CliError::WriteConflict { current_sha, .. } => Some(serde_json::json!({
+                "error": self.to_string(),
+                "currentSha": current_sha,
+            })),
             _ => None,
         }
     }
@@ -364,9 +408,30 @@ impl std::fmt::Display for CliError {
             ),
             CliError::SyncRefusal { line, .. } => write!(f, "{line}"),
             CliError::PartialAnswer { line, .. } => write!(f, "{line}"),
-            CliError::NotText { path } => write!(
+            CliError::NotText {
+                path,
+                surface: NotTextSurface::NumberedRead,
+            } => write!(
                 f,
                 "cannot number content that is not text: {path} \u{2014} read it with syns cat {path}"
+            ),
+            CliError::NotText {
+                path,
+                surface: NotTextSurface::Write,
+            } => write!(
+                f,
+                "cannot write content that is not text: {path} \u{2014} this repository holds UTF-8 text alone"
+            ),
+            CliError::WriteConflict {
+                parent,
+                current_sha,
+            } => write!(
+                f,
+                "conflict: the repository moved past {parent}; its head is now {current_sha}"
+            ),
+            CliError::ChangesetEmpty => write!(
+                f,
+                "push_empty: the changeset names neither a file nor a deletion"
             ),
         }
     }
@@ -450,6 +515,7 @@ mod tests {
     fn not_text_refusal_names_the_path_and_cat_at_exit_one() {
         let err = CliError::NotText {
             path: "assets/logo.png".to_string(),
+            surface: NotTextSurface::NumberedRead,
         };
         assert_eq!(
             err.to_string(),
@@ -483,6 +549,82 @@ mod tests {
         }
         .with_versioned_read_context("path not found at version 58: a.md".to_string());
         assert_eq!(other.to_string(), "server error (500): internal_error");
+    }
+
+    // SPEC u271 Contract Surface, the conflict refusal: its line names
+    // the parent and the moved head, its document carries the hash
+    // beside `error`, and it stands at exit `7`.
+    #[test]
+    fn the_conflict_refusal_carries_its_line_its_document_and_exit_seven() {
+        let err = CliError::WriteConflict {
+            parent: "a".repeat(40),
+            current_sha: "c".repeat(40),
+        };
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "conflict: the repository moved past {}; its head is now {}",
+                "a".repeat(40),
+                "c".repeat(40)
+            )
+        );
+        assert_eq!(err.exit_code(), 7);
+        let doc = err.json_value().expect("the refusal carries a document");
+        assert_eq!(doc["currentSha"], serde_json::json!("c".repeat(40)));
+        assert_eq!(doc["error"], serde_json::json!(err.to_string()));
+        assert_eq!(
+            doc.as_object().map(|m| m.len()),
+            Some(2),
+            "the document carries `error` and `currentSha` and nothing else"
+        );
+    }
+
+    // SPEC u271 Contract Surface, the empty-changeset refusal: exit `6`
+    // and a document of `error` alone, carrying none of the three keys a
+    // collected publication's own emptiness document carries.
+    #[test]
+    fn the_empty_changeset_refusal_is_exit_six_and_error_alone() {
+        let err = CliError::ChangesetEmpty;
+        assert_eq!(
+            err.to_string(),
+            "push_empty: the changeset names neither a file nor a deletion"
+        );
+        assert_eq!(err.exit_code(), 6);
+        assert!(
+            err.json_value().is_none(),
+            "the refusal takes the generic `error`-alone envelope"
+        );
+        let rendered = crate::output::Output::new(true).format_error(&err);
+        let doc: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(doc.as_object().map(|m| m.len()), Some(1));
+        assert!(doc.get("path").is_none());
+        assert!(doc.get("cause").is_none());
+        assert!(doc.get("totalWalked").is_none());
+    }
+
+    // SPEC u271 Contract Surface, the not-text refusal: a second arm of
+    // the code the numbered read already raises, at exit `1`, naming the
+    // path it was raised on.
+    #[test]
+    fn the_write_not_text_refusal_is_a_second_arm_of_the_same_code() {
+        let err = CliError::NotText {
+            path: "b.bin".to_string(),
+            surface: NotTextSurface::Write,
+        };
+        assert_eq!(
+            err.to_string(),
+            "cannot write content that is not text: b.bin \u{2014} this repository holds UTF-8 text alone"
+        );
+        assert_eq!(err.exit_code(), 1);
+        assert!(err.json_value().is_none());
+        assert_ne!(
+            err.to_string(),
+            CliError::NotText {
+                path: "b.bin".to_string(),
+                surface: NotTextSurface::NumberedRead,
+            }
+            .to_string()
+        );
     }
 
     #[test]

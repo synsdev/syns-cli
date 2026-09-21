@@ -1494,7 +1494,7 @@ async fn publish_reviewed(
             Err(CliError::Api {
                 status: Some(409),
                 ref error,
-                context: Some(ApiErrorContext::HeadMoved),
+                context: Some(ApiErrorContext::HeadMoved { .. }),
             }) if error == "conflict" => {
                 // 7
                 copy.remove_outbox()?;

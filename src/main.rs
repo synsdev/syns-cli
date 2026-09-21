@@ -1,4 +1,4 @@
-use syns_cli::{commands, config, errors, output, read};
+use syns_cli::{commands, config, errors, output, read, write};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use syns_cli::commands::collaborators::CollaboratorsAction;
@@ -50,6 +50,51 @@ impl From<ReadOpts> for read::ReadOptions {
             repo: opts.repo,
             version: opts.version,
             if_repo: opts.if_repo,
+        }
+    }
+}
+
+/// The options every write verb carries, spelt and bound identically on
+/// each (SPEC u271 Contract Surface, `WriteOptions`). `--parent` is
+/// required by the parser on all four and carries no single-letter
+/// alias.
+#[derive(clap::Args, Clone)]
+struct WriteOpts {
+    /// Write to another repository, as OWNER/NAME
+    #[arg(long, value_name = "OWNER/NAME", value_parser = read::parse_repo_id)]
+    repo: Option<String>,
+    /// The commit this write is made against (number or SHA)
+    #[arg(long, value_name = "REF")]
+    parent: String,
+    /// Commit message
+    #[arg(long, short = 'm')]
+    message: Option<String>,
+    /// What integration is publishing this commit
+    #[arg(long)]
+    integration: Option<String>,
+    /// The run publishing this commit
+    #[arg(long)]
+    run: Option<String>,
+    /// What triggered this commit
+    #[arg(long)]
+    trigger: Option<String>,
+    /// The task this commit belongs to
+    #[arg(long)]
+    task_ref: Option<String>,
+}
+
+impl From<WriteOpts> for write::WriteOptions {
+    fn from(opts: WriteOpts) -> write::WriteOptions {
+        write::WriteOptions {
+            repo: opts.repo,
+            parent: opts.parent,
+            message: opts.message,
+            provenance: write::ProvenanceOptions {
+                integration: opts.integration,
+                run: opts.run,
+                trigger: opts.trigger,
+                task_ref: opts.task_ref,
+            },
         }
     }
 }
@@ -165,6 +210,44 @@ enum Commands {
         head_limit: Option<u32>,
         #[command(flatten)]
         read: ReadOpts,
+    },
+    /// Replace text in one file and publish the result as one commit
+    Edit {
+        /// File path to edit
+        #[arg()]
+        path: String,
+        /// The exact text to replace
+        #[arg(long)]
+        old: String,
+        /// The text to put in its place
+        #[arg(long)]
+        new: String,
+        /// Replace every occurrence rather than refusing more than one
+        #[arg(long)]
+        replace_all: bool,
+        #[command(flatten)]
+        write: WriteOpts,
+    },
+    /// Write one file's whole content, read from standard input
+    Write {
+        /// File path to write
+        #[arg()]
+        path: String,
+        #[command(flatten)]
+        write: WriteOpts,
+    },
+    /// Remove one path from a repository
+    Rm {
+        /// File or directory path to remove
+        #[arg()]
+        path: String,
+        #[command(flatten)]
+        write: WriteOpts,
+    },
+    /// Publish a changeset read from standard input as one commit
+    Commit {
+        #[command(flatten)]
+        write: WriteOpts,
     },
     /// Show repository status
     Status {
@@ -420,6 +503,25 @@ async fn run(
                 head_limit,
             };
             commands::grep::cmd_grep(config, output, pattern, args, read.into()).await?
+        }
+        Commands::Edit {
+            path,
+            old,
+            new,
+            replace_all,
+            write,
+        } => {
+            commands::edit::cmd_edit(config, output, path, old, new, replace_all, write.into())
+                .await?
+        }
+        Commands::Write { path, write } => {
+            commands::write::cmd_write(config, output, path, write.into()).await?
+        }
+        Commands::Rm { path, write } => {
+            commands::rm::cmd_rm(config, output, path, write.into()).await?
+        }
+        Commands::Commit { write } => {
+            commands::commit::cmd_commit(config, output, write.into()).await?
         }
         Commands::Status { if_repo } => {
             commands::status::cmd_status(config, output, if_repo).await?

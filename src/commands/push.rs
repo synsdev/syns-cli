@@ -32,7 +32,7 @@ pub struct PushArgs {
     #[arg(long, short = 'm')]
     pub message: Option<String>,
 
-    /// Send all files, bypassing manifest diffing
+    /// Send all files, bypassing manifest diffing; also claims no parent, so a publication that landed since this folder last published is overwritten
     #[arg(long, short = 'f')]
     pub force: bool,
 
@@ -275,6 +275,48 @@ fn lay_publication_over_base(copy: &WorkingCopy, response: &PushResponse, meta: 
     }
 }
 
+/// The parent a publication held and did not claim (SPEC u271, the
+/// force warning): `Some` only where the run held such a parent and the
+/// body it sent claimed none. A publication into an identity holding no
+/// commit held none, so it writes neither the line nor the key.
+fn unclaimed_parent(meta: &PushPipelineMeta) -> Option<&str> {
+    match meta.sent_parent {
+        Some(_) => None,
+        None => meta.unclaimed_parent.as_deref(),
+    }
+}
+
+/// The diagnostic line a forced publication that claimed no parent
+/// writes, outside machine-readable mode (SPEC u271, the force warning;
+/// `issues/118-push-force-silently-disables-overwrite-protection`,
+/// `D-007`).
+pub(crate) fn force_warning_line(repo_id: &str, parent: &str) -> String {
+    format!(
+        "warning: --force claimed no parent, so the head check did not run; whatever {repo_id} gained since {parent} is overwritten at every path this publication carried"
+    )
+}
+
+/// The served body with `unclaimedParent` added where the publication
+/// held a parent and claimed none.
+///
+/// The key is placed OUTSIDE `build_json_envelope`: that function's
+/// early return hands back the served body unchanged wherever no file
+/// was dropped, so a key placed inside would never reach the document a
+/// publication dropping nothing writes (`SPEC_REVIEW_R2.md` CF-01).
+pub(crate) fn with_unclaimed_parent(
+    body: serde_json::Value,
+    meta: &PushPipelineMeta,
+) -> serde_json::Value {
+    let mut body = body;
+    if let (Some(parent), Some(map)) = (unclaimed_parent(meta), body.as_object_mut()) {
+        map.insert(
+            "unclaimedParent".to_string(),
+            serde_json::Value::from(parent),
+        );
+    }
+    body
+}
+
 /// Build the JSON envelope for `--json` mode: the verbatim server
 /// response, augmented with `skipped: [...]` iff non-empty.
 fn build_json_envelope(raw: &serde_json::Value, skipped: &[SkippedFile]) -> serde_json::Value {
@@ -321,10 +363,19 @@ fn format_response(
 ) {
     if output.is_json() {
         // SPEC § 3.5: augment the verbatim server response with the
-        // additive `skipped` field when meta.skipped is non-empty.
-        let envelope = build_json_envelope(raw, &meta.skipped);
+        // additive `skipped` field when meta.skipped is non-empty, and
+        // SPEC u271: the unclaimed parent beside it, whether or not the
+        // collector dropped a file.
+        let envelope = with_unclaimed_parent(build_json_envelope(raw, &meta.skipped), meta);
         output.json(&envelope);
         return;
+    }
+
+    // SPEC u271: outside machine-readable mode the same fact stands on
+    // the diagnostic stream, so a caller of either mode learns the guard
+    // did not run.
+    if let Some(parent) = unclaimed_parent(meta) {
+        eprintln!("{}", force_warning_line(repo_id, parent));
     }
 
     let changed = response.files_changed > 0 || response.created;
@@ -1050,5 +1101,114 @@ mod tests {
         for body in &bodies {
             assert!(body.get("author").is_none(), "{body}");
         }
+    }
+}
+
+#[cfg(test)]
+mod force_warning_tests {
+    use super::*;
+    use crate::push::collector::SkipReason;
+
+    const RECORDED: &str = "aa11bb22cc33dd44ee55ff6600778899001122bb";
+
+    fn meta(
+        sent: Option<&str>,
+        unclaimed: Option<&str>,
+        skipped: Vec<SkippedFile>,
+    ) -> PushPipelineMeta {
+        PushPipelineMeta {
+            skipped,
+            manifest_existed: true,
+            strict: false,
+            no_default_excludes: false,
+            sent_parent: sent.map(str::to_string),
+            unclaimed_parent: unclaimed.map(str::to_string),
+            collected: Default::default(),
+            deleted: vec![],
+        }
+    }
+
+    fn served() -> serde_json::Value {
+        serde_json::json!({
+            "commitSha": "b".repeat(40), "version": 2,
+            "filesChanged": 1, "created": false,
+        })
+    }
+
+    // SPEC u271, the force warning: the key stands where the collector
+    // dropped no file — `build_json_envelope`'s early return hands back
+    // the served body unchanged there, so a key placed inside it would
+    // never reach this document (`SPEC_REVIEW_R2.md` CF-01).
+    #[test]
+    fn the_key_stands_where_no_file_was_dropped() {
+        let meta = meta(None, Some(RECORDED), vec![]);
+        let body = with_unclaimed_parent(build_json_envelope(&served(), &meta.skipped), &meta);
+        assert_eq!(body["unclaimedParent"], serde_json::json!(RECORDED));
+        assert_eq!(body["version"], serde_json::json!(2));
+        assert!(body.get("skipped").is_none());
+    }
+
+    // And beside the collector's dropped files where it dropped some.
+    #[test]
+    fn the_key_stands_beside_the_dropped_files_too() {
+        let meta = meta(
+            None,
+            Some(RECORDED),
+            vec![SkippedFile {
+                path: "a/b.png".into(),
+                reason: SkipReason::Binary,
+            }],
+        );
+        let body = with_unclaimed_parent(build_json_envelope(&served(), &meta.skipped), &meta);
+        assert_eq!(body["unclaimedParent"], serde_json::json!(RECORDED));
+        assert_eq!(body["skipped"].as_array().unwrap().len(), 1);
+    }
+
+    // Neither line nor key where the publication held no parent, or
+    // where the body it sent claimed one.
+    #[test]
+    fn neither_line_nor_key_where_the_publication_held_no_parent() {
+        let held_none = meta(None, None, vec![]);
+        assert_eq!(unclaimed_parent(&held_none), None);
+        assert!(
+            with_unclaimed_parent(served(), &held_none)
+                .get("unclaimedParent")
+                .is_none()
+        );
+
+        let claimed = meta(Some(RECORDED), Some(RECORDED), vec![]);
+        assert_eq!(unclaimed_parent(&claimed), None);
+        assert!(
+            with_unclaimed_parent(served(), &claimed)
+                .get("unclaimedParent")
+                .is_none()
+        );
+    }
+
+    // The line names the repository and the parent, and says what the
+    // dropped parent does to a concurrent publication.
+    #[test]
+    fn the_line_names_the_repository_and_the_parent_it_did_not_claim() {
+        assert_eq!(
+            force_warning_line("alice/notes", RECORDED),
+            format!(
+                "warning: --force claimed no parent, so the head check did not run; whatever alice/notes gained since {RECORDED} is overwritten at every path this publication carried"
+            )
+        );
+    }
+
+    // The help text a caller reads names what the flag does to a
+    // concurrent publication (`issues/118`, `D-007`).
+    #[test]
+    fn the_force_help_text_names_the_concurrency_effect() {
+        let command = <PushArgs as clap::Args>::augment_args(clap::Command::new("push"));
+        let force = command
+            .get_arguments()
+            .find(|a| a.get_id() == "force")
+            .expect("--force is registered");
+        assert_eq!(
+            force.get_help().map(|h| h.to_string()).unwrap_or_default(),
+            "Send all files, bypassing manifest diffing; also claims no parent, so a publication that landed since this folder last published is overwritten"
+        );
     }
 }

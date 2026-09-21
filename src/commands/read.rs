@@ -7,7 +7,7 @@
 
 use crate::client::SynsClient;
 use crate::config::Config;
-use crate::errors::CliError;
+use crate::errors::{CliError, NotTextSurface};
 use crate::output::Output;
 use crate::read::{ReadOptions, read_not_found, report_reference, resolve_read_target};
 
@@ -77,7 +77,10 @@ pub async fn cmd_read(
     // 3 — classify the decoded content, then split a text one on
     // newlines and take the window the two options name.
     if response.content.contains('\0') {
-        return Err(CliError::NotText { path });
+        return Err(CliError::NotText {
+            path,
+            surface: NotTextSurface::NumberedRead,
+        });
     }
     let lines: Vec<&str> = response.content.lines().collect();
     let total_lines = lines.len();

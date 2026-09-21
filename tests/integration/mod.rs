@@ -17,3 +17,4 @@ mod repo_root_test;
 mod teams_remove_json_test;
 mod upgrade_test;
 mod version_test;
+mod writes_test;
