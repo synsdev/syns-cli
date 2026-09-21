@@ -235,6 +235,27 @@ fn seed_checkout(d: &Deployment, root: &Path, repo: &str, record: bool) {
         .expect("recorded base");
 }
 
+/// Every path standing under this repository's working-copy state.
+fn state_entries(d: &Deployment, repo: &str) -> Vec<String> {
+    let (owner, name) = repo.split_once('/').expect("owner/name");
+    let mut out = Vec::new();
+    fn walk(dir: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            out.push(entry.path().display().to_string());
+            walk(&entry.path(), out);
+        }
+    }
+    walk(
+        &d.cache.path().join("working-copies").join(owner).join(name),
+        &mut out,
+    );
+    out.sort();
+    out
+}
+
 fn folder_hashes(root: &Path) -> std::collections::HashMap<String, String> {
     collect_files(root, &[], CollectOptions::default())
         .expect("collected")
@@ -709,6 +730,7 @@ fn a_dirty_checkout_refuses_its_own_repository_and_admits_another() {
     let d = Deployment::new();
     seed_checkout(&d, d.work.path(), REPO, true);
     std::fs::write(d.work.path().join("a.md"), "edited since").expect("an edit");
+    let before_state = state_entries(&d, REPO);
     mount_repo(&d, REPO, HEAD_SHA);
     mount_repo(&d, "bob/other", HEAD_SHA);
     mount_push(&d, "bob/other", push_body(NEXT_SHA, 8, 1));
@@ -728,9 +750,9 @@ fn a_dirty_checkout_refuses_its_own_repository_and_admits_another() {
     );
     assert!(d.requests().is_empty(), "{:?}", d.paths());
     assert_eq!(
-        std::fs::read_to_string(d.work.path().join("a.md")).unwrap(),
-        "edited since",
-        "the working copy is left untouched"
+        state_entries(&d, REPO),
+        before_state,
+        "the working copy's state is left untouched (CR1-2)"
     );
 
     let other = d.run_with_stdin(
@@ -755,6 +777,7 @@ fn a_checkout_recording_no_base_refuses_a_write_to_its_own_repository() {
     mount_repo(&d, REPO, HEAD_SHA);
     mount_push(&d, REPO, push_body(NEXT_SHA, 8, 1));
 
+    let before_state = state_entries(&d, REPO);
     let out = d.run_with_stdin(b"hi", &["write", "c.md", "--parent", HEAD_SHA]);
 
     assert_eq!(exit_of(&out), 1);
@@ -769,6 +792,11 @@ fn a_checkout_recording_no_base_refuses_a_write_to_its_own_repository() {
         stderr_of(&out)
     );
     assert!(d.requests().is_empty(), "{:?}", d.paths());
+    assert_eq!(
+        state_entries(&d, REPO),
+        before_state,
+        "the guard writes no state to refuse (CR1-2)"
+    );
 }
 
 #[test]

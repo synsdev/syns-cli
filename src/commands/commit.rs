@@ -46,6 +46,13 @@ pub fn path_in_both_members(path: &str) -> String {
     format!("{path} stands as a file and as a deletion in one changeset")
 }
 
+/// The refusal a path named twice under `files` takes: two entries at
+/// one path would ride in one body at two hashes, leaving which content
+/// the commit holds to the receiving side (CR1-3).
+pub fn path_named_twice(path: &str) -> String {
+    format!("{path} is named twice under files in one changeset")
+}
+
 /// Parses the document, refusing every shape the four keys do not admit.
 pub fn parse_changeset_document(bytes: &[u8]) -> Result<ChangesetDocument, CliError> {
     serde_json::from_slice(bytes).map_err(|e| CliError::Config {
@@ -60,11 +67,21 @@ pub fn classify_changeset(document: ChangesetDocument) -> Result<Changeset, CliE
     files.sort_by(|a, b| a.path.cmp(&b.path));
     let deletions: Vec<String> = document.deletions.into_iter().map(|d| d.path).collect();
 
-    let mut classified = Vec::with_capacity(files.len());
+    let mut classified: Vec<(String, String)> = Vec::with_capacity(files.len());
     for file in &files {
         if deletions.contains(&file.path) {
             return Err(CliError::Config {
                 message: path_in_both_members(&file.path),
+            });
+        }
+        // `files` is in path order here, so a repeat stands beside its
+        // first.
+        if classified
+            .last()
+            .is_some_and(|(path, _)| path == &file.path)
+        {
+            return Err(CliError::Config {
+                message: path_named_twice(&file.path),
             });
         }
         classified.push((
@@ -169,6 +186,22 @@ mod tests {
             err.to_string(),
             "configuration error: a.md stands as a file and as a deletion in one changeset"
         );
+    }
+
+    // CR1-3: a path named twice under `files` never reaches the wire
+    // at two hashes.
+    #[test]
+    fn a_path_named_twice_under_files_is_refused() {
+        let document = parse_changeset_document(
+            br#"{"files":[{"path":"a.md","content":"x"},{"path":"a.md","content":"y"}]}"#,
+        )
+        .unwrap();
+        let err = classify_changeset(document).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "configuration error: a.md is named twice under files in one changeset"
+        );
+        assert_eq!(err.exit_code(), 1);
     }
 
     #[test]

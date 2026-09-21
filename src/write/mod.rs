@@ -12,7 +12,7 @@
 //! `issues/069-failed-push-leaves-stuck-postgres-row-and-bare-git-repo`
 //! owns the half-created row that path leaves behind.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 
@@ -25,6 +25,7 @@ use crate::config::Config;
 use crate::errors::{ApiErrorContext, CliError, IdentityRemedy, NotTextSurface};
 use crate::output::Output;
 use crate::push::collector::{CollectOptions, collect_files};
+use crate::push::converge::{excluded_local_files, is_partial_write};
 use crate::push::hash::blob_sha1;
 use crate::push::working_copy::WorkingCopy;
 use crate::repo::if_repo::resolve_full_or_skip;
@@ -197,17 +198,20 @@ pub fn checkout_of(
         message: checkout_guard_refusal(&root, repo_id),
     };
 
-    // 2 — open the working copy at the directory that identity file
-    // stands in. A state directory that does not open carries no
-    // recorded base, which step 3 reads as unpublished local work.
-    let base = match WorkingCopy::open(config.cache_dir(), owner, name, &identity.dir) {
-        Ok(copy) => {
+    // 2 — the working copy at the directory that identity file stands
+    // in, where its state already stands. It is opened rather than
+    // created: a guard that creates the state directory writes state to
+    // answer, which this function does not do (CR1-2). A state
+    // directory that does not stand carries no recorded base, which
+    // step 3 reads as unpublished local work.
+    let base = match WorkingCopy::open_existing(config.cache_dir(), owner, name, &identity.dir) {
+        Ok(Some(copy)) => {
             if copy.outbox()?.is_some() || copy.resolution()?.is_some() {
                 return Err(refuse());
             }
             copy.base()
         }
-        Err(_) => None,
+        Ok(None) | Err(_) => None,
     };
 
     // 3 — the folder's file hashes against the recorded base, collected
@@ -216,9 +220,12 @@ pub fn checkout_of(
     // base was written under, so a folder last published under either
     // collection flag reads as holding unpublished work.
     let collected = collect_files(&identity.dir, &[], CollectOptions::default())?;
-    let folder: HashMap<String, String> = collected
+    let folder: BTreeMap<String, String> = collected
         .files
         .iter()
+        // A sibling a killed convergence left is no local work: the
+        // next collection sweeps it.
+        .filter(|(path, _)| !is_partial_write(path))
         .map(|(path, bytes)| (path.clone(), blob_sha1(bytes)))
         .collect();
 
@@ -231,12 +238,27 @@ pub fn checkout_of(
             Err(refuse())
         };
     };
-    let recorded: HashMap<String, String> = base
+    let recorded: BTreeMap<String, String> = base
         .file_paths()
         .filter_map(|path| {
             base.file_sha(path)
                 .map(|sha| (path.to_string(), sha.to_string()))
         })
+        .collect();
+    // A path the base names that a file stands at and the collection
+    // left out is an exclusion, not an edit — a convergence drops it
+    // from both sides before comparing, and so does this guard. Without
+    // it, a checkout of a repository holding any path the local
+    // collector skips is refused every write for good, with no override
+    // (CR1-1).
+    let excluded = excluded_local_files(
+        &identity.dir,
+        |path| folder.contains_key(path),
+        recorded.keys(),
+    );
+    let recorded: BTreeMap<String, String> = recorded
+        .into_iter()
+        .filter(|(path, _)| !excluded.contains(path))
         .collect();
     if folder != recorded {
         return Err(refuse());
@@ -306,10 +328,21 @@ fn is_full_commit_hash(value: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// `configuration error: --parent must be ≥ 1` for an all-digit value
-/// below `1`, raised before any request leaves.
-fn refuse_ordinal_below_one(value: &str) -> Result<(), CliError> {
-    let all_digits = !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
+/// The two refusals a `--parent` spelling earns on its own: an empty
+/// value, and an all-digit value below `1`.
+///
+/// They are raised ahead of step 1 rather than in step 5's own place,
+/// because a refusal the caller alone earned owes the deployment no
+/// request — and step 5's failure cell reads "before any request",
+/// which the numbered order would otherwise leave false of every run
+/// reaching it (CR1 Open Questions).
+fn refuse_parent_spelling(value: &str) -> Result<(), CliError> {
+    if value.trim().is_empty() {
+        return Err(CliError::Config {
+            message: "--parent cannot be empty".to_string(),
+        });
+    }
+    let all_digits = value.bytes().all(|b| b.is_ascii_digit());
     if all_digits && value.parse::<u64>().unwrap_or(u64::MAX) < 1 {
         return Err(CliError::Config {
             message: "--parent must be \u{2265} 1".to_string(),
@@ -327,12 +360,6 @@ async fn resolve_parent(
     token: &str,
     spelling: &str,
 ) -> Result<ParentRef, CliError> {
-    if spelling.trim().is_empty() {
-        return Err(CliError::Config {
-            message: "--parent cannot be empty".to_string(),
-        });
-    }
-    refuse_ordinal_below_one(spelling)?;
     if is_full_commit_hash(spelling) {
         // The hash-addressed read `cmd_edit` 2 then makes runs the same
         // commit walk a version request at this hash would run, so
@@ -357,6 +384,10 @@ pub async fn resolve_write_target(
     cwd: &Path,
     opts: &WriteOptions,
 ) -> Result<WriteTarget, CliError> {
+    // 5's own refusals, raised ahead of step 1: no request is made for
+    // a spelling the caller alone got wrong.
+    refuse_parent_spelling(&opts.parent)?;
+
     // 1 — bind the repository. A `--repo` value takes it outright, in
     // exactly the spelling the five read verbs admit; no ladder, no
     // mismatch check and no skip runs beside it.
@@ -665,13 +696,7 @@ mod tests {
             return;
         }
         let copy = WorkingCopy::open(config.cache_dir(), owner, name, root).unwrap();
-        let collected = collect_files(root, &[], CollectOptions::default()).unwrap();
-        let hashes: HashMap<String, String> = collected
-            .files
-            .iter()
-            .map(|(path, bytes)| (path.clone(), blob_sha1(bytes)))
-            .collect();
-        copy.record_base(HEAD_SHA, hashes).unwrap();
+        copy.record_base(HEAD_SHA, folder_hashes(root)).unwrap();
     }
 
     // ---- step 3 -------------------------------------------------------
@@ -753,6 +778,84 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    // CR1-1: a path the recorded base names that a file stands at and
+    // the collection left out is an exclusion, not an edit — a
+    // convergence drops it from both sides, and so does this guard.
+    #[test]
+    #[serial]
+    fn a_path_the_collection_excludes_does_not_read_as_local_work() {
+        let env = env_for("https://syns.dev");
+        let work = tempfile::tempdir().unwrap();
+        seed_checkout(&env.config, work.path(), "alice", "notes", true);
+
+        // A path the built-in skip list keeps out, standing in the head
+        // and so in the base a retrieval recorded.
+        std::fs::create_dir_all(work.path().join("dist")).unwrap();
+        std::fs::write(work.path().join("dist/index.js"), "built").unwrap();
+        let copy =
+            WorkingCopy::open(env.config.cache_dir(), "alice", "notes", work.path()).unwrap();
+        let mut recorded = folder_hashes(work.path());
+        recorded.insert("dist/index.js".to_string(), blob_sha1(b"built"));
+        copy.record_base(HEAD_SHA, recorded).unwrap();
+
+        assert!(
+            checkout_of(&env.config, work.path(), "alice/notes")
+                .unwrap()
+                .is_some(),
+            "the excluded path is dropped from both sides"
+        );
+
+        // An edit to a path the collection does take still refuses.
+        std::fs::write(work.path().join("a.md"), "edited since").unwrap();
+        assert!(checkout_of(&env.config, work.path(), "alice/notes").is_err());
+    }
+
+    // CR1-2: the guard answers none of its three by writing state, so a
+    // folder whose repository was never synced there leaves no state
+    // directory behind.
+    #[test]
+    #[serial]
+    fn the_guard_creates_no_working_copy_state() {
+        let env = env_for("https://syns.dev");
+        let work = tempfile::tempdir().unwrap();
+        seed_checkout(&env.config, work.path(), "alice", "notes", false);
+        let before = cache_entries(env.config.cache_dir());
+
+        assert!(checkout_of(&env.config, work.path(), "alice/notes").is_err());
+        assert_eq!(
+            cache_entries(env.config.cache_dir()),
+            before,
+            "a refused guard writes no state"
+        );
+    }
+
+    /// Every path standing under the cache root.
+    fn cache_entries(root: &Path) -> Vec<String> {
+        fn walk(dir: &Path, out: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                out.push(entry.path().display().to_string());
+                walk(&entry.path(), out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, &mut out);
+        out.sort();
+        out
+    }
+
+    /// The folder as the guard collects it.
+    fn folder_hashes(root: &Path) -> std::collections::HashMap<String, String> {
+        collect_files(root, &[], CollectOptions::default())
+            .unwrap()
+            .files
+            .iter()
+            .map(|(path, bytes)| (path.clone(), blob_sha1(bytes)))
+            .collect()
     }
 
     // SPEC u271 Contract Surface, `text_or_refuse`.
@@ -905,16 +1008,12 @@ mod tests {
             assert_eq!(err.to_string(), message);
             assert_eq!(err.exit_code(), 1);
         }
-        // The repository read stands ahead of the parent, and nothing
-        // carrying a commit follows it.
-        let paths: Vec<String> = server
-            .received_requests()
-            .await
-            .unwrap()
-            .iter()
-            .map(|r| r.url.path().to_string())
-            .collect();
-        assert!(paths.iter().all(|p| p == "/api/v1/repos/alice/notes"));
+        // A refusal the caller alone earned owes the deployment no
+        // request at all (CR1 Open Questions).
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "no request is made for a spelling the caller got wrong"
+        );
     }
 
     // `resolve_write_target` 4: a repository standing at no identity is

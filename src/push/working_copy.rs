@@ -119,12 +119,7 @@ impl WorkingCopy {
         let canonical = std::fs::canonicalize(root).map_err(|err| CliError::Io {
             message: format!("could not resolve working copy {}: {err}", root.display()),
         })?;
-        let key = blob_sha1(canonical.as_os_str().as_encoded_bytes());
-        let state_dir = cache_dir
-            .join("working-copies")
-            .join(owner)
-            .join(name)
-            .join(key);
+        let state_dir = Self::state_dir_for(cache_dir, owner, name, &canonical);
         std::fs::create_dir_all(&state_dir).map_err(|err| CliError::Io {
             message: format!(
                 "could not create working copy state {}: {err}",
@@ -152,6 +147,36 @@ impl WorkingCopy {
             root: canonical,
             state_dir: canonical_state,
         })
+    }
+
+    /// Where the state directory for `owner/name` at `root` already
+    /// stands, the working copy holding it, and `None` where it does not
+    /// — the read a guard makes when it must not create one (SPEC u271,
+    /// `checkout_of`, which answers none of its three by writing state).
+    pub fn open_existing(
+        cache_dir: &Path,
+        owner: &str,
+        name: &str,
+        root: &Path,
+    ) -> Result<Option<WorkingCopy>, CliError> {
+        let Ok(canonical) = std::fs::canonicalize(root) else {
+            return Ok(None);
+        };
+        if !Self::state_dir_for(cache_dir, owner, name, &canonical).is_dir() {
+            return Ok(None);
+        }
+        Self::open(cache_dir, owner, name, root).map(Some)
+    }
+
+    /// Where the state for `owner/name` at a canonical root stands. The
+    /// key is that root, so two spellings of one directory — a link to
+    /// it included — address one state directory.
+    fn state_dir_for(cache_dir: &Path, owner: &str, name: &str, canonical: &Path) -> PathBuf {
+        cache_dir
+            .join("working-copies")
+            .join(owner)
+            .join(name)
+            .join(blob_sha1(canonical.as_os_str().as_encoded_bytes()))
     }
 
     /// Take the exclusive state lock, waiting while another process
