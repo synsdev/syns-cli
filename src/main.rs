@@ -397,8 +397,39 @@ enum ResolutionCommand {
     },
 }
 
+/// The stack `syns` runs on, reserved by this program rather than by
+/// the linker. Windows reserves 1 MiB for a process's main thread — the
+/// MSVC and GNU linker defaults — where Linux and macOS reserve 8 MiB,
+/// and the whole clap command tree is built on that thread before the
+/// first argument is read. An unoptimised build of `Commands` already
+/// stands within 2% of 1 MiB, so a subcommand added to it overflows the
+/// Windows binary on `syns --help` (CI run 35555203821, job
+/// `convergence-windows`). Reserving it here rather than through a
+/// linker argument keeps it out of reach of a `RUSTFLAGS` the release
+/// build sets, which makes cargo discard every `[target.*]` section of
+/// a `.cargo/config.toml`.
+const RUN_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+/// The exit code an unwinding `main` takes, which a panic on the run
+/// thread must still reach the caller as.
+const PANIC_EXIT: i32 = 101;
+
+fn main() {
+    let run = std::thread::Builder::new()
+        .name("syns".to_string())
+        .stack_size(RUN_STACK_BYTES)
+        .spawn(run_cli)
+        .expect("the run thread spawns");
+    // The panic hook has already written whatever a panic on that
+    // thread had to say, so the join answer carries nothing left to
+    // report and only the exit code is owed.
+    if run.join().is_err() {
+        std::process::exit(PANIC_EXIT);
+    }
+}
+
 #[tokio::main]
-async fn main() {
+async fn run_cli() {
     let cli = Cli::parse();
     let output = output::Output::new(cli.json);
 
