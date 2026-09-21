@@ -610,6 +610,82 @@ fn repo_create_writes_no_file() {
     );
 }
 
+// --- the noun's own options, read by the arm it routes to ---
+
+// CR1-1: `--if-repo` written ahead of the subcommand word is the
+// noun's own flag, and the arm it routes to must read it — the skip
+// envelope at exit `0` is what the flag guarantees wherever it stands.
+#[test]
+fn history_show_skips_under_the_nouns_own_if_repo() {
+    let deployment = Deployment::new();
+
+    let output = deployment.run(&["history", "--if-repo", "show", "2", "--json"]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(
+        document(&output),
+        json!({"skipped": true, "reason": "no_syns_repo"})
+    );
+    assert!(deployment.paths().is_empty(), "no request was made");
+}
+
+// CR1-4: the role change now reaches its verb through the noun's own
+// routing alone, so the flag the noun carries still reaches it.
+#[test]
+fn collaborators_role_skips_under_the_nouns_own_if_repo() {
+    let deployment = Deployment::new();
+    deployment.credential("u272-token", Some("alice"));
+
+    let output = deployment.run(&[
+        "collaborators",
+        "--if-repo",
+        "role",
+        "u272user1111111111111111111111111",
+        "--role",
+        "write",
+        "--json",
+    ]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(
+        document(&output),
+        json!({"skipped": true, "reason": "no_syns_repo"})
+    );
+    assert!(deployment.paths().is_empty(), "no request was made");
+}
+
+// CR1-2: the noun's update options cannot reach `EP-create-repo`, so a
+// run naming one beside `create` is refused before any request rather
+// than served a repository at the entry's own defaults, which `INV-12`
+// then answers `CONFLICT` on the corrective repeat.
+#[test]
+fn repo_create_refuses_the_nouns_update_options() {
+    let deployment = Deployment::new();
+    deployment.credential("u272-token", Some("alice"));
+    deployment.serves("POST", "/api/v1/repos", 201, bodies::CREATED_REPO);
+
+    for option in [
+        vec!["--visibility", "public"],
+        vec!["--description", "d"],
+        vec!["--status", "active"],
+        vec!["--tag", "t"],
+    ] {
+        let mut args = vec!["repo"];
+        args.extend(option.iter());
+        args.extend(["create", "notes", "--json"]);
+        let output = deployment.run(&args);
+
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+        assert_eq!(
+            document(&output)["error"],
+            json!(
+                "configuration error: --description, --status, --visibility and --tag belong after create"
+            )
+        );
+    }
+    assert!(deployment.paths().is_empty(), "no request was made");
+}
+
 // --- the registered invocation set ---
 
 /// The invocation spellings the argument tree is to register: the set

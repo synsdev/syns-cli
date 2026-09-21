@@ -605,7 +605,14 @@ async fn run(
             if_repo,
             action,
         } => match action {
-            Some(HistoryAction::Show { reference, scope }) => {
+            Some(HistoryAction::Show {
+                reference,
+                mut scope,
+            }) => {
+                // `--if-repo` written ahead of the subcommand word is
+                // the noun's own, and the arm it routes to reads both
+                // (CR1-1), as `Commands::Collaborators` does below.
+                scope.if_repo = scope.if_repo || if_repo;
                 commands::history::cmd_history_show(config, output, reference, scope).await?
             }
             None => commands::history::cmd_history(config, output, file, limit, if_repo).await?,
@@ -652,24 +659,18 @@ async fn run(
                 Some(CollaboratorsAction::Remove { if_repo, .. }) => *if_repo,
                 None => false,
             };
-            let if_repo = parent_if_repo || action_if_repo;
-            // The role change binds the repository itself, so it is
-            // routed straight rather than through the noun's listing
-            // path (SPEC u272 Behaviour, `cmd_collaborators_role` 1).
-            match action {
-                Some(CollaboratorsAction::Role { user_id, role, .. }) => {
-                    commands::collaborators::cmd_collaborators_role(
-                        config, output, user_id, role, if_repo,
-                    )
-                    .await?
-                }
-                action => {
-                    commands::collaborators::cmd_collaborators(
-                        config, output, action, if_repo, limit, offset,
-                    )
-                    .await?
-                }
-            }
+            // Every arm of the noun goes one way, `cmd_collaborators`
+            // routing the role change ahead of its own identity read
+            // (CR1-4), so one route carries the folded `--if-repo`.
+            commands::collaborators::cmd_collaborators(
+                config,
+                output,
+                action,
+                parent_if_repo || action_if_repo,
+                limit,
+                offset,
+            )
+            .await?
         }
         Commands::Delete { yes, if_repo } => {
             commands::delete::cmd_delete(config, output, yes, if_repo).await?

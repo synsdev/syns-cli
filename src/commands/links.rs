@@ -95,8 +95,12 @@ pub const UPDATE_NAMES_NOTHING: &str =
 
 /// The reorder's own refusal: the entry takes every identifier exactly
 /// once, so a repeat is refused here rather than spent on a round trip.
+///
+/// The repeated value is a positional of `syns links reorder` and no
+/// option of any invocation, so the refusal names the invocation and
+/// the move that corrects it rather than a flag (CR1-3).
 pub fn reorder_repeats_refusal(id: &str) -> String {
-    format!("--reorder names '{id}' more than once")
+    format!("links reorder names '{id}' more than once — name every link identifier exactly once")
 }
 
 /// The arm's own pre-request checks (SPEC u272 Behaviour, `cmd_links` 2).
@@ -264,7 +268,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "configuration error: --reorder names 'a' more than once"
+            "configuration error: links reorder names 'a' more than once — name every link identifier exactly once"
         );
         assert_eq!(err.exit_code(), 1);
 
@@ -402,7 +406,7 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            "configuration error: --reorder names 'a' more than once"
+            "configuration error: links reorder names 'a' more than once — name every link identifier exactly once"
         );
         assert!(server.received_requests().await.unwrap().is_empty());
     }

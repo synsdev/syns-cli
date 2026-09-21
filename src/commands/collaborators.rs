@@ -159,6 +159,26 @@ pub async fn cmd_collaborators_role(
     Ok(())
 }
 
+/// The repository the noun's listing, add and remove arms all act on,
+/// with the client addressing it — `None` where the skip envelope was
+/// written under `--if-repo`.
+fn bind_repo(
+    config: &Config,
+    output: &Output,
+    if_repo: bool,
+) -> Result<Option<(String, SynsClient)>, CliError> {
+    let current_dir = std::env::current_dir().map_err(|e| CliError::Io {
+        message: format!("could not determine current directory: {e}"),
+    })?;
+    let Some((owner, name)) = resolve_full_or_skip(None, &current_dir, if_repo, output)? else {
+        return Ok(None);
+    };
+    Ok(Some((
+        format!("{owner}/{name}"),
+        SynsClient::new(config.server_url())?,
+    )))
+}
+
 pub async fn cmd_collaborators(
     config: &Config,
     output: &Output,
@@ -167,18 +187,19 @@ pub async fn cmd_collaborators(
     limit: u32,
     offset: u32,
 ) -> Result<(), CliError> {
-    let current_dir = std::env::current_dir().map_err(|e| CliError::Io {
-        message: format!("could not determine current directory: {e}"),
-    })?;
-    let (owner, name) = match resolve_full_or_skip(None, &current_dir, if_repo, output)? {
-        Some(pair) => pair,
-        None => return Ok(()),
-    };
-    let repo_id = format!("{owner}/{name}");
-    let client = SynsClient::new(config.server_url())?;
-
     match action {
+        // The role change binds the repository itself (SPEC u272
+        // Behaviour, `cmd_collaborators_role` 1), so it is one arm of
+        // the noun's own routing rather than a second route to the
+        // same verb (CR1-4).
+        Some(CollaboratorsAction::Role { user_id, role, .. }) => {
+            return cmd_collaborators_role(config, output, user_id, role, if_repo).await;
+        }
         None => {
+            let (repo_id, client) = match bind_repo(config, output, if_repo)? {
+                Some(pair) => pair,
+                None => return Ok(()),
+            };
             // The page window the caller named, refused outside the
             // paged-listing bound before any request leaves.
             refuse_limit_outside(limit, LIMIT_MIN, LIMIT_MAX)?;
@@ -204,6 +225,10 @@ pub async fn cmd_collaborators(
             }
         }
         Some(CollaboratorsAction::Add { target, role, .. }) => {
+            let (repo_id, client) = match bind_repo(config, output, if_repo)? {
+                Some(pair) => pair,
+                None => return Ok(()),
+            };
             let token = TokenStore::new(config.credentials_path())
                 .read()?
                 .ok_or(CliError::AuthRequired)?;
@@ -263,13 +288,11 @@ pub async fn cmd_collaborators(
                 Err(e) => return Err(e),
             }
         }
-        // The role change binds the repository itself, so `src/main.rs`
-        // routes that arm straight to `cmd_collaborators_role` and this
-        // match never sees it.
-        Some(CollaboratorsAction::Role { user_id, role, .. }) => {
-            return cmd_collaborators_role(config, output, user_id, role, if_repo).await;
-        }
         Some(CollaboratorsAction::Remove { user_id, yes, .. }) => {
+            let (repo_id, client) = match bind_repo(config, output, if_repo)? {
+                Some(pair) => pair,
+                None => return Ok(()),
+            };
             let token = TokenStore::new(config.credentials_path())
                 .read()?
                 .ok_or(CliError::AuthRequired)?;

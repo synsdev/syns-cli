@@ -58,6 +58,11 @@ pub enum RepoAction {
     },
 }
 
+/// The refusal a run naming one of the noun's update options beside
+/// `create` takes, raised before any request (CR1-2).
+pub const CREATE_TAKES_ITS_OWN_OPTIONS: &str =
+    "--description, --status, --visibility and --tag belong after create";
+
 /// Creates an empty repository under the caller (SPEC u272 Behaviour,
 /// `cmd_repo_create`).
 ///
@@ -162,10 +167,22 @@ pub async fn cmd_repo(
         // and no working directory is reached.
         Some(RepoAction::Create {
             name,
-            description,
-            visibility,
+            description: create_description,
+            visibility: create_visibility,
         }) => {
-            return cmd_repo_create(config, output, name, description, visibility).await;
+            // The noun's four options update a standing repository and
+            // reach `EP-create-repo` nowhere, so one named beside
+            // `create` is refused before any request rather than
+            // dropped (CR1-2) — a creation at the entry's own defaults
+            // is what `INV-12` then answers `CONFLICT` on the repeat.
+            if description.is_some() || status.is_some() || visibility.is_some() || !tags.is_empty()
+            {
+                return Err(CliError::Config {
+                    message: CREATE_TAKES_ITS_OWN_OPTIONS.to_string(),
+                });
+            }
+            return cmd_repo_create(config, output, name, create_description, create_visibility)
+                .await;
         }
         None => {}
     }
