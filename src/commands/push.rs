@@ -170,6 +170,12 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
         reference: None,
         expected: None,
         provenance: provenance_from_env(),
+        collected: None,
+        held: None,
+        json_output: output.is_json(),
+        // SPEC u280 `converge` 3: a landed publication's own summary
+        // carries the too-large line.
+        renders_publication_summary: true,
     };
 
     let client = match client {
@@ -210,7 +216,21 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
 
     // `cmd_push` 4 — a bare publication converges.
     ensure_identity_file(&copy.root, &owner, &name)?;
-    let outcome = converge(&client, Some(&token), &copy, ConvergeMode::Publish, opts).await?;
+    let outcome = match converge(&client, Some(&token), &copy, ConvergeMode::Publish, opts).await {
+        Ok(outcome) => outcome,
+        // SPEC u280: the left-out refusal is carried as `error` under
+        // attention required, as `syns sync` carries it.
+        Err(err @ CliError::LeftOut { .. }) => {
+            let cause = err.to_string();
+            return render_outcome(
+                output,
+                Some(&repo_id),
+                SyncOutcome::AttentionRequired(None),
+                Some(cause),
+            );
+        }
+        Err(err) => return Err(err),
+    };
     match outcome {
         SyncOutcome::Synced {
             written,
@@ -839,7 +859,7 @@ mod tests {
         let skipped = vec![
             SkippedFile {
                 path: "a.png".into(),
-                reason: SkipReason::Binary,
+                reason: SkipReason::TooLarge,
             },
             SkippedFile {
                 path: "b/c.js".into(),
@@ -856,7 +876,7 @@ mod tests {
             .unwrap();
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["path"], "a.png");
-        assert_eq!(arr[0]["reason"], "binary");
+        assert_eq!(arr[0]["reason"], "too_large");
         assert_eq!(arr[1]["path"], "b/c.js");
         assert_eq!(arr[1]["reason"], "default_exclude_dir");
     }
@@ -1156,7 +1176,7 @@ mod force_warning_tests {
             Some(RECORDED),
             vec![SkippedFile {
                 path: "a/b.png".into(),
-                reason: SkipReason::Binary,
+                reason: SkipReason::TooLarge,
             }],
         );
         let body = with_unclaimed_parent(build_json_envelope(&served(), &meta.skipped), &meta);

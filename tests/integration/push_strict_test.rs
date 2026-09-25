@@ -7,6 +7,15 @@ use std::fs;
 
 use super::common::{SpawnOpts, spawn_mock_env};
 
+/// A sparse file one byte past `LIM-file-size` — the drop `--strict`
+/// refuses (SPEC u280).
+fn too_large(path: &std::path::Path) {
+    fs::File::create(path)
+        .unwrap()
+        .set_len(syns_cli::push::collector::MAX_FILE_BYTES + 1)
+        .unwrap();
+}
+
 #[test]
 #[serial]
 fn mixed_text_and_binary_with_strict_exits_3() {
@@ -14,7 +23,7 @@ fn mixed_text_and_binary_with_strict_exits_3() {
     // No PUT mock mounted — strict guard must fire before any wire call.
 
     fs::write(env.project_dir.path().join("README.md"), "hello").unwrap();
-    fs::write(env.project_dir.path().join("logo.png"), b"data\x00more").unwrap();
+    too_large(&env.project_dir.path().join("logo.png"));
 
     let output = AssertCommand::cargo_bin("syns")
         .expect("syns binary")
@@ -43,7 +52,7 @@ fn mixed_text_and_binary_with_strict_exits_3() {
         "stderr missing one-line abort message — stderr: {stderr}"
     );
     assert!(
-        stderr.contains("binary content (1): logo.png"),
+        stderr.contains("larger than 25 MiB (1): logo.png"),
         "stderr missing per-category breakdown — stderr: {stderr}"
     );
 
@@ -76,7 +85,7 @@ fn strict_with_json_does_not_emit_stderr_summary() {
     // No PUT mock mounted — strict guard must fire before any wire call.
 
     fs::write(env.project_dir.path().join("README.md"), "hello").unwrap();
-    fs::write(env.project_dir.path().join("logo.png"), b"data\x00more").unwrap();
+    too_large(&env.project_dir.path().join("logo.png"));
     fs::create_dir_all(env.project_dir.path().join("dist")).unwrap();
     fs::write(env.project_dir.path().join("dist/bundle.js"), "x=1").unwrap();
 
@@ -118,7 +127,7 @@ fn push_partial_json_envelope_has_structured_skipped_field() {
     let env = spawn_mock_env(SpawnOpts::default());
 
     fs::write(env.project_dir.path().join("README.md"), "hello").unwrap();
-    fs::write(env.project_dir.path().join("logo.png"), b"data\x00more").unwrap();
+    too_large(&env.project_dir.path().join("logo.png"));
 
     let output = AssertCommand::cargo_bin("syns")
         .expect("syns binary")
@@ -158,7 +167,7 @@ fn push_partial_json_envelope_has_structured_skipped_field() {
         .unwrap_or_else(|| panic!("envelope.skipped is not an array: {parsed}"));
     assert_eq!(arr.len(), 1, "expected exactly one skipped entry: {parsed}");
     assert_eq!(arr[0]["path"], "logo.png");
-    assert_eq!(arr[0]["reason"], "binary");
+    assert_eq!(arr[0]["reason"], "too_large");
 }
 
 /// CODE_REVIEW M5 (negative): under `--strict`, the strict hint
@@ -170,7 +179,7 @@ fn strict_mode_omits_strict_hint() {
     let env = spawn_mock_env(SpawnOpts::default());
 
     fs::write(env.project_dir.path().join("README.md"), "hello").unwrap();
-    fs::write(env.project_dir.path().join("logo.png"), b"data\x00more").unwrap();
+    too_large(&env.project_dir.path().join("logo.png"));
 
     let output = AssertCommand::cargo_bin("syns")
         .expect("syns binary")
@@ -194,9 +203,9 @@ fn strict_mode_omits_strict_hint() {
         !stderr.contains("pass --strict to fail the push"),
         "strict hint must NOT appear under --strict — stderr: {stderr}"
     );
-    // Binary hint should still appear (the binary file justifies it).
+    // No line or hint names binary content (SPEC u280).
     assert!(
-        stderr.contains("add binary extensions"),
-        "binary hint should still appear under --strict — stderr: {stderr}"
+        !stderr.contains("binary"),
+        "no binary hint under --strict — stderr: {stderr}"
     );
 }

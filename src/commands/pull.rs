@@ -1,16 +1,20 @@
 use crate::auth::token::TokenStore;
 use crate::client::{EntryType, SynsClient};
-use crate::commands::sync::{convergence_options, render_outcome, render_transfer_lines};
+use crate::commands::sync::{convergence_options_for, render_outcome, render_transfer_lines};
 use crate::config::Config;
 use crate::errors::{CliError, IdentityRemedy};
 use crate::output::Output;
-use crate::push::converge::{ConvergeMode, SyncOutcome, converge};
+use crate::push::collector::{HELD_BYTES_BUDGET, HeldBytes};
+use crate::push::converge::{
+    ConvergeMode, Staging, SyncOutcome, converge, read_blobs, replace_file_whole,
+};
 use crate::push::working_copy::WorkingCopy;
 use crate::repo::if_repo::resolve_full_or_skip;
 use crate::repo::root::resolve_start_path;
 use crate::repo::syns_yaml::{nearest_identity, write_syns_yaml_where_none_stands};
 use console::style;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Whether a positional is spelt as a repository: one `/` joining an owner
@@ -220,6 +224,7 @@ pub async fn cmd_pull(
             &owner,
             &name,
             &version,
+            config.cache_dir(),
         )
         .await;
     }
@@ -237,7 +242,7 @@ pub async fn cmd_pull(
         ConvergeMode::Retrieve {
             overwrite: overwrite_local,
         },
-        convergence_options(config),
+        convergence_options_for(config, output),
     )
     .await?;
 
@@ -288,7 +293,9 @@ pub async fn cmd_pull(
 /// The registered snapshot retrieval at `--version`: every file at that
 /// version written, nothing removed, no record kept — but for a local file
 /// an ignore rule excludes, which is named and left untouched as a
-/// convergence leaves it.
+/// convergence leaves it. Every path is checked and read, each answer
+/// verified by its hash and held or staged, before the first file is
+/// written (SPEC u280 `pull_snapshot` 1–2).
 #[allow(clippy::too_many_arguments)]
 async fn pull_snapshot(
     output: &Output,
@@ -300,6 +307,7 @@ async fn pull_snapshot(
     owner: &str,
     name: &str,
     version: &str,
+    cache_dir: &Path,
 ) -> Result<(), CliError> {
     let (tree_response, _raw) = client
         .get_tree(repo_id, token, None, true, Some(version))
@@ -310,15 +318,24 @@ async fn pull_snapshot(
         .iter()
         .filter(|e| e.entry_type == EntryType::File)
         .collect();
+    // 1 — every path the version's tree carries checked before anything
+    // is read or written.
+    for entry in &server_files {
+        validate_entry_path(&entry.path)?;
+    }
 
+    let staging = Staging::open(cache_dir)?;
     std::fs::create_dir_all(target_dir).map_err(|e| CliError::Io {
         message: format!("could not create target directory: {e}"),
     })?;
 
+    let held = HeldBytes::new(HELD_BYTES_BUDGET);
     let collected = crate::push::collector::collect_files(
         target_dir,
         &[],
         crate::push::collector::CollectOptions::default(),
+        None,
+        &held,
     )?;
     let mut excluded = crate::push::converge::excluded_local_files(
         target_dir,
@@ -334,11 +351,18 @@ async fn pull_snapshot(
     if identity_stands {
         excluded.remove(".syns.yaml");
     }
-    let mut kept = 0;
+    let kept = usize::from(identity_stands && server_files.iter().any(|e| e.path == ".syns.yaml"));
+
+    let wanted: BTreeMap<String, (String, Option<u64>)> = server_files
+        .iter()
+        .filter(|e| !(identity_stands && e.path == ".syns.yaml"))
+        .filter(|e| !excluded.contains(&e.path))
+        .map(|e| (e.path.clone(), (e.sha.clone().unwrap_or_default(), e.size)))
+        .collect();
+    let blobs = read_blobs(client, token, repo_id, version, &wanted, &held, &staging).await?;
 
     for entry in &server_files {
         if identity_stands && entry.path == ".syns.yaml" {
-            kept += 1;
             continue;
         }
         if excluded.contains(&entry.path) {
@@ -347,21 +371,18 @@ async fn pull_snapshot(
             }
             continue;
         }
-        let (response, _raw) = client
-            .get_file(repo_id, token, &entry.path, Some(version))
-            .await?;
+        let Some(content) = blobs.get(&entry.path) else {
+            continue;
+        };
         safe_join(target_dir, &entry.path)?;
-        // Replaced whole, so a run killed part-way leaves the file as it
-        // stood rather than torn.
-        crate::push::converge::replace_file_whole(
-            target_dir,
-            &entry.path,
-            response.content.as_bytes(),
-        )?;
+        // 2 — replaced whole, so a run killed part-way leaves the file as
+        // it stood rather than torn.
+        replace_file_whole(target_dir, &entry.path, content)?;
         if !output.is_json() {
             eprintln!("  {}", style(format!("downloaded: {}", entry.path)).green());
         }
     }
+    drop(blobs);
 
     write_identity_file(repository, target_dir, owner, name)?;
 

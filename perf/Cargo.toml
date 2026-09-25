@@ -1,0 +1,15 @@
+[package]
+name = "syns-perf"
+version = "0.1.0"
+edition = "2024"
+description = "u280's timing harness: the released CLI and this build, each against its own stack, sample by sample."
+publish = false
+
+# A workspace of its own, so no `cargo` command run at the repository root
+# builds, tests or lints this package.
+[workspace]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.11"

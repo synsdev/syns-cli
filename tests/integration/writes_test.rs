@@ -9,7 +9,7 @@ use assert_cmd::Command as AssertCommand;
 use serde_json::{Value, json};
 use serial_test::serial;
 use std::path::Path;
-use syns_cli::push::collector::{CollectOptions, collect_files};
+use syns_cli::push::collector::{CollectOptions, HeldBytes, collect_files};
 use syns_cli::push::hash::blob_sha1;
 use syns_cli::push::manifest::Manifest;
 use syns_cli::push::working_copy::WorkingCopy;
@@ -257,12 +257,15 @@ fn state_entries(d: &Deployment, repo: &str) -> Vec<String> {
 }
 
 fn folder_hashes(root: &Path) -> std::collections::HashMap<String, String> {
-    collect_files(root, &[], CollectOptions::default())
-        .expect("collected")
-        .files
-        .iter()
-        .map(|(path, bytes)| (path.clone(), blob_sha1(bytes)))
-        .collect()
+    collect_files(
+        root,
+        &[],
+        CollectOptions::default(),
+        None,
+        &HeldBytes::new(0),
+    )
+    .expect("collected")
+    .hashes()
 }
 
 // ---- edit --------------------------------------------------------------

@@ -21,7 +21,7 @@ use syns_cli::commands::sync::cmd_sync;
 use syns_cli::config::Config;
 use syns_cli::errors::CliError;
 use syns_cli::output::Output;
-use syns_cli::push::collector::{CollectOptions, collect_files};
+use syns_cli::push::collector::{CollectOptions, HELD_BYTES_BUDGET, HeldBytes, collect_files};
 use syns_cli::push::converge::{
     ConvergeMode, ROUND_BOUND, SyncOutcome, WorkingCopyState, continue_resolution, converge,
     discard_resolution, working_copy_state,
@@ -183,8 +183,8 @@ async fn dropped_push_connection_classifies_as_server_unreachable() {
 
 #[derive(Default)]
 struct FakeRepo {
-    /// Every commit oldest first: its sha and its whole tree, path to content.
-    commits: Vec<(String, BTreeMap<String, String>)>,
+    /// Every commit oldest first: its sha and its whole tree, path to bytes.
+    commits: Vec<(String, BTreeMap<String, Vec<u8>>)>,
     /// Every request received: method, target and body.
     requests: Vec<(String, String, Vec<u8>)>,
     drop_next_push: bool,
@@ -193,12 +193,42 @@ struct FakeRepo {
     identity_taken: bool,
 }
 
+/// One answer the fake writes: its status, body, content type and `ETag`.
+struct Answer {
+    status: u16,
+    body: Vec<u8>,
+    content_type: &'static str,
+    etag: Option<String>,
+}
+
+impl Answer {
+    fn json(status: u16, body: String) -> Answer {
+        Answer {
+            status,
+            body: body.into_bytes(),
+            content_type: "application/json",
+            etag: None,
+        }
+    }
+}
+
 fn error_body(code: &str) -> String {
     json!({"error": code, "message": code}).to_string()
 }
 
+/// Text as the server classifies it: valid UTF-8 holding no NUL byte.
+fn is_text(bytes: &[u8]) -> bool {
+    !bytes.contains(&0) && std::str::from_utf8(bytes).is_ok()
+}
+
+fn lossy(tree: &BTreeMap<String, Vec<u8>>) -> BTreeMap<String, String> {
+    tree.iter()
+        .map(|(p, b)| (p.clone(), String::from_utf8_lossy(b).to_string()))
+        .collect()
+}
+
 impl FakeRepo {
-    fn answer(&mut self, req: &RawRequest) -> Option<(u16, String)> {
+    fn answer(&mut self, req: &RawRequest) -> Option<Answer> {
         self.requests
             .push((req.method.clone(), req.target.clone(), req.body.clone()));
         let (route, query) = req.target.split_once('?').unwrap_or((&req.target, ""));
@@ -219,33 +249,39 @@ impl FakeRepo {
                     .to_string();
                 Some(self.file(&path, params.get("ref")))
             }
+            ("GET", raw) if raw.starts_with("raw/") => {
+                let path = urlencoding::decode(&raw["raw/".len()..])
+                    .unwrap()
+                    .to_string();
+                Some(self.raw(&path, params.get("ref")))
+            }
             ("PUT", "push") => {
                 if self.drop_next_push {
                     self.drop_next_push = false;
                     return None;
                 }
                 if self.identity_taken {
-                    return Some((409, error_body("conflict")));
+                    return Some(Answer::json(409, error_body("conflict")));
                 }
                 Some(self.push(&req.body))
             }
-            _ => Some((404, error_body("not_found"))),
+            _ => Some(Answer::json(404, error_body("not_found"))),
         }
     }
 
-    fn find(&self, reference: Option<&String>) -> Option<&(String, BTreeMap<String, String>)> {
+    fn find(&self, reference: Option<&String>) -> Option<&(String, BTreeMap<String, Vec<u8>>)> {
         match reference {
             Some(sha) => self.commits.iter().find(|(s, _)| s == sha),
             None => self.commits.last(),
         }
     }
 
-    fn tree(&self, reference: Option<&String>) -> (u16, String) {
+    fn tree(&self, reference: Option<&String>) -> Answer {
         if self.commits.is_empty() {
-            return (422, error_body("validation_error"));
+            return Answer::json(422, error_body("validation_error"));
         }
         let Some((sha, files)) = self.find(reference) else {
-            return (404, error_body("ref_not_found"));
+            return Answer::json(404, error_body("ref_not_found"));
         };
         let entries: Vec<Value> = files
             .iter()
@@ -255,58 +291,89 @@ impl FakeRepo {
                     "path": path,
                     "type": "file",
                     "size": content.len(),
-                    "sha": blob_sha1(content.as_bytes()),
+                    "sha": blob_sha1(content),
                 })
             })
             .collect();
-        (
+        Answer::json(
             200,
             json!({"entries": entries, "commitSha": sha, "truncated": false}).to_string(),
         )
     }
 
-    fn file(&self, path: &str, reference: Option<&String>) -> (u16, String) {
+    fn file(&self, path: &str, reference: Option<&String>) -> Answer {
         match self.find(reference).and_then(|(_, files)| files.get(path)) {
-            Some(content) => (
+            Some(content) => Answer::json(
                 200,
-                json!({"content": content, "sha": blob_sha1(content.as_bytes()), "size": content.len()})
-                    .to_string(),
+                json!({
+                    "content": is_text(content).then(|| String::from_utf8_lossy(content).to_string()),
+                    "sha": blob_sha1(content),
+                    "size": content.len(),
+                })
+                .to_string(),
             ),
-            None => (404, error_body("not_found")),
+            None => Answer::json(404, error_body("not_found")),
         }
     }
 
-    fn push(&mut self, body: &[u8]) -> (u16, String) {
+    /// The raw entry: the stored bytes exactly, under an `ETag` of their
+    /// blob hash (SPEC u280, `GET /raw/{path}` from u279).
+    fn raw(&self, path: &str, reference: Option<&String>) -> Answer {
+        match self.find(reference).and_then(|(_, files)| files.get(path)) {
+            Some(content) => Answer {
+                status: 200,
+                body: content.clone(),
+                content_type: "application/octet-stream",
+                etag: Some(blob_sha1(content)),
+            },
+            None => Answer::json(404, error_body("not_found")),
+        }
+    }
+
+    fn push(&mut self, body: &[u8]) -> Answer {
+        use base64::Engine as _;
         let body: Value = serde_json::from_slice(body).unwrap();
         let head = self.commits.last().cloned();
         if let Some(parent) = body.get("parentSha").and_then(Value::as_str)
             && head.as_ref().map(|(sha, _)| sha.as_str()) != Some(parent)
         {
             let current = head.as_ref().map(|(sha, _)| sha.as_str()).unwrap_or("");
-            return (
+            return Answer::json(
                 409,
                 json!({"error": "conflict", "message": "Head mismatch", "currentSha": current})
                     .to_string(),
             );
         }
-        let known: HashMap<String, String> = self
+        let known: HashMap<String, Vec<u8>> = self
             .commits
             .iter()
             .flat_map(|(_, files)| files.values())
-            .map(|content| (blob_sha1(content.as_bytes()), content.clone()))
+            .map(|content| (blob_sha1(content), content.clone()))
             .collect();
         let mut files = head.map(|(_, files)| files).unwrap_or_default();
         for entry in body["files"].as_array().unwrap() {
             let path = entry["path"].as_str().unwrap().to_string();
-            match entry.get("content").and_then(Value::as_str) {
-                Some(content) => {
-                    files.insert(path, content.to_string());
+            let text = entry.get("content").and_then(Value::as_str);
+            let encoded = entry.get("contentBase64").and_then(Value::as_str);
+            assert!(
+                text.is_none() || encoded.is_none(),
+                "an entry carried both content fields: {entry}"
+            );
+            match (text, encoded) {
+                (Some(content), _) => {
+                    files.insert(path, content.as_bytes().to_vec());
                 }
-                None => match known.get(entry["sha"].as_str().unwrap()) {
+                (None, Some(encoded)) => {
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(encoded)
+                        .unwrap();
+                    files.insert(path, bytes);
+                }
+                (None, None) => match known.get(entry["sha"].as_str().unwrap()) {
                     Some(content) => {
                         files.insert(path, content.clone());
                     }
-                    None => return (409, error_body("missing_blobs")),
+                    None => return Answer::json(409, error_body("missing_blobs")),
                 },
             }
         }
@@ -319,7 +386,7 @@ impl FakeRepo {
             files.remove(deletion["path"].as_str().unwrap());
         }
         let sha = self.add_commit(files);
-        (
+        Answer::json(
             200,
             json!({
                 "commitSha": sha,
@@ -331,21 +398,22 @@ impl FakeRepo {
         )
     }
 
-    fn add_commit(&mut self, files: BTreeMap<String, String>) -> String {
+    fn add_commit(&mut self, files: BTreeMap<String, Vec<u8>>) -> String {
         let sha = blob_sha1(format!("commit {} {files:?}", self.commits.len()).as_bytes());
         self.commits.push((sha.clone(), files));
         sha
     }
 }
 
+/// The stateful fake repository, shared with `binary_content_test`.
 #[derive(Clone)]
-struct Fake {
-    uri: String,
+pub(crate) struct Fake {
+    pub(crate) uri: String,
     repo: Arc<Mutex<FakeRepo>>,
 }
 
 impl Fake {
-    async fn start() -> Fake {
+    pub(crate) async fn start() -> Fake {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let uri = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
         let repo = Arc::new(Mutex::new(FakeRepo::default()));
@@ -356,14 +424,22 @@ impl Fake {
                 tokio::spawn(async move {
                     while let Some(req) = read_raw_request(&mut sock).await {
                         let answer = shared.lock().unwrap().answer(&req);
-                        let Some((status, body)) = answer else {
+                        let Some(answer) = answer else {
                             return;
                         };
-                        let response = format!(
-                            "HTTP/1.1 {status} FAKE\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
-                            body.len()
-                        );
-                        if sock.write_all(response.as_bytes()).await.is_err() {
+                        let etag = answer
+                            .etag
+                            .map(|etag| format!("etag: \"{etag}\"\r\n"))
+                            .unwrap_or_default();
+                        let mut response = format!(
+                            "HTTP/1.1 {} FAKE\r\ncontent-type: {}\r\n{etag}content-length: {}\r\n\r\n",
+                            answer.status,
+                            answer.content_type,
+                            answer.body.len()
+                        )
+                        .into_bytes();
+                        response.extend_from_slice(&answer.body);
+                        if sock.write_all(&response).await.is_err() {
                             return;
                         }
                     }
@@ -373,21 +449,39 @@ impl Fake {
         Fake { uri, repo }
     }
 
-    fn client(&self) -> SynsClient {
+    pub(crate) fn client(&self) -> SynsClient {
         SynsClient::new(&self.uri).unwrap()
     }
 
     /// A commit holding exactly `files`.
-    fn commit(&self, files: &[(&str, &str)]) -> String {
+    pub(crate) fn commit(&self, files: &[(&str, &str)]) -> String {
         let tree = files
             .iter()
-            .map(|(p, c)| (p.to_string(), c.to_string()))
+            .map(|(p, c)| (p.to_string(), c.as_bytes().to_vec()))
+            .collect();
+        self.repo.lock().unwrap().add_commit(tree)
+    }
+
+    /// A commit holding exactly `files`, as bytes.
+    pub(crate) fn commit_bytes(&self, files: &[(&str, &[u8])]) -> String {
+        let tree = files
+            .iter()
+            .map(|(p, c)| (p.to_string(), c.to_vec()))
             .collect();
         self.repo.lock().unwrap().add_commit(tree)
     }
 
     /// A commit laying `changes` over the head, `None` removing a path.
-    fn commit_changes(&self, changes: &[(&str, Option<&str>)]) -> String {
+    pub(crate) fn commit_changes(&self, changes: &[(&str, Option<&str>)]) -> String {
+        let changes: Vec<(&str, Option<&[u8]>)> = changes
+            .iter()
+            .map(|(p, c)| (*p, c.map(str::as_bytes)))
+            .collect();
+        self.commit_byte_changes(&changes)
+    }
+
+    /// `commit_changes` over bytes.
+    pub(crate) fn commit_byte_changes(&self, changes: &[(&str, Option<&[u8]>)]) -> String {
         let mut repo = self.repo.lock().unwrap();
         let mut tree = repo
             .commits
@@ -396,18 +490,27 @@ impl Fake {
             .unwrap_or_default();
         for (path, content) in changes {
             match content {
-                Some(content) => tree.insert(path.to_string(), content.to_string()),
+                Some(content) => tree.insert(path.to_string(), content.to_vec()),
                 None => tree.remove(*path),
             };
         }
         repo.add_commit(tree)
     }
 
-    fn head(&self) -> (String, BTreeMap<String, String>) {
+    pub(crate) fn head(&self) -> (String, BTreeMap<String, String>) {
+        let (sha, tree) = self.head_bytes();
+        (sha, lossy(&tree))
+    }
+
+    pub(crate) fn head_bytes(&self) -> (String, BTreeMap<String, Vec<u8>>) {
         self.repo.lock().unwrap().commits.last().cloned().unwrap()
     }
 
-    fn tree_at(&self, sha: &str) -> BTreeMap<String, String> {
+    pub(crate) fn tree_at(&self, sha: &str) -> BTreeMap<String, String> {
+        lossy(&self.tree_bytes_at(sha))
+    }
+
+    pub(crate) fn tree_bytes_at(&self, sha: &str) -> BTreeMap<String, Vec<u8>> {
         let repo = self.repo.lock().unwrap();
         repo.commits
             .iter()
@@ -416,7 +519,7 @@ impl Fake {
             .unwrap()
     }
 
-    fn push_bodies(&self) -> Vec<Value> {
+    pub(crate) fn push_bodies(&self) -> Vec<Value> {
         self.repo
             .lock()
             .unwrap()
@@ -427,11 +530,11 @@ impl Fake {
             .collect()
     }
 
-    fn drop_next_push(&self) {
+    pub(crate) fn drop_next_push(&self) {
         self.repo.lock().unwrap().drop_next_push = true;
     }
 
-    fn take_identity(&self) {
+    pub(crate) fn take_identity(&self) {
         self.repo.lock().unwrap().identity_taken = true;
     }
 }
@@ -492,6 +595,10 @@ fn opts_at(cache_dir: &Path) -> SmartPushOptions {
         reference: None,
         expected: None,
         provenance: None,
+        collected: None,
+        held: None,
+        json_output: false,
+        renders_publication_summary: false,
     }
 }
 
@@ -516,20 +623,33 @@ fn hashes(tree: &BTreeMap<String, String>) -> HashMap<String, String> {
 /// Write the tree of commit `sha` into the working copy and record it as
 /// the base.
 fn checkout(fake: &Fake, copy: &WorkingCopy, sha: &str) {
-    let tree = fake.tree_at(sha);
+    let tree = fake.tree_bytes_at(sha);
     for (path, content) in &tree {
-        write_files(&copy.root, &[(path.as_str(), content.as_str())]);
+        let target = copy.root.join(path);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(target, content).unwrap();
     }
-    copy.record_base(sha, hashes(&tree)).unwrap();
+    copy.record_base(
+        sha,
+        tree.iter()
+            .map(|(p, c)| (p.clone(), blob_sha1(c)))
+            .collect(),
+    )
+    .unwrap();
 }
 
 fn folder_hashes(dir: &Path) -> BTreeMap<String, String> {
-    collect_files(dir, &[], CollectOptions::default())
-        .unwrap()
-        .files
-        .iter()
-        .map(|(p, b)| (p.clone(), blob_sha1(b)))
-        .collect()
+    collect_files(
+        dir,
+        &[],
+        CollectOptions::default(),
+        None,
+        &HeldBytes::new(HELD_BYTES_BUDGET),
+    )
+    .unwrap()
+    .hashes()
+    .into_iter()
+    .collect()
 }
 
 fn body_content<'a>(body: &'a Value, path: &str) -> Option<&'a str> {
@@ -701,7 +821,7 @@ async fn retrieval_takes_a_head_edit_to_an_unedited_identity_file() {
     }
     assert_eq!(read(&dir, ".syns.yaml"), IDENTITY_WITH_CHECK);
     assert_eq!(
-        snapshot_bytes(&copy.local_snapshot().unwrap(), ".syns.yaml"),
+        snapshot_bytes(&copy, &copy.local_snapshot().unwrap(), ".syns.yaml"),
         Some(IDENTITY.as_bytes().to_vec())
     );
     assert_eq!(copy.base().unwrap().commit_sha(), Some(h1.as_str()));
@@ -904,7 +1024,8 @@ async fn retrieval_with_lost_base_prepares_every_differing_path() {
     assert!(read(&dir, "a.md").lines().any(|l| l == "<<<<<<< local"));
     let snapshot = copy.local_snapshot().unwrap();
     assert_eq!(
-        snapshot["a.md"].clone().unwrap().into_bytes(),
+        copy.content_bytes(&snapshot["a.md"].clone().unwrap())
+            .unwrap(),
         b"local a\n".to_vec()
     );
 }
@@ -1069,6 +1190,7 @@ const FOLDER_WORK: [FolderWork; 2] = [
 ];
 
 fn snapshot_bytes(
+    copy: &WorkingCopy,
     snapshot: &syns_cli::push::working_copy::Snapshot,
     path: &str,
 ) -> Option<Vec<u8>> {
@@ -1076,7 +1198,7 @@ fn snapshot_bytes(
         .get(path)
         .cloned()
         .flatten()
-        .map(|c| c.into_bytes())
+        .map(|c| copy.content_bytes(&c).unwrap())
 }
 
 fn names_collision(resolution: &Resolution, path: &str, kind: &str) -> bool {
@@ -1126,14 +1248,14 @@ async fn a_head_replacing_a_folder_holding_local_work_with_a_file_prepares_a_res
             for (path, content) in work {
                 assert_eq!(read(dir, path), *content, "{label}");
                 assert_eq!(
-                    snapshot_bytes(&local, path),
+                    snapshot_bytes(&copy, &local, path),
                     Some(content.as_bytes().to_vec()),
                     "{label}"
                 );
             }
             assert_eq!(local.get("d"), Some(&None), "{label}");
             assert_eq!(
-                snapshot_bytes(&copy.remote_snapshot().unwrap(), "d"),
+                snapshot_bytes(&copy, &copy.remote_snapshot().unwrap(), "d"),
                 Some(b"file\n".to_vec()),
                 "{label}"
             );
@@ -1348,7 +1470,7 @@ async fn a_head_replacing_a_file_holding_local_work_with_a_folder_prepares_a_res
         );
         assert_eq!(read(dir, "d"), local, "{label}");
         assert_eq!(
-            snapshot_bytes(&copy.remote_snapshot().unwrap(), "d/x.md"),
+            snapshot_bytes(&copy, &copy.remote_snapshot().unwrap(), "d/x.md"),
             Some(b"x\n".to_vec()),
             "{label}"
         );
@@ -1463,7 +1585,14 @@ async fn a_head_file_over_a_folder_holding_only_excluded_files_publishes_nothing
     )
     .await;
 
-    assert!(matches!(outcome, Err(CliError::Io { .. })), "{outcome:?}");
+    // SPEC u280: the left-out refusal names what the folder still holds.
+    match &outcome {
+        Err(CliError::LeftOut { path, entries }) => {
+            assert_eq!(path, "d");
+            assert_eq!(entries, &vec!["d/node_modules/".to_string()]);
+        }
+        other => panic!("expected the left-out refusal, got {other:?}"),
+    }
     assert!(copy.resolution().unwrap().is_none());
     assert!(e.fake.push_bodies().is_empty());
     assert_eq!(read(&dir, "d/node_modules/p.js"), "p\n");
@@ -1880,10 +2009,8 @@ async fn killed_resolution_resumes_under_its_recovery_id() {
     let resumed = expect_resolution(outcome);
     assert_eq!(resumed.recovery_id, earlier.recovery_id);
     assert_eq!(
-        copy.local_snapshot().unwrap()["a.md"]
-            .clone()
-            .unwrap()
-            .into_bytes(),
+        copy.content_bytes(&copy.local_snapshot().unwrap()["a.md"].clone().unwrap())
+            .unwrap(),
         b"a\nL\nc\n".to_vec()
     );
 }
@@ -2720,10 +2847,8 @@ async fn a_resumed_preparation_keeps_a_candidate_that_already_landed() {
     );
     assert!(copy.resolution().unwrap().unwrap().pending_writes.is_none());
     assert_eq!(
-        copy.local_snapshot().unwrap()["a.md"]
-            .clone()
-            .unwrap()
-            .into_bytes(),
+        copy.content_bytes(&copy.local_snapshot().unwrap()["a.md"].clone().unwrap())
+            .unwrap(),
         b"a\nL\nc\n".to_vec()
     );
     assert!(e.fake.push_bodies().is_empty());
@@ -2936,10 +3061,8 @@ async fn a_preparation_killed_after_recording_its_resolution_is_finished_before_
     );
     assert!(read(&dir, "a.md").lines().any(|l| l == "<<<<<<< local"));
     assert_eq!(
-        copy.local_snapshot().unwrap()["a.md"]
-            .clone()
-            .unwrap()
-            .into_bytes(),
+        copy.content_bytes(&copy.local_snapshot().unwrap()["a.md"].clone().unwrap())
+            .unwrap(),
         b"one\nLOCAL two\nthree\n".to_vec()
     );
 
@@ -3393,4 +3516,170 @@ fn state_write_replaces_a_base_another_process_holds_open() {
     assert_eq!(copy.base().unwrap().commit_sha(), Some("h1-commit"));
     assert!(held.contains("h0-commit"), "{held}");
     assert!(!held.contains("h1-commit"), "{held}");
+}
+
+// ---- u280: the budget at zero, and a text merge outside it --------------
+
+fn opts_held_at(e: &Env, budget: u64) -> SmartPushOptions {
+    SmartPushOptions {
+        held: Some(HeldBytes::new(budget)),
+        ..e.opts()
+    }
+}
+
+/// SPEC u280 `a_zero_budget_snapshot_restores_the_same_bytes`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_zero_budget_snapshot_restores_the_same_bytes() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let base: &[u8] = b"\x89PNG\x00base";
+    let local: &[u8] = b"\x89PNG\x00local";
+    let head: &[u8] = b"\x89PNG\x00head";
+    let h0 = e.fake.commit_bytes(&[
+        (".syns.yaml", b"owner: alice\nname: proj\n"),
+        ("image.png", base),
+    ]);
+    checkout(&e.fake, &copy, &h0);
+    std::fs::write(dir.join("image.png"), local).unwrap();
+    e.fake.commit_byte_changes(&[("image.png", Some(head))]);
+
+    let outcome = converge(
+        &e.fake.client(),
+        Some(TOKEN),
+        &copy,
+        ConvergeMode::Publish,
+        opts_held_at(&e, 0),
+    )
+    .await
+    .unwrap();
+
+    expect_resolution(outcome);
+    let remote = copy.remote_snapshot().unwrap();
+    let head_side = remote["image.png"].clone().unwrap();
+    assert!(matches!(
+        head_side,
+        syns_cli::push::working_copy::SnapshotContent::Stored { .. }
+    ));
+    assert_eq!(copy.content_bytes(&head_side).unwrap(), head);
+
+    discard_resolution(&copy).unwrap();
+
+    assert_eq!(std::fs::read(dir.join("image.png")).unwrap(), local);
+}
+
+/// SPEC u280 `a_zero_budget_overwrite_snapshots_by_hash`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_zero_budget_overwrite_snapshots_by_hash() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let h0 = e.fake.commit_bytes(&[
+        (".syns.yaml", b"owner: alice\nname: proj\n"),
+        ("image.png", b"\x89PNG\x00zero"),
+        ("a.md", b"a\n"),
+    ]);
+    checkout(&e.fake, &copy, &h0);
+    std::fs::write(dir.join("image.png"), b"\x89PNG\x00local").unwrap();
+    std::fs::write(dir.join("a.md"), b"a local\n").unwrap();
+    e.fake.commit_byte_changes(&[
+        ("image.png", Some(b"\x89PNG\x00head")),
+        ("a.md", Some(b"a head\n")),
+    ]);
+
+    let outcome = converge(
+        &e.fake.client(),
+        Some(TOKEN),
+        &copy,
+        ConvergeMode::Retrieve { overwrite: true },
+        opts_held_at(&e, 0),
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(outcome, SyncOutcome::Synced { .. }), "{outcome:?}");
+    assert_eq!(
+        std::fs::read(dir.join("image.png")).unwrap(),
+        b"\x89PNG\x00head"
+    );
+    assert_eq!(std::fs::read(dir.join("a.md")).unwrap(), b"a head\n");
+    let snapshot = copy.local_snapshot().unwrap();
+    for (path, prior) in [
+        ("image.png", &b"\x89PNG\x00local"[..]),
+        ("a.md", &b"a local\n"[..]),
+    ] {
+        let content = snapshot[path].clone().unwrap();
+        match &content {
+            syns_cli::push::working_copy::SnapshotContent::Stored { stored } => {
+                assert_eq!(
+                    std::fs::read(copy.snapshot_content_dir().join(stored)).unwrap(),
+                    prior,
+                    "{path}"
+                );
+            }
+            other => panic!("{path} was snapshotted inline: {other:?}"),
+        }
+    }
+}
+
+/// SPEC u280 `a_large_text_collision_merges_outside_the_budget`: two
+/// copies of one working copy, a text collision past 11 MiB a side,
+/// merged under the full budget in the first and under none in the
+/// second, answer the same candidate.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_large_text_collision_merges_outside_the_budget() {
+    let e = env().await;
+    let line = |i: usize, tag: &str| format!("line {i:07} of the shared text {tag}\n");
+    let base: String = (0..11_534_336 / 40).map(|i| line(i, "base")).collect();
+    let mut base = base.into_bytes();
+    base.resize(11_534_336, b'\n');
+    let edit = |tag: &str| -> Vec<u8> {
+        let mut bytes = base.clone();
+        let mut tail = format!("{tag} changed this middle line\n").into_bytes();
+        let middle = bytes.len() / 2 / 40 * 40;
+        bytes.splice(middle..middle + 40, tail.drain(..));
+        bytes.extend_from_slice(format!("{tag} appends a line past the base\n").as_bytes());
+        bytes
+    };
+    let (local, head) = (edit("LOCAL"), edit("HEAD"));
+    assert!(local.len() > 11 * 1024 * 1024 && head.len() > 11 * 1024 * 1024);
+    let identity: &[u8] = b"owner: alice\nname: proj\n";
+    let h0 = e
+        .fake
+        .commit_bytes(&[(".syns.yaml", identity), ("a.md", &base)]);
+    e.fake.commit_byte_changes(&[("a.md", Some(&head))]);
+
+    let mut merged = Vec::new();
+    for budget in [syns_cli::push::collector::HELD_BYTES_BUDGET, 0] {
+        let dir = tempfile::tempdir().unwrap();
+        let copy = e.copy(dir.path());
+        checkout(&e.fake, &copy, &h0);
+        std::fs::write(dir.path().join("a.md"), &local).unwrap();
+
+        let outcome = converge(
+            &e.fake.client(),
+            Some(TOKEN),
+            &copy,
+            ConvergeMode::Publish,
+            opts_held_at(&e, budget),
+        )
+        .await
+        .unwrap();
+
+        expect_resolution(outcome);
+        let text = std::fs::read(dir.path().join("a.md")).unwrap();
+        let shown = String::from_utf8_lossy(&text);
+        assert!(
+            shown.contains("<<<<<<< local\n"),
+            "budget {budget}: no markers"
+        );
+        assert!(shown.contains("LOCAL changed this middle line"));
+        assert!(shown.contains("HEAD changed this middle line"));
+        assert!(shown.contains(">>>>>>> remote"));
+        merged.push(text);
+    }
+    assert!(merged[0] == merged[1], "the two candidates differ");
 }

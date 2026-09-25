@@ -543,20 +543,24 @@ async fn mount_pull_mocks(ctx: &TestContext, repo_id: &str, entries: serde_json:
         .await;
     Mock::given(method("GET"))
         .and(path_matcher(format!(
-            "/api/v1/repos/{repo_id}/files/root-a.md"
+            "/api/v1/repos/{repo_id}/raw/root-a.md"
         )))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "content": "a", "sha": blob_sha1(b"a"), "size": 1
-        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("ETag", format!("\"{}\"", blob_sha1(b"a")).as_str())
+                .set_body_bytes("a".as_bytes().to_vec()),
+        )
         .mount(&ctx.mock_server)
         .await;
     Mock::given(method("GET"))
         .and(path_matcher(format!(
-            "/api/v1/repos/{repo_id}/files/sub/nested.md"
+            "/api/v1/repos/{repo_id}/raw/sub/nested.md"
         )))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "content": "n", "sha": blob_sha1(b"n"), "size": 1
-        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("ETag", format!("\"{}\"", blob_sha1(b"n")).as_str())
+                .set_body_bytes("n".as_bytes().to_vec()),
+        )
         .mount(&ctx.mock_server)
         .await;
 }

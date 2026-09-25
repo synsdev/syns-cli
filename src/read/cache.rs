@@ -16,6 +16,7 @@ use std::time::SystemTime;
 use crate::client::SynsClient;
 use crate::config::Config;
 use crate::errors::CliError;
+use crate::push::collector::is_text;
 use crate::push::hash::blob_sha1;
 use crate::read::ReadTarget;
 
@@ -144,17 +145,20 @@ impl BlobCache {
         // 3 — classify the decoded answer as text or binary on a NUL
         // byte, the test `src/push/collector.rs` takes over a local file
         // taken here over the decoded answer.
-        if response.content.contains('\0') {
-            return Ok(BlobContent::Binary);
-        }
+        // `content: null` is a content that is not text, and so is one
+        // `is_text` refuses (SPEC u280 `get_or_fetch` 3).
+        let content = match response.content {
+            Some(content) if is_text(content.as_bytes()) => content,
+            _ => return Ok(BlobContent::Binary),
+        };
 
         // 4 — derive the blob hash of the answered bytes and store a
         // text answer under that hash alone, and only where it equals
         // the served one.
-        if is_blob_hash(&response.sha) && blob_sha1(response.content.as_bytes()) == response.sha {
-            self.store(&response.sha, response.content.as_bytes());
+        if is_blob_hash(&response.sha) && blob_sha1(content.as_bytes()) == response.sha {
+            self.store(&response.sha, content.as_bytes());
         }
-        Ok(BlobContent::Text(response.content))
+        Ok(BlobContent::Text(content))
     }
 
     /// Writes one blob through a named temporary in the destination's

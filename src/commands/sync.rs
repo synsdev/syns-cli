@@ -86,6 +86,18 @@ pub fn convergence_options(config: &Config) -> SmartPushOptions {
         reference: None,
         expected: None,
         provenance: provenance_from_env(),
+        collected: None,
+        held: None,
+        json_output: false,
+        renders_publication_summary: false,
+    }
+}
+
+/// `convergence_options` for a command writing in `output`'s mode.
+pub fn convergence_options_for(config: &Config, output: &Output) -> SmartPushOptions {
+    SmartPushOptions {
+        json_output: output.is_json(),
+        ..convergence_options(config)
     }
 }
 
@@ -484,7 +496,7 @@ pub async fn cmd_sync(config: &Config, output: &Output, if_repo: bool) -> Result
             Some(&token),
             &copy,
             ConvergeMode::Publish,
-            convergence_options(config),
+            convergence_options_for(config, output),
         )
         .await
     };
@@ -602,9 +614,13 @@ pub async fn cmd_resolution(
                 let token = load_token(config)?;
                 let client = SynsClient::new(config.server_url())?;
                 ensure_identity_file(&copy.root, &owner, &name)?;
-                let outcome =
-                    continue_resolution(&client, &token, &copy, convergence_options(config))
-                        .await?;
+                let outcome = continue_resolution(
+                    &client,
+                    &token,
+                    &copy,
+                    convergence_options_for(config, output),
+                )
+                .await?;
                 Ok(Rendered::Outcome(outcome))
             }
             // 4

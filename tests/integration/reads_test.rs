@@ -66,7 +66,7 @@ impl Deployment {
     fn file_calls(&self) -> usize {
         self.requests()
             .iter()
-            .filter(|r| r.url.path().contains("/files/"))
+            .filter(|r| r.url.path().contains("/files/") || r.url.path().contains("/raw/"))
             .count()
     }
 
@@ -171,6 +171,28 @@ fn mount_file(d: &Deployment, path: &str, content: &str) {
     );
 }
 
+/// The raw entry `syns cat` reads outside machine-readable mode, answering
+/// `bytes` under an `ETag` of their blob hash (SPEC u280 `cmd_cat` 1).
+fn mount_raw(d: &Deployment, path: &str, bytes: &[u8]) {
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path_matcher(format!("/api/v1/repos/{REPO}/raw/{path}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", format!("\"{}\"", blob_sha1(bytes)).as_str())
+                    .set_body_bytes(bytes.to_vec()),
+            ),
+    );
+}
+
+fn mount_raw_status(d: &Deployment, path: &str, status: u16, body: Value) {
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path_matcher(format!("/api/v1/repos/{REPO}/raw/{path}")))
+            .respond_with(ResponseTemplate::new(status).set_body_json(body)),
+    );
+}
+
 fn mount_file_status(d: &Deployment, path: &str, status: u16, body: Value) {
     d.mount(
         Mock::given(method("GET"))
@@ -268,7 +290,7 @@ fn query_of(request: &Request, key: &str) -> Option<String> {
 fn cat_at_a_version_reads_that_version_and_reports_it() {
     let d = Deployment::new();
     mount_version(&d, "2", 2, OLD_SHA);
-    mount_file(&d, "a.md", "old");
+    mount_raw(&d, "a.md", b"old");
 
     let output = d.run(&["cat", "a.md", "--repo", REPO, "--version", "2"]);
     assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
@@ -282,8 +304,8 @@ fn cat_at_a_version_reads_that_version_and_reports_it() {
     let requests = d.requests();
     let file = requests
         .iter()
-        .find(|r| r.url.path().contains("/files/"))
-        .expect("a file request");
+        .find(|r| r.url.path().contains("/raw/"))
+        .expect("a raw request");
     assert_eq!(query_of(file, "ref").as_deref(), Some("2"));
 }
 
@@ -315,7 +337,7 @@ fn cat_json_carries_the_resolved_reference_beside_the_served_body() {
 fn a_hash_version_is_resolved_once_and_sent_as_an_ordinal() {
     let d = Deployment::new();
     mount_version(&d, OLD_SHA, 2, OLD_SHA);
-    mount_file(&d, "a.md", "old");
+    mount_raw(&d, "a.md", b"old");
 
     let output = d.run(&["cat", "a.md", "--repo", REPO, "--version", OLD_SHA]);
     assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
@@ -330,8 +352,8 @@ fn a_hash_version_is_resolved_once_and_sent_as_an_ordinal() {
 
     let file = requests
         .iter()
-        .find(|r| r.url.path().contains("/files/"))
-        .expect("a file request");
+        .find(|r| r.url.path().contains("/raw/"))
+        .expect("a raw request");
     assert_eq!(query_of(file, "ref").as_deref(), Some("2"));
 }
 
@@ -376,7 +398,7 @@ fn an_out_of_range_version_names_the_version_rather_than_the_path() {
 fn a_path_absent_at_the_pinned_version_names_that_version() {
     let d = Deployment::new();
     mount_version(&d, "58", 58, OLD_SHA);
-    mount_file_status(
+    mount_raw_status(
         &d,
         "a.md",
         404,
@@ -562,6 +584,7 @@ fn read_refuses_a_content_that_is_not_text_where_cat_passes_it_through() {
     let d = Deployment::new();
     mount_head(&d);
     mount_file(&d, "a.md", "one\u{0}two");
+    mount_raw(&d, "a.md", b"one\0two");
 
     let numbered = d.run(&["read", "a.md", "--repo", REPO]);
     assert_eq!(numbered.status.code(), Some(1));

@@ -2240,6 +2240,7 @@ name = "syns"
 version = "0.3.3"
 dependencies = [
  "assert_cmd",
+ "base64",
  "clap",
  "comfy-table",
  "console",

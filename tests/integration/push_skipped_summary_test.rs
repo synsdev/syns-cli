@@ -11,6 +11,14 @@ use std::fs;
 
 use super::common::{SpawnOpts, default_push_response, spawn_mock_env};
 
+/// A sparse file one byte past `LIM-file-size` (SPEC u280).
+fn too_large(path: &std::path::Path) {
+    fs::File::create(path)
+        .unwrap()
+        .set_len(syns_cli::push::collector::MAX_FILE_BYTES + 1)
+        .unwrap();
+}
+
 #[test]
 #[serial]
 fn mixed_text_and_binary_emits_stderr_summary_exit_0() {
@@ -20,13 +28,9 @@ fn mixed_text_and_binary_emits_stderr_summary_exit_0() {
     });
 
     fs::write(env.project_dir.path().join("README.md"), "hello world").unwrap();
-    // First byte of a real PNG header includes a 0x0A but the third byte
-    // is the null which is_binary keys on (null-byte in first 8 KB).
-    fs::write(
-        env.project_dir.path().join("logo.png"),
-        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR",
-    )
-    .unwrap();
+    // SPEC u280: a file is dropped for its size alone, never for what it
+    // holds.
+    too_large(&env.project_dir.path().join("logo.png"));
     fs::create_dir_all(env.project_dir.path().join("dist")).unwrap();
     fs::write(env.project_dir.path().join("dist/bundle.js"), "x=1").unwrap();
 
@@ -55,8 +59,8 @@ fn mixed_text_and_binary_emits_stderr_summary_exit_0() {
         "stderr did not contain the summary header — stderr: {stderr}"
     );
     assert!(
-        stderr.contains("binary content (1): logo.png"),
-        "stderr missing binary line — stderr: {stderr}"
+        stderr.contains("larger than 25 MiB (1): logo.png"),
+        "stderr missing too-large line — stderr: {stderr}"
     );
     assert!(
         stderr.contains("default-excluded directory (1): dist/bundle.js"),
@@ -65,12 +69,12 @@ fn mixed_text_and_binary_emits_stderr_summary_exit_0() {
     // CODE_REVIEW M5: assert all three expected hint lines individually
     // so a regression that drops one or two still fails the test.
     assert!(
-        stderr.contains("hint: pass --strict to fail the push"),
+        stderr.contains("hint: pass --strict to fail the push when a file is too large to publish"),
         "stderr missing strict hint — stderr: {stderr}"
     );
     assert!(
-        stderr.contains("hint: add binary extensions"),
-        "stderr missing binary hint — stderr: {stderr}"
+        !stderr.contains("binary"),
+        "no line or hint names binary content — stderr: {stderr}"
     );
     assert!(
         stderr.contains("hint: pass --no-default-excludes"),
@@ -173,7 +177,7 @@ fn no_default_excludes_flag_re_includes_build_dirs() {
 
 /// CODE_REVIEW M4: smoke test for the `--debug` flag. Asserts the
 /// `[debug] skip` breadcrumb fires for each skipped file with the
-/// SPEC § 3.2 source label (here: `binary-heuristic`).
+/// SPEC § 3.2 source label (here, SPEC u280: `size-limit`).
 #[test]
 #[serial]
 fn debug_flag_emits_per_file_decisions() {
@@ -183,7 +187,7 @@ fn debug_flag_emits_per_file_decisions() {
     });
 
     fs::write(env.project_dir.path().join("README.md"), "hello").unwrap();
-    fs::write(env.project_dir.path().join("logo.png"), b"data\x00null").unwrap();
+    too_large(&env.project_dir.path().join("logo.png"));
 
     let output = AssertCommand::cargo_bin("syns")
         .expect("syns binary")
@@ -211,8 +215,8 @@ fn debug_flag_emits_per_file_decisions() {
         "stderr missing [debug] skip breadcrumb — stderr: {stderr}"
     );
     assert!(
-        stderr.contains("binary-heuristic"),
-        "stderr missing binary-heuristic source label — stderr: {stderr}"
+        stderr.contains("(size-limit)"),
+        "stderr missing size-limit source label — stderr: {stderr}"
     );
     assert!(
         stderr.contains("logo.png"),
@@ -222,8 +226,8 @@ fn debug_flag_emits_per_file_decisions() {
 
 /// CODE_REVIEW L2: the `+K more` truncation branch in
 /// `write_skip_summary` (commands/push.rs originally) fires when a
-/// single category exceeds `MAX_PER_CATEGORY = 5`. Six binary files
-/// yield "+1 more". Verifies the exact suffix and that exactly five
+/// single category exceeds `MAX_PER_CATEGORY = 5`. Six files a
+/// `.gitignore` rule drops yield "+1 more". Verifies the exact suffix and that exactly five
 /// concrete file names precede it.
 #[test]
 #[serial]
@@ -234,8 +238,9 @@ fn truncates_excess_paths_with_k_more() {
     });
 
     // One text file (so the push doesn't abort with PUSH_EMPTY) plus
-    // six binary files (one over the MAX_PER_CATEGORY=5 threshold).
+    // six ignored files (one over the MAX_PER_CATEGORY=5 threshold).
     fs::write(env.project_dir.path().join("README.md"), "keep").unwrap();
+    fs::write(env.project_dir.path().join(".gitignore"), "*.png\n").unwrap();
     for i in 0..6 {
         fs::write(
             env.project_dir.path().join(format!("img_{i}.png")),
@@ -265,8 +270,8 @@ fn truncates_excess_paths_with_k_more() {
         "non-zero exit; stderr was: {stderr}"
     );
     assert!(
-        stderr.contains("binary content (6):"),
-        "stderr missing 6-count header for binary category — stderr: {stderr}"
+        stderr.contains(".gitignore rule (6):"),
+        "stderr missing 6-count header for the .gitignore category — stderr: {stderr}"
     );
     assert!(
         stderr.contains("+1 more"),

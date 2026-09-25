@@ -249,7 +249,7 @@ mod tests {
         let err = CliError::PushPartial {
             skipped: vec![SkippedFile {
                 path: "a/b.png".into(),
-                reason: SkipReason::Binary,
+                reason: SkipReason::TooLarge,
             }],
             no_default_excludes: false,
         };
@@ -259,6 +259,6 @@ mod tests {
         let arr = parsed["skipped"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["path"], "a/b.png");
-        assert_eq!(arr[0]["reason"], "binary");
+        assert_eq!(arr[0]["reason"], "too_large");
     }
 }

@@ -97,17 +97,24 @@ impl Env {
                 .mount(&self.server)
                 .await;
             Mock::given(method("GET"))
-                .and(path("/api/v1/repos/alice/notes/files/.syns.yaml"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "content": yaml, "sha": blob_sha1(yaml.as_bytes()), "size": yaml.len()
-                })))
+                .and(path("/api/v1/repos/alice/notes/raw/.syns.yaml"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header(
+                            "ETag",
+                            format!("\"{}\"", blob_sha1(yaml.as_bytes())).as_str(),
+                        )
+                        .set_body_bytes(yaml.as_bytes().to_vec()),
+                )
                 .mount(&self.server)
                 .await;
             Mock::given(method("GET"))
-                .and(path("/api/v1/repos/alice/notes/files/a.md"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "content": "a", "sha": blob_sha1(b"a"), "size": 1
-                })))
+                .and(path("/api/v1/repos/alice/notes/raw/a.md"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("ETag", format!("\"{}\"", blob_sha1(b"a")).as_str())
+                        .set_body_bytes("a".as_bytes().to_vec()),
+                )
                 .mount(&self.server)
                 .await;
         });

@@ -1,3 +1,4 @@
+use crate::client::{ANSWER_STALL, api_client, read_body, send_bounded};
 use crate::errors::CliError;
 
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
@@ -36,7 +37,11 @@ struct TokenErrorResponse {
 }
 
 async fn extract_api_error(response: reqwest::Response, status_code: u16) -> CliError {
-    let error = match response.json::<TokenErrorResponse>().await {
+    let body = match read_body(response, ANSWER_STALL).await {
+        Ok(body) => body,
+        Err(err) => return err,
+    };
+    let error = match serde_json::from_slice::<TokenErrorResponse>(&body) {
         Ok(body) => body.error,
         Err(_) => format!("HTTP {status_code}"),
     };
@@ -45,6 +50,42 @@ async fn extract_api_error(response: reqwest::Response, status_code: u16) -> Cli
         error,
         context: None,
     }
+}
+
+/// Post `body` as JSON through the bounded transport (SPEC u280
+/// `send_bounded`), any failure to reach the server named by its address.
+async fn post_json<T: serde::Serialize>(
+    client: &reqwest::Client,
+    url: &str,
+    body: &T,
+    server_url: &str,
+) -> Result<reqwest::Response, CliError> {
+    let unreachable = || CliError::ServerUnreachable {
+        url: server_url.to_string(),
+    };
+    let bytes = serde_json::to_vec(body).map_err(|_| unreachable())?;
+    let len = bytes.len();
+    send_bounded(
+        client
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(bytes),
+        len,
+    )
+    .await
+    .map_err(|_| unreachable())
+}
+
+/// Decode an answer read through `read_body`, or `refusal` where it does
+/// not decode.
+async fn decode<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    refusal: &str,
+) -> Result<T, CliError> {
+    let body = read_body(response, ANSWER_STALL).await?;
+    serde_json::from_slice(&body).map_err(|_| CliError::Io {
+        message: refusal.into(),
+    })
 }
 
 #[derive(Debug)]
@@ -89,22 +130,19 @@ impl DeviceAuthFlow {
             });
         }
 
-        // 2. Create reqwest client
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .expect("failed to build HTTP client");
+        // 2. The client every request to `BND-public-api` is built as
+        // (SPEC u280 `SynsClient::new`).
+        let client = api_client()?;
 
         // 3. Request device code
         let code_url = format!("{server_url}{DEVICE_CODE_PATH}");
-        let response = client
-            .post(&code_url)
-            .json(&serde_json::json!({"client_id": CLIENT_ID}))
-            .send()
-            .await
-            .map_err(|_| CliError::ServerUnreachable {
-                url: server_url.to_string(),
-            })?;
+        let response = post_json(
+            &client,
+            &code_url,
+            &serde_json::json!({"client_id": CLIENT_ID}),
+            server_url,
+        )
+        .await?;
 
         // 4. Handle non-200
         if !response.status().is_success() {
@@ -114,9 +152,7 @@ impl DeviceAuthFlow {
 
         // 5. Deserialize response
         let device_code_response: DeviceCodeResponse =
-            response.json().await.map_err(|_| CliError::Io {
-                message: "unexpected response from device code endpoint".into(),
-            })?;
+            decode(response, "unexpected response from device code endpoint").await?;
 
         // 6. Display to stderr
         let display_url = device_code_response
@@ -162,33 +198,28 @@ impl DeviceAuthFlow {
             }
             tokio::time::sleep(std::time::Duration::from_secs(poll_interval_secs)).await;
 
-            let response = client
-                .post(&token_url)
-                .json(&TokenPollRequest {
+            let response = post_json(
+                &client,
+                &token_url,
+                &TokenPollRequest {
                     device_code: device_code_response.device_code.clone(),
                     client_id: CLIENT_ID.to_string(),
                     grant_type: "urn:ietf:params:oauth:grant-type:device_code".to_string(),
-                })
-                .send()
-                .await
-                .map_err(|_| CliError::ServerUnreachable {
-                    url: server_url.to_string(),
-                })?;
+                },
+                server_url,
+            )
+            .await?;
             let status = response.status();
 
             if status.is_success() {
                 let success: TokenSuccessResponse =
-                    response.json().await.map_err(|_| CliError::Io {
-                        message: "unexpected response from token endpoint".into(),
-                    })?;
+                    decode(response, "unexpected response from token endpoint").await?;
                 return Ok(success.access_token);
             }
 
             if status == reqwest::StatusCode::BAD_REQUEST {
                 let error_body: TokenErrorResponse =
-                    response.json().await.map_err(|_| CliError::Io {
-                        message: "unexpected response from token endpoint".into(),
-                    })?;
+                    decode(response, "unexpected response from token endpoint").await?;
                 match classify_poll_error(&error_body.error, poll_interval_secs) {
                     PollAction::Continue => continue,
                     PollAction::SlowDown(new_interval) => {

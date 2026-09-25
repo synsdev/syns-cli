@@ -14,6 +14,7 @@ pub async fn cmd_logout(config: &Config, output: &Output) -> Result<(), CliError
 
     if let Some(token) = &token
         && let Ok(client) = reqwest::Client::builder()
+            .user_agent(crate::client::USER_AGENT)
             .timeout(Duration::from_secs(SIGN_OUT_TIMEOUT_SECS))
             .redirect(reqwest::redirect::Policy::none())
             .build()

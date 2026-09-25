@@ -7,3 +7,5 @@
 # Nix build symlink (out of `nix build`)
 /result
 /result-*
+# The perf harness builds into its own target directory (u280).
+/perf/target

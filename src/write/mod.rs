@@ -24,7 +24,7 @@ use crate::commands::sync::provenance_from;
 use crate::config::Config;
 use crate::errors::{ApiErrorContext, CliError, IdentityRemedy, NotTextSurface};
 use crate::output::Output;
-use crate::push::collector::{CollectOptions, collect_files};
+use crate::push::collector::{CollectOptions, HeldBytes, collect_files};
 use crate::push::converge::{excluded_local_files, is_partial_write};
 use crate::push::hash::blob_sha1;
 use crate::push::working_copy::WorkingCopy;
@@ -219,14 +219,23 @@ pub fn checkout_of(
     // with no `--exclude` pattern. No working copy records the pair its
     // base was written under, so a folder last published under either
     // collection flag reads as holding unpublished work.
-    let collected = collect_files(&identity.dir, &[], CollectOptions::default())?;
+    // The guard compares hashes alone, so its collection is handed no
+    // record and holds no byte: a budget of zero keeps each kept file's
+    // hash and nothing more (SPEC u280, the `src/write/mod.rs` row).
+    let collected = collect_files(
+        &identity.dir,
+        &[],
+        CollectOptions::default(),
+        None,
+        &HeldBytes::new(0),
+    )?;
     let folder: BTreeMap<String, String> = collected
         .files
         .iter()
         // A sibling a killed convergence left is no local work: the
         // next collection sweeps it.
         .filter(|(path, _)| !is_partial_write(path))
-        .map(|(path, bytes)| (path.clone(), blob_sha1(bytes)))
+        .map(|(path, file)| (path.clone(), file.sha.clone()))
         .collect();
 
     let Some(base) = base else {
@@ -463,6 +472,7 @@ fn push_body(
                 path: path.clone(),
                 sha: blob_sha1(content.as_bytes()),
                 content: Some(content.clone()),
+                content_base64: None,
             })
             .collect(),
         deletions: if changeset.deletions.is_empty() {
@@ -850,12 +860,15 @@ mod tests {
 
     /// The folder as the guard collects it.
     fn folder_hashes(root: &Path) -> std::collections::HashMap<String, String> {
-        collect_files(root, &[], CollectOptions::default())
-            .unwrap()
-            .files
-            .iter()
-            .map(|(path, bytes)| (path.clone(), blob_sha1(bytes)))
-            .collect()
+        collect_files(
+            root,
+            &[],
+            CollectOptions::default(),
+            None,
+            &HeldBytes::new(0),
+        )
+        .unwrap()
+        .hashes()
     }
 
     // SPEC u271 Contract Surface, `text_or_refuse`.

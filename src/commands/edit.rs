@@ -9,7 +9,7 @@
 
 use crate::client::SynsClient;
 use crate::config::Config;
-use crate::errors::CliError;
+use crate::errors::{CliError, NotTextSurface};
 use crate::output::Output;
 use crate::write::{
     Changeset, WriteOptions, commit_changeset, default_message, resolve_write_target,
@@ -117,7 +117,16 @@ pub async fn cmd_edit(
     // 3 — classify the answered content. A content the store already
     // replaced byte by byte classifies as text and passes
     // (`issues/082-engine-binary-content-corrupted-via-utf8-roundtrip`).
-    let content = text_or_refuse(&path, response.content.as_bytes())?;
+    // A `content: null` answer is a content that is not text (SPEC u280).
+    let content = match &response.content {
+        Some(content) => text_or_refuse(&path, content.as_bytes())?,
+        None => {
+            return Err(CliError::NotText {
+                path,
+                surface: NotTextSurface::Write,
+            });
+        }
+    };
 
     // 4 and 5 — count the occurrences and replace them.
     let edited = replaced(&content, &old, &new, replace_all, &path, &opts.parent)?;

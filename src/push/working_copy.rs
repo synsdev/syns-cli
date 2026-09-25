@@ -29,6 +29,158 @@ const RESOLUTION_FILE: &str = "resolution.json";
 const OUTBOX_FILE: &str = "outbox.json";
 const LOCAL_SNAPSHOT_FILE: &str = "local-snapshot.json";
 const REMOTE_SNAPSHOT_FILE: &str = "remote-snapshot.json";
+const STAT_RECORD_FILE: &str = "stat-record.json";
+
+/// What a collection saw of each file it read, so the next collection
+/// spares a file its read where nothing about it moved (SPEC u280
+/// `StatRecord`, `NR-01`): kept per working copy as `stat-record.json`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatRecord {
+    pub entries: BTreeMap<String, StatEntry>,
+    /// The modification time of the probe the writing collection made in
+    /// the working copy's root after its last read, none where no probe
+    /// could be made. An entry whose times do not both stand earlier than
+    /// it is too recent to trust.
+    pub stamp: Option<(i64, i64)>,
+}
+
+/// One file as a collection read it, symbolic links followed, each time
+/// as seconds and nanoseconds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatEntry {
+    pub size: u64,
+    pub mtime: (i64, i64),
+    pub ctime: (i64, i64),
+    pub inode: u64,
+    pub sha: String,
+}
+
+/// The size, modification time, change time and inode `meta` answers.
+#[cfg(unix)]
+fn stat_of(meta: &std::fs::Metadata) -> (u64, (i64, i64), (i64, i64), u64) {
+    use std::os::unix::fs::MetadataExt;
+    (
+        meta.len(),
+        (meta.mtime(), meta.mtime_nsec()),
+        (meta.ctime(), meta.ctime_nsec()),
+        meta.ino(),
+    )
+}
+
+impl StatRecord {
+    /// The record kept in `state_dir`, empty with no stamp where its file
+    /// is absent or unreadable.
+    pub fn load(state_dir: &Path) -> StatRecord {
+        std::fs::read(state_dir.join(STAT_RECORD_FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    /// Write the record into `state_dir`.
+    pub fn save(&self, state_dir: &Path) -> Result<(), CliError> {
+        write_json(&state_dir.join(STAT_RECORD_FILE), self)
+    }
+
+    /// The hash the entry for `path` answers where it trusts `meta`: the
+    /// size, both times and the inode all equal, and both times earlier
+    /// than the stamp.
+    #[cfg(unix)]
+    pub fn trusted(&self, path: &str, meta: &std::fs::Metadata) -> Option<String> {
+        let stamp = self.stamp?;
+        let entry = self.entries.get(path)?;
+        let (size, mtime, ctime, inode) = stat_of(meta);
+        (entry.size == size
+            && entry.mtime == mtime
+            && entry.ctime == ctime
+            && entry.inode == inode
+            && mtime < stamp
+            && ctime < stamp)
+            .then(|| entry.sha.clone())
+    }
+
+    /// A record kept on no platform but unix trusts nothing.
+    #[cfg(not(unix))]
+    pub fn trusted(&self, _path: &str, _meta: &std::fs::Metadata) -> Option<String> {
+        None
+    }
+
+    /// Record what a read of `path` hashing to `sha` saw, where the file
+    /// answered the same size, times and inode before the read and after
+    /// it; drop its entry otherwise.
+    #[cfg(unix)]
+    pub fn observe(
+        &mut self,
+        path: &str,
+        before: &std::fs::Metadata,
+        after: &std::fs::Metadata,
+        sha: &str,
+    ) {
+        let seen = stat_of(before);
+        if seen != stat_of(after) {
+            self.entries.remove(path);
+            return;
+        }
+        let (size, mtime, ctime, inode) = seen;
+        self.entries.insert(
+            path.to_string(),
+            StatEntry {
+                size,
+                mtime,
+                ctime,
+                inode,
+                sha: sha.to_string(),
+            },
+        );
+    }
+
+    #[cfg(not(unix))]
+    pub fn observe(
+        &mut self,
+        path: &str,
+        _before: &std::fs::Metadata,
+        _after: &std::fs::Metadata,
+        _sha: &str,
+    ) {
+        self.entries.remove(path);
+    }
+
+    /// Whether an entry stands at or past the stamp, or no stamp stands —
+    /// an entry the next collection could not trust.
+    pub fn holds_untrusted(&self) -> bool {
+        match self.stamp {
+            None => !self.entries.is_empty(),
+            Some(stamp) => self
+                .entries
+                .values()
+                .any(|entry| entry.mtime >= stamp || entry.ctime >= stamp),
+        }
+    }
+
+    /// Take a fresh stamp: the modification time of a probe created in
+    /// `root` under a name a collection sweeps as a partial write, and
+    /// removed at once. None where the probe could not be made.
+    #[cfg(unix)]
+    pub fn restamp(&mut self, root: &Path) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let minted = &blob_sha1(format!("{nanos}-{}", std::process::id()).as_bytes())[..16];
+        let probe = root.join(format!(".syns-partial-{minted}"));
+        self.stamp = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+            .and_then(|file| file.metadata())
+            .ok()
+            .map(|meta| {
+                let (_, mtime, _, _) = stat_of(&meta);
+                mtime
+            });
+        let _ = std::fs::remove_file(&probe);
+    }
+}
 
 /// One folder a repository is worked on in, and where its state lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,30 +221,27 @@ pub struct Outbox {
     pub tree: BTreeMap<String, String>,
 }
 
-/// One path's content in a snapshot — text where the bytes are UTF-8,
-/// the bytes themselves otherwise.
+/// One path's content in a snapshot (SPEC u280 `SnapshotContent`). Every
+/// snapshot this build writes carries `Stored`: the blob hash naming the
+/// file `snapshot-content/{stored}` in the state directory, which holds
+/// the content. `Text` and `Bytes` are the inline forms a released build
+/// wrote, still loaded as they stand.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SnapshotContent {
     Text(String),
     Bytes(Vec<u8>),
+    Stored { stored: String },
 }
 
-impl SnapshotContent {
-    pub fn from_bytes(bytes: Vec<u8>) -> SnapshotContent {
-        match String::from_utf8(bytes) {
-            Ok(text) => SnapshotContent::Text(text),
-            Err(err) => SnapshotContent::Bytes(err.into_bytes()),
-        }
-    }
+/// The directory under the state directory each snapshot content is
+/// stored in, one file per content.
+const SNAPSHOT_CONTENT_DIR: &str = "snapshot-content";
 
-    pub fn into_bytes(self) -> Vec<u8> {
-        match self {
-            SnapshotContent::Text(text) => text.into_bytes(),
-            SnapshotContent::Bytes(bytes) => bytes,
-        }
-    }
-}
+#[cfg(unix)]
+const CONTENT_DIR_MODE: u32 = 0o700;
+#[cfg(unix)]
+const CONTENT_FILE_MODE: u32 = 0o600;
 
 /// Each snapshotted path mapped to its content, or to `None` where the
 /// path was absent.
@@ -247,7 +396,9 @@ impl WorkingCopy {
     }
 
     pub fn write_local_snapshot(&self, snapshot: &Snapshot) -> Result<(), CliError> {
-        write_json(&self.local_snapshot_path(), snapshot)
+        self.flush_snapshot_content()?;
+        write_json(&self.local_snapshot_path(), snapshot)?;
+        self.prune_snapshot_content()
     }
 
     /// Each collision's content at the head it was prepared against.
@@ -256,12 +407,240 @@ impl WorkingCopy {
     }
 
     pub fn write_remote_snapshot(&self, snapshot: &Snapshot) -> Result<(), CliError> {
-        write_json(&self.remote_snapshot_path(), snapshot)
+        self.flush_snapshot_content()?;
+        write_json(&self.remote_snapshot_path(), snapshot)?;
+        self.prune_snapshot_content()
     }
 
+    /// Make every content stored since the last flush durable in its
+    /// directory, once for all of them, before a document names any.
+    fn flush_snapshot_content(&self) -> Result<(), CliError> {
+        let dir = self.snapshot_content_dir();
+        if !dir.is_dir() {
+            return Ok(());
+        }
+        finish_directory_flush(&dir, flush_directory(&dir))
+    }
+
+    /// Write whichever snapshot documents are given, then remove every
+    /// content file neither standing snapshot names — the one prune a
+    /// step writing both documents takes, so no content the second
+    /// document names is removed before it is written.
+    pub fn write_snapshots(
+        &self,
+        local: Option<&Snapshot>,
+        remote: Option<&Snapshot>,
+    ) -> Result<(), CliError> {
+        self.flush_snapshot_content()?;
+        if let Some(local) = local {
+            write_json(&self.local_snapshot_path(), local)?;
+        }
+        if let Some(remote) = remote {
+            write_json(&self.remote_snapshot_path(), remote)?;
+        }
+        self.prune_snapshot_content()
+    }
+
+    /// Remove both snapshots, then every content file neither names.
     pub fn remove_snapshots(&self) -> Result<(), CliError> {
         remove_state_file(&self.local_snapshot_path())?;
-        remove_state_file(&self.remote_snapshot_path())
+        remove_state_file(&self.remote_snapshot_path())?;
+        self.prune_snapshot_content()
+    }
+
+    /// The directory holding each stored snapshot content.
+    pub fn snapshot_content_dir(&self) -> PathBuf {
+        self.state_dir.join(SNAPSHOT_CONTENT_DIR)
+    }
+
+    /// Create the content directory, reachable by the person's own
+    /// account alone, where it does not stand.
+    fn content_dir(&self) -> Result<PathBuf, CliError> {
+        let dir = self.snapshot_content_dir();
+        let io = |err: std::io::Error| CliError::Io {
+            message: format!("could not write {}: {err}", dir.display()),
+        };
+        if !dir.is_dir() {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(CONTENT_DIR_MODE);
+            }
+            builder.create(&dir).map_err(io)?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(CONTENT_DIR_MODE))
+                .map_err(io)?;
+        }
+        Ok(dir)
+    }
+
+    /// Store content by its blob hash: `fill` writes it into a fresh file
+    /// beside the content files and answers its blob hash, and the file
+    /// is made durable and renamed to that hash — its directory entry made
+    /// durable by the flush the next snapshot document's write opens with. Answers the hash and
+    /// whether this call created the content file, none standing there
+    /// before.
+    fn store_with(
+        &self,
+        fill: impl FnOnce(&mut File) -> Result<String, CliError>,
+    ) -> Result<(String, bool), CliError> {
+        let dir = self.content_dir()?;
+        let temp = dir.join(format!(
+            ".incoming.{}.{}",
+            std::process::id(),
+            SIBLING_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let io = |err: std::io::Error| CliError::Io {
+            message: format!("could not write {}: {err}", temp.display()),
+        };
+        let mut options = OpenOptions::new();
+        options.write(true).read(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(CONTENT_FILE_MODE);
+        }
+        let stored = (|| {
+            let mut file = options.open(&temp).map_err(io)?;
+            let sha = fill(&mut file)?;
+            file.sync_all().map_err(io)?;
+            drop(file);
+            let target = dir.join(&sha);
+            let created = !target.exists();
+            std::fs::rename(&temp, &target).map_err(io)?;
+            Ok((sha, created))
+        })();
+        if stored.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        stored
+    }
+
+    /// Store `bytes` as a snapshot content.
+    pub fn store_bytes(&self, bytes: &[u8]) -> Result<(String, bool), CliError> {
+        self.store_with(|file| {
+            file.write_all(bytes).map_err(|err| CliError::Io {
+                message: format!("could not write a snapshot content: {err}"),
+            })?;
+            Ok(blob_sha1(bytes))
+        })
+    }
+
+    /// Store the file at `source` as a snapshot content, copied in
+    /// pieces as it stands.
+    pub fn store_file(&self, source: &Path) -> Result<(String, bool), CliError> {
+        self.store_with(|file| {
+            copy_hashing(source, file).map_err(|err| CliError::Io {
+                message: format!("could not read {}: {err}", source.display()),
+            })
+        })
+    }
+
+    /// Store a collected file as a snapshot content through
+    /// `copy_collected`, so what is stored hashes to what the collection
+    /// took.
+    pub fn store_collected(
+        &self,
+        root: &Path,
+        path: &str,
+        collected: &crate::push::collector::CollectedFile,
+    ) -> Result<(String, bool), CliError> {
+        let dir = self.content_dir()?;
+        let temp = dir.join(format!(
+            ".incoming.{}.{}",
+            std::process::id(),
+            SIBLING_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        crate::push::collector::copy_collected(root, path, collected, &temp)?;
+        let io = |err: std::io::Error| CliError::Io {
+            message: format!("could not write {}: {err}", temp.display()),
+        };
+        let stored = (|| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(CONTENT_FILE_MODE))
+                    .map_err(io)?;
+            }
+            File::open(&temp).and_then(|f| f.sync_all()).map_err(io)?;
+            let target = dir.join(&collected.sha);
+            let created = !target.exists();
+            std::fs::rename(&temp, &target).map_err(io)?;
+            Ok((collected.sha.clone(), created))
+        })();
+        if stored.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        stored
+    }
+
+    /// Remove a content file this run stored and no snapshot came to name.
+    pub fn remove_stored(&self, sha: &str) {
+        let _ = std::fs::remove_file(self.snapshot_content_dir().join(sha));
+    }
+
+    /// The file holding a stored content, answered only where its bytes,
+    /// read in pieces, hash to its name.
+    pub fn stored_content(&self, sha: &str) -> Result<PathBuf, CliError> {
+        let path = self.snapshot_content_dir().join(sha);
+        let refused = || CliError::Io {
+            message: format!(
+                "could not read {}: content does not match its hash",
+                path.display()
+            ),
+        };
+        let mut sink = std::io::sink();
+        match copy_hashing(&path, &mut sink) {
+            Ok(actual) if actual == sha => Ok(path),
+            _ => Err(refused()),
+        }
+    }
+
+    /// A snapshot content's bytes, whatever form it was written in, a
+    /// stored one read only where it hashes to its name.
+    pub fn content_bytes(&self, content: &SnapshotContent) -> Result<Vec<u8>, CliError> {
+        match content {
+            SnapshotContent::Text(text) => Ok(text.clone().into_bytes()),
+            SnapshotContent::Bytes(bytes) => Ok(bytes.clone()),
+            SnapshotContent::Stored { stored } => {
+                let path = self.stored_content(stored)?;
+                std::fs::read(&path).map_err(|err| CliError::Io {
+                    message: format!("could not read {}: {err}", path.display()),
+                })
+            }
+        }
+    }
+
+    /// Remove every content file neither standing snapshot names.
+    pub fn prune_snapshot_content(&self) -> Result<(), CliError> {
+        let dir = self.snapshot_content_dir();
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Ok(());
+        };
+        let mut named = std::collections::HashSet::new();
+        for snapshot in [self.local_snapshot()?, self.remote_snapshot()?] {
+            for content in snapshot.into_values().flatten() {
+                if let SnapshotContent::Stored { stored } = content {
+                    named.insert(stored);
+                }
+            }
+        }
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(".incoming.") || named.contains(&name) {
+                continue;
+            }
+            let _ = std::fs::remove_file(entry.path());
+        }
+        if named.is_empty() {
+            let _ = std::fs::remove_dir(&dir);
+        }
+        Ok(())
     }
 
     pub fn local_snapshot_path(&self) -> PathBuf {
@@ -271,6 +650,51 @@ impl WorkingCopy {
     pub fn remote_snapshot_path(&self) -> PathBuf {
         self.state_dir.join(REMOTE_SNAPSHOT_FILE)
     }
+
+    /// The stat record this working copy keeps, empty where none loads.
+    pub fn stat_record(&self) -> StatRecord {
+        StatRecord::load(&self.state_dir)
+    }
+
+    pub fn write_stat_record(&self, record: &StatRecord) -> Result<(), CliError> {
+        record.save(&self.state_dir)
+    }
+}
+
+/// Copy `source` into `dest` in pieces, answering the blob hash of what
+/// was copied.
+fn copy_hashing(source: &Path, dest: &mut impl Write) -> std::io::Result<String> {
+    use sha1::{Digest, Sha1};
+    use std::io::Read;
+    let mut from = File::open(source)?;
+    let declared = from.metadata()?.len();
+    let mut hasher = Sha1::new();
+    hasher.update(format!("blob {declared}\0").as_bytes());
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut copied = 0u64;
+    loop {
+        let n = match from.read(&mut buf) {
+            Ok(n) => n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        if n == 0 {
+            break;
+        }
+        copied += n as u64;
+        hasher.update(&buf[..n]);
+        dest.write_all(&buf[..n])?;
+    }
+    if copied != declared {
+        return Err(std::io::Error::other(
+            "the file changed while it was copied",
+        ));
+    }
+    Ok(hasher.finalize().iter().fold(String::new(), |mut acc, b| {
+        use std::fmt::Write as _;
+        let _ = write!(acc, "{b:02x}");
+        acc
+    }))
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, CliError> {
@@ -524,13 +948,10 @@ mod tests {
         assert!(copy.base().is_none());
 
         let mut snapshot = Snapshot::new();
-        snapshot.insert(
-            "t.md".into(),
-            Some(SnapshotContent::from_bytes(b"text".to_vec())),
-        );
+        snapshot.insert("t.md".into(), Some(SnapshotContent::Text("text".into())));
         snapshot.insert(
             "b.bin".into(),
-            Some(SnapshotContent::from_bytes(vec![0xff, 0x00])),
+            Some(SnapshotContent::Bytes(vec![0xff, 0x00])),
         );
         snapshot.insert("gone.md".into(), None);
         copy.write_local_snapshot(&snapshot).unwrap();
@@ -553,5 +974,140 @@ mod tests {
         let cache = tree.path().join(".cache");
         let result = WorkingCopy::open(&cache, "alice", "proj", tree.path());
         assert!(matches!(result, Err(CliError::Io { .. })), "{result:?}");
+    }
+
+    // ---- u280: the stat record and stored snapshot content -------------
+
+    fn open_copy() -> (tempfile::TempDir, tempfile::TempDir, WorkingCopy) {
+        let cache = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        let copy = WorkingCopy::open(cache.path(), "alice", "proj", tree.path()).unwrap();
+        (cache, tree, copy)
+    }
+
+    #[test]
+    fn the_stat_record_round_trips_and_an_unreadable_one_loads_empty() {
+        let (_cache, _tree, copy) = open_copy();
+        assert_eq!(copy.stat_record(), StatRecord::default());
+
+        let mut record = StatRecord::default();
+        record.entries.insert(
+            "a.png".into(),
+            StatEntry {
+                size: 6,
+                mtime: (1, 2),
+                ctime: (3, 4),
+                inode: 5,
+                sha: "0".repeat(40),
+            },
+        );
+        record.stamp = Some((7, 8));
+        copy.write_stat_record(&record).unwrap();
+        assert_eq!(copy.stat_record(), record);
+
+        std::fs::write(copy.state_dir.join(STAT_RECORD_FILE), "{torn").unwrap();
+        assert_eq!(copy.stat_record(), StatRecord::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_whose_mtime_equals_the_stamp_is_not_trusted() {
+        use std::os::unix::fs::MetadataExt;
+        let (_cache, tree, _copy) = open_copy();
+        let file = tree.path().join("a.png");
+        std::fs::write(&file, b"\x89PNG\x00").unwrap();
+        let meta = std::fs::metadata(&file).unwrap();
+        let mut record = StatRecord::default();
+        record.observe("a.png", &meta, &meta, "sha");
+        record.stamp = Some((meta.mtime(), meta.mtime_nsec()));
+        assert_eq!(record.trusted("a.png", &meta), None);
+        record.stamp = Some((meta.mtime().max(meta.ctime()) + 1, 0));
+        assert_eq!(record.trusted("a.png", &meta).as_deref(), Some("sha"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_restamp_leaves_no_probe_behind() {
+        let (_cache, tree, _copy) = open_copy();
+        let mut record = StatRecord::default();
+        record.restamp(tree.path());
+        assert!(record.stamp.is_some());
+        assert_eq!(std::fs::read_dir(tree.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_stored_content_round_trips_by_its_hash() {
+        let (_cache, _tree, copy) = open_copy();
+        let bytes = [0x89u8, b'P', b'N', b'G', 0x00, 0xff];
+        let (sha, created) = copy.store_bytes(&bytes).unwrap();
+        assert!(created);
+        assert_eq!(sha, blob_sha1(&bytes));
+        let content = SnapshotContent::Stored {
+            stored: sha.clone(),
+        };
+        assert_eq!(copy.content_bytes(&content).unwrap(), bytes.to_vec());
+        let json = serde_json::to_string(&content).unwrap();
+        assert_eq!(json, format!("{{\"stored\":\"{sha}\"}}"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = std::fs::metadata(copy.snapshot_content_dir()).unwrap();
+            assert_eq!(dir.permissions().mode() & 0o777, 0o700);
+            let file = std::fs::metadata(copy.snapshot_content_dir().join(&sha)).unwrap();
+            assert_eq!(file.permissions().mode() & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn a_content_file_no_longer_hashing_to_its_name_is_refused() {
+        let (_cache, _tree, copy) = open_copy();
+        let (sha, _) = copy.store_bytes(b"local\n").unwrap();
+        std::fs::write(copy.snapshot_content_dir().join(&sha), b"tampered\n").unwrap();
+        match copy.stored_content(&sha) {
+            Err(CliError::Io { message }) => {
+                assert!(
+                    message.contains("content does not match its hash"),
+                    "{message}"
+                )
+            }
+            other => panic!("expected the refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_orphaned_content_file_is_removed_on_the_next_snapshot_write() {
+        let (_cache, _tree, copy) = open_copy();
+        let (kept, _) = copy.store_bytes(b"kept\n").unwrap();
+        let (orphan, _) = copy.store_bytes(b"orphan\n").unwrap();
+        let mut snapshot = Snapshot::new();
+        snapshot.insert(
+            "a.md".into(),
+            Some(SnapshotContent::Stored {
+                stored: kept.clone(),
+            }),
+        );
+        copy.write_local_snapshot(&snapshot).unwrap();
+        assert!(copy.snapshot_content_dir().join(&kept).exists());
+        assert!(!copy.snapshot_content_dir().join(&orphan).exists());
+
+        copy.remove_snapshots().unwrap();
+        assert!(!copy.snapshot_content_dir().exists());
+    }
+
+    #[test]
+    fn a_released_builds_inline_snapshot_still_loads() {
+        let (_cache, _tree, copy) = open_copy();
+        std::fs::write(
+            copy.local_snapshot_path(),
+            r#"{"image.png":[137,80,78,71,0,255],"a.md":"a\n","gone.md":null}"#,
+        )
+        .unwrap();
+        let snapshot = copy.local_snapshot().unwrap();
+        assert_eq!(
+            snapshot["image.png"],
+            Some(SnapshotContent::Bytes(vec![137, 80, 78, 71, 0, 255]))
+        );
+        assert_eq!(snapshot["a.md"], Some(SnapshotContent::Text("a\n".into())));
+        assert_eq!(snapshot["gone.md"], None);
     }
 }

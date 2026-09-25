@@ -9,6 +9,7 @@ use crate::client::SynsClient;
 use crate::config::Config;
 use crate::errors::{CliError, NotTextSurface};
 use crate::output::Output;
+use crate::push::collector::is_text;
 use crate::read::{ReadOptions, read_not_found, report_reference, resolve_read_target};
 
 /// The default window: `--offset` counts from `1`, `--limit` from
@@ -76,13 +77,18 @@ pub async fn cmd_read(
 
     // 3 — classify the decoded content, then split a text one on
     // newlines and take the window the two options name.
-    if response.content.contains('\0') {
-        return Err(CliError::NotText {
-            path,
-            surface: NotTextSurface::NumberedRead,
-        });
-    }
-    let lines: Vec<&str> = response.content.lines().collect();
+    // `content: null` is a content that is not text, as one holding a
+    // NUL or failing UTF-8 is (SPEC u280 `FileResponse`).
+    let content = match response.content {
+        Some(content) if is_text(content.as_bytes()) => content,
+        _ => {
+            return Err(CliError::NotText {
+                path,
+                surface: NotTextSurface::NumberedRead,
+            });
+        }
+    };
+    let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len();
     let start = (offset as usize) - 1;
     let window: Vec<&str> = lines.into_iter().skip(start).take(limit as usize).collect();

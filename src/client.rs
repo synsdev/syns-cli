@@ -145,13 +145,19 @@ pub struct CommitProvenance {
     pub task_ref: Option<String>,
 }
 
-#[derive(Serialize, Clone)]
+/// One file a publication names: its hash alone, or its bytes beside it —
+/// `content` where they are text, `content_base64` (standard padded
+/// base64 of the bytes) where they are not, never both (SPEC u280,
+/// `D-088`).
+#[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct PushFileEntry {
     pub path: String,
     pub sha: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_base64: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -285,11 +291,43 @@ pub struct TreeEntry {
     pub sha: Option<String>,
 }
 
+/// `EP-file-read`'s answer: `content` is `None` exactly where the answer
+/// carried `content: null`, a content that is not text (SPEC u280,
+/// `D-088`).
 #[derive(Deserialize, Debug)]
 pub struct FileResponse {
-    pub content: String,
+    pub content: Option<String>,
     pub sha: String,
     pub size: u64,
+}
+
+/// A raw read's answer: the body exactly as it arrived, and the `ETag`
+/// with its quotes removed.
+#[derive(Debug)]
+pub struct RawFile {
+    pub bytes: Vec<u8>,
+    pub etag: Option<String>,
+}
+
+/// A raw read staged into a file: the blob hash of the bytes written, and
+/// the `ETag` as `RawFile` takes it.
+#[derive(Debug)]
+pub struct StagedRaw {
+    pub sha: String,
+    pub etag: Option<String>,
+}
+
+fn etag_of(response: &reqwest::Response) -> Option<String> {
+    response
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.trim()
+                .trim_start_matches("W/")
+                .trim_matches('"')
+                .to_string()
+        })
 }
 
 #[derive(Deserialize, Debug)]
@@ -673,13 +711,210 @@ fn encode_path_segments(path: &str) -> String {
         .join("/")
 }
 
+// --- The bounded transport (SPEC u280, `D-089`, `D-090`) ---
+
+/// The `User-Agent` every request the binary sends to `BND-public-api`
+/// carries, naming the running build (`D-089`).
+pub const USER_AGENT: &str = concat!("syns/", env!("CARGO_PKG_VERSION"));
+
+/// How long an answer's body may go with no byte of it arriving.
+pub const ANSWER_STALL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The longest any request lives, `OPS-res-server-runtime`'s ceiling.
+pub const REQUEST_CEILING: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long a request waits for its answer's head: 30 seconds, and one
+/// more per 256 KiB of the body it sends (`D-089`).
+pub fn request_deadline(body_len: usize) -> std::time::Duration {
+    let millis = 30_000u64.saturating_add((body_len as u64).saturating_mul(1_000) / 262_144);
+    std::time::Duration::from_millis(millis)
+}
+
+/// The one client builder every client of `BND-public-api` is built by:
+/// the build's `User-Agent`, no redirect followed, and `REQUEST_CEILING`
+/// as its only client-wide bound.
+pub(crate) fn api_client() -> Result<reqwest::Client, CliError> {
+    reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(REQUEST_CEILING)
+        .redirect(Policy::none())
+        .build()
+        .map_err(|e| CliError::Config {
+            message: e.to_string(),
+        })
+}
+
+fn unreachable_at(url: &str) -> CliError {
+    CliError::ServerUnreachable {
+        url: url.to_string(),
+    }
+}
+
+/// Send `request`, awaiting its answer's head within the deadline a body
+/// of `body_len` bytes earns, the client's ceiling bounding the rest.
+pub(crate) async fn send_bounded(
+    request: reqwest::RequestBuilder,
+    body_len: usize,
+) -> Result<reqwest::Response, CliError> {
+    let (client, request) = request.build_split();
+    let request = request?;
+    let url = request.url().to_string();
+    match tokio::time::timeout(request_deadline(body_len), client.execute(request)).await {
+        Err(_elapsed) => Err(unreachable_at(&url)),
+        Ok(Err(err)) if err.is_builder() => Err(CliError::from(err)),
+        Ok(Err(_transport)) => Err(unreachable_at(&url)),
+        Ok(Ok(response)) => Ok(response),
+    }
+}
+
+/// Read an answer's body chunk by chunk, each chunk arriving within
+/// `stall` of the head or of the chunk before it; a stalled, failed or
+/// short body ends as `SERVER_UNREACHABLE`.
+pub(crate) async fn read_body(
+    mut response: reqwest::Response,
+    stall: std::time::Duration,
+) -> Result<Vec<u8>, CliError> {
+    let url = response.url().to_string();
+    let declared = response.content_length();
+    let mut body = Vec::with_capacity(declared.unwrap_or(0).min(1 << 20) as usize);
+    loop {
+        match tokio::time::timeout(stall, response.chunk()).await {
+            Err(_elapsed) => return Err(unreachable_at(&url)),
+            Ok(Err(_transport)) => return Err(unreachable_at(&url)),
+            Ok(Ok(None)) => break,
+            Ok(Ok(Some(chunk))) => body.extend_from_slice(&chunk),
+        }
+    }
+    if declared.is_some_and(|declared| declared != body.len() as u64) {
+        return Err(unreachable_at(&url));
+    }
+    Ok(body)
+}
+
+/// Write an answer's body to `dest` as it arrives, one chunk held at a
+/// time, under `read_body`'s stall and short-body refusal, answering the
+/// blob hash of the bytes written.
+pub(crate) async fn read_body_to(
+    mut response: reqwest::Response,
+    stall: std::time::Duration,
+    dest: &mut std::fs::File,
+) -> Result<String, CliError> {
+    use sha1::{Digest, Sha1};
+    use std::io::Write;
+    let url = response.url().to_string();
+    let declared = response.content_length();
+    let write_failed = |err: std::io::Error| CliError::Io {
+        message: format!("could not write a staged answer for {url}: {err}"),
+    };
+    let mut hasher = declared.map(|len| {
+        let mut hasher = Sha1::new();
+        hasher.update(format!("blob {len}\0").as_bytes());
+        hasher
+    });
+    let mut written = 0u64;
+    loop {
+        match tokio::time::timeout(stall, response.chunk()).await {
+            Err(_elapsed) => return Err(unreachable_at(&url)),
+            Ok(Err(_transport)) => return Err(unreachable_at(&url)),
+            Ok(Ok(None)) => break,
+            Ok(Ok(Some(chunk))) => {
+                written += chunk.len() as u64;
+                if let Some(hasher) = hasher.as_mut() {
+                    hasher.update(&chunk);
+                }
+                dest.write_all(&chunk).map_err(write_failed)?;
+            }
+        }
+    }
+    if declared.is_some_and(|declared| declared != written) {
+        return Err(unreachable_at(&url));
+    }
+    dest.flush().map_err(write_failed)?;
+    match hasher {
+        Some(hasher) => Ok(hex_digest(&hasher.finalize())),
+        // No declared length: hash what was written, once it all stands.
+        None => {
+            use std::io::{Read, Seek, SeekFrom};
+            dest.seek(SeekFrom::Start(0)).map_err(write_failed)?;
+            let mut hasher = Sha1::new();
+            hasher.update(format!("blob {written}\0").as_bytes());
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let n = dest.read(&mut buf).map_err(write_failed)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            Ok(hex_digest(&hasher.finalize()))
+        }
+    }
+}
+
+fn hex_digest(digest: &[u8]) -> String {
+    digest.iter().fold(String::new(), |mut acc, b| {
+        use std::fmt::Write;
+        let _ = write!(acc, "{b:02x}");
+        acc
+    })
+}
+
+/// A body serialised once, the bytes the request sends.
+fn json_body<T: Serialize + ?Sized>(body: &T) -> Result<Option<Vec<u8>>, CliError> {
+    serde_json::to_vec(body)
+        .map(Some)
+        .map_err(|e| CliError::Io {
+            message: format!("could not serialise a request body: {e}"),
+        })
+}
+
+/// Sending a request through `send_bounded`, with a JSON body serialised
+/// once or with none.
+pub(crate) trait BoundedSend {
+    async fn send_json_bounded<T: Serialize + ?Sized>(
+        self,
+        body: &T,
+    ) -> Result<reqwest::Response, CliError>;
+    async fn send_empty_bounded(self) -> Result<reqwest::Response, CliError>;
+}
+
+impl BoundedSend for reqwest::RequestBuilder {
+    async fn send_json_bounded<T: Serialize + ?Sized>(
+        self,
+        body: &T,
+    ) -> Result<reqwest::Response, CliError> {
+        let body = json_body(body)?.unwrap_or_default();
+        let len = body.len();
+        send_bounded(
+            self.header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body),
+            len,
+        )
+        .await
+    }
+
+    async fn send_empty_bounded(self) -> Result<reqwest::Response, CliError> {
+        send_bounded(self, 0).await
+    }
+}
+
+/// The mismatch refusal: a raw answer whose bytes are not the ones named
+/// (SPEC u280 Contract Surface, `D-089`).
+pub(crate) fn hash_mismatch(path: &str, expected: &str, actual: &str) -> CliError {
+    CliError::Api {
+        status: Some(200),
+        error: format!("invalid response body: {path}: expected {expected}, got {actual}"),
+        context: None,
+    }
+}
+
 async fn check_response(response: reqwest::Response) -> Result<reqwest::Response, CliError> {
     let status = response.status();
     if status == reqwest::StatusCode::UNAUTHORIZED {
         return Err(CliError::AuthRequired);
     }
     if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
-        let bytes = response.bytes().await.unwrap_or_default();
+        let bytes = read_body(response, ANSWER_STALL).await.unwrap_or_default();
         let prefix = &bytes[..bytes.len().min(4096)];
         let lower = String::from_utf8_lossy(prefix).to_ascii_lowercase();
         let rejecter = if lower.contains("cloudflare") {
@@ -715,8 +950,12 @@ async fn check_response(response: reqwest::Response) -> Result<reqwest::Response
         // rather than reduced to its presence — the conflict refusal
         // renders it and its document carries it, and nothing downstream
         // can read the body again once this fold has consumed it.
-        let (error, current_sha) = match response.json::<serde_json::Value>().await {
-            Ok(body) => match serde_json::from_value::<ApiErrorBody>(body.clone()) {
+        let body = read_body(response, ANSWER_STALL).await.ok();
+        let (error, current_sha) = match body
+            .as_deref()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+        {
+            Some(body) => match serde_json::from_value::<ApiErrorBody>(body.clone()) {
                 Ok(parsed) => (
                     parsed.error,
                     body.get("currentSha")
@@ -725,7 +964,7 @@ async fn check_response(response: reqwest::Response) -> Result<reqwest::Response
                 ),
                 Err(_) => ("unknown error".to_string(), None),
             },
-            Err(_) => ("unknown error".to_string(), None),
+            None => ("unknown error".to_string(), None),
         };
         let context = match current_sha {
             Some(current_sha) if code == 409 && error == "conflict" => {
@@ -749,16 +988,21 @@ async fn check_response(response: reqwest::Response) -> Result<reqwest::Response
     Ok(response)
 }
 
+fn undecodable(status: reqwest::StatusCode, e: impl std::fmt::Display) -> CliError {
+    CliError::Api {
+        status: Some(status.as_u16()),
+        error: format!("invalid response body: {e}"),
+        context: None,
+    }
+}
+
 async fn process_response<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
 ) -> Result<T, CliError> {
     let response = check_response(response).await?;
     let status = response.status();
-    response.json::<T>().await.map_err(|e| CliError::Api {
-        status: Some(status.as_u16()),
-        error: format!("invalid response body: {e}"),
-        context: None,
-    })
+    let bytes = read_body(response, ANSWER_STALL).await?;
+    serde_json::from_slice::<T>(&bytes).map_err(|e| undecodable(status, e))
 }
 
 /// Reads the response body once, parses it to `serde_json::Value`, and additionally
@@ -771,32 +1015,22 @@ async fn process_response<T: serde::de::DeserializeOwned>(
 ///
 /// `Value::clone` is a deep clone, but its cost is dwarfed by the network round-trip
 /// for typical CLI payloads; the response body cannot be read twice because
-/// `reqwest::Response::bytes` consumes the response.
+/// reading it consumes the response.
 async fn process_response_raw<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
 ) -> Result<(T, serde_json::Value), CliError> {
     let response = check_response(response).await?;
     let status = response.status();
-    let bytes = response.bytes().await.map_err(|e| CliError::Api {
-        status: Some(status.as_u16()),
-        error: format!("invalid response body: {e}"),
-        context: None,
-    })?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| CliError::Api {
-        status: Some(status.as_u16()),
-        error: format!("invalid response body: {e}"),
-        context: None,
-    })?;
-    let typed: T = serde_json::from_value(value.clone()).map_err(|e| CliError::Api {
-        status: Some(status.as_u16()),
-        error: format!("invalid response body: {e}"),
-        context: None,
-    })?;
+    let bytes = read_body(response, ANSWER_STALL).await?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| undecodable(status, e))?;
+    let typed: T = serde_json::from_value(value.clone()).map_err(|e| undecodable(status, e))?;
     Ok((typed, value))
 }
 
 async fn process_empty_response(response: reqwest::Response) -> Result<(), CliError> {
-    check_response(response).await?;
+    let response = check_response(response).await?;
+    read_body(response, ANSWER_STALL).await?;
     Ok(())
 }
 
@@ -824,7 +1058,7 @@ pub(crate) mod u272_bodies {
 
 // --- SynsClient ---
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SynsClient {
     client: reqwest::Client,
     base_url: String,
@@ -842,13 +1076,7 @@ impl SynsClient {
 
         let base_url = server_url.trim_end_matches('/').to_string();
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .redirect(Policy::none())
-            .build()
-            .map_err(|e| CliError::Config {
-                message: e.to_string(),
-            })?;
+        let client = api_client()?;
 
         Ok(SynsClient { client, base_url })
     }
@@ -864,8 +1092,7 @@ impl SynsClient {
             .client
             .put(&url)
             .bearer_auth(token)
-            .json(request)
-            .send()
+            .send_json_bounded(request)
             .await?;
         process_response_raw(response).await
     }
@@ -876,7 +1103,7 @@ impl SynsClient {
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
-        let response = req.send().await?;
+        let response = req.send_empty_bounded().await?;
         process_response(response).await
     }
 
@@ -916,7 +1143,7 @@ impl SynsClient {
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
-        let response = req.send().await?;
+        let response = req.send_empty_bounded().await?;
         process_response(response).await
     }
 
@@ -930,7 +1157,7 @@ impl SynsClient {
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
-        let response = req.send().await?;
+        let response = req.send_empty_bounded().await?;
         process_response(response).await
     }
 
@@ -961,7 +1188,7 @@ impl SynsClient {
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
-        let response = req.send().await?;
+        let response = req.send_empty_bounded().await?;
         process_response_raw(response).await
     }
 
@@ -985,8 +1212,81 @@ impl SynsClient {
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
-        let response = req.send().await?;
+        let response = req.send_empty_bounded().await?;
         process_response_raw(response).await
+    }
+
+    fn raw_request(
+        &self,
+        repo_id: &str,
+        token: Option<&str>,
+        path: &str,
+        version_ref: Option<&str>,
+    ) -> reqwest::RequestBuilder {
+        let url = format!(
+            "{}/api/v1/repos/{}/raw/{}",
+            self.base_url,
+            repo_id,
+            encode_path_segments(path)
+        );
+        let mut req = self.client.get(&url);
+        if let Some(r) = version_ref {
+            req = req.query(&[("ref", r)]);
+        }
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        req
+    }
+
+    /// One `GET` of the raw entry (SPEC u280 `get_raw`, `D-088`): the
+    /// stored bytes exactly, `ref` sent as `get_file` sends it, a refusal
+    /// raised under the code `get_file` raises for the path.
+    pub async fn get_raw(
+        &self,
+        repo_id: &str,
+        token: Option<&str>,
+        path: &str,
+        version_ref: Option<&str>,
+    ) -> Result<RawFile, CliError> {
+        let response = self
+            .raw_request(repo_id, token, path, version_ref)
+            .send_empty_bounded()
+            .await?;
+        let response = check_response(response).await?;
+        let etag = etag_of(&response);
+        let bytes = read_body(response, ANSWER_STALL).await?;
+        Ok(RawFile { bytes, etag })
+    }
+
+    /// The `GET` `get_raw` sends, its body written into a file created at
+    /// `dest` as it arrives rather than held.
+    pub async fn get_raw_staged(
+        &self,
+        repo_id: &str,
+        token: Option<&str>,
+        path: &str,
+        version_ref: Option<&str>,
+        dest: &std::path::Path,
+    ) -> Result<StagedRaw, CliError> {
+        let response = self
+            .raw_request(repo_id, token, path, version_ref)
+            .send_empty_bounded()
+            .await?;
+        let response = check_response(response).await?;
+        let etag = etag_of(&response);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).read(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(dest).map_err(|err| CliError::Io {
+            message: format!("could not write {}: {err}", dest.display()),
+        })?;
+        let sha = read_body_to(response, ANSWER_STALL, &mut file).await?;
+        Ok(StagedRaw { sha, etag })
     }
 
     /// Reads one version of a repository (`EP-get-version`).
@@ -1012,7 +1312,7 @@ impl SynsClient {
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
-        let response = req.send().await?;
+        let response = req.send_empty_bounded().await?;
         process_response_raw(response).await
     }
 
@@ -1033,7 +1333,7 @@ impl SynsClient {
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
-        let response = req.send().await?;
+        let response = req.send_empty_bounded().await?;
         process_response_raw(response).await
     }
 
@@ -1052,7 +1352,7 @@ impl SynsClient {
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
-        let response = req.send().await?;
+        let response = req.send_empty_bounded().await?;
         process_response_raw(response).await
     }
 
@@ -1068,7 +1368,7 @@ impl SynsClient {
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
-        let response = req.send().await?;
+        let response = req.send_empty_bounded().await?;
         process_response_raw(response).await
     }
 
@@ -1087,7 +1387,7 @@ impl SynsClient {
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
-        let response = req.send().await?;
+        let response = req.send_empty_bounded().await?;
         process_response_raw(response).await
     }
 
@@ -1102,8 +1402,7 @@ impl SynsClient {
             .client
             .post(&url)
             .bearer_auth(token)
-            .json(request)
-            .send()
+            .send_json_bounded(request)
             .await?;
 
         if response.status().as_u16() == 404 {
@@ -1112,8 +1411,9 @@ impl SynsClient {
             // and "repo not visible" (no `reason`). We surface the
             // `reason` through CliError::Api.error so the command layer
             // can format a target-bearing message.
-            let bytes = match response.bytes().await {
+            let bytes = match read_body(response, ANSWER_STALL).await {
                 Ok(b) => b,
+                Err(err @ CliError::ServerUnreachable { .. }) => return Err(err),
                 Err(_) => {
                     return Err(CliError::Api {
                         status: Some(404),
@@ -1151,7 +1451,12 @@ impl SynsClient {
             repo_id,
             urlencoding::encode(user_id)
         );
-        let response = self.client.delete(&url).bearer_auth(token).send().await?;
+        let response = self
+            .client
+            .delete(&url)
+            .bearer_auth(token)
+            .send_empty_bounded()
+            .await?;
         process_empty_response(response).await
     }
 
@@ -1179,8 +1484,7 @@ impl SynsClient {
             .client
             .patch(&url)
             .bearer_auth(token)
-            .json(request)
-            .send()
+            .send_json_bounded(request)
             .await?;
         process_response_raw(response).await
     }
@@ -1207,7 +1511,7 @@ impl SynsClient {
         if let Some(s) = status {
             req = req.query(&[("status", s.as_query_str())]);
         }
-        let response = req.send().await?;
+        let response = req.send_empty_bounded().await?;
         process_response_raw(response).await
     }
 
@@ -1222,15 +1526,19 @@ impl SynsClient {
             .client
             .post(&url)
             .bearer_auth(token)
-            .json(request)
-            .send()
+            .send_json_bounded(request)
             .await?;
         process_response_raw(response).await
     }
 
     pub async fn delete_repo(&self, repo_id: &str, token: &str) -> Result<(), CliError> {
         let url = format!("{}/api/v1/repos/{}", self.base_url, repo_id);
-        let response = self.client.delete(&url).bearer_auth(token).send().await?;
+        let response = self
+            .client
+            .delete(&url)
+            .bearer_auth(token)
+            .send_empty_bounded()
+            .await?;
         process_empty_response(response).await
     }
 
@@ -1239,13 +1547,18 @@ impl SynsClient {
         token: &str,
     ) -> Result<(SessionResponse, serde_json::Value), CliError> {
         let url = format!("{}/api/auth/get-session", self.base_url);
-        let response = self.client.get(&url).bearer_auth(token).send().await?;
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(token)
+            .send_empty_bounded()
+            .await?;
         let response = check_response(response).await?;
         // Special handling: better-auth returns 200 with null when token is invalid.
         // Every body-read / parse / typed-deserialize failure on this endpoint
         // maps to AuthRequired (not the generic "invalid response body" surface),
         // preserving observable behavior on token-expiry for cmd_login / cmd_whoami.
-        let bytes = response.bytes().await.map_err(|_| CliError::AuthRequired)?;
+        let bytes = read_body(response, ANSWER_STALL).await?;
         let value: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|_| CliError::AuthRequired)?;
         let typed: SessionResponse =
@@ -1264,8 +1577,7 @@ impl SynsClient {
             .client
             .patch(&url)
             .bearer_auth(token)
-            .json(update)
-            .send()
+            .send_json_bounded(update)
             .await?;
         process_response(response).await
     }
@@ -1287,8 +1599,7 @@ impl SynsClient {
             .client
             .post(&url)
             .bearer_auth(token)
-            .json(request)
-            .send()
+            .send_json_bounded(request)
             .await?;
         process_response_raw(response).await
     }
@@ -1313,7 +1624,7 @@ impl SynsClient {
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
-        let response = req.send().await?;
+        let response = req.send_empty_bounded().await?;
         process_response_raw(response).await
     }
 
@@ -1333,7 +1644,7 @@ impl SynsClient {
             .get(&url)
             .query(&[("q", q.to_string()), ("limit", limit.to_string())])
             .bearer_auth(token)
-            .send()
+            .send_empty_bounded()
             .await?;
         process_response_raw(response).await
     }
@@ -1357,7 +1668,7 @@ impl SynsClient {
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
-        let response = req.send().await?;
+        let response = req.send_empty_bounded().await?;
         process_response_raw(response).await
     }
 
@@ -1374,42 +1685,57 @@ impl SynsClient {
     ) -> Result<(UserLinksResponse, serde_json::Value), CliError> {
         use crate::commands::links::LinksAction;
         let base = format!("{}/api/v1/me/links", self.base_url);
-        let request = match action {
-            LinksAction::Add { kind, value, label } => {
-                self.client.post(&base).json(&CreateUserLinkRequest {
+        let (request, body) = match action {
+            LinksAction::Add { kind, value, label } => (
+                self.client.post(&base),
+                json_body(&CreateUserLinkRequest {
                     kind: kind.as_wire_str().to_string(),
                     value: value.clone(),
                     label: label.clone(),
-                })
-            }
+                })?,
+            ),
             LinksAction::Update {
                 id,
                 kind,
                 value,
                 label,
                 sort_order,
-            } => self
-                .client
-                .patch(format!("{}/{}", base, urlencoding::encode(id)))
-                .json(&UpdateUserLinkRequest {
+            } => (
+                self.client
+                    .patch(format!("{}/{}", base, urlencoding::encode(id))),
+                json_body(&UpdateUserLinkRequest {
                     kind: kind.map(|k| k.as_wire_str().to_string()),
                     value: value.clone(),
                     label: label.clone(),
                     sort_order: *sort_order,
-                }),
-            LinksAction::Remove { id } => {
+                })?,
+            ),
+            LinksAction::Remove { id } => (
                 self.client
-                    .delete(format!("{}/{}", base, urlencoding::encode(id)))
-            }
-            LinksAction::Reorder { order } => {
-                self.client
-                    .post(format!("{base}/reorder"))
-                    .json(&ReorderUserLinksRequest {
-                        order: order.clone(),
-                    })
-            }
+                    .delete(format!("{}/{}", base, urlencoding::encode(id))),
+                None,
+            ),
+            LinksAction::Reorder { order } => (
+                self.client.post(format!("{base}/reorder")),
+                json_body(&ReorderUserLinksRequest {
+                    order: order.clone(),
+                })?,
+            ),
         };
-        let response = request.bearer_auth(token).send().await?;
+        let request = request.bearer_auth(token);
+        let response = match body {
+            Some(body) => {
+                let len = body.len();
+                send_bounded(
+                    request
+                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                        .body(body),
+                    len,
+                )
+                .await?
+            }
+            None => send_bounded(request, 0).await?,
+        };
         process_response_raw(response).await
     }
 
@@ -1435,8 +1761,7 @@ impl SynsClient {
             .client
             .post(&url)
             .bearer_auth(token)
-            .json(&request)
-            .send()
+            .send_json_bounded(&request)
             .await?;
         process_response_raw(response).await
     }
@@ -1457,8 +1782,7 @@ impl SynsClient {
             .client
             .post(&url)
             .bearer_auth(token)
-            .json(request)
-            .send()
+            .send_json_bounded(request)
             .await?;
         process_response_raw(response).await
     }
@@ -1468,7 +1792,12 @@ impl SynsClient {
         token: &str,
     ) -> Result<(TeamListResponse, serde_json::Value), CliError> {
         let url = format!("{}/api/v1/teams", self.base_url);
-        let response = self.client.get(&url).bearer_auth(token).send().await?;
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(token)
+            .send_empty_bounded()
+            .await?;
         process_response_raw(response).await
     }
 
@@ -1478,7 +1807,12 @@ impl SynsClient {
         team_id: &str,
     ) -> Result<(TeamResponse, serde_json::Value), CliError> {
         let url = format!("{}/api/v1/teams/{}", self.base_url, team_id);
-        let response = self.client.get(&url).bearer_auth(token).send().await?;
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(token)
+            .send_empty_bounded()
+            .await?;
         process_response_raw(response).await
     }
 
@@ -1493,15 +1827,19 @@ impl SynsClient {
             .client
             .patch(&url)
             .bearer_auth(token)
-            .json(request)
-            .send()
+            .send_json_bounded(request)
             .await?;
         process_response_raw(response).await
     }
 
     pub async fn delete_team(&self, token: &str, team_id: &str) -> Result<(), CliError> {
         let url = format!("{}/api/v1/teams/{}", self.base_url, team_id);
-        let response = self.client.delete(&url).bearer_auth(token).send().await?;
+        let response = self
+            .client
+            .delete(&url)
+            .bearer_auth(token)
+            .send_empty_bounded()
+            .await?;
         process_empty_response(response).await
     }
 
@@ -1513,7 +1851,12 @@ impl SynsClient {
         team_id: &str,
     ) -> Result<(TeamMembersResponse, serde_json::Value), CliError> {
         let url = format!("{}/api/v1/teams/{}/members", self.base_url, team_id);
-        let response = self.client.get(&url).bearer_auth(token).send().await?;
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(token)
+            .send_empty_bounded()
+            .await?;
         process_response_raw(response).await
     }
 
@@ -1528,8 +1871,7 @@ impl SynsClient {
             .client
             .post(&url)
             .bearer_auth(token)
-            .json(request)
-            .send()
+            .send_json_bounded(request)
             .await?;
         process_response_raw(response).await
     }
@@ -1549,8 +1891,7 @@ impl SynsClient {
             .client
             .post(&url)
             .bearer_auth(token)
-            .json(request)
-            .send()
+            .send_json_bounded(request)
             .await?;
         process_response_raw(response).await
     }
@@ -1565,7 +1906,12 @@ impl SynsClient {
             "{}/api/v1/teams/{}/members/{}",
             self.base_url, team_id, user_id
         );
-        let response = self.client.delete(&url).bearer_auth(token).send().await?;
+        let response = self
+            .client
+            .delete(&url)
+            .bearer_auth(token)
+            .send_empty_bounded()
+            .await?;
         process_empty_response(response).await
     }
 
@@ -1576,7 +1922,12 @@ impl SynsClient {
         token: &str,
     ) -> Result<(InvitationListResponse, serde_json::Value), CliError> {
         let url = format!("{}/api/v1/teams/invitations", self.base_url);
-        let response = self.client.get(&url).bearer_auth(token).send().await?;
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(token)
+            .send_empty_bounded()
+            .await?;
         process_response_raw(response).await
     }
 
@@ -1589,7 +1940,12 @@ impl SynsClient {
             "{}/api/v1/teams/invitations/{}/accept",
             self.base_url, invitation_id
         );
-        let response = self.client.post(&url).bearer_auth(token).send().await?;
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(token)
+            .send_empty_bounded()
+            .await?;
         process_response_raw(response).await
     }
 
@@ -1602,7 +1958,12 @@ impl SynsClient {
             "{}/api/v1/teams/invitations/{}/decline",
             self.base_url, invitation_id
         );
-        let response = self.client.post(&url).bearer_auth(token).send().await?;
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(token)
+            .send_empty_bounded()
+            .await?;
         process_empty_response(response).await
     }
 
@@ -1624,8 +1985,7 @@ impl SynsClient {
             .client
             .put(&url)
             .bearer_auth(token)
-            .json(request)
-            .send()
+            .send_json_bounded(request)
             .await?;
         process_response_raw(response).await
     }
@@ -1641,7 +2001,12 @@ impl SynsClient {
             "{}/api/v1/teams/{}/repos/{}/{}",
             self.base_url, team_id, owner, name
         );
-        let response = self.client.delete(&url).bearer_auth(token).send().await?;
+        let response = self
+            .client
+            .delete(&url)
+            .bearer_auth(token)
+            .send_empty_bounded()
+            .await?;
         process_empty_response(response).await
     }
 
@@ -1651,7 +2016,12 @@ impl SynsClient {
         team_id: &str,
     ) -> Result<(TeamReposResponse, serde_json::Value), CliError> {
         let url = format!("{}/api/v1/teams/{}/repos", self.base_url, team_id);
-        let response = self.client.get(&url).bearer_auth(token).send().await?;
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(token)
+            .send_empty_bounded()
+            .await?;
         process_response_raw(response).await
     }
 }
@@ -2478,6 +2848,7 @@ mod head_moved_tests {
                 path: "a.md".into(),
                 sha: "0".repeat(40),
                 content: Some("keep two".into()),
+                content_base64: None,
             }],
             deletions: None,
             message: Some("edit a.md".into()),
@@ -3080,5 +3451,185 @@ mod u272_entry_tests {
         }
         assert_eq!(err.exit_code(), 1);
         assert_eq!(err.to_string(), "server error (429): rate_limited");
+    }
+}
+
+#[cfg(test)]
+mod u280_transport_tests {
+    use super::*;
+    use crate::push::hash::blob_sha1;
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn deadline_grows_with_the_body() {
+        assert_eq!(request_deadline(0), Duration::from_secs(30));
+        assert_eq!(request_deadline(262_144), Duration::from_secs(31));
+        assert_eq!(request_deadline(52_428_800), Duration::from_secs(230));
+    }
+
+    /// A listener answering one request under `Content-Length: 40` with
+    /// `script`: each piece written after its pause, then the connection
+    /// held open for `linger` or closed at once.
+    async fn scripted_listener(script: Vec<(Duration, Vec<u8>)>, linger: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let mut seen = Vec::new();
+            while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    return;
+                }
+                seen.extend_from_slice(&buf[..n]);
+            }
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 40\r\n\r\n")
+                .await
+                .unwrap();
+            for (pause, piece) in script {
+                tokio::time::sleep(pause).await;
+                if sock.write_all(&piece).await.is_err() {
+                    return;
+                }
+                let _ = sock.flush().await;
+            }
+            tokio::time::sleep(linger).await;
+        });
+        format!("http://127.0.0.1:{}/slow", addr.port())
+    }
+
+    async fn head_of(url: &str) -> reqwest::Response {
+        let client = api_client().unwrap();
+        send_bounded(client.get(url), 0).await.unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_moving_answer_outlasts_the_stall_bound() {
+        let script = (0..40)
+            .map(|i| (Duration::from_millis(100), vec![b'a' + (i % 26) as u8]))
+            .collect();
+        let url = scripted_listener(script, Duration::ZERO).await;
+        let response = head_of(&url).await;
+        let started = Instant::now();
+
+        let body = read_body(response, Duration::from_secs(1)).await.unwrap();
+
+        assert_eq!(body.len(), 40);
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(3_500) && took < Duration::from_secs(8),
+            "answered after {took:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stalled_or_short_answer_ends_as_unreachable() {
+        // Ten bytes, then nothing while the connection stays open.
+        let stalled = scripted_listener(
+            vec![(Duration::ZERO, vec![b'x'; 10])],
+            Duration::from_secs(10),
+        )
+        .await;
+        let response = head_of(&stalled).await;
+        let started = Instant::now();
+        let err = read_body(response, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CliError::ServerUnreachable { .. }), "{err:?}");
+        assert!(!err.to_string().contains("invalid response body"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        // Ten bytes, then the connection closed.
+        let short = scripted_listener(vec![(Duration::ZERO, vec![b'x'; 10])], Duration::ZERO).await;
+        let response = head_of(&short).await;
+        let err = read_body(response, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CliError::ServerUnreachable { .. }), "{err:?}");
+        assert!(!err.to_string().contains("invalid response body"));
+    }
+
+    const BYTES: &[u8] = b"\x89PNG\r\n\x1a\n\x00\xff";
+
+    async fn raw_server() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/r/raw/image.png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", format!("\"{}\"", blob_sha1(BYTES)).as_str())
+                    .set_body_bytes(BYTES.to_vec()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/r/raw/missing.png"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error": "not_found", "message": "File not found"
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn a_raw_answer_carries_its_bytes_and_its_etag() {
+        let server = raw_server().await;
+        let client = SynsClient::new(&server.uri()).unwrap();
+
+        let raw = client
+            .get_raw("alice/r", Some("t"), "image.png", Some("2"))
+            .await
+            .unwrap();
+
+        assert_eq!(raw.bytes, BYTES);
+        assert_eq!(raw.etag.as_deref(), Some(blob_sha1(BYTES).as_str()));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests[0].url.query(), Some("ref=2"));
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("user-agent")
+                .and_then(|v| v.to_str().ok()),
+            Some(USER_AGENT)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_raw_path_is_refused_as_the_file_read_refuses_it() {
+        let server = raw_server().await;
+        let client = SynsClient::new(&server.uri()).unwrap();
+
+        let err = client
+            .get_raw("alice/r", None, "missing.png", None)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, CliError::Api { status: Some(404), error, .. } if error == "not_found"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_staged_raw_answer_holds_the_body_in_its_file() {
+        let server = raw_server().await;
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("0");
+
+        let staged = client
+            .get_raw_staged("alice/r", None, "image.png", None, &dest)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), BYTES);
+        assert_eq!(staged.sha, blob_sha1(BYTES));
+        assert_eq!(staged.etag.as_deref(), Some(blob_sha1(BYTES).as_str()));
     }
 }

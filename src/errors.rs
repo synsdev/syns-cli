@@ -97,6 +97,14 @@ pub enum CliError {
     /// `error` alone — none of the three keys a collected publication's
     /// own emptiness document carries.
     ChangesetEmpty,
+    /// SPEC u280, the left-out refusal (`unregistered`): a head file
+    /// could not be written because the folder standing at its path
+    /// still holds entries no retrieval removes — each named as a
+    /// root-relative path, a folder suffixed `/`, in lexical order.
+    LeftOut {
+        path: String,
+        entries: Vec<String>,
+    },
 }
 
 /// Which of the two not-text wordings a refused content takes (SPEC
@@ -390,10 +398,16 @@ impl std::fmt::Display for CliError {
                 // skip-summary block from § 3.4 (without the strict
                 // hint — strict is true by construction here; the
                 // binary and no-default-excludes hints remain).
+                // SPEC u280: the count names the drops `--strict`
+                // refuses — the size drops — while the block beneath it
+                // names every drop.
                 write!(
                     f,
                     "push aborted: {} file(s) were skipped under --strict",
-                    skipped.len()
+                    skipped
+                        .iter()
+                        .filter(|sf| sf.reason == crate::push::collector::SkipReason::TooLarge)
+                        .count()
                 )?;
                 if !skipped.is_empty() {
                     writeln!(f)?;
@@ -432,6 +446,11 @@ impl std::fmt::Display for CliError {
             CliError::ChangesetEmpty => write!(
                 f,
                 "push_empty: the changeset names neither a file nor a deletion"
+            ),
+            CliError::LeftOut { path, entries } => write!(
+                f,
+                "could not write {path}: the folder there still holds {}, which no retrieval removes \u{2014} move or remove them, then run again",
+                entries.join(", ")
             ),
         }
     }
@@ -840,12 +859,12 @@ mod tests {
         let pe = CliError::PushEmpty {
             path: "/tmp/x".into(),
             total_walked: 3,
-            cause: "every file appears to be binary".into(),
+            cause: "every file is larger than 25 MiB".into(),
         };
         let pe_text = pe.to_string();
         assert!(pe_text.starts_with("nothing to push from /tmp/x"));
         assert!(pe_text.contains("source contained 3 files but all were excluded"));
-        assert!(pe_text.contains("every file appears to be binary"));
+        assert!(pe_text.contains("every file is larger than 25 MiB"));
         assert!(pe_text.contains("--allow-empty"));
 
         let pp = CliError::PushPartial {
@@ -868,7 +887,7 @@ mod tests {
             skipped: vec![
                 SkippedFile {
                     path: "logo.png".into(),
-                    reason: SkipReason::Binary,
+                    reason: SkipReason::TooLarge,
                 },
                 SkippedFile {
                     path: "dist/bundle.js".into(),
@@ -878,7 +897,9 @@ mod tests {
             no_default_excludes: false,
         };
         let s = pp.to_string();
-        let headline_pos = s.find("push aborted: 2 file(s)").expect("headline missing");
+        // SPEC u280: the headline counts the size drops alone; the block
+        // beneath it names every drop.
+        let headline_pos = s.find("push aborted: 1 file(s)").expect("headline missing");
         let warning_pos = s
             .find("warning: 2 file(s) skipped")
             .expect("breakdown missing");
@@ -886,12 +907,12 @@ mod tests {
             headline_pos < warning_pos,
             "headline must come BEFORE per-category breakdown (SPEC § 7); got: {s}"
         );
-        assert!(s.contains("binary content (1): logo.png"));
+        assert!(s.contains("larger than 25 MiB (1): logo.png"));
         assert!(s.contains("default-excluded directory (1): dist/bundle.js"));
         // strict hint absent (PushPartial implies strict=true).
         assert!(!s.contains("pass --strict to fail the push"));
-        // binary hint present.
-        assert!(s.contains("add binary extensions"));
+        // no line or hint names binary content.
+        assert!(!s.contains("binary"));
         // no-default-excludes hint present (no_default_excludes=false + DefaultExcludeDir entry).
         assert!(s.contains("pass --no-default-excludes"));
     }
@@ -916,7 +937,7 @@ mod tests {
         let pp = CliError::PushPartial {
             skipped: vec![SkippedFile {
                 path: "logo.png".into(),
-                reason: SkipReason::Binary,
+                reason: SkipReason::TooLarge,
             }],
             no_default_excludes: false,
         };
@@ -925,7 +946,7 @@ mod tests {
         let arr = v["skipped"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["path"], "logo.png");
-        assert_eq!(arr[0]["reason"], "binary");
+        assert_eq!(arr[0]["reason"], "too_large");
     }
 
     #[test]

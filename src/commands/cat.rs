@@ -1,7 +1,10 @@
-use crate::client::SynsClient;
+use std::io::Write;
+
+use crate::client::{SynsClient, hash_mismatch};
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
+use crate::push::hash::blob_sha1;
 use crate::read::{
     ReadOptions, read_not_found, report_reference, resolve_read_target, with_reference,
 };
@@ -20,35 +23,57 @@ pub async fn cmd_cat(
     };
     let client = SynsClient::new(config.server_url())?;
 
-    // 2 — read the path at that reference, sending the pinned ordinal.
+    // 2 — read the path at that reference, sending the pinned ordinal:
+    // outside machine-readable mode through the raw entry, whose bytes
+    // are the stored ones exactly (SPEC u280 `cmd_cat` 1), and under
+    // `--json` through the file read, passed through as served.
     let version_ref = target.version_ref();
-    let (response, raw) = match client
-        .get_file(
-            &target.repo_id,
-            target.token.as_deref(),
-            &path,
-            Some(&version_ref),
-        )
-        .await
-    {
-        Ok(tuple) => tuple,
-        Err(e) => {
-            if opts.version.is_some() {
-                return Err(read_not_found(e, &opts, &target.reference, &path));
-            }
-            if !output.is_json() {
-                return Err(e.with_cat_path_context(path.clone()));
-            }
-            return Err(e);
+    let refused = |e: CliError| -> CliError {
+        if opts.version.is_some() {
+            return read_not_found(e, &opts, &target.reference, &path);
         }
+        if !output.is_json() {
+            return e.with_cat_path_context(path.clone());
+        }
+        e
     };
 
-    // 3 — write the bytes unframed, or the served body carrying the
-    // reference.
     if output.is_json() {
+        let (_response, raw) = client
+            .get_file(
+                &target.repo_id,
+                target.token.as_deref(),
+                &path,
+                Some(&version_ref),
+            )
+            .await
+            .map_err(refused)?;
         output.json(&with_reference(raw, &target.reference));
     } else {
-        print!("{}", response.content);
+        let raw = client
+            .get_raw(
+                &target.repo_id,
+                target.token.as_deref(),
+                &path,
+                Some(&version_ref),
+            )
+            .await
+            .map_err(refused)?;
+        // `cmd_cat` 2 — the bytes are the ones the `ETag` names, or none
+        // is printed.
+        if let Some(etag) = &raw.etag {
+            let actual = blob_sha1(&raw.bytes);
+            if &actual != etag {
+                return Err(hash_mismatch(&path, etag, &actual));
+            }
+        }
+        // `cmd_cat` 3 — the bytes unchanged, and no byte more. A write
+        // the stream refuses ends the run as `print!` ends it.
+        let stdout = std::io::stdout();
+        let mut lock = stdout.lock();
+        if let Err(err) = lock.write_all(&raw.bytes).and_then(|()| lock.flush()) {
+            panic!("failed printing to stdout: {err}");
+        }
     }
 
     // 4 — report the reference.
@@ -91,6 +116,66 @@ mod tests {
             .await;
     }
 
+    /// Mounts the raw entry answering `bytes` under an `ETag` of their
+    /// blob hash (SPEC u280 `cmd_cat` 1–2).
+    async fn mount_raw(server: &MockServer, file: &str, bytes: &[u8]) {
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/repos/alice/my-project/raw/{file}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", format!("\"{}\"", blob_sha1(bytes)).as_str())
+                    .set_body_bytes(bytes.to_vec()),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn cat_refuses_bytes_the_etag_does_not_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".syns.yaml"),
+            "owner: alice\nname: my-project\n",
+        )
+        .unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+
+        let mock_server = MockServer::start().await;
+        mount_reference(&mock_server, "alice/my-project").await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/my-project/raw/image.png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", format!("\"{}\"", "0".repeat(40)).as_str())
+                    .set_body_bytes(b"\x89PNG\x00".to_vec()),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let result = cmd_cat(
+            &config,
+            &Output::new(false),
+            "image.png".to_string(),
+            here(),
+        )
+        .await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains(&format!(
+                "invalid response body: image.png: expected {}, got {}",
+                "0".repeat(40),
+                blob_sha1(b"\x89PNG\x00")
+            )),
+            "{err}"
+        );
+        assert_eq!(err.exit_code(), 1);
+    }
+
     fn here() -> ReadOptions {
         ReadOptions::default()
     }
@@ -117,15 +202,7 @@ mod tests {
         let mock_server = MockServer::start().await;
         mount_reference(&mock_server, "alice/my-project").await;
 
-        Mock::given(method("GET"))
-            .and(path("/api/v1/repos/alice/my-project/files/src/main.ts"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "content": "console.log('hello');",
-                "sha": "abc123",
-                "size": 21
-            })))
-            .mount(&mock_server)
-            .await;
+        mount_raw(&mock_server, "src/main.ts", b"console.log('hello');").await;
 
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
@@ -186,7 +263,7 @@ mod tests {
         mount_reference(&mock_server, "alice/my-project").await;
 
         Mock::given(method("GET"))
-            .and(path("/api/v1/repos/alice/my-project/files/src/missing.ts"))
+            .and(path("/api/v1/repos/alice/my-project/raw/src/missing.ts"))
             .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
                 "error": "not_found",
                 "message": "File not found"
@@ -221,7 +298,7 @@ mod tests {
         mount_reference(&mock_server, "alice/my-project").await;
 
         Mock::given(method("GET"))
-            .and(path("/api/v1/repos/alice/my-project/files/README.md"))
+            .and(path("/api/v1/repos/alice/my-project/raw/README.md"))
             .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
                 "error": "repo_not_found",
                 "message": "Repository not found"
@@ -289,15 +366,7 @@ mod tests {
 
         let mock_server = MockServer::start().await;
         mount_reference(&mock_server, "alice/my-project").await;
-        Mock::given(method("GET"))
-            .and(path("/api/v1/repos/alice/my-project/files/src/main.ts"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "content": "console.log('hello');",
-                "sha": "abc123",
-                "size": 21
-            })))
-            .mount(&mock_server)
-            .await;
+        mount_raw(&mock_server, "src/main.ts", b"console.log('hello');").await;
 
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
