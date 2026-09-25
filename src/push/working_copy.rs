@@ -561,12 +561,6 @@ impl WorkingCopy {
             message: format!("could not write {}: {err}", temp.display()),
         };
         let stored = (|| {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(CONTENT_FILE_MODE))
-                    .map_err(io)?;
-            }
             File::open(&temp).and_then(|f| f.sync_all()).map_err(io)?;
             let target = dir.join(&collected.sha);
             let created = !target.exists();
@@ -632,7 +626,10 @@ impl WorkingCopy {
         }
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with(".incoming.") || named.contains(&name) {
+            // Every caller holds the state lock and has renamed each of
+            // its own stores, so an `.incoming.` file standing here is a
+            // killed run's (CR1-4).
+            if named.contains(&name) {
                 continue;
             }
             let _ = std::fs::remove_file(entry.path());
@@ -662,39 +659,12 @@ impl WorkingCopy {
 }
 
 /// Copy `source` into `dest` in pieces, answering the blob hash of what
-/// was copied.
+/// was copied; a file whose length moves under the copy is refused.
 fn copy_hashing(source: &Path, dest: &mut impl Write) -> std::io::Result<String> {
-    use sha1::{Digest, Sha1};
-    use std::io::Read;
-    let mut from = File::open(source)?;
+    let from = File::open(source)?;
     let declared = from.metadata()?.len();
-    let mut hasher = Sha1::new();
-    hasher.update(format!("blob {declared}\0").as_bytes());
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut copied = 0u64;
-    loop {
-        let n = match from.read(&mut buf) {
-            Ok(n) => n,
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(err) => return Err(err),
-        };
-        if n == 0 {
-            break;
-        }
-        copied += n as u64;
-        hasher.update(&buf[..n]);
-        dest.write_all(&buf[..n])?;
-    }
-    if copied != declared {
-        return Err(std::io::Error::other(
-            "the file changed while it was copied",
-        ));
-    }
-    Ok(hasher.finalize().iter().fold(String::new(), |mut acc, b| {
-        use std::fmt::Write as _;
-        let _ = write!(acc, "{b:02x}");
-        acc
-    }))
+    crate::push::hash::hash_pieces(from, declared, dest)?
+        .ok_or_else(|| std::io::Error::other("the file changed while it was copied"))
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, CliError> {
@@ -1090,6 +1060,17 @@ mod tests {
         assert!(copy.snapshot_content_dir().join(&kept).exists());
         assert!(!copy.snapshot_content_dir().join(&orphan).exists());
 
+        copy.remove_snapshots().unwrap();
+        assert!(!copy.snapshot_content_dir().exists());
+    }
+
+    /// CR1-4: a store a killed run left part-way is removed by the next
+    /// prune, so the directory goes with the snapshots.
+    #[test]
+    fn a_killed_runs_incoming_content_is_pruned() {
+        let (_cache, _tree, copy) = open_copy();
+        copy.store_bytes(b"kept\n").unwrap();
+        std::fs::write(copy.snapshot_content_dir().join(".incoming.1.0"), b"torn").unwrap();
         copy.remove_snapshots().unwrap();
         assert!(!copy.snapshot_content_dir().exists());
     }

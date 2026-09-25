@@ -430,11 +430,14 @@ fn invoke(side: &Side, cwd: &Path, cache: &Path, args: &[&str]) -> Result<Answer
         if started.elapsed() > INVOCATION_BOUND {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = out.join();
+            let stderr = err.join().unwrap_or_default();
             return Err(format!(
-                "{} {} ran past {:?}",
+                "{} `syns {}` ran past {:?}:\n{}",
                 side.binary.display(),
                 args.join(" "),
-                INVOCATION_BOUND
+                INVOCATION_BOUND,
+                String::from_utf8_lossy(&stderr)
             ));
         }
         std::thread::sleep(Duration::from_millis(2));
@@ -458,7 +461,8 @@ fn expect(
     args: &[&str],
     code: i32,
 ) -> Result<Answer, String> {
-    let answer = invoke(side, cwd, cache, args)?;
+    let answer = invoke(side, cwd, cache, args)
+        .map_err(|e| format!("{} {fixture} {operation}: {e}", side.label))?;
     if answer.code != Some(code) {
         return Err(format!(
             "{} {fixture} {operation}: `syns {}` exited {:?}, not {code}:\n{}",
@@ -669,6 +673,10 @@ impl Harness {
                 let cache = self.fresh_dir("first-cache")?;
                 write_tree(&copy, &self.fixtures[fixture])?;
                 let name = format!("u280-perf-{}-{fixture}-{n}-{}", side.label, self.nonce);
+                // Registered before the push, so a failed push or delete
+                // still leaves it to the teardown (CR1-6).
+                self.made
+                    .push((side.clone(), name.clone(), copy.clone(), cache.clone()));
                 let timed = expect(
                     side,
                     fixture,
@@ -687,6 +695,7 @@ impl Harness {
                     &["delete", "--yes"],
                     0,
                 )?;
+                self.made.pop();
                 let _ = std::fs::remove_dir_all(&copy);
                 let _ = std::fs::remove_dir_all(&cache);
                 Ok(Sample {
@@ -880,20 +889,42 @@ impl Harness {
 
     /// Delete every repository the run made, and remove the scratch
     /// directory.
-    fn tear_down(&mut self) {
-        for (side, _name, copy, cache) in std::mem::take(&mut self.made) {
-            let _ = invoke(&side, &copy, &cache, &["delete", "--yes"]);
+    /// Every step is taken whatever an earlier one answered; the first
+    /// refusal is the one answered (CR1-6).
+    fn tear_down(&mut self) -> Result<(), String> {
+        let mut first = None;
+        for (side, name, copy, cache) in std::mem::take(&mut self.made) {
+            if let Err(e) = expect(
+                &side,
+                &name,
+                "teardown",
+                &copy,
+                &cache,
+                &["delete", "--yes"],
+                0,
+            ) {
+                first.get_or_insert(e);
+            }
         }
-        let _ = std::fs::remove_dir_all(&self.scratch);
+        if let Err(e) = std::fs::remove_dir_all(&self.scratch) {
+            first.get_or_insert(format!("could not remove {}: {e}", self.scratch.display()));
+        }
+        first.map_or(Ok(()), Err)
     }
-}
 
-fn cli_version(side: &Side) -> String {
-    Command::new(&side.binary)
-        .arg("--version")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default()
+    /// The side's own `--version`, run as every other invocation is.
+    fn cli_version(&self, side: &Side) -> Result<String, String> {
+        let answer = expect(
+            side,
+            "-",
+            "version",
+            &self.scratch,
+            &self.scratch,
+            &["--version"],
+            0,
+        )?;
+        Ok(String::from_utf8_lossy(&answer.stdout).trim().to_string())
+    }
 }
 
 fn scratch_dir() -> Result<PathBuf, String> {
@@ -962,16 +993,32 @@ fn run(out: &str, sides: &[Side; 2], judged_only: bool) -> Result<(), String> {
         made: Vec::new(),
         counter: 0,
     };
-    let measured = measure_all(&mut harness, sides, judged_only);
-    harness.tear_down();
-    let runs = measured?;
+    let measured = measure_all(&mut harness, sides, judged_only).and_then(|runs| {
+        let versions = sides
+            .iter()
+            .map(|side| harness.cli_version(side))
+            .collect::<Result<Vec<String>, String>>()?;
+        Ok((runs, versions))
+    });
+    let (runs, versions) = match measured {
+        Ok(measured) => measured,
+        Err(e) => {
+            // The measurement's refusal is the one answered; the teardown
+            // still runs.
+            let _ = harness.tear_down();
+            return Err(e);
+        }
+    };
 
     // 5 — the two documents.
-    std::fs::create_dir_all(out).map_err(|e| format!("could not write {out}: {e}"))?;
+    if let Err(e) = std::fs::create_dir_all(out) {
+        let _ = harness.tear_down();
+        return Err(format!("could not write {out}: {e}"));
+    }
     for (i, side) in sides.iter().enumerate() {
         let results = Results {
             label: side.label.clone(),
-            cli_version: cli_version(side),
+            cli_version: versions[i].clone(),
             server_url: side.url.clone(),
             server_commit: side.server_sha.clone(),
             engine_commit: side.engine_sha.clone(),
@@ -987,10 +1034,13 @@ fn run(out: &str, sides: &[Side; 2], judged_only: bool) -> Result<(), String> {
         };
         let path = Path::new(out).join(format!("{}.json", side.label));
         let body = serde_json::to_vec_pretty(&results).map_err(|e| e.to_string())?;
-        std::fs::write(&path, body)
-            .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+        if let Err(e) = std::fs::write(&path, body) {
+            let _ = harness.tear_down();
+            return Err(format!("could not write {}: {e}", path.display()));
+        }
     }
-    Ok(())
+    // Then every repository deleted and the scratch directory removed.
+    harness.tear_down()
 }
 
 type Measured = Vec<(String, String, Vec<[Measurement; 2]>)>;

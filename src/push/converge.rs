@@ -15,7 +15,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -26,8 +26,8 @@ use crate::client::{EntryType, PushResponse, SynsClient};
 use crate::errors::{ApiErrorContext, CliError};
 use crate::push::collector::{
     CollectOptions, CollectResult, CollectedFile, HELD_BYTES_BUDGET, HeldBytes, Hold,
-    MAX_FILE_BYTES, PIECE_BYTES, SkippedFile, collect_files, is_text, is_text_reader,
-    read_collected, too_large_line,
+    MAX_FILE_BYTES, SkippedFile, collect_files, is_text, is_text_reader, read_collected,
+    too_large_line,
 };
 use crate::push::hash::blob_sha1;
 use crate::push::reconcile::{
@@ -802,34 +802,10 @@ fn disk_hash(copy: &WorkingCopy, path: &str) -> Result<Option<String>, CliError>
 /// Copy `source` into `dest` in pieces, answering the blob hash of what
 /// was copied.
 fn hash_copying(source: &Path, dest: &mut impl Write) -> std::io::Result<String> {
-    use sha1::{Digest, Sha1};
-    let mut from = std::fs::File::open(source)?;
+    let from = std::fs::File::open(source)?;
     let declared = from.metadata()?.len();
-    let mut hasher = Sha1::new();
-    hasher.update(format!("blob {declared}\0").as_bytes());
-    let mut buf = vec![0u8; PIECE_BYTES];
-    let mut copied = 0u64;
-    loop {
-        let n = match from.read(&mut buf) {
-            Ok(n) => n,
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(err) => return Err(err),
-        };
-        if n == 0 {
-            break;
-        }
-        copied += n as u64;
-        hasher.update(&buf[..n]);
-        dest.write_all(&buf[..n])?;
-    }
-    if copied != declared {
-        return Err(std::io::Error::other("the file changed while it was read"));
-    }
-    Ok(hasher.finalize().iter().fold(String::new(), |mut acc, b| {
-        use std::fmt::Write as _;
-        let _ = write!(acc, "{b:02x}");
-        acc
-    }))
+    crate::push::hash::hash_pieces(from, declared, dest)?
+        .ok_or_else(|| std::io::Error::other("the file changed while it was read"))
 }
 
 /// The file-name prefix of the sibling a folder write lands through.
@@ -2331,24 +2307,21 @@ fn marked_text(
         return Ok(is_text(&bytes) && holds_conflict_marker(&String::from_utf8_lossy(&bytes)));
     }
     // Read in pieces: the hash, the text test and the marker test in one
-    // pass over the file.
-    struct Scan {
-        hasher_len: u64,
-        text: TextPieces,
-        markers: MarkerScan,
-    }
+    // pass over the file, the two tests fed as the hash's sink.
     struct TextPieces {
         carried: Vec<u8>,
         text: bool,
+        markers: MarkerScan,
     }
-    impl TextPieces {
-        fn feed(&mut self, piece: &[u8]) {
+    impl Write for TextPieces {
+        fn write(&mut self, piece: &[u8]) -> std::io::Result<usize> {
+            self.markers.feed(piece);
             if !self.text {
-                return;
+                return Ok(piece.len());
             }
             if piece.contains(&0) {
                 self.text = false;
-                return;
+                return Ok(piece.len());
             }
             let mut joined = std::mem::take(&mut self.carried);
             joined.extend_from_slice(piece);
@@ -2359,44 +2332,24 @@ fn marked_text(
                 }
                 Err(_) => self.text = false,
             }
+            Ok(piece.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
         }
     }
-    use sha1::{Digest, Sha1};
-    let mut from = std::fs::File::open(root.join(path)).map_err(|_| changed())?;
-    let mut hasher = Sha1::new();
-    hasher.update(format!("blob {size}\0").as_bytes());
-    let mut scan = Scan {
-        hasher_len: 0,
-        text: TextPieces {
-            carried: Vec::new(),
-            text: true,
-        },
+    let from = std::fs::File::open(root.join(path)).map_err(|_| changed())?;
+    let mut scan = TextPieces {
+        carried: Vec::new(),
+        text: true,
         markers: MarkerScan::new(),
     };
-    let mut buf = vec![0u8; PIECE_BYTES];
-    loop {
-        let n = match from.read(&mut buf) {
-            Ok(n) => n,
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return Err(changed()),
-        };
-        if n == 0 {
-            break;
-        }
-        scan.hasher_len += n as u64;
-        hasher.update(&buf[..n]);
-        scan.text.feed(&buf[..n]);
-        scan.markers.feed(&buf[..n]);
-    }
-    let sha = hasher.finalize().iter().fold(String::new(), |mut acc, b| {
-        use std::fmt::Write as _;
-        let _ = write!(acc, "{b:02x}");
-        acc
-    });
-    if scan.hasher_len != size || sha != file.sha {
+    let sha = crate::push::hash::hash_pieces(from, size, &mut scan).map_err(|_| changed())?;
+    if sha.as_deref() != Some(file.sha.as_str()) {
         return Err(changed());
     }
-    let text = scan.text.text && scan.text.carried.is_empty();
+    let text = scan.text && scan.carried.is_empty();
     Ok(text && scan.markers.finish())
 }
 

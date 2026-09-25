@@ -914,7 +914,13 @@ async fn check_response(response: reqwest::Response) -> Result<reqwest::Response
         return Err(CliError::AuthRequired);
     }
     if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
-        let bytes = read_body(response, ANSWER_STALL).await.unwrap_or_default();
+        // A stalled or short body is the server unreachable, as it is on
+        // every other answer (CR1-1).
+        let bytes = match read_body(response, ANSWER_STALL).await {
+            Ok(bytes) => bytes,
+            Err(err @ CliError::ServerUnreachable { .. }) => return Err(err),
+            Err(_) => Vec::new(),
+        };
         let prefix = &bytes[..bytes.len().min(4096)];
         let lower = String::from_utf8_lossy(prefix).to_ascii_lowercase();
         let rejecter = if lower.contains("cloudflare") {
@@ -950,7 +956,11 @@ async fn check_response(response: reqwest::Response) -> Result<reqwest::Response
         // rather than reduced to its presence — the conflict refusal
         // renders it and its document carries it, and nothing downstream
         // can read the body again once this fold has consumed it.
-        let body = read_body(response, ANSWER_STALL).await.ok();
+        let body = match read_body(response, ANSWER_STALL).await {
+            Ok(bytes) => Some(bytes),
+            Err(err @ CliError::ServerUnreachable { .. }) => return Err(err),
+            Err(_) => None,
+        };
         let (error, current_sha) = match body
             .as_deref()
             .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
@@ -3552,6 +3562,58 @@ mod u280_transport_tests {
             .unwrap_err();
         assert!(matches!(err, CliError::ServerUnreachable { .. }), "{err:?}");
         assert!(!err.to_string().contains("invalid response body"));
+    }
+
+    /// A listener answering one request with `status` under
+    /// `Content-Length: 40`, sending 10 bytes of it and then nothing.
+    async fn stalled_refusal(status: u16) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let mut seen = Vec::new();
+            while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    return;
+                }
+                seen.extend_from_slice(&buf[..n]);
+            }
+            let head = format!("HTTP/1.1 {status} X\r\nContent-Length: 40\r\n\r\n{{\"error\":\"x");
+            sock.write_all(head.as_bytes()).await.unwrap();
+            let _ = sock.flush().await;
+            tokio::time::sleep(Duration::from_secs(40)).await;
+        });
+        format!("http://127.0.0.1:{}/refused", addr.port())
+    }
+
+    /// CR1-1: a refusal whose body stalls is the server unreachable, never
+    /// an unknown error or a frontend's 413.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refusal_whose_body_stalls_ends_as_unreachable() {
+        // The four statuses wait out the stall bound side by side.
+        let mut waits = Vec::new();
+        for status in [404u16, 409, 413, 503] {
+            let url = stalled_refusal(status).await;
+            waits.push(tokio::spawn(async move {
+                let response = head_of(&url).await;
+                let started = Instant::now();
+                let err = tokio::time::timeout(Duration::from_secs(45), check_response(response))
+                    .await
+                    .expect("the stall bound ended the read")
+                    .unwrap_err();
+                (status, err, started.elapsed())
+            }));
+        }
+        for wait in waits {
+            let (status, err, took) = wait.await.unwrap();
+            assert!(
+                matches!(err, CliError::ServerUnreachable { .. }),
+                "{status}: {err:?}"
+            );
+            assert!(took >= Duration::from_secs(25), "{status}: {took:?}");
+        }
     }
 
     const BYTES: &[u8] = b"\x89PNG\r\n\x1a\n\x00\xff";

@@ -406,9 +406,50 @@ async fn too_large_is_dropped_and_named() {
         )),
         "{diagnostic}"
     );
+    assert_eq!(
+        diagnostic
+            .matches(&format!(
+                "larger than {} MiB (7)",
+                MAX_FILE_BYTES / (1024 * 1024)
+            ))
+            .count(),
+        1,
+        "the too-large line stands once: {diagnostic}"
+    );
     assert!(!diagnostic.contains("more"), "{diagnostic}");
     assert!(!diagnostic.contains("binary"), "{diagnostic}");
     assert!(!stdout(&out).contains("binary"));
+}
+
+/// CR1-2: a convergence writes the too-large line once, and none in
+/// machine-readable mode.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn sync_names_a_too_large_drop_once() {
+    let fake = Fake::start().await;
+    let m = Machine::new(&fake.uri);
+    write(&m.dir(), "a.md", b"a\n");
+    let first = m.run(&["push", "--name", "proj"]).await;
+    assert_eq!(first.status.code(), Some(0), "{}", stderr(&first));
+    sparse(&m.dir(), "big.bin", MAX_FILE_BYTES + 1);
+
+    let out = m.run(&["sync"]).await;
+    let json = m.run(&["--json", "sync"]).await;
+
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let line = format!(
+        "  larger than {} MiB (1): big.bin",
+        MAX_FILE_BYTES / (1024 * 1024)
+    );
+    assert_eq!(
+        stderr(&out).lines().filter(|l| *l == line).count(),
+        1,
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(json.status.code(), Some(0), "{}", stderr(&json));
+    assert!(!stderr(&json).contains("larger than"), "{}", stderr(&json));
+    assert!(!stdout(&json).contains("larger than"), "{}", stdout(&json));
 }
 
 // ---- publication -----------------------------------------------------------

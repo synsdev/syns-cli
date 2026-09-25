@@ -1,12 +1,11 @@
 use crate::errors::CliError;
-use crate::push::hash::blob_sha1;
+use crate::push::hash::{blob_sha1, hash_pieces};
 use crate::push::working_copy::StatRecord;
 use crate::repo::root::{path_is_prefix_ancestor, path_within_prefix, to_forward_slash};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::overrides::OverrideBuilder;
 use ignore::{Match, WalkBuilder};
 use serde::Serialize;
-use sha1::{Digest, Sha1};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -294,44 +293,13 @@ fn in_default_exclude_dir(rel_path: &Path) -> bool {
     false
 }
 
-/// The lowercase hex of a finished SHA-1.
-fn hex(digest: &[u8]) -> String {
-    digest.iter().fold(String::new(), |mut acc, b| {
-        use std::fmt::Write;
-        let _ = write!(acc, "{b:02x}");
-        acc
-    })
-}
-
 /// The blob hash of the file at `path`, read in pieces under the header
 /// `blob_sha1` writes, and the length it read. `None` where the file's
 /// length moved while it was read.
 fn hash_file_in_pieces(path: &Path) -> std::io::Result<Option<(String, u64)>> {
-    let mut file = std::fs::File::open(path)?;
+    let file = std::fs::File::open(path)?;
     let declared = file.metadata()?.len();
-    let mut hasher = Sha1::new();
-    hasher.update(format!("blob {declared}\0").as_bytes());
-    let mut buf = vec![0u8; PIECE_BYTES];
-    let mut read = 0u64;
-    loop {
-        let n = match file.read(&mut buf) {
-            Ok(n) => n,
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(err) => return Err(err),
-        };
-        if n == 0 {
-            break;
-        }
-        read += n as u64;
-        if read > declared {
-            return Ok(None);
-        }
-        hasher.update(&buf[..n]);
-    }
-    if read != declared {
-        return Ok(None);
-    }
-    Ok(Some((hex(&hasher.finalize()), declared)))
+    Ok(hash_pieces(file, declared, &mut std::io::sink())?.map(|sha| (sha, declared)))
 }
 
 /// The blob hash of a file a collection does not hold, retried while its
@@ -741,18 +709,28 @@ pub fn read_collected<'a>(
 
 /// Make `dest` hold a collected file's bytes — the held ones, or the
 /// folder's copied in pieces — only where they hash to what the
-/// collection took; otherwise refuse, leaving no `dest`.
+/// collection took; otherwise refuse, leaving no `dest`. `dest` is created
+/// anew, reachable by the person's own account alone on unix (CR1-3).
 pub fn copy_collected(
     root: &Path,
     path: &str,
     file: &CollectedFile,
     dest: &Path,
 ) -> Result<(), CliError> {
-    let written = if let Some((bytes, _)) = &file.bytes {
-        std::fs::write(dest, bytes).map(|_| true)
-    } else {
-        copy_verified(&root.join(path), dest, &file.sha)
-    };
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let written = options.open(dest).and_then(|mut to| {
+        if let Some((bytes, _)) = &file.bytes {
+            to.write_all(bytes).and_then(|()| to.flush()).map(|()| true)
+        } else {
+            copy_verified(&root.join(path), &mut to, &file.sha)
+        }
+    });
     match written {
         Ok(true) => Ok(()),
         Ok(false) => {
@@ -772,31 +750,12 @@ pub fn copy_collected(
     }
 }
 
-/// Copy `source` to `dest` in pieces, answering whether what was copied
+/// Copy `source` into `to` in pieces, answering whether what was copied
 /// hashes to `sha`.
-pub(crate) fn copy_verified(source: &Path, dest: &Path, sha: &str) -> std::io::Result<bool> {
-    let mut from = std::fs::File::open(source)?;
+fn copy_verified(source: &Path, to: &mut std::fs::File, sha: &str) -> std::io::Result<bool> {
+    let from = std::fs::File::open(source)?;
     let declared = from.metadata()?.len();
-    let mut to = std::fs::File::create(dest)?;
-    let mut hasher = Sha1::new();
-    hasher.update(format!("blob {declared}\0").as_bytes());
-    let mut buf = vec![0u8; PIECE_BYTES];
-    let mut copied = 0u64;
-    loop {
-        let n = match from.read(&mut buf) {
-            Ok(n) => n,
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(err) => return Err(err),
-        };
-        if n == 0 {
-            break;
-        }
-        copied += n as u64;
-        hasher.update(&buf[..n]);
-        to.write_all(&buf[..n])?;
-    }
-    to.flush()?;
-    Ok(copied == declared && hex(&hasher.finalize()) == sha)
+    Ok(hash_pieces(from, declared, to)?.as_deref() == Some(sha))
 }
 
 /// Maximum file paths shown per category in the skip-summary block
@@ -1774,6 +1733,36 @@ mod tests {
             Err(CliError::CollectedSetChanged { .. })
         ));
         assert!(!dest.exists());
+    }
+
+    /// CR1-3: a collected file's copy is created private, held bytes and
+    /// bytes read again alike.
+    #[cfg(unix)]
+    #[test]
+    fn a_collected_copy_is_created_reachable_by_its_owner_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = three_files();
+        for budget in [HELD_BYTES_BUDGET, 0] {
+            let collected = collect_files(
+                dir.path(),
+                &[],
+                CollectOptions::default(),
+                None,
+                &HeldBytes::new(budget),
+            )
+            .unwrap();
+            let dest = dir.path().join(format!("copy-{budget}"));
+            copy_collected(
+                dir.path(),
+                "image.png",
+                &collected.files["image.png"],
+                &dest,
+            )
+            .unwrap();
+            let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "budget {budget}");
+            std::fs::remove_file(&dest).unwrap();
+        }
     }
 
     #[test]
