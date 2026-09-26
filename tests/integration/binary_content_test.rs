@@ -1093,6 +1093,35 @@ async fn a_refused_trusted_entry_is_read_again() {
     );
 }
 
+/// `D-093`: a candidate pass refused on a file its record trusted under a
+/// hash the file no longer has drops that entry before its fresh
+/// collection, so the retaken pass reads the file and converges.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_refused_trusted_entry_is_collected_again_by_the_candidate() {
+    let fake = Fake::start().await;
+    let m = Machine::new(&fake.uri);
+    let h0 = fake.commit_bytes(&[(".syns.yaml", identity()), ("a.md", b"a\nb\nc\n")]);
+    checkout(&fake, &m, &h0);
+    let first = m.run(&["--json", "sync"]).await;
+    assert_eq!(first.status.code(), Some(0), "{}", stdout(&first));
+    let copy = m.copy();
+    let mut record = copy.stat_record();
+    record.entries.get_mut("a.md").expect("a recorded a.md").sha = "0".repeat(40);
+    assert!(record.stamp.is_some());
+    copy.write_stat_record(&record).unwrap();
+    fake.commit_byte_changes(&[("a.md", Some(b"a\nHEAD\nc\n"))]);
+
+    let out = m.run(&["--json", "sync"]).await;
+
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert_eq!(
+        std::fs::read(m.dir().join("a.md")).unwrap(),
+        b"a\nHEAD\nc\n"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 #[serial]

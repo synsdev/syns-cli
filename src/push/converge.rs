@@ -1681,6 +1681,8 @@ async fn prepare_candidate(
         let mut left_untouched = false;
         let mut blocked: Vec<&String> = Vec::new();
         let mut acted: BTreeSet<&String> = BTreeSet::new();
+        #[cfg(test)]
+        tests::before_folder_writes();
         for path in clearing {
             if !unchanged(path)? {
                 left_untouched = true;
@@ -2795,6 +2797,118 @@ pub async fn working_copy_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// Run once between a candidate pass's snapshot and its first
+        /// folder write, on the thread driving the pass.
+        static BEFORE_FOLDER_WRITES: RefCell<Option<Box<dyn FnOnce()>>> =
+            const { RefCell::new(None) };
+    }
+
+    pub(super) fn before_folder_writes() {
+        if let Some(hook) = BEFORE_FOLDER_WRITES.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    /// `D-093`: a path a pass snapshotted and then left untouched — a
+    /// writer landing between its snapshot and its write — is snapshotted
+    /// again by the next pass, so a discard gives back the writer's bytes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_path_left_untouched_is_snapshotted_again() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let base: &[u8] = b"a\nb\nc\n";
+        let head_bytes: &[u8] = b"a\nHEAD\nc\n";
+        let server = MockServer::start().await;
+        for (at, bytes) in [("h0", base), ("h1", head_bytes)] {
+            Mock::given(method("GET"))
+                .and(path("/api/v1/repos/alice/r/raw/a.md"))
+                .and(query_param("ref", at))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
+                .mount(&server)
+                .await;
+        }
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(folder.path().join("a.md"), base).unwrap();
+        let copy = WorkingCopy::open(cache.path(), "alice", "r", folder.path()).unwrap();
+        let staging = Staging::open(cache.path()).unwrap();
+        let opts = SmartPushOptions {
+            force: false,
+            message: "push".into(),
+            author: None,
+            parent_sha: None,
+            excludes: vec![],
+            cache_dir: cache.path().to_path_buf(),
+            description: None,
+            tags: None,
+            status: None,
+            visibility: None,
+            strict: false,
+            allow_empty: false,
+            debug: false,
+            no_default_excludes: false,
+            prefix: None,
+            reference: None,
+            expected: None,
+            provenance: None,
+            collected: None,
+            held: None,
+            json_output: false,
+            renders_publication_summary: false,
+        };
+        let head = Head {
+            commit: Some("h1".into()),
+            files: BTreeMap::from([("a.md".to_string(), blob_sha1(head_bytes))]),
+            sizes: BTreeMap::from([("a.md".to_string(), Some(head_bytes.len() as u64))]),
+            truncated: false,
+        };
+        let target = folder.path().join("a.md");
+        BEFORE_FOLDER_WRITES.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(target, b"a\nagent\nc\n").unwrap();
+            }));
+        });
+
+        let prepared = prepare_candidate(
+            &client,
+            None,
+            &copy,
+            &opts,
+            &staging,
+            Candidate {
+                base_commit: Some("h0".into()),
+                base_files: BTreeMap::from([("a.md".to_string(), blob_sha1(base))]),
+                head: &head,
+                publishing: false,
+                existing: None,
+                force_resolution: false,
+                hold_root_identity: Some(false),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let Prepared::Resolution(resolution) = prepared else {
+            panic!("expected a resolution");
+        };
+        assert!(
+            resolution
+                .collisions
+                .contains(&("a.md".to_string(), CollisionKind::ModifyModify)),
+            "{:?}",
+            resolution.collisions
+        );
+        discard_resolution(&copy).unwrap();
+        assert_eq!(
+            std::fs::read(folder.path().join("a.md")).unwrap(),
+            b"a\nagent\nc\n"
+        );
+    }
 
     #[test]
     fn is_partial_write_admits_only_the_minted_sibling_name() {
