@@ -779,12 +779,18 @@ struct U283Kept {
 
 /// The answer a u283 read's check refuses, naming the operation and the
 /// sample.
+///
+/// `released` admits the document the released build answers a not-text
+/// file with, `content: null`, checked by its `sha` — the baseline's
+/// `cat-json-binary` alone, so an after binary regressing to that form is
+/// refused rather than timed (CR1-2).
 fn check_cat(
     operation: &str,
     n: usize,
     stdout: &[u8],
     expected: &[u8],
     json: bool,
+    released: bool,
 ) -> Result<(), String> {
     let refused = |why: &str| format!("u283 {operation} sample {n}: {why}");
     if !json {
@@ -803,7 +809,8 @@ fn check_cat(
     } else {
         // The released build answers a not-text file as `content: null`
         // (`D-089`): its `sha` is what it can be checked by.
-        document["content"].is_null()
+        released
+            && document["content"].is_null()
             && document["sha"].as_str() == Some(blob_sha1(expected).as_str())
     };
     if matches {
@@ -1052,8 +1059,9 @@ impl Harness {
 
         // The reads: the invocation, then its check.
         let read = |args: &[&str]| expect(side, U283_FIXTURE, operation, &scratch, &cache, args, 0);
+        let released = side.label == "baseline" && operation == "cat-json-binary";
         let checked = |answer: &Answer, path: &str, json: bool| {
-            check_cat(operation, n, &answer.stdout, &fixture[path], json)
+            check_cat(operation, n, &answer.stdout, &fixture[path], json, released)
         };
         let answer = match operation {
             "cat-text" => {
@@ -2022,17 +2030,48 @@ mod tests {
     #[test]
     fn each_cat_answer_is_checked_against_the_fixture() {
         let bytes = b"\x89PNG\x00".to_vec();
-        let raw = check_cat("cat-text", 1, &bytes, &bytes, false);
-        assert!(raw.is_ok());
-        assert!(check_cat("cat-text", 1, b"other", &bytes, false).is_err());
+        assert!(check_cat("cat-text", 1, &bytes, &bytes, false, false).is_ok());
+        assert!(check_cat("cat-text", 1, b"other", &bytes, false, false).is_err());
         let encoded = serde_json::json!({ "contentBase64": encode_base64(&bytes) }).to_string();
-        assert!(check_cat("cat-json-binary", 1, encoded.as_bytes(), &bytes, true).is_ok());
+        assert!(
+            check_cat(
+                "cat-json-binary",
+                1,
+                encoded.as_bytes(),
+                &bytes,
+                true,
+                false
+            )
+            .is_ok()
+        );
         let released = serde_json::json!({ "content": null, "sha": blob_sha1(&bytes) }).to_string();
-        assert!(check_cat("cat-json-binary", 1, released.as_bytes(), &bytes, true).is_ok());
+        assert!(
+            check_cat(
+                "cat-json-binary",
+                1,
+                released.as_bytes(),
+                &bytes,
+                true,
+                true
+            )
+            .is_ok()
+        );
+        // CR1-2: the released form is refused wherever it is not admitted.
+        assert!(
+            check_cat(
+                "cat-json-binary",
+                1,
+                released.as_bytes(),
+                &bytes,
+                true,
+                false
+            )
+            .is_err()
+        );
         let wrong = serde_json::json!({ "content": null, "sha": "0" }).to_string();
-        assert!(check_cat("cat-json-binary", 1, wrong.as_bytes(), &bytes, true).is_err());
+        assert!(check_cat("cat-json-binary", 1, wrong.as_bytes(), &bytes, true, true).is_err());
         let text = serde_json::json!({ "content": "# a\n" }).to_string();
-        assert!(check_cat("cat-json-text", 1, text.as_bytes(), b"# a\n", true).is_ok());
+        assert!(check_cat("cat-json-text", 1, text.as_bytes(), b"# a\n", true, false).is_ok());
     }
 
     #[test]

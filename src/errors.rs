@@ -495,8 +495,8 @@ impl std::fmt::Display for CliError {
             ),
             CliError::FileTooLarge { path, size } => write!(
                 f,
-                "payload_too_large: {path} holds {size} bytes, past the {} MiB one file may hold; nothing was sent",
-                crate::push::collector::MAX_FILE_BYTES / (1024 * 1024)
+                "payload_too_large: {path} holds {size} bytes, past the {} one file may hold; nothing was sent",
+                crate::push::collector::file_bound_label()
             ),
         }
     }

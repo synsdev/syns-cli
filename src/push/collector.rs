@@ -184,10 +184,16 @@ pub enum SkipReason {
     Synsignore,
 }
 
-/// The summary source of the size drop: `larger than {n} MiB`, `{n}` the
-/// whole MiB `MAX_FILE_BYTES` holds.
+/// The bound one file may hold as every label names it: `{n} MiB`, `{n}`
+/// the whole MiB `MAX_FILE_BYTES` holds — the size drop's summary source
+/// and the too-large refusal both write it (SPEC u283, CR1-3).
+pub fn file_bound_label() -> String {
+    format!("{} MiB", MAX_FILE_BYTES / (1024 * 1024))
+}
+
+/// The summary source of the size drop: `larger than {n} MiB`.
 pub fn too_large_label() -> String {
-    format!("larger than {} MiB", MAX_FILE_BYTES / (1024 * 1024))
+    format!("larger than {}", file_bound_label())
 }
 
 impl SkipReason {

@@ -348,6 +348,16 @@ fn media_type_of(response: &reqwest::Response) -> Option<String> {
         })
 }
 
+/// The buffer an unsized raw read allocates up front: the declared
+/// length where it stands at or under `MAX_FILE_BYTES`, and otherwise
+/// none, so an answer declaring a length no file may hold reserves
+/// nothing on its word (SPEC u283 `get_raw`, CR1-1).
+fn unsized_capacity(declared: Option<u64>) -> Option<usize> {
+    declared
+        .filter(|declared| *declared <= crate::push::collector::MAX_FILE_BYTES)
+        .map(|declared| declared as usize)
+}
+
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct FileHistoryResponse {
@@ -1312,12 +1322,7 @@ impl SynsClient {
         let response = check_response(response).await?;
         let etag = etag_of(&response);
         let media_type = media_type_of(&response);
-        let capacity = capacity.or_else(|| {
-            response
-                .content_length()
-                .filter(|declared| *declared <= crate::push::collector::MAX_FILE_BYTES)
-                .map(|declared| declared as usize)
-        });
+        let capacity = capacity.or_else(|| unsized_capacity(response.content_length()));
         let bytes = read_body(response, ANSWER_STALL, capacity).await?;
         Ok(RawFile {
             bytes,
@@ -3912,6 +3917,17 @@ mod u280_transport_tests {
 
         assert_eq!(raw.bytes, bytes);
         assert_eq!(raw.bytes.capacity(), len);
+    }
+
+    /// CR1-1: the declared length sizes the buffer at the bound and not
+    /// one byte past it.
+    #[test]
+    fn an_unsized_capacity_stops_at_the_bound() {
+        use crate::push::collector::MAX_FILE_BYTES;
+        assert_eq!(unsized_capacity(Some(MAX_FILE_BYTES)), Some(26_214_400));
+        assert_eq!(unsized_capacity(Some(MAX_FILE_BYTES + 1)), None);
+        assert_eq!(unsized_capacity(Some(68_719_476_736)), None);
+        assert_eq!(unsized_capacity(None), None);
     }
 
     #[tokio::test]
