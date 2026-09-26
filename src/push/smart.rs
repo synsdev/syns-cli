@@ -542,6 +542,33 @@ struct Overheads {
     later: usize,
 }
 
+/// The overheads a chunked publication of `base_request` packs against:
+/// the frame each batch shares, its message the longest a batch carries
+/// and its deletions the whole list, so no batch packs past the budget on
+/// account of either, the first batch's also carrying every hash-only
+/// entry `base_request` names (CR3-2).
+fn batch_overheads(base_request: &PushRequest) -> Overheads {
+    let mut probe = request_frame(
+        base_request,
+        Some(format!(
+            "{} (part {}/{})",
+            base_request.message.as_deref().unwrap_or(""),
+            usize::MAX,
+            usize::MAX
+        )),
+        base_request.parent_sha.clone(),
+    );
+    probe.deletions = base_request.deletions.clone();
+    let later = estimate_body_bytes(&probe);
+    probe.files = base_request.files.clone();
+    let first = estimate_body_bytes(&probe);
+    Overheads {
+        first,
+        first_carries: !base_request.files.is_empty(),
+        later,
+    }
+}
+
 /// Pack pending entries into batches by their serialised lengths: in
 /// descending `encoded_len`, ascending path among equal lengths, a batch
 /// closed before an entry that would carry it past `CHUNK_BUDGET_BYTES`
@@ -697,33 +724,7 @@ async fn chunked_push(
     pending: Vec<PendingEntry>,
     scratch: &mut Vec<u8>,
 ) -> Result<(PushResponse, serde_json::Value), PassRefusal> {
-    // The frame each batch shares, its message the longest a batch
-    // carries and its deletions the whole list, so no batch packs past
-    // the budget on account of either; the first batch's also carries
-    // every hash-only entry.
-    let mut probe = request_frame(
-        base_request,
-        Some(format!(
-            "{} (part {}/{})",
-            base_request.message.as_deref().unwrap_or(""),
-            usize::MAX,
-            usize::MAX
-        )),
-        base_request.parent_sha.clone(),
-    );
-    probe.deletions = base_request.deletions.clone();
-    let later = estimate_body_bytes(&probe);
-    probe.files = base_request.files.clone();
-    let first = estimate_body_bytes(&probe);
-    drop(probe);
-    let batches = pack_batches(
-        pending,
-        Overheads {
-            first,
-            first_carries: !base_request.files.is_empty(),
-            later,
-        },
-    );
+    let batches = pack_batches(pending, batch_overheads(base_request));
 
     let n = batches.len();
 
@@ -864,9 +865,12 @@ async fn chunked_push(
             }
             Err(CliError::PayloadTooLarge { rejecter, .. }) => {
                 batch_failed(k1, &previous_commit_sha);
+                // Every entry the refused body carried, the hash-only
+                // ones the first batch's frame names included (CR3-3).
+                let carried = if k1 == 1 { base_request.files.len() } else { 0 };
                 return Err(PassRefusal::standing(CliError::PayloadTooLarge {
                     bytes_sent,
-                    file_count: batch_files,
+                    file_count: batch_files + carried,
                     rejecter,
                 }));
             }
@@ -3424,5 +3428,163 @@ mod u280_publication_tests {
             .filter(|r| r.method == reqwest::Method::PUT)
             .count();
         assert_eq!(puts, 1);
+    }
+
+    fn put_count(requests: &[wiremock::Request]) -> usize {
+        requests
+            .iter()
+            .filter(|r| r.method == reqwest::Method::PUT)
+            .count()
+    }
+
+    /// CR3-1: a second `MISSING_BLOBS` ends the run, nothing further
+    /// sent (SPEC u280 `smart_push` 5).
+    #[tokio::test]
+    async fn a_second_missing_blobs_ends_the_run() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/repos/alice/repo/push"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "error": "missing_blobs",
+                "missing": {"a.txt": blob_sha1(b"a")},
+            })))
+            .with_priority(1)
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/repos/alice/repo/push"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "error": "missing_blobs",
+                "missing": {"b.txt": blob_sha1(b"b")},
+            })))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        let folder = tempfile::tempdir().unwrap();
+        let identity = b"owner: alice\nname: repo\n";
+        std::fs::write(folder.path().join(".syns.yaml"), identity).unwrap();
+        std::fs::write(folder.path().join("a.txt"), "a").unwrap();
+        std::fs::write(folder.path().join("b.txt"), "b").unwrap();
+        std::fs::write(folder.path().join("c.txt"), "c edited").unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut manifest = Manifest::default();
+        manifest.update(
+            "base-sha".into(),
+            HashMap::from([
+                (".syns.yaml".into(), blob_sha1(identity)),
+                ("a.txt".into(), blob_sha1(b"a")),
+                ("b.txt".into(), blob_sha1(b"b")),
+                ("c.txt".into(), blob_sha1(b"c")),
+            ]),
+        );
+        manifest.save(cache.path(), "alice", "repo").unwrap();
+        let client = SynsClient::new(&server.uri()).unwrap();
+
+        let err = smart_push(
+            &client,
+            "t",
+            "alice/repo",
+            folder.path(),
+            opts(cache.path()),
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            CliError::Api {
+                status: Some(409),
+                error,
+                ..
+            } => assert_eq!(error, "missing_blobs"),
+            other => panic!("expected MISSING_BLOBS, got {other:?}"),
+        }
+        assert_eq!(put_count(&server.received_requests().await.unwrap()), 2);
+    }
+
+    /// CR3-2: the first batch's budget counts the hash-only entries its
+    /// frame carries, so two entries each under half the budget that fit
+    /// together beside a bare frame are packed apart beside 20,000 of
+    /// them (SPEC u280 `smart_push` 4).
+    #[test]
+    fn the_first_batch_counts_its_hash_only_entries() {
+        let mut frame = bare_frame();
+        frame.files = (0..20_000)
+            .map(|i| PushFileEntry {
+                path: format!("docs/{i:05}.md"),
+                sha: "0".repeat(40),
+                content: None,
+                content_base64: None,
+            })
+            .collect();
+        let pending: Vec<PendingEntry> = ["a.bin", "b.bin"]
+            .into_iter()
+            .map(|path| PendingEntry {
+                path: path.into(),
+                sha: "1".repeat(40),
+                text: false,
+                size: 0,
+                encoded_len: CHUNK_BUDGET_BYTES / 2 - 4096,
+            })
+            .collect();
+
+        let beside_none = pack_batches(pending.clone(), batch_overheads(&bare_frame()));
+        let beside_many = pack_batches(pending, batch_overheads(&frame));
+
+        assert_eq!(beside_none.len(), 1);
+        assert_eq!(beside_many.len(), 2);
+        assert!(beside_many.iter().all(|batch| batch.len() == 1));
+    }
+
+    /// CR3-3: a refused first batch reports every entry its body carried,
+    /// the hash-only ones its frame names included.
+    #[tokio::test]
+    async fn a_refused_first_batch_counts_its_hash_only_entries() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/repos/alice/repo/push"))
+            .respond_with(
+                ResponseTemplate::new(413)
+                    .set_body_json(serde_json::json!({"error": "payload_too_large"})),
+            )
+            .mount(&server)
+            .await;
+        let folder = tempfile::tempdir().unwrap();
+        let identity = b"owner: alice\nname: repo\n";
+        std::fs::write(folder.path().join(".syns.yaml"), identity).unwrap();
+        std::fs::write(folder.path().join("n1.md"), "one").unwrap();
+        std::fs::write(folder.path().join("n2.md"), "two").unwrap();
+        std::fs::write(folder.path().join("big1.txt"), vec![b'a'; 14 * 1024 * 1024]).unwrap();
+        std::fs::write(folder.path().join("big2.txt"), vec![b'b'; 14 * 1024 * 1024]).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut manifest = Manifest::default();
+        manifest.update(
+            "base-sha".into(),
+            HashMap::from([
+                (".syns.yaml".into(), blob_sha1(identity)),
+                ("n1.md".into(), blob_sha1(b"one")),
+                ("n2.md".into(), blob_sha1(b"two")),
+                ("big1.txt".into(), blob_sha1(b"old")),
+                ("big2.txt".into(), blob_sha1(b"old")),
+            ]),
+        );
+        manifest.save(cache.path(), "alice", "repo").unwrap();
+        let client = SynsClient::new(&server.uri()).unwrap();
+
+        let err = smart_push(
+            &client,
+            "t",
+            "alice/repo",
+            folder.path(),
+            opts(cache.path()),
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            CliError::PayloadTooLarge { file_count, .. } => assert_eq!(file_count, 4),
+            other => panic!("expected PAYLOAD_TOO_LARGE, got {other:?}"),
+        }
+        assert_eq!(put_count(&server.received_requests().await.unwrap()), 1);
     }
 }
