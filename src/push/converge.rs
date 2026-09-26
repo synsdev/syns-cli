@@ -1280,6 +1280,14 @@ async fn prepare_candidate(
     let mut resumed_combined: BTreeSet<String> = BTreeSet::new();
     let mut first_folder = first_folder;
     let mut hold = candidate.hold_root_identity;
+    // Paths a pass refused on as changed since its collection, their
+    // record entries dropped before the next collection (`D-093`).
+    let mut forget: Vec<String> = Vec::new();
+    // Whether a pass of this run wrote the snapshot documents, and the
+    // paths whose local snapshot a pass of this run took and then left
+    // untouched, which the next pass takes afresh (`D-093`).
+    let mut snapshots_written = false;
+    let mut untouched: BTreeSet<String> = BTreeSet::new();
 
     // A preparation resumed over a resolution a killed or failed run left
     // half-written keeps that run's summaries, and counts a path already
@@ -1301,13 +1309,15 @@ async fn prepare_candidate(
         }
     }
 
-    for pass in 0..MAX_PASSES {
+    'passes: for _ in 0..MAX_PASSES {
         // `converge` 1: the run's own collection on the first pass, a
-        // fresh one on every pass after the run wrote the folder.
+        // fresh one on every pass after the run wrote the folder or after
+        // a pass refused on a file changed since its collection.
         let mut folder = match first_folder.take() {
             Some(folder) => folder,
-            None => collect_folder(copy, opts, &[], true)?,
+            None => collect_folder(copy, opts, &forget, true)?,
         };
+        forget.clear();
         if *hold.get_or_insert_with(|| {
             holds_root_identity(!candidate.publishing, &candidate.base_files, &folder, head)
         }) {
@@ -1323,12 +1333,6 @@ async fn prepare_candidate(
             &folder.hashes,
             &without(&head.files, &excluded),
         );
-        local_paths.extend(rec.local_only.iter().cloned());
-        remote_paths.extend(rec.remote_only.iter().cloned());
-        for (path, kind) in &rec.collisions {
-            collisions.entry(path.clone()).or_insert(*kind);
-        }
-
         // `converge` 4 — the collection's bytes given back, then every
         // head file this pass writes, each collision's head content and a
         // modify/modify collision's base content read before any state or
@@ -1440,7 +1444,15 @@ async fn prepare_candidate(
                         CollisionKind::ModifyModify => base_blobs.get(path),
                         _ => None,
                     };
-                    match merge_collision(copy, path, local, head_blob, base, &held, staging)? {
+                    let merged =
+                        match merge_collision(copy, path, local, head_blob, base, &held, staging) {
+                            Err(CliError::CollectedSetChanged { paths }) => {
+                                forget = paths;
+                                continue 'passes;
+                            }
+                            other => other?,
+                        };
+                    match merged {
                         Some((merged, hash)) => {
                             candidate_hashes.insert(path.clone(), Some(hash.clone()));
                             writes.push((path.clone(), WriteSource::Merged(merged), hash));
@@ -1467,6 +1479,7 @@ async fn prepare_candidate(
         // snapshotted as absent, and the path both sides hold is a collision.
         let removed_here: BTreeSet<String> = removals.iter().cloned().collect();
         let mut held_paths: Vec<(String, bool)> = Vec::new();
+        let mut held_collisions: Vec<(String, CollisionKind)> = Vec::new();
         let mut kept_writes: Vec<(String, WriteSource, String)> = Vec::with_capacity(writes.len());
         for (path, source, hash) in writes {
             let (contested, kind, local_files) =
@@ -1487,7 +1500,7 @@ async fn prepare_candidate(
                     held_paths.push((file, true));
                 }
             }
-            collisions.insert(contested, kind);
+            held_collisions.push((contested, kind));
             held_paths.push((path.clone(), false));
             candidate_hashes.insert(path.clone(), None);
             remote_entries.insert(
@@ -1501,16 +1514,23 @@ async fn prepare_candidate(
         let writes = kept_writes;
 
         // `converge` 5 — the snapshots, each content in a file of its
-        // own. Replaced whole where no resolution stands; while one does —
-        // or once an earlier pass of this run has written — a path already
-        // held keeps its first content.
-        let keep_first = candidate.existing.is_some() || pass > 0;
+        // own. Replaced whole where no resolution stood when the run began
+        // and no earlier pass of this run wrote them; otherwise a path
+        // keeps its first content — taken before this run, or by the pass
+        // that then wrote, removed or withheld it — and a path an earlier
+        // pass snapshotted and left untouched is taken afresh (`D-093`).
+        let keep_first = candidate.existing.is_some() || snapshots_written;
         let mut local_snapshot = if keep_first {
             copy.local_snapshot()?
         } else {
             Snapshot::new()
         };
+        let mut retaken = false;
+        for path in &untouched {
+            retaken |= local_snapshot.remove(path).is_some();
+        }
         let mut created: Vec<String> = Vec::new();
+        let mut taken: Vec<String> = Vec::new();
         let mut before: HashMap<String, Option<String>> = HashMap::new();
         let snapshotted: Result<Snapshot, CliError> = (|| {
             for path in writes.iter().map(|(p, _, _)| p).chain(removals.iter()) {
@@ -1518,6 +1538,7 @@ async fn prepare_candidate(
                 if !(keep_first && local_snapshot.contains_key(path)) {
                     let prior = snapshot_prior(copy, &folder, path, &mut created)?;
                     local_snapshot.insert(path.clone(), prior);
+                    taken.push(path.clone());
                 }
             }
             for (path, present) in &held_paths {
@@ -1556,11 +1577,25 @@ async fn prepare_candidate(
             Ok(remote_snapshot) => remote_snapshot,
             Err(err) => {
                 remove_created(copy, &created);
+                if let CliError::CollectedSetChanged { paths } = err {
+                    forget = paths;
+                    continue 'passes;
+                }
                 return Err(err);
             }
         };
-        let write_local =
-            !writes.is_empty() || !removals.is_empty() || !held_paths.is_empty() || !keep_first;
+        // The pass stands from here: its summaries join the run's.
+        local_paths.extend(rec.local_only.iter().cloned());
+        remote_paths.extend(rec.remote_only.iter().cloned());
+        for (path, kind) in &rec.collisions {
+            collisions.entry(path.clone()).or_insert(*kind);
+        }
+        collisions.extend(held_collisions);
+        let write_local = !writes.is_empty()
+            || !removals.is_empty()
+            || !held_paths.is_empty()
+            || !keep_first
+            || retaken;
         let write_remote = !remote_snapshot.is_empty() || !keep_first;
         let remote_standing = if write_remote {
             let mut standing = if keep_first {
@@ -1580,6 +1615,7 @@ async fn prepare_candidate(
             remove_created(copy, &created);
             return Err(err);
         }
+        snapshots_written = true;
         drop(remote_entries);
 
         let needs_resolution = candidate.force_resolution
@@ -1644,6 +1680,7 @@ async fn prepare_candidate(
         drop(written_paths);
         let mut left_untouched = false;
         let mut blocked: Vec<&String> = Vec::new();
+        let mut acted: BTreeSet<&String> = BTreeSet::new();
         for path in clearing {
             if !unchanged(path)? {
                 left_untouched = true;
@@ -1652,6 +1689,7 @@ async fn prepare_candidate(
             }
             remove_clearing(copy, path)?;
             removed.insert(path.clone());
+            acted.insert(path);
         }
         for (path, source, hash) in &writes {
             if blocked.iter().any(|removal| clears_way(removal, path)) || !unchanged(path)? {
@@ -1667,9 +1705,9 @@ async fn prepare_candidate(
             replace_file_whole(&copy.root, path, content)?;
             written_this_run.insert(path.clone(), hash.clone());
             written.insert(path.clone());
+            acted.insert(path);
         }
         head_blobs.clear();
-        drop(writes);
         for path in later {
             if !unchanged(path)? {
                 left_untouched = true;
@@ -1677,7 +1715,14 @@ async fn prepare_candidate(
             }
             remove_folder_file(copy, path)?;
             removed.insert(path.clone());
+            acted.insert(path);
         }
+        untouched = taken
+            .into_iter()
+            .filter(|path| !acted.contains(path))
+            .collect();
+        drop(acted);
+        drop(writes);
 
         if !left_untouched {
             // `converge` 12.

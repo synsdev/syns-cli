@@ -191,6 +191,19 @@ struct FakeRepo {
     /// Refuse every publication as the server refuses a first push over a
     /// content store already holding commits: `CONFLICT` naming no head.
     identity_taken: bool,
+    /// A writer rewriting a folder file as a raw read of its path is
+    /// answered.
+    racing_writer: Option<RacingWriter>,
+}
+
+/// A writer landing in the folder while a run reads the head: each raw
+/// read of `path` rewrites `target` to `a\nagent {n}\nc\n`, `n` counting
+/// its writes, on the first read alone unless `every` holds.
+struct RacingWriter {
+    path: String,
+    target: PathBuf,
+    every: bool,
+    writes: usize,
 }
 
 /// One answer the fake writes: its status, body, content type and `ETag`.
@@ -253,6 +266,14 @@ impl FakeRepo {
                 let path = urlencoding::decode(&raw["raw/".len()..])
                     .unwrap()
                     .to_string();
+                if let Some(writer) = self.racing_writer.as_mut()
+                    && writer.path == path
+                    && (writer.every || writer.writes == 0)
+                {
+                    writer.writes += 1;
+                    std::fs::write(&writer.target, format!("a\nagent {}\nc\n", writer.writes))
+                        .unwrap();
+                }
                 Some(self.raw(&path, params.get("ref")))
             }
             ("PUT", "push") => {
@@ -536,6 +557,34 @@ impl Fake {
 
     pub(crate) fn take_identity(&self) {
         self.repo.lock().unwrap().identity_taken = true;
+    }
+
+    /// Rewrite `target` as each raw read of `path` is answered, on the
+    /// first read alone unless `every` holds.
+    pub(crate) fn race_raw_reads(&self, path: &str, target: PathBuf, every: bool) {
+        self.repo.lock().unwrap().racing_writer = Some(RacingWriter {
+            path: path.to_string(),
+            target,
+            every,
+            writes: 0,
+        });
+    }
+
+    /// How many raw reads of `path` at the commit `at` the fake answered.
+    pub(crate) fn raw_reads(&self, path: &str, at: &str) -> usize {
+        let route = format!("/raw/{}", urlencoding::encode(path));
+        self.repo
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|(method, target, _)| {
+                let (target_route, query) = target.split_once('?').unwrap_or((target, ""));
+                method == "GET"
+                    && target_route.ends_with(&route)
+                    && query.split('&').any(|kv| kv == format!("ref={at}"))
+            })
+            .count()
     }
 }
 

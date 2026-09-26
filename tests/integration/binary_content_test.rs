@@ -785,6 +785,105 @@ async fn text_collision_still_merges() {
     assert!(merged.contains("HEAD\n>>>>>>> remote"), "{merged}");
 }
 
+/// `D-093`: a writer landing in the folder while the head is read sends
+/// the candidate pass back to a fresh collection, and the local snapshot
+/// keeps the bytes that collection found.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_write_racing_the_head_read_is_collected_again() {
+    let fake = Fake::start().await;
+    let m = Machine::new(&fake.uri);
+    let h0 = fake.commit_bytes(&[(".syns.yaml", identity()), ("a.md", b"a\nb\nc\n")]);
+    checkout(&fake, &m, &h0);
+    fake.commit_byte_changes(&[("a.md", Some(b"a\nHEAD\nc\n"))]);
+    fake.race_raw_reads("a.md", m.dir().join("a.md"), false);
+
+    let out = m.run(&["--json", "sync"]).await;
+
+    assert_eq!(out.status.code(), Some(4), "{}", stdout(&out));
+    assert_eq!(document(&out)["outcome"], json!("resolution_required"));
+    let resolution = m.copy().resolution().unwrap().unwrap();
+    assert!(
+        json!(resolution.collisions)
+            .as_array()
+            .unwrap()
+            .contains(&json!(["a.md", "modify_modify"])),
+        "{:?}",
+        resolution.collisions
+    );
+    let candidate = std::fs::read_to_string(m.dir().join("a.md")).unwrap();
+    assert!(
+        candidate.contains("<<<<<<< local\nagent 1\n"),
+        "{candidate}"
+    );
+    assert!(candidate.contains("HEAD\n>>>>>>> remote"), "{candidate}");
+
+    let out = m.run(&["resolution", "discard"]).await;
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(
+        std::fs::read(m.dir().join("a.md")).unwrap(),
+        b"a\nagent 1\nc\n"
+    );
+}
+
+/// `D-093`: a pass retaken after a refusal replaces the snapshot documents
+/// an earlier run's retrieval left standing, rather than keeping that
+/// run's content as the path's first.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_retaken_pass_keeps_no_snapshot_an_earlier_run_left() {
+    let fake = Fake::start().await;
+    let m = Machine::new(&fake.uri);
+    let h0 = fake.commit_bytes(&[(".syns.yaml", identity()), ("a.md", b"a\nold\nc\n")]);
+    checkout(&fake, &m, &h0);
+    fake.commit_byte_changes(&[("a.md", Some(b"a\nb\nc\n"))]);
+    let out = m.run(&["--json", "sync"]).await;
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert!(m.copy().local_snapshot().unwrap().contains_key("a.md"));
+
+    fake.commit_byte_changes(&[("a.md", Some(b"a\nHEAD\nc\n"))]);
+    fake.race_raw_reads("a.md", m.dir().join("a.md"), false);
+    let out = m.run(&["--json", "sync"]).await;
+    assert_eq!(out.status.code(), Some(4), "{}", stdout(&out));
+
+    let out = m.run(&["resolution", "discard"]).await;
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(
+        std::fs::read(m.dir().join("a.md")).unwrap(),
+        b"a\nagent 1\nc\n"
+    );
+}
+
+/// `D-093`: a writer that never pauses spends the candidate's pass bound,
+/// each refused pass leaving nothing standing, and only then is the run
+/// answered attention required.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_writer_that_never_pauses_spends_the_pass_bound() {
+    let fake = Fake::start().await;
+    let m = Machine::new(&fake.uri);
+    let h0 = fake.commit_bytes(&[(".syns.yaml", identity()), ("a.md", b"a\nb\nc\n")]);
+    checkout(&fake, &m, &h0);
+    let h1 = fake.commit_byte_changes(&[("a.md", Some(b"a\nHEAD\nc\n"))]);
+    fake.race_raw_reads("a.md", m.dir().join("a.md"), true);
+
+    let out = m.run(&["--json", "sync"]).await;
+
+    assert_eq!(out.status.code(), Some(5), "{}", stdout(&out));
+    assert_eq!(document(&out)["outcome"], json!("attention_required"));
+    // One head read of `a.md` per candidate pass.
+    assert_eq!(fake.raw_reads("a.md", &h1), 8);
+    let copy = m.copy();
+    assert!(copy.resolution().unwrap().is_none());
+    assert!(copy.local_snapshot().unwrap().is_empty());
+    assert!(copy.remote_snapshot().unwrap().is_empty());
+    let left = std::fs::read_to_string(m.dir().join("a.md")).unwrap();
+    assert!(
+        left.starts_with("a\nagent ") && !left.contains("<<<<<<<"),
+        "{left}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn a_full_budget_still_merges_text() {
