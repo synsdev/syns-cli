@@ -561,7 +561,7 @@ impl WorkingCopy {
             message: format!("could not write {}: {err}", temp.display()),
         };
         let stored = (|| {
-            File::open(&temp).and_then(|f| f.sync_all()).map_err(io)?;
+            flush_file(&temp).map_err(io)?;
             let target = dir.join(&collected.sha);
             let created = !target.exists();
             std::fs::rename(&temp, &target).map_err(io)?;
@@ -768,6 +768,13 @@ fn finish_directory_flush(dir: &Path, flushed: std::io::Result<()>) -> Result<()
     }
 }
 
+/// Flush a file written through a handle since closed, reopened for
+/// writing: Windows refuses `FlushFileBuffers` on a handle opened only to
+/// read, answering `Access is denied`.
+fn flush_file(path: &Path) -> std::io::Result<()> {
+    OpenOptions::new().write(true).open(path)?.sync_all()
+}
+
 #[cfg(windows)]
 fn flush_directory(dir: &Path) -> std::io::Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
@@ -852,6 +859,22 @@ mod tests {
             1,
             "a sibling was left behind: {leftovers:?}"
         );
+    }
+
+    /// Windows refuses a flush through a handle opened only to read, so
+    /// the flush must open its file for writing: a file the account may
+    /// write but not read is flushed.
+    #[cfg(unix)]
+    #[test]
+    fn a_closed_file_is_flushed_through_a_handle_that_may_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("written");
+        std::fs::write(&path, b"written").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+        let flushed = flush_file(&path);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        flushed.unwrap();
     }
 
     #[test]
@@ -1026,6 +1049,28 @@ mod tests {
             let file = std::fs::metadata(copy.snapshot_content_dir().join(&sha)).unwrap();
             assert_eq!(file.permissions().mode() & 0o777, 0o600);
         }
+    }
+
+    /// A collected file is stored by its hash, held or copied from the
+    /// folder, and storing it again over the standing content succeeds.
+    #[test]
+    fn a_collected_file_is_stored_by_its_hash() {
+        use crate::push::collector::CollectedFile;
+        let (_cache, tree, copy) = open_copy();
+        let bytes = [0x89u8, b'P', b'N', b'G', 0x00, 0xff];
+        std::fs::write(tree.path().join("a.png"), bytes).unwrap();
+        let unheld = CollectedFile {
+            sha: blob_sha1(&bytes),
+            bytes: None,
+        };
+        let (sha, created) = copy.store_collected(tree.path(), "a.png", &unheld).unwrap();
+        assert!(created);
+        assert_eq!(sha, blob_sha1(&bytes));
+        let (again, created) = copy.store_collected(tree.path(), "a.png", &unheld).unwrap();
+        assert_eq!(again, sha);
+        assert!(!created);
+        let content = SnapshotContent::Stored { stored: sha };
+        assert_eq!(copy.content_bytes(&content).unwrap(), bytes.to_vec());
     }
 
     #[test]
