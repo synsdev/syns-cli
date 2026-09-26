@@ -769,14 +769,19 @@ pub(crate) async fn send_bounded(
 
 /// Read an answer's body chunk by chunk, each chunk arriving within
 /// `stall` of the head or of the chunk before it; a stalled, failed or
-/// short body ends as `SERVER_UNREACHABLE`.
+/// short body ends as `SERVER_UNREACHABLE`. A given `capacity` allocates
+/// the one buffer the body is read into before its first chunk is
+/// awaited (SPEC u280 `read_body`, `D-094`); `None` sizes it from the
+/// declared length, up to 1 MiB.
 pub(crate) async fn read_body(
     mut response: reqwest::Response,
     stall: std::time::Duration,
+    capacity: Option<usize>,
 ) -> Result<Vec<u8>, CliError> {
     let url = response.url().to_string();
     let declared = response.content_length();
-    let mut body = Vec::with_capacity(declared.unwrap_or(0).min(1 << 20) as usize);
+    let mut body =
+        Vec::with_capacity(capacity.unwrap_or_else(|| declared.unwrap_or(0).min(1 << 20) as usize));
     loop {
         match tokio::time::timeout(stall, response.chunk()).await {
             Err(_elapsed) => return Err(unreachable_at(&url)),
@@ -916,7 +921,7 @@ async fn check_response(response: reqwest::Response) -> Result<reqwest::Response
     if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
         // A stalled or short body is the server unreachable, as it is on
         // every other answer (CR1-1).
-        let bytes = match read_body(response, ANSWER_STALL).await {
+        let bytes = match read_body(response, ANSWER_STALL, None).await {
             Ok(bytes) => bytes,
             Err(err @ CliError::ServerUnreachable { .. }) => return Err(err),
             Err(_) => Vec::new(),
@@ -956,30 +961,41 @@ async fn check_response(response: reqwest::Response) -> Result<reqwest::Response
         // rather than reduced to its presence — the conflict refusal
         // renders it and its document carries it, and nothing downstream
         // can read the body again once this fold has consumed it.
-        let body = match read_body(response, ANSWER_STALL).await {
+        let body = match read_body(response, ANSWER_STALL, None).await {
             Ok(bytes) => Some(bytes),
             Err(err @ CliError::ServerUnreachable { .. }) => return Err(err),
             Err(_) => None,
         };
-        let (error, current_sha) = match body
+        let parsed = body
             .as_deref()
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok());
+        let error = match parsed
+            .as_ref()
+            .map(|body| serde_json::from_value::<ApiErrorBody>(body.clone()))
         {
-            Some(body) => match serde_json::from_value::<ApiErrorBody>(body.clone()) {
-                Ok(parsed) => (
-                    parsed.error,
-                    body.get("currentSha")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string),
-                ),
-                Err(_) => ("unknown error".to_string(), None),
-            },
-            None => ("unknown error".to_string(), None),
+            Some(Ok(known)) => known.error,
+            _ => "unknown error".to_string(),
         };
-        let context = match current_sha {
-            Some(current_sha) if code == 409 && error == "conflict" => {
-                Some(ApiErrorContext::HeadMoved { current_sha })
+        let context = match (code, error.as_str(), &parsed) {
+            (409, "conflict", Some(body)) => {
+                body.get("currentSha")
+                    .and_then(|v| v.as_str())
+                    .map(|current_sha| ApiErrorContext::HeadMoved {
+                        current_sha: current_sha.to_string(),
+                    })
             }
+            // SPEC u280 `ApiErrorContext::MissingBlobs`: the `missing`
+            // map crosses whole, and only where it is a map of path to
+            // hash.
+            (409, "missing_blobs", Some(body)) => body
+                .get("missing")
+                .and_then(|v| v.as_object())
+                .and_then(|map| {
+                    map.iter()
+                        .map(|(path, sha)| Some((path.clone(), sha.as_str()?.to_string())))
+                        .collect::<Option<std::collections::BTreeMap<String, String>>>()
+                })
+                .map(|missing| ApiErrorContext::MissingBlobs { missing }),
             _ => None,
         };
         return Err(CliError::Api {
@@ -1011,7 +1027,7 @@ async fn process_response<T: serde::de::DeserializeOwned>(
 ) -> Result<T, CliError> {
     let response = check_response(response).await?;
     let status = response.status();
-    let bytes = read_body(response, ANSWER_STALL).await?;
+    let bytes = read_body(response, ANSWER_STALL, None).await?;
     serde_json::from_slice::<T>(&bytes).map_err(|e| undecodable(status, e))
 }
 
@@ -1031,7 +1047,7 @@ async fn process_response_raw<T: serde::de::DeserializeOwned>(
 ) -> Result<(T, serde_json::Value), CliError> {
     let response = check_response(response).await?;
     let status = response.status();
-    let bytes = read_body(response, ANSWER_STALL).await?;
+    let bytes = read_body(response, ANSWER_STALL, None).await?;
     let value: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|e| undecodable(status, e))?;
     let typed: T = serde_json::from_value(value.clone()).map_err(|e| undecodable(status, e))?;
@@ -1040,7 +1056,7 @@ async fn process_response_raw<T: serde::de::DeserializeOwned>(
 
 async fn process_empty_response(response: reqwest::Response) -> Result<(), CliError> {
     let response = check_response(response).await?;
-    read_body(response, ANSWER_STALL).await?;
+    read_body(response, ANSWER_STALL, None).await?;
     Ok(())
 }
 
@@ -1091,19 +1107,26 @@ impl SynsClient {
         Ok(SynsClient { client, base_url })
     }
 
-    pub async fn push(
+    /// One `EP-push` request carrying `body` as it stands (SPEC u280
+    /// `push_body`, `D-094`): the one sender of every publication's body,
+    /// which `fill_batch` built at its final length.
+    pub async fn push_body(
         &self,
         repo_id: &str,
         token: &str,
-        request: &PushRequest,
+        body: Vec<u8>,
     ) -> Result<(PushResponse, serde_json::Value), CliError> {
         let url = format!("{}/api/v1/repos/{}/push", self.base_url, repo_id);
-        let response = self
-            .client
-            .put(&url)
-            .bearer_auth(token)
-            .send_json_bounded(request)
-            .await?;
+        let len = body.len();
+        let response = send_bounded(
+            self.client
+                .put(&url)
+                .bearer_auth(token)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body),
+            len,
+        )
+        .await?;
         process_response_raw(response).await
     }
 
@@ -1251,13 +1274,16 @@ impl SynsClient {
 
     /// One `GET` of the raw entry (SPEC u280 `get_raw`, `D-088`): the
     /// stored bytes exactly, `ref` sent as `get_file` sends it, a refusal
-    /// raised under the code `get_file` raises for the path.
+    /// raised under the code `get_file` raises for the path. A given
+    /// `capacity` is the size a retrieval's hold admitted, the buffer the
+    /// bytes are read into allocated at it (`D-094`).
     pub async fn get_raw(
         &self,
         repo_id: &str,
         token: Option<&str>,
         path: &str,
         version_ref: Option<&str>,
+        capacity: Option<usize>,
     ) -> Result<RawFile, CliError> {
         let response = self
             .raw_request(repo_id, token, path, version_ref)
@@ -1265,7 +1291,7 @@ impl SynsClient {
             .await?;
         let response = check_response(response).await?;
         let etag = etag_of(&response);
-        let bytes = read_body(response, ANSWER_STALL).await?;
+        let bytes = read_body(response, ANSWER_STALL, capacity).await?;
         Ok(RawFile { bytes, etag })
     }
 
@@ -1421,7 +1447,7 @@ impl SynsClient {
             // and "repo not visible" (no `reason`). We surface the
             // `reason` through CliError::Api.error so the command layer
             // can format a target-bearing message.
-            let bytes = match read_body(response, ANSWER_STALL).await {
+            let bytes = match read_body(response, ANSWER_STALL, None).await {
                 Ok(b) => b,
                 Err(err @ CliError::ServerUnreachable { .. }) => return Err(err),
                 Err(_) => {
@@ -1568,7 +1594,7 @@ impl SynsClient {
         // Every body-read / parse / typed-deserialize failure on this endpoint
         // maps to AuthRequired (not the generic "invalid response body" surface),
         // preserving observable behavior on token-expiry for cmd_login / cmd_whoami.
-        let bytes = read_body(response, ANSWER_STALL).await?;
+        let bytes = read_body(response, ANSWER_STALL, None).await?;
         let value: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|_| CliError::AuthRequired)?;
         let typed: SessionResponse =
@@ -2872,6 +2898,10 @@ mod head_moved_tests {
         }
     }
 
+    fn push_body_bytes() -> Vec<u8> {
+        serde_json::to_vec(&push_request()).unwrap()
+    }
+
     /// SPEC u271, `src/client.rs`: the `409` fold carries the refused
     /// answer's `currentSha` out rather than reducing it to a presence
     /// test — nothing downstream can read the body a second time.
@@ -2890,7 +2920,7 @@ mod head_moved_tests {
 
         let client = SynsClient::new(&server.uri()).unwrap();
         let err = client
-            .push("alice/notes", "t", &push_request())
+            .push_body("alice/notes", "t", push_body_bytes())
             .await
             .unwrap_err();
 
@@ -2922,12 +2952,119 @@ mod head_moved_tests {
 
         let client = SynsClient::new(&server.uri()).unwrap();
         let err = client
-            .push("alice/notes", "t", &push_request())
+            .push_body("alice/notes", "t", push_body_bytes())
             .await
             .unwrap_err();
 
         assert!(matches!(err, CliError::Api { context: None, .. }));
         assert_eq!(err.exit_code(), 1);
+    }
+
+    async fn refusing_push(body: serde_json::Value) -> CliError {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/repos/alice/notes/push"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(body))
+            .mount(&server)
+            .await;
+        let client = SynsClient::new(&server.uri()).unwrap();
+        client
+            .push_body("alice/notes", "t", push_body_bytes())
+            .await
+            .unwrap_err()
+    }
+
+    /// SPEC u280 `ApiErrorContext::MissingBlobs`: the refusal's `missing`
+    /// map crosses whole.
+    #[tokio::test]
+    async fn a_missing_blobs_answer_carries_its_map() {
+        let err = refusing_push(serde_json::json!({
+            "error": "missing_blobs",
+            "message": "some referenced blobs are missing on the server",
+            "missing": {"a.md": "1".repeat(40), "b/c.png": "2".repeat(40)},
+        }))
+        .await;
+        match err {
+            CliError::Api {
+                status: Some(409),
+                error,
+                context: Some(ApiErrorContext::MissingBlobs { missing }),
+            } => {
+                assert_eq!(error, "missing_blobs");
+                assert_eq!(
+                    missing,
+                    std::collections::BTreeMap::from([
+                        ("a.md".to_string(), "1".repeat(40)),
+                        ("b/c.png".to_string(), "2".repeat(40)),
+                    ])
+                );
+            }
+            other => panic!("expected the missing map, got {other:?}"),
+        }
+    }
+
+    /// A `missing_blobs` naming no map, or one that is no map of path to
+    /// hash, carries no context.
+    #[tokio::test]
+    async fn a_missing_blobs_answer_naming_no_map_carries_no_context() {
+        for body in [
+            serde_json::json!({"error": "missing_blobs"}),
+            serde_json::json!({"error": "missing_blobs", "missing": ["a.md"]}),
+            serde_json::json!({"error": "missing_blobs", "missing": {"a.md": 1}}),
+        ] {
+            let err = refusing_push(body.clone()).await;
+            assert!(
+                matches!(
+                    err,
+                    CliError::Api {
+                        status: Some(409),
+                        context: None,
+                        ..
+                    }
+                ),
+                "{body}: {err:?}"
+            );
+        }
+    }
+
+    /// SPEC u280 `push_body`: one `EP-push` request carrying the body it
+    /// is handed byte for byte, under the bearer token and JSON type.
+    #[tokio::test]
+    async fn push_body_sends_its_bytes_unchanged() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/repos/alice/notes/push"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "commitSha": "c".repeat(40),
+                "version": 1,
+                "filesChanged": 1,
+                "created": false,
+            })))
+            .mount(&server)
+            .await;
+        let client = SynsClient::new(&server.uri()).unwrap();
+        // Bytes no serialiser of this crate would write: key order and
+        // spacing of their own.
+        let body = br#"{ "message":"m",  "files":[{"sha":"s","path":"a.md"}] }"#.to_vec();
+
+        let (response, raw) = client
+            .push_body("alice/notes", "t", body.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(response.commit_sha, "c".repeat(40));
+        assert_eq!(raw["version"], 1);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].body, body);
+        assert_eq!(
+            requests[0].headers.get("authorization").unwrap(),
+            "Bearer t"
+        );
+        assert_eq!(
+            requests[0].headers.get("content-type").unwrap(),
+            "application/json"
+        );
     }
 }
 
@@ -3518,6 +3655,27 @@ mod u280_transport_tests {
         send_bounded(client.get(url), 0).await.unwrap()
     }
 
+    /// SPEC u280 `read_body`, `D-094`: a given capacity is the one buffer
+    /// the body is read into, so a body of exactly that length leaves it
+    /// neither grown nor reallocated.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_body_of_the_given_capacity_fills_a_buffer_of_that_capacity() {
+        let len = 3 * 1024 * 1024 + 17;
+        let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/sized"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.clone()))
+            .mount(&server)
+            .await;
+        let response = head_of(&format!("{}/sized", server.uri())).await;
+
+        let body = read_body(response, ANSWER_STALL, Some(len)).await.unwrap();
+
+        assert_eq!(body, bytes);
+        assert_eq!(body.capacity(), len);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_moving_answer_outlasts_the_stall_bound() {
         let script = (0..40)
@@ -3527,7 +3685,9 @@ mod u280_transport_tests {
         let response = head_of(&url).await;
         let started = Instant::now();
 
-        let body = read_body(response, Duration::from_secs(1)).await.unwrap();
+        let body = read_body(response, Duration::from_secs(1), None)
+            .await
+            .unwrap();
 
         assert_eq!(body.len(), 40);
         let took = started.elapsed();
@@ -3547,7 +3707,7 @@ mod u280_transport_tests {
         .await;
         let response = head_of(&stalled).await;
         let started = Instant::now();
-        let err = read_body(response, Duration::from_secs(1))
+        let err = read_body(response, Duration::from_secs(1), None)
             .await
             .unwrap_err();
         assert!(matches!(err, CliError::ServerUnreachable { .. }), "{err:?}");
@@ -3557,7 +3717,7 @@ mod u280_transport_tests {
         // Ten bytes, then the connection closed.
         let short = scripted_listener(vec![(Duration::ZERO, vec![b'x'; 10])], Duration::ZERO).await;
         let response = head_of(&short).await;
-        let err = read_body(response, Duration::from_secs(1))
+        let err = read_body(response, Duration::from_secs(1), None)
             .await
             .unwrap_err();
         assert!(matches!(err, CliError::ServerUnreachable { .. }), "{err:?}");
@@ -3645,7 +3805,7 @@ mod u280_transport_tests {
         let client = SynsClient::new(&server.uri()).unwrap();
 
         let raw = client
-            .get_raw("alice/r", Some("t"), "image.png", Some("2"))
+            .get_raw("alice/r", Some("t"), "image.png", Some("2"), None)
             .await
             .unwrap();
 
@@ -3668,7 +3828,7 @@ mod u280_transport_tests {
         let client = SynsClient::new(&server.uri()).unwrap();
 
         let err = client
-            .get_raw("alice/r", None, "missing.png", None)
+            .get_raw("alice/r", None, "missing.png", None, None)
             .await
             .unwrap_err();
 

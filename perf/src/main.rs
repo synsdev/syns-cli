@@ -33,13 +33,26 @@ const RECORDED: usize = 30;
 /// No invocation of either binary outlives this.
 const INVOCATION_BOUND: Duration = Duration::from_secs(1_200);
 
-const FIXTURES: [&str; 2] = ["agent-text", "agent-mixed"];
+const FIXTURES: [&str; 3] = ["agent-text", "agent-mixed", "agent-large"];
 const OPERATIONS: [&str; 4] = ["push-first", "push-incremental", "pull", "sync"];
 
 /// Whether `perf compare` judges a pair; every other pair is reference.
 fn judged(fixture: &str, operation: &str) -> bool {
     fixture == "agent-text" || matches!(operation, "push-incremental" | "sync")
 }
+
+/// Whether a fixture is timed on an operation: `agent-large` on
+/// `push-incremental` alone, every other fixture on every operation.
+fn timed(fixture: &str, operation: &str) -> bool {
+    fixture != "agent-large" || operation == "push-incremental"
+}
+
+/// The length of each of `agent-large`'s `large/` files.
+const LARGE_FILE: usize = 8 * MIB;
+/// How many `large/` files `agent-large` holds, and how many of them a
+/// `push-incremental` sample rewrites.
+const LARGE_FILES: usize = 24;
+const LARGE_REWRITTEN: usize = 4;
 
 // ---- the generator and the fixtures ----------------------------------------
 
@@ -129,6 +142,35 @@ fn agent_text() -> BTreeMap<String, Vec<u8>> {
     files
 }
 
+/// The 200 markdown notes `agent-mixed` and `agent-large` both open on,
+/// drawn from `rng` in turn.
+fn mixed_notes(rng: &mut SplitMix64, files: &mut BTreeMap<String, Vec<u8>>) {
+    for i in 0..200 {
+        let (a, b, c) = (i % 4, (i / 4) % 5, (i / 20) % 10);
+        let size = rng.between(512, 32 * KIB);
+        files.insert(
+            format!("docs/a{a}/b{b}/c{c}/note{i:03}.md"),
+            note(i, prose(rng, size)),
+        );
+    }
+}
+
+/// `agent-large`: the 200 notes `agent-mixed` draws, beside twenty-four
+/// text files `large/{n}.txt` of `LARGE_FILE` bytes of prose each, padded
+/// with ASCII spaces to that length, four of which serialise past
+/// `CHUNK_BUDGET_BYTES` together.
+fn agent_large() -> BTreeMap<String, Vec<u8>> {
+    let mut rng = SplitMix64(280);
+    let mut files = BTreeMap::new();
+    mixed_notes(&mut rng, &mut files);
+    for n in 0..LARGE_FILES {
+        let mut bytes = prose(&mut rng, LARGE_FILE);
+        bytes.resize(LARGE_FILE, b' ');
+        files.insert(format!("large/{n}.txt"), bytes);
+    }
+    files
+}
+
 /// `agent-mixed`: 200 such files beside PNGs, JPEGs and PDFs, each opening
 /// on its format's signature and holding a NUL within its first 8,192
 /// bytes.
@@ -148,14 +190,7 @@ fn agent_mixed() -> BTreeMap<String, Vec<u8>> {
     ];
     let mut rng = SplitMix64(280);
     let mut files = BTreeMap::new();
-    for i in 0..200 {
-        let (a, b, c) = (i % 4, (i / 4) % 5, (i / 20) % 10);
-        let size = rng.between(512, 32 * KIB);
-        files.insert(
-            format!("docs/a{a}/b{b}/c{c}/note{i:03}.md"),
-            note(i, prose(&mut rng, size)),
-        );
-    }
+    mixed_notes(&mut rng, &mut files);
     for (path, signature, size) in binaries {
         let mut bytes = vec![0u8; size];
         bytes[..signature.len()].copy_from_slice(signature);
@@ -169,6 +204,7 @@ fn agent_mixed() -> BTreeMap<String, Vec<u8>> {
 fn fixture(name: &str) -> BTreeMap<String, Vec<u8>> {
     match name {
         "agent-text" => agent_text(),
+        "agent-large" => agent_large(),
         _ => agent_mixed(),
     }
 }
@@ -545,18 +581,23 @@ fn append(
 }
 
 /// Everything one side keeps for one fixture across its samples: the seed
-/// repository's copy and the two copies of the sync repository, with what
-/// each flow owes every fixture path.
+/// repository's copy and, but for `agent-large`, the two copies of the
+/// sync repository, with what each flow owes every fixture path.
 struct Kept {
     seed_name: String,
     seed: PathBuf,
     seed_cache: PathBuf,
     seed_owed: BTreeMap<String, Vec<u8>>,
-    sync_a: PathBuf,
-    sync_a_cache: PathBuf,
-    sync_b: PathBuf,
-    sync_b_cache: PathBuf,
-    sync_owed: BTreeMap<String, Vec<u8>>,
+    sync: Option<SyncCopies>,
+}
+
+/// The two copies of a side's sync repository for one fixture.
+struct SyncCopies {
+    a: PathBuf,
+    a_cache: PathBuf,
+    b: PathBuf,
+    b_cache: PathBuf,
+    owed: BTreeMap<String, Vec<u8>>,
 }
 
 /// One timed sample: its duration and its work counts.
@@ -615,51 +656,72 @@ impl Harness {
             seed_cache.clone(),
         ));
 
-        let sync_a = self.fresh_dir("sync-a")?;
-        let sync_a_cache = self.fresh_dir("sync-a-cache")?;
-        write_tree(&sync_a, &files)?;
-        expect(
-            side,
-            fixture,
-            "setup",
-            &sync_a,
-            &sync_a_cache,
-            &["push", "--name", &sync_name],
-            0,
-        )?;
-        self.made.push((
-            side.clone(),
-            sync_name.clone(),
-            sync_a.clone(),
-            sync_a_cache.clone(),
-        ));
-        let sync_b = self.fresh_dir("sync-b")?;
-        let sync_b_cache = self.fresh_dir("sync-b-cache")?;
-        let repository = format!("{}/{sync_name}", side.owner);
-        expect(
-            side,
-            fixture,
-            "setup",
-            &self.scratch,
-            &sync_b_cache,
-            &["pull", &repository, sync_b.to_str().unwrap()],
-            0,
-        )?;
+        // `agent-large` times `push-incremental` alone, so it publishes
+        // no sync repository.
+        let sync = if timed(fixture, "sync") {
+            Some(self.keep_sync(side, fixture, &files, &sync_name)?)
+        } else {
+            None
+        };
         self.kept.insert(
             key,
             Kept {
                 seed_name,
                 seed,
                 seed_cache,
-                seed_owed: files.clone(),
-                sync_a,
-                sync_a_cache,
-                sync_b,
-                sync_b_cache,
-                sync_owed: files,
+                seed_owed: files,
+                sync,
             },
         );
         Ok(())
+    }
+
+    /// Publish the sync repository from the fixture as generated through a
+    /// bare `syns push` in one copy, and take it into a second.
+    fn keep_sync(
+        &mut self,
+        side: &Side,
+        fixture: &str,
+        files: &BTreeMap<String, Vec<u8>>,
+        sync_name: &str,
+    ) -> Result<SyncCopies, String> {
+        let a = self.fresh_dir("sync-a")?;
+        let a_cache = self.fresh_dir("sync-a-cache")?;
+        write_tree(&a, files)?;
+        expect(
+            side,
+            fixture,
+            "setup",
+            &a,
+            &a_cache,
+            &["push", "--name", sync_name],
+            0,
+        )?;
+        self.made.push((
+            side.clone(),
+            sync_name.to_string(),
+            a.clone(),
+            a_cache.clone(),
+        ));
+        let b = self.fresh_dir("sync-b")?;
+        let b_cache = self.fresh_dir("sync-b-cache")?;
+        let repository = format!("{}/{sync_name}", side.owner);
+        expect(
+            side,
+            fixture,
+            "setup",
+            &self.scratch,
+            &b_cache,
+            &["pull", &repository, b.to_str().unwrap()],
+            0,
+        )?;
+        Ok(SyncCopies {
+            a,
+            a_cache,
+            b,
+            b_cache,
+            owed: files.clone(),
+        })
     }
 
     fn sample(&mut self, side: &Side, fixture: &str, operation: &str) -> Result<Sample, String> {
@@ -706,8 +768,17 @@ impl Harness {
             }
             "push-incremental" => {
                 let kept = self.kept.get_mut(&key).unwrap();
-                let ten: Vec<String> = notes(&kept.seed_owed).into_iter().take(10).collect();
-                // The same ten files, rewritten: their fixture bytes and a
+                let mut ten: Vec<String> = notes(&kept.seed_owed).into_iter().take(10).collect();
+                // `agent-large` also rewrites the first four `large/`
+                // files in ascending order, so the change chunks.
+                ten.extend(
+                    kept.seed_owed
+                        .keys()
+                        .filter(|p| p.starts_with("large/"))
+                        .take(LARGE_REWRITTEN)
+                        .cloned(),
+                );
+                // The same files, rewritten: their fixture bytes and a
                 // line naming this sample.
                 for path in &ten {
                     let mut bytes = self.fixtures[fixture][path].clone();
@@ -756,7 +827,13 @@ impl Harness {
             }
             _ => {
                 let kept = self.kept.get_mut(&key).unwrap();
-                let all = notes(&kept.sync_owed);
+                let Some(sync) = kept.sync.as_mut() else {
+                    return Err(format!(
+                        "{} {fixture} {operation}: the fixture keeps no sync repository",
+                        side.label
+                    ));
+                };
+                let all = notes(&sync.owed);
                 let (b_paths, a_paths) = (all[all.len() - 10..].to_vec(), all[10..20].to_vec());
                 // The second copy takes the head and publishes ten edits of
                 // its own, outside the timed window.
@@ -764,14 +841,14 @@ impl Harness {
                     side,
                     fixture,
                     operation,
-                    &kept.sync_b.clone(),
-                    &kept.sync_b_cache.clone(),
+                    &sync.b.clone(),
+                    &sync.b_cache.clone(),
                     &["pull"],
                     0,
                 )?;
                 append(
-                    &kept.sync_b.clone(),
-                    &mut kept.sync_owed,
+                    &sync.b.clone(),
+                    &mut sync.owed,
                     &b_paths,
                     &format!("\nremote edit {n}\n"),
                 )?;
@@ -779,21 +856,21 @@ impl Harness {
                     side,
                     fixture,
                     operation,
-                    &kept.sync_b.clone(),
-                    &kept.sync_b_cache.clone(),
+                    &sync.b.clone(),
+                    &sync.b_cache.clone(),
                     &["push"],
                     0,
                 )?;
                 // The first copy's ten local edits, then the timed pair.
-                let mut local = kept.sync_owed.clone();
+                let mut local = sync.owed.clone();
                 for path in &a_paths {
                     let bytes = local.get_mut(path).unwrap();
                     bytes.extend_from_slice(format!("\nlocal edit {n}\n").as_bytes());
-                    std::fs::write(kept.sync_a.join(path), &*bytes)
+                    std::fs::write(sync.a.join(path), &*bytes)
                         .map_err(|e| format!("could not write {path}: {e}"))?;
                 }
-                kept.sync_owed = local;
-                let (a, cache) = (kept.sync_a.clone(), kept.sync_a_cache.clone());
+                sync.owed = local;
+                let (a, cache) = (sync.a.clone(), sync.a_cache.clone());
                 let synced = expect(side, fixture, operation, &a, &cache, &["sync"], 4)?;
                 let continued = expect(
                     side,
@@ -805,14 +882,14 @@ impl Harness {
                     0,
                 )?;
                 let ms = (synced.took + continued.took).as_secs_f64() * 1000.0;
-                let kept = &self.kept[&key];
-                let count = matched(&kept.sync_a, &kept.sync_owed)?;
+                let sync = self.kept[&key].sync.as_ref().expect("checked above");
+                let count = matched(&sync.a, &sync.owed)?;
                 let listing = expect(
                     side,
                     fixture,
                     operation,
-                    &kept.sync_a,
-                    &kept.sync_a_cache,
+                    &sync.a,
+                    &sync.a_cache,
                     &["--json", "ls", "--recursive"],
                     0,
                 )?;
@@ -840,8 +917,8 @@ impl Harness {
                         ))
                     })
                     .collect();
-                let published = kept
-                    .sync_owed
+                let published = sync
+                    .owed
                     .iter()
                     .filter(|(path, bytes)| served.get(*path) == Some(&blob_sha1(bytes)))
                     .count();
@@ -1054,7 +1131,7 @@ fn measure_all(
     let mut runs: Measured = Vec::new();
     for fixture in FIXTURES {
         for operation in OPERATIONS {
-            if judged_only && !judged(fixture, operation) {
+            if !timed(fixture, operation) || (judged_only && !judged(fixture, operation)) {
                 continue;
             }
             eprintln!("measuring {fixture} {operation}");
@@ -1123,6 +1200,55 @@ mod tests {
                 assert!(bytes[..8192.min(bytes.len())].contains(&0), "{path}");
             }
         }
+    }
+
+    #[test]
+    fn agent_large_holds_224_files_of_which_24_are_large_text() {
+        let large = agent_large();
+        assert_eq!(large.len(), 224);
+        let mixed = agent_mixed();
+        let mut big = 0;
+        for (path, bytes) in &large {
+            if path.starts_with("large/") {
+                big += 1;
+                assert_eq!(bytes.len(), 8_388_608, "{path}");
+                assert!(std::str::from_utf8(bytes).is_ok(), "{path}");
+                assert!(!bytes.contains(&0), "{path}");
+            } else {
+                assert_eq!(Some(bytes), mixed.get(path), "{path} is agent-mixed's note");
+            }
+        }
+        assert_eq!(big, 24);
+    }
+
+    #[test]
+    fn agent_large_is_timed_on_push_incremental_alone() {
+        for operation in OPERATIONS {
+            assert_eq!(
+                timed("agent-large", operation),
+                operation == "push-incremental",
+                "{operation}"
+            );
+            assert!(timed("agent-text", operation) && timed("agent-mixed", operation));
+        }
+    }
+
+    #[test]
+    fn agent_large_push_incremental_slower_on_both_measurements_stands_slower() {
+        let b = results(
+            "baseline",
+            &[("agent-large", "push-incremental", &[1000.0, 1000.0])],
+        );
+        let a = results(
+            "after",
+            &[("agent-large", "push-incremental", &[1300.0, 1250.0])],
+        );
+        let (lines, slower) = compare(&b, &a).unwrap();
+        assert!(slower);
+        assert_eq!(
+            lines,
+            vec!["agent-large push-incremental 1000 ms -> 1300 ms; 1000 ms -> 1250 ms slower"]
+        );
     }
 
     fn results(label: &str, medians: &[(&str, &str, &[f64])]) -> Results {

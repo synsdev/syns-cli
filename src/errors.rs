@@ -167,6 +167,13 @@ pub enum ApiErrorContext {
     HeadMoved {
         current_sha: String,
     },
+    /// A `409` `missing_blobs` whose body names a `missing` map from path
+    /// to hash: the paths the publication must resend carrying their
+    /// content (SPEC u280, `smart_push` 5). An answer naming no such map
+    /// carries no context.
+    MissingBlobs {
+        missing: std::collections::BTreeMap<String, String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

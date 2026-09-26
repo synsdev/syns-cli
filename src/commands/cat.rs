@@ -56,6 +56,7 @@ pub async fn cmd_cat(
                 target.token.as_deref(),
                 &path,
                 Some(&version_ref),
+                None,
             )
             .await
             .map_err(refused)?;

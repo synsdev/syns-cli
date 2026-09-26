@@ -153,7 +153,11 @@ async fn dropped_push_connection_classifies_as_server_unreachable() {
 
     let fresh = SynsClient::new(&uri).unwrap();
     let fresh_err = fresh
-        .push("alice/proj", "t", &empty_push_request())
+        .push_body(
+            "alice/proj",
+            "t",
+            serde_json::to_vec(&empty_push_request()).unwrap(),
+        )
         .await
         .expect_err("fresh connection");
     println!("fresh connection: {fresh_err:?}");
@@ -163,7 +167,11 @@ async fn dropped_push_connection_classifies_as_server_unreachable() {
         .await
         .expect("the tree read answers");
     let kept_err = kept
-        .push("alice/proj", "t", &empty_push_request())
+        .push_body(
+            "alice/proj",
+            "t",
+            serde_json::to_vec(&empty_push_request()).unwrap(),
+        )
         .await
         .expect_err("kept-alive connection");
     println!("kept-alive connection: {kept_err:?}");
@@ -372,6 +380,28 @@ impl FakeRepo {
             .map(|content| (blob_sha1(content), content.clone()))
             .collect();
         let mut files = head.map(|(_, files)| files).unwrap_or_default();
+        // Every hash-only entry whose bytes no commit holds, named in one
+        // `missing` map from path to hash, as `EP-push` answers it.
+        let missing: serde_json::Map<String, Value> = body["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.get("content").is_none() && entry.get("contentBase64").is_none())
+            .filter(|entry| !known.contains_key(entry["sha"].as_str().unwrap()))
+            .map(|entry| {
+                (
+                    entry["path"].as_str().unwrap().to_string(),
+                    entry["sha"].clone(),
+                )
+            })
+            .collect();
+        if !missing.is_empty() {
+            return Answer::json(
+                409,
+                json!({"error": "missing_blobs", "message": "some referenced blobs are missing", "missing": missing})
+                    .to_string(),
+            );
+        }
         for entry in body["files"].as_array().unwrap() {
             let path = entry["path"].as_str().unwrap().to_string();
             let text = entry.get("content").and_then(Value::as_str);
@@ -390,12 +420,9 @@ impl FakeRepo {
                         .unwrap();
                     files.insert(path, bytes);
                 }
-                (None, None) => match known.get(entry["sha"].as_str().unwrap()) {
-                    Some(content) => {
-                        files.insert(path, content.clone());
-                    }
-                    None => return Answer::json(409, error_body("missing_blobs")),
-                },
+                (None, None) => {
+                    files.insert(path, known[entry["sha"].as_str().unwrap()].clone());
+                }
             }
         }
         for deletion in body

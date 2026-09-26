@@ -832,7 +832,11 @@ mod tests {
             provenance: None,
         };
         let (typed, raw) = client
-            .push("alice/my-project", "test-token", &request)
+            .push_body(
+                "alice/my-project",
+                "test-token",
+                serde_json::to_vec(&request).unwrap(),
+            )
             .await
             .unwrap();
 

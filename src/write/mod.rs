@@ -594,10 +594,16 @@ pub async fn commit_changeset(
     let message = caption(opts, default_message)?;
     let request = push_body(target, &changeset, opts, message);
 
-    // 3 — the one call of `EP-push`.
+    // 3 — the one call of `EP-push`, its body serialised once and sent
+    // through the one sender of every publication's body (SPEC u280
+    // `push_body`).
+    let body = serde_json::to_vec(&request).map_err(|e| CliError::Io {
+        message: format!("could not serialise a request body: {e}"),
+    })?;
+    drop(request);
     let client = SynsClient::new(config.server_url())?;
     let (response, raw) = client
-        .push(&target.repo_id, &target.token, &request)
+        .push_body(&target.repo_id, &target.token, body)
         .await
         .map_err(|err| fold_conflict(err, &target.parent.commit_sha))?;
 

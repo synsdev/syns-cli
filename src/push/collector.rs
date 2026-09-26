@@ -707,6 +707,32 @@ pub fn read_collected<'a>(
     Ok(Cow::Owned(bytes))
 }
 
+/// Make `buf` hold a collected file's bytes — the held ones copied in, or
+/// the folder's read into its own allocation — only where they hash to
+/// what the collection took (SPEC u280 `read_collected_into`, `D-094`).
+/// `buf` grows only for a file past its capacity, so one buffer serves a
+/// whole publication.
+pub fn read_collected_into(
+    root: &Path,
+    path: &str,
+    file: &CollectedFile,
+    buf: &mut Vec<u8>,
+) -> Result<(), CliError> {
+    buf.clear();
+    if let Some((bytes, _)) = &file.bytes {
+        buf.extend_from_slice(bytes);
+        return Ok(());
+    }
+    std::fs::File::open(root.join(path))
+        .and_then(|mut from| from.read_to_end(buf))
+        .map_err(|_| changed_since_collection(path))?;
+    if blob_sha1(buf) != file.sha {
+        buf.clear();
+        return Err(changed_since_collection(path));
+    }
+    Ok(())
+}
+
 /// Make `dest` hold a collected file's bytes — the held ones, or the
 /// folder's copied in pieces — only where they hash to what the
 /// collection took; otherwise refuse, leaving no `dest`. `dest` is created
@@ -1733,6 +1759,69 @@ mod tests {
             Err(CliError::CollectedSetChanged { .. })
         ));
         assert!(!dest.exists());
+    }
+
+    fn unheld(bytes: &[u8]) -> CollectedFile {
+        CollectedFile {
+            sha: blob_sha1(bytes),
+            bytes: None,
+        }
+    }
+
+    /// SPEC u280 `read_collected_into`: a file within the buffer's
+    /// capacity leaves that capacity as it stood.
+    #[test]
+    fn a_file_within_the_buffers_capacity_leaves_it_as_it_stood() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i % 253) as u8).collect();
+        std::fs::write(dir.path().join("a.bin"), &bytes).unwrap();
+        let mut buf = Vec::with_capacity(bytes.len());
+        buf.extend_from_slice(b"stale bytes of an earlier file");
+        let capacity = buf.capacity();
+
+        read_collected_into(dir.path(), "a.bin", &unheld(&bytes), &mut buf).unwrap();
+
+        assert_eq!(buf, bytes);
+        assert_eq!(buf.capacity(), capacity);
+
+        // A held file is copied into the same buffer.
+        let held = HeldBytes::new(HELD_BYTES_BUDGET);
+        let file = CollectedFile {
+            sha: blob_sha1(b"held"),
+            bytes: Some((b"held".to_vec(), held.try_hold(4).unwrap())),
+        };
+        read_collected_into(dir.path(), "gone.bin", &file, &mut buf).unwrap();
+        assert_eq!(buf, b"held");
+        assert_eq!(buf.capacity(), capacity);
+    }
+
+    #[test]
+    fn a_file_past_the_buffers_capacity_grows_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 241) as u8).collect();
+        std::fs::write(dir.path().join("a.bin"), &bytes).unwrap();
+        let mut buf = Vec::with_capacity(1_000);
+
+        read_collected_into(dir.path(), "a.bin", &unheld(&bytes), &mut buf).unwrap();
+
+        assert_eq!(buf, bytes);
+        assert!(buf.capacity() >= bytes.len());
+    }
+
+    #[test]
+    fn a_rewritten_file_read_into_a_buffer_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.png"), b"\x89PNG\x01").unwrap();
+        let mut buf = Vec::with_capacity(64);
+
+        match read_collected_into(dir.path(), "a.png", &unheld(b"\x89PNG\x00"), &mut buf) {
+            Err(CliError::CollectedSetChanged { paths }) => assert_eq!(paths, vec!["a.png"]),
+            other => panic!("expected CollectedSetChanged, got {other:?}"),
+        }
+        match read_collected_into(dir.path(), "gone.png", &unheld(b"x"), &mut buf) {
+            Err(CliError::CollectedSetChanged { paths }) => assert_eq!(paths, vec!["gone.png"]),
+            other => panic!("expected CollectedSetChanged, got {other:?}"),
+        }
     }
 
     /// CR1-3: a collected file's copy is created private, held bytes and

@@ -490,7 +490,10 @@ async fn missing_blobs_resend_keeps_the_byte_field() {
     let server = MockServer::start().await;
     Mock::given(method("PUT"))
         .and(path("/api/v1/repos/alice/proj/push"))
-        .respond_with(ResponseTemplate::new(409).set_body_json(json!({"error": "missing_blobs"})))
+        .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+            "error": "missing_blobs",
+            "missing": {"image.png": blob_sha1(PNG)},
+        })))
         .with_priority(1)
         .up_to_n_times(1)
         .mount(&server)
@@ -505,7 +508,8 @@ async fn missing_blobs_resend_keeps_the_byte_field() {
     let dir = m.dir();
     write(&dir, ".syns.yaml", identity());
     write(&dir, "image.png", PNG);
-    write(&dir, "a.md", b"a edited\n");
+    write(&dir, "a.md", b"a\n");
+    write(&dir, "b.md", b"b edited\n");
     let mut record = Manifest::default();
     record.update(
         "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0".into(),
@@ -513,6 +517,7 @@ async fn missing_blobs_resend_keeps_the_byte_field() {
             (".syns.yaml".to_string(), blob_sha1(identity())),
             ("image.png".to_string(), blob_sha1(PNG)),
             ("a.md".to_string(), blob_sha1(b"a\n")),
+            ("b.md".to_string(), blob_sha1(b"b\n")),
         ]
         .into_iter()
         .collect(),
@@ -537,6 +542,201 @@ async fn missing_blobs_resend_keeps_the_byte_field() {
             .unwrap(),
         PNG
     );
+    let b = entry(&bodies[1], "b.md");
+    assert_eq!(b["content"], json!("b edited\n"));
+    assert!(b.get("contentBase64").is_none(), "{b}");
+    let a = entry(&bodies[1], "a.md");
+    assert_eq!(a["sha"], json!(blob_sha1(b"a\n")));
+    assert!(
+        a.get("content").is_none() && a.get("contentBase64").is_none(),
+        "{a}"
+    );
+}
+
+/// Not-text bytes of `len` drawn from `seed`, opening on a NUL.
+fn noise(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut bytes: Vec<u8> = (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect();
+    bytes[0] = 0;
+    bytes
+}
+
+/// Eight not-text files `f0.bin` to `f7.bin` of `len` bytes recorded as
+/// published, then the ones `rewritten` names rewritten since; answers
+/// the eight paths.
+fn recorded_eight(m: &Machine, len: usize, rewritten: &[usize]) -> Vec<String> {
+    let dir = m.dir();
+    write(&dir, ".syns.yaml", identity());
+    let mut recorded: std::collections::HashMap<String, String> =
+        [(".syns.yaml".to_string(), blob_sha1(identity()))]
+            .into_iter()
+            .collect();
+    let names: Vec<String> = (0..8).map(|i| format!("f{i}.bin")).collect();
+    for (i, name) in names.iter().enumerate() {
+        let before = noise(i as u64 + 1, len);
+        recorded.insert(name.clone(), blob_sha1(&before));
+        let now = if rewritten.contains(&i) {
+            noise(i as u64 + 101, len)
+        } else {
+            before
+        };
+        write(&dir, name, &now);
+    }
+    let mut record = Manifest::default();
+    record.update("b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0".into(), recorded);
+    record.save(m.cache.path(), "alice", "proj").unwrap();
+    names
+}
+
+/// The paths a body carries content for, and the ones it names by their
+/// hash alone.
+fn carried(body: &Value) -> (Vec<String>, Vec<String>) {
+    let mut with_content = Vec::new();
+    let mut by_hash = Vec::new();
+    for f in body["files"].as_array().unwrap() {
+        let path = f["path"].as_str().unwrap().to_string();
+        if f.get("content").is_some() || f.get("contentBase64").is_some() {
+            with_content.push(path);
+        } else {
+            by_hash.push(path);
+        }
+    }
+    (with_content, by_hash)
+}
+
+async fn accepting_after(server: &MockServer, first: ResponseTemplate) {
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/repos/alice/proj/push"))
+        .respond_with(first)
+        .with_priority(1)
+        .up_to_n_times(1)
+        .mount(server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/repos/alice/proj/push"))
+        .respond_with(push_ok())
+        .with_priority(2)
+        .mount(server)
+        .await;
+}
+
+/// Issue 186: a publication whose changed content passes the chunk
+/// budget sends content for the changed files alone, every other file
+/// riding the first batch by its hash.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_chunked_publication_sends_only_changed_content() {
+    let server = MockServer::start().await;
+    accepting_after(&server, push_ok()).await;
+    let m = Machine::new(&server.uri());
+    let names = recorded_eight(&m, 10 * 1024 * 1024, &[1, 4, 6]);
+    let dir = m.dir();
+
+    let out = m.run(&["push", dir.to_str().unwrap()]).await;
+
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let bodies = put_bodies(&server).await;
+    assert_eq!(bodies.len(), 3, "three PUT requests");
+    let mut sent = Vec::new();
+    for body in &bodies {
+        let (with_content, _) = carried(body);
+        assert_eq!(with_content.len(), 1, "{with_content:?}");
+        sent.extend(with_content);
+    }
+    sent.sort();
+    assert_eq!(sent, vec!["f1.bin", "f4.bin", "f6.bin"]);
+    let unchanged: Vec<&String> = [0, 2, 3, 5, 7].iter().map(|&i| &names[i]).collect();
+    let (_, first_by_hash) = carried(&bodies[0]);
+    for name in &unchanged {
+        assert!(first_by_hash.contains(name), "{name} rode the first batch");
+    }
+    for body in &bodies[1..] {
+        let (_, by_hash) = carried(body);
+        for name in &unchanged {
+            assert!(!by_hash.contains(name), "{name} named again");
+        }
+    }
+}
+
+/// Issue 186: the edge refusing the one request as too large chunks the
+/// changed content alone, every other file named by its hash.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_too_large_refusal_resends_only_changed_content() {
+    let server = MockServer::start().await;
+    accepting_after(
+        &server,
+        ResponseTemplate::new(413).set_body_json(json!({"error": "payload_too_large"})),
+    )
+    .await;
+    let m = Machine::new(&server.uri());
+    let names = recorded_eight(&m, 1024 * 1024, &[2, 5]);
+    let dir = m.dir();
+
+    let out = m.run(&["push", dir.to_str().unwrap()]).await;
+
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let bodies = put_bodies(&server).await;
+    assert_eq!(bodies.len(), 2, "two PUT requests");
+    let (mut with_content, by_hash) = carried(&bodies[1]);
+    with_content.sort();
+    assert_eq!(with_content, vec!["f2.bin", "f5.bin"]);
+    for i in [0, 1, 3, 4, 6, 7] {
+        assert!(by_hash.contains(&names[i]), "{} by its hash", names[i]);
+    }
+}
+
+/// Issue 186: a `MISSING_BLOBS` refusing a chunked publication's first
+/// batch resends the path its `missing` map names beside the changed
+/// ones, and no other.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_missing_blob_in_a_chunked_publication_is_resent_by_name() {
+    let server = MockServer::start().await;
+    let named = noise(1, 10 * 1024 * 1024);
+    accepting_after(
+        &server,
+        ResponseTemplate::new(409).set_body_json(json!({
+            "error": "missing_blobs",
+            "missing": {"f0.bin": blob_sha1(&named)},
+        })),
+    )
+    .await;
+    let m = Machine::new(&server.uri());
+    let names = recorded_eight(&m, 10 * 1024 * 1024, &[1, 4, 6]);
+    let dir = m.dir();
+
+    let out = m.run(&["push", dir.to_str().unwrap()]).await;
+
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let bodies = put_bodies(&server).await;
+    assert_eq!(bodies.len(), 5, "one refused PUT, then four");
+    let mut sent = Vec::new();
+    for body in &bodies[1..] {
+        let (with_content, _) = carried(body);
+        assert_eq!(with_content.len(), 1, "{with_content:?}");
+        sent.extend(with_content);
+    }
+    sent.sort();
+    assert_eq!(sent, vec!["f0.bin", "f1.bin", "f4.bin", "f6.bin"]);
+    let others: Vec<&String> = [2, 3, 5, 7].iter().map(|&i| &names[i]).collect();
+    let (_, first_by_hash) = carried(&bodies[1]);
+    for name in &others {
+        assert!(first_by_hash.contains(name), "{name} rode the first batch");
+    }
+    for body in &bodies[2..] {
+        let (_, by_hash) = carried(body);
+        for name in &others {
+            assert!(!by_hash.contains(name), "{name} named again");
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

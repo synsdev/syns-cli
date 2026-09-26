@@ -8,10 +8,10 @@ use crate::client::{
     EntryType, PushDeleteEntry, PushFileEntry, PushProvenance, PushRequest, PushResponse,
     RepoStatus, SynsClient, TreeResponse, Visibility,
 };
-use crate::errors::CliError;
+use crate::errors::{ApiErrorContext, CliError};
 use crate::push::collector::{
     CollectOptions, CollectResult, CollectedFile, HELD_BYTES_BUDGET, HeldBytes, SkipReason,
-    SkippedFile, collect_files, is_text, read_collected, too_large_label,
+    SkippedFile, collect_files, is_text, read_collected, read_collected_into, too_large_label,
 };
 use crate::push::manifest::Manifest;
 use crate::repo::root::path_within_prefix;
@@ -169,9 +169,25 @@ pub const CHUNK_BUDGET_BYTES: usize = 25 * 1024 * 1024;
 /// serialization failure so the caller errs on the side of chunking
 /// rather than silently bypassing the budget check.
 fn estimate_body_bytes(request: &PushRequest) -> usize {
-    serde_json::to_vec(request)
-        .map(|s| s.len())
+    let mut counted = ByteCount(0);
+    serde_json::to_writer(&mut counted, request)
+        .map(|()| counted.0)
         .unwrap_or(usize::MAX)
+}
+
+/// A sink counting the bytes written to it, so a serialised length is
+/// taken without the serialisation standing anywhere.
+struct ByteCount(usize);
+
+impl std::io::Write for ByteCount {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn split_repo_id(repo_id: &str) -> Result<(&str, &str), CliError> {
@@ -189,13 +205,14 @@ pub(crate) fn tree_to_sha_map(tree: &TreeResponse) -> HashMap<String, String> {
 }
 
 /// One entry a request carries bytes for, before its bytes are read into
-/// it: which field `is_text` chose, and the length the entry serialises
-/// to (SPEC u280 `PendingEntry`).
+/// it: which field `is_text` chose, the file's length in bytes, and the
+/// length the entry serialises to (SPEC u280 `PendingEntry`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingEntry {
     path: String,
     sha: String,
     text: bool,
+    size: u64,
     encoded_len: usize,
 }
 
@@ -238,6 +255,7 @@ fn pend(root: &Path, path: &str, file: &CollectedFile) -> Result<PendingEntry, C
         path: path.to_string(),
         sha: file.sha.clone(),
         text,
+        size: bytes.len() as u64,
         encoded_len: frame + body,
     })
 }
@@ -311,47 +329,136 @@ fn hash_only_entries(
     entries
 }
 
-/// Fill one batch's entries with their bytes, only as that batch is sent:
-/// `content` where the entry is text, `content_base64` otherwise, each
-/// from bytes `read_collected` answers hashing to its `sha`.
+/// What every serialised `PushRequest` opens on: its `files` array, the
+/// first field it declares.
+const FILES_OPEN: &[u8] = b"{\"files\":[";
+
+/// Build one batch's body, only as that batch is sent (SPEC u280
+/// `fill_batch`, `D-094`): allocated at the length `projected_body_bytes`
+/// answers and ending at it, equal byte for byte to `serde_json`'s
+/// serialisation of `frame` with `batch` filled beside the entries it
+/// carries, every entry in ascending path order. Each pending entry's
+/// content is escaped as `content` where it is text and encoded as
+/// `contentBase64` otherwise straight into the body, from its held bytes
+/// or from `scratch`, which a not-held file is read into through
+/// `read_collected_into`; no copy of any content stands anywhere else.
 fn fill_batch(
     root: &Path,
     local_files: &HashMap<String, CollectedFile>,
+    frame: &PushRequest,
     batch: &[PendingEntry],
-) -> Result<Vec<PushFileEntry>, CliError> {
-    let mut filled = Vec::with_capacity(batch.len());
-    for entry in batch {
-        let file = local_files
-            .get(&entry.path)
-            .ok_or_else(|| CliError::CollectedSetChanged {
-                paths: vec![entry.path.clone()],
-            })?;
-        let bytes = read_collected(root, &entry.path, file)?;
-        let (content, content_base64) = if entry.text {
-            let text = match bytes {
-                std::borrow::Cow::Borrowed(bytes) => {
-                    std::str::from_utf8(bytes).map(str::to_string).ok()
-                }
-                std::borrow::Cow::Owned(bytes) => String::from_utf8(bytes).ok(),
-            }
-            .ok_or_else(|| CliError::CollectedSetChanged {
-                paths: vec![entry.path.clone()],
-            })?;
-            (Some(text), None)
-        } else {
-            (
-                None,
-                Some(base64::engine::general_purpose::STANDARD.encode(&bytes)),
-            )
+    scratch: &mut Vec<u8>,
+) -> Result<Vec<u8>, CliError> {
+    let unserialisable = |e: serde_json::Error| CliError::Io {
+        message: format!("could not serialise a request body: {e}"),
+    };
+    // The frame's other fields as `serde_json` writes them: everything
+    // its serialisation carries after the `files` array opens.
+    let tail = serde_json::to_vec(&request_frame_of(frame)).map_err(unserialisable)?;
+    debug_assert!(tail.starts_with(FILES_OPEN));
+    let tail = &tail[FILES_OPEN.len()..];
+
+    let projected = projected_body_bytes(frame, batch);
+    let mut body = Vec::with_capacity(projected);
+    body.extend_from_slice(FILES_OPEN);
+
+    let mut carried: Vec<&PushFileEntry> = frame.files.iter().collect();
+    carried.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut pending: Vec<&PendingEntry> = batch.iter().collect();
+    pending.sort_by(|a, b| a.path.cmp(&b.path));
+    let (mut carried, mut pending) = (
+        carried.into_iter().peekable(),
+        pending.into_iter().peekable(),
+    );
+    let mut first = true;
+    loop {
+        let next_is_pending = match (carried.peek(), pending.peek()) {
+            (None, None) => break,
+            (Some(_), None) => false,
+            (None, Some(_)) => true,
+            (Some(c), Some(p)) => p.path < c.path,
         };
-        filled.push(PushFileEntry {
-            path: entry.path.clone(),
-            sha: entry.sha.clone(),
-            content,
-            content_base64,
-        });
+        if !first {
+            body.push(b',');
+        }
+        first = false;
+        if next_is_pending {
+            let entry = pending.next().expect("peeked");
+            write_pending(&mut body, root, local_files, entry, scratch)?;
+        } else {
+            let entry = carried.next().expect("peeked");
+            serde_json::to_writer(&mut body, entry).map_err(unserialisable)?;
+        }
     }
-    Ok(filled)
+    body.extend_from_slice(tail);
+    debug_assert_eq!(body.len(), projected, "the body is its projected length");
+    Ok(body)
+}
+
+/// One pending entry written into `body` as `serde_json` writes a
+/// `PushFileEntry`: its path, its hash, and its content in the one field
+/// `is_text` chose.
+fn write_pending(
+    body: &mut Vec<u8>,
+    root: &Path,
+    local_files: &HashMap<String, CollectedFile>,
+    entry: &PendingEntry,
+    scratch: &mut Vec<u8>,
+) -> Result<(), CliError> {
+    let changed = || CliError::CollectedSetChanged {
+        paths: vec![entry.path.clone()],
+    };
+    let unserialisable = |e: serde_json::Error| CliError::Io {
+        message: format!("could not serialise a request body: {e}"),
+    };
+    let file = local_files.get(&entry.path).ok_or_else(changed)?;
+    let bytes: &[u8] = match &file.bytes {
+        Some((bytes, _)) => bytes,
+        None => {
+            read_collected_into(root, &entry.path, file, scratch)?;
+            scratch
+        }
+    };
+    body.extend_from_slice(b"{\"path\":");
+    serde_json::to_writer(&mut *body, &entry.path).map_err(unserialisable)?;
+    body.extend_from_slice(b",\"sha\":");
+    serde_json::to_writer(&mut *body, &entry.sha).map_err(unserialisable)?;
+    if entry.text {
+        let text = std::str::from_utf8(bytes).map_err(|_| changed())?;
+        body.extend_from_slice(b",\"content\":");
+        serde_json::to_writer(&mut *body, text).map_err(unserialisable)?;
+    } else {
+        body.extend_from_slice(b",\"contentBase64\":\"");
+        let start = body.len();
+        body.resize(start + base64_len(bytes.len()), 0);
+        base64::engine::general_purpose::STANDARD
+            .encode_slice(bytes, &mut body[start..])
+            .map_err(|e| CliError::Io {
+                message: format!("could not encode {}: {e}", entry.path),
+            })?;
+        body.push(b'"');
+    }
+    body.push(b'}');
+    Ok(())
+}
+
+/// The one buffer a publication pass reads a not-held file into: sized
+/// at the largest pending file whose bytes the collection does not hold,
+/// and empty where it holds every one (SPEC u280 `smart_push` 4).
+fn scratch_for(local_files: &HashMap<String, CollectedFile>, pending: &[PendingEntry]) -> Vec<u8> {
+    let largest = pending
+        .iter()
+        .filter(|entry| {
+            local_files
+                .get(&entry.path)
+                .is_some_and(|file| file.bytes.is_none())
+        })
+        .map(|entry| entry.size)
+        .max();
+    match largest {
+        Some(size) => Vec::with_capacity(usize::try_from(size).unwrap_or(0)),
+        None => Vec::new(),
+    }
 }
 
 /// The local record a run writes (SPEC u255 `smart_push` 7): the set
@@ -378,28 +485,6 @@ fn merged_record(
     merged
 }
 
-/// Every hash-only entry pended for its bytes — what a chunked
-/// publication and a `MISSING_BLOBS` resend carry — beside the entries
-/// already pending.
-fn upgrade_to_full(
-    root: &Path,
-    hash_only: &[PushFileEntry],
-    pending: &[PendingEntry],
-    local_files: &HashMap<String, CollectedFile>,
-) -> Result<Vec<PendingEntry>, CliError> {
-    let mut upgraded = pending.to_vec();
-    for entry in hash_only {
-        let file = local_files
-            .get(&entry.path)
-            .ok_or_else(|| CliError::CollectedSetChanged {
-                paths: vec![entry.path.clone()],
-            })?;
-        upgraded.push(pend(root, &entry.path, file)?);
-    }
-    upgraded.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(upgraded)
-}
-
 /// The request every batch of one publication shares, its files and
 /// deletions left for the batch to fill.
 fn request_frame(
@@ -421,6 +506,14 @@ fn request_frame(
     }
 }
 
+/// Every field of `base` but its files, which the body a batch fills
+/// writes of its own.
+fn request_frame_of(base: &PushRequest) -> PushRequest {
+    let mut frame = request_frame(base, base.message.clone(), base.parent_sha.clone());
+    frame.deletions = base.deletions.clone();
+    frame
+}
+
 /// The serialised length of `base` with `pending` filled in beside the
 /// entries it already carries.
 fn projected_body_bytes(base: &PushRequest, pending: &[PendingEntry]) -> usize {
@@ -437,11 +530,25 @@ fn projected_body_bytes(base: &PushRequest, pending: &[PendingEntry]) -> usize {
         .saturating_add(separators)
 }
 
+/// The overhead each batch's frame adds to the entries packed into it:
+/// the first batch's, which carries every hash-only entry, and every
+/// later one's, which carries none.
+#[derive(Debug, Clone, Copy)]
+struct Overheads {
+    first: usize,
+    /// Whether the first batch's frame carries entries of its own, so
+    /// every pending entry packed beside them adds a separator.
+    first_carries: bool,
+    later: usize,
+}
+
 /// Pack pending entries into batches by their serialised lengths: in
 /// descending `encoded_len`, ascending path among equal lengths, a batch
 /// closed before an entry that would carry it past `CHUNK_BUDGET_BYTES`
-/// and a lone entry past it standing alone (SPEC u280 `smart_push` 4).
-fn pack_batches(mut pending: Vec<PendingEntry>, overhead: usize) -> Vec<Vec<PendingEntry>> {
+/// and a lone entry past it standing alone, the first batch's budget
+/// counting the hash-only entries its frame carries (SPEC u280
+/// `smart_push` 4).
+fn pack_batches(mut pending: Vec<PendingEntry>, overheads: Overheads) -> Vec<Vec<PendingEntry>> {
     pending.sort_by(|a, b| {
         b.encoded_len
             .cmp(&a.encoded_len)
@@ -449,15 +556,17 @@ fn pack_batches(mut pending: Vec<PendingEntry>, overhead: usize) -> Vec<Vec<Pend
     });
     let mut batches: Vec<Vec<PendingEntry>> = Vec::new();
     let mut current: Vec<PendingEntry> = Vec::new();
-    let mut current_len = overhead;
+    let mut current_len = overheads.first;
+    let mut carries = overheads.first_carries;
     for entry in pending {
-        let added = entry.encoded_len + usize::from(!current.is_empty());
+        let added = entry.encoded_len + usize::from(carries || !current.is_empty());
         if !current.is_empty() && current_len.saturating_add(added) > CHUNK_BUDGET_BYTES {
             batches.push(std::mem::take(&mut current));
-            current_len = overhead;
+            current_len = overheads.later;
+            carries = false;
         }
-        current_len =
-            current_len.saturating_add(entry.encoded_len + usize::from(!current.is_empty()));
+        current_len = current_len
+            .saturating_add(entry.encoded_len + usize::from(carries || !current.is_empty()));
         current.push(entry);
     }
     if !current.is_empty() || batches.is_empty() {
@@ -466,18 +575,102 @@ fn pack_batches(mut pending: Vec<PendingEntry>, overhead: usize) -> Vec<Vec<Pend
     batches
 }
 
-/// Auto-chunk a publication into sequential `client.push` calls, each
+/// A publication pass's refusal, and whether it is the `MISSING_BLOBS`
+/// a resend answers: one refusing the one request, or a chunked
+/// publication's first batch, before any batch of the pass committed
+/// (SPEC u280 `smart_push` 5).
+struct PassRefusal {
+    error: CliError,
+    resendable: bool,
+}
+
+impl PassRefusal {
+    /// A refusal no resend answers.
+    fn standing(error: CliError) -> PassRefusal {
+        PassRefusal {
+            error,
+            resendable: false,
+        }
+    }
+
+    /// A refusal of a request no earlier request of the pass committed
+    /// before: a resend answers it where it is `MISSING_BLOBS`.
+    fn before_any_commit(error: CliError) -> PassRefusal {
+        let resendable = matches!(
+            &error,
+            CliError::Api { status: Some(409), error, .. } if error == "missing_blobs"
+        );
+        PassRefusal { error, resendable }
+    }
+}
+
+/// Where every body of one publication pass is sent from, and the record
+/// its intermediate batches save.
+struct Target<'a> {
+    client: &'a SynsClient,
+    token: &'a str,
+    repo_id: &'a str,
+    root: &'a Path,
+    local_files: &'a HashMap<String, CollectedFile>,
+    cache_dir: &'a Path,
+    owner: &'a str,
+    name: &'a str,
+    record_base: &'a HashMap<String, String>,
+}
+
+/// One publication pass (SPEC u280 `smart_push` 4): `pending` sent beside
+/// every hash-only entry and deletion `request` carries as one body, or
+/// chunked where that body's projection passes `CHUNK_BUDGET_BYTES` or
+/// the edge refused it as `PAYLOAD_TOO_LARGE`. The one buffer a not-held
+/// file is read into is allocated once for the pass.
+async fn publish_pass(
+    target: &Target<'_>,
+    request: &PushRequest,
+    pending: &[PendingEntry],
+) -> Result<(PushResponse, serde_json::Value), PassRefusal> {
+    let mut scratch = scratch_for(target.local_files, pending);
+    let oversize =
+        !pending.is_empty() && projected_body_bytes(request, pending) > CHUNK_BUDGET_BYTES;
+    if !oversize {
+        let body = fill_batch(
+            target.root,
+            target.local_files,
+            request,
+            pending,
+            &mut scratch,
+        )
+        .map_err(PassRefusal::standing)?;
+        match target
+            .client
+            .push_body(target.repo_id, target.token, body)
+            .await
+        {
+            Ok(answered) => return Ok(answered),
+            // The 413 fallback: the chunker over the same pending
+            // entries, which rewrites the metrics of any batch the edge
+            // refuses again.
+            Err(CliError::PayloadTooLarge { .. }) => {}
+            Err(other) => return Err(PassRefusal::before_any_commit(other)),
+        }
+    }
+    chunked_push(target, request, pending.to_vec(), &mut scratch).await
+}
+
+/// Auto-chunk a publication into sequential `push_body` calls, each
 /// batch's serialised body under `CHUNK_BUDGET_BYTES` where its entries
-/// allow. Used by `smart_push` both pre-flight (when the projected body
+/// allow. Used by `publish_pass` both pre-flight (when the projected body
 /// exceeds the budget) and as a 413 fallback (when the wire returns
-/// `PayloadTooLarge`). Each batch's entries are filled only as that batch
-/// is sent, so no batch's bytes are held before or after it.
+/// `PayloadTooLarge`). Only the pending entries are packed: every
+/// hash-only entry rides the first batch's frame and is counted against
+/// its budget, and the deletions ride the last (SPEC u280 `smart_push`
+/// 4, issue 186). Each batch's body is built only as that batch is sent,
+/// so no batch's bytes are held before or after it.
 ///
 /// Best-effort: a single entry whose materialised content alone
 /// exceeds the budget still becomes its own one-entry batch and may
 /// still 413 — the chunker then rewrites the propagated
-/// `PayloadTooLarge` with the offending batch's serialised length and
-/// file count (both in the loop branch and in the n==1 short-circuit).
+/// `PayloadTooLarge` with the offending body's length and file count
+/// (both in the loop branch and in the n==1 short-circuit).
 ///
 /// Per-batch manifest save (loop branch only): after each successful
 /// batch `k` where `1 ≤ k < n`, the chunker writes a manifest snapshot
@@ -498,24 +691,16 @@ fn pack_batches(mut pending: Vec<PendingEntry>, overhead: usize) -> Vec<Vec<Pend
 /// The final batch's save is left to `smart_push` Phase 6, which lays
 /// the full `local_shas` map over the same base and takes the
 /// deletion list out there.
-#[allow(clippy::too_many_arguments)]
 async fn chunked_push(
-    client: &SynsClient,
-    token: &str,
-    repo_id: &str,
-    root: &Path,
+    target: &Target<'_>,
     base_request: &PushRequest,
     pending: Vec<PendingEntry>,
-    local_files: &HashMap<String, CollectedFile>,
-    starting_parent_sha: Option<String>,
-    cache_dir: &Path,
-    owner: &str,
-    name: &str,
-    record_base: &HashMap<String, String>,
-) -> Result<(PushResponse, serde_json::Value), CliError> {
+    scratch: &mut Vec<u8>,
+) -> Result<(PushResponse, serde_json::Value), PassRefusal> {
     // The frame each batch shares, its message the longest a batch
     // carries and its deletions the whole list, so no batch packs past
-    // the budget on account of either.
+    // the budget on account of either; the first batch's also carries
+    // every hash-only entry.
     let mut probe = request_frame(
         base_request,
         Some(format!(
@@ -524,35 +709,54 @@ async fn chunked_push(
             usize::MAX,
             usize::MAX
         )),
-        starting_parent_sha.clone(),
+        base_request.parent_sha.clone(),
     );
     probe.deletions = base_request.deletions.clone();
-    let batches = pack_batches(pending, estimate_body_bytes(&probe));
+    let later = estimate_body_bytes(&probe);
+    probe.files = base_request.files.clone();
+    let first = estimate_body_bytes(&probe);
     drop(probe);
+    let batches = pack_batches(
+        pending,
+        Overheads {
+            first,
+            first_carries: !base_request.files.is_empty(),
+            later,
+        },
+    );
 
     let n = batches.len();
 
-    // Short-circuit if no chunking actually needed. The push is wrapped
-    // in the same match as the loop body so that a 413 on the only
-    // batch still rewrites bytes_sent/file_count with the batch's
+    // Short-circuit if no chunking actually needed: the one body is the
+    // request as it stands with the batch filled beside it. The push is
+    // wrapped in the same match as the loop body so that a 413 on the
+    // only batch still rewrites bytes_sent/file_count with the batch's
     // metrics (HIGH-1).
     if n == 1 {
         let only_batch = batches.into_iter().next().unwrap_or_default();
-        let mut request = request_frame(
+        let body = fill_batch(
+            target.root,
+            target.local_files,
             base_request,
-            base_request.message.clone(),
-            starting_parent_sha,
-        );
-        request.files = fill_batch(root, local_files, &only_batch)?;
-        request.deletions = base_request.deletions.clone();
-        return match client.push(repo_id, token, &request).await {
+            &only_batch,
+            scratch,
+        )
+        .map_err(PassRefusal::standing)?;
+        let bytes_sent = body.len() as u64;
+        return match target
+            .client
+            .push_body(target.repo_id, target.token, body)
+            .await
+        {
             Ok(ok) => Ok(ok),
-            Err(CliError::PayloadTooLarge { rejecter, .. }) => Err(CliError::PayloadTooLarge {
-                bytes_sent: estimate_body_bytes(&request) as u64,
-                file_count: request.files.len(),
-                rejecter,
-            }),
-            Err(other) => Err(other),
+            Err(CliError::PayloadTooLarge { rejecter, .. }) => {
+                Err(PassRefusal::standing(CliError::PayloadTooLarge {
+                    bytes_sent,
+                    file_count: base_request.files.len() + only_batch.len(),
+                    rejecter,
+                }))
+            }
+            Err(other) => Err(PassRefusal::before_any_commit(other)),
         };
     }
 
@@ -560,7 +764,7 @@ async fn chunked_push(
     // PushResponse does not derive Clone, so we keep commit_sha
     // (which is String: Clone) separately and store the most recent
     // (response, raw) pair in last_completed for the final return.
-    let mut previous_commit_sha: Option<String> = starting_parent_sha;
+    let mut previous_commit_sha: Option<String> = base_request.parent_sha.clone();
     let mut last_completed: Option<(PushResponse, serde_json::Value)> = None;
     // Cumulative `path → sha` map of every entry uploaded so far. After
     // each successful batch, the per-batch manifest snapshot is
@@ -591,22 +795,27 @@ async fn chunked_push(
             k1,
             n,
         );
-        let mut request = request_frame(
+        let mut frame = request_frame(
             base_request,
             Some(synthesised_message),
             previous_commit_sha.clone(),
         );
-        if k1 == n {
-            request.deletions = base_request.deletions.clone();
+        if k1 == 1 {
+            frame.files = base_request.files.clone();
         }
-        // The batch's bytes are read only now, as it is sent.
-        request.files = match fill_batch(root, local_files, batch) {
-            Ok(files) => files,
+        if k1 == n {
+            frame.deletions = base_request.deletions.clone();
+        }
+        // The batch's body is built only now, as it is sent.
+        let body = match fill_batch(target.root, target.local_files, &frame, batch, scratch) {
+            Ok(body) => body,
             Err(err) => {
                 batch_failed(k1, &previous_commit_sha);
-                return Err(err);
+                return Err(PassRefusal::standing(err));
             }
         };
+        drop(frame);
+        let bytes_sent = body.len() as u64;
 
         // Progress line — matches existing smart.rs stderr-progress convention.
         eprintln!(
@@ -621,7 +830,11 @@ async fn chunked_push(
         // On any error after at least one batch has committed, emit a
         // stderr warning so the user understands that the local manifest
         // now reflects server HEAD at batch k-1 (HIGH-2 fix).
-        match client.push(repo_id, token, &request).await {
+        match target
+            .client
+            .push_body(target.repo_id, target.token, body)
+            .await
+        {
             Ok((response, raw)) => {
                 for entry in batch {
                     uploaded.insert(entry.path.clone(), entry.sha.clone());
@@ -637,10 +850,10 @@ async fn chunked_push(
                 // in `smart_push` takes them out, its batch being the one
                 // that carried them.
                 if k1 < n {
-                    let cumulative = merged_record(record_base, &[], &uploaded);
+                    let cumulative = merged_record(target.record_base, &[], &uploaded);
                     let mut manifest = Manifest::default();
                     manifest.update(response.commit_sha.clone(), cumulative);
-                    if let Err(e) = manifest.save(cache_dir, owner, name) {
+                    if let Err(e) = manifest.save(target.cache_dir, target.owner, target.name) {
                         eprintln!(
                             "warning: could not save per-batch manifest after chunk {}/{}: {}",
                             k1, n, e,
@@ -651,21 +864,41 @@ async fn chunked_push(
             }
             Err(CliError::PayloadTooLarge { rejecter, .. }) => {
                 batch_failed(k1, &previous_commit_sha);
-                return Err(CliError::PayloadTooLarge {
-                    bytes_sent: estimate_body_bytes(&request) as u64,
+                return Err(PassRefusal::standing(CliError::PayloadTooLarge {
+                    bytes_sent,
                     file_count: batch_files,
                     rejecter,
-                });
+                }));
             }
+            // The first batch's refusal comes before any commit of the
+            // pass; a later one's after its batches committed.
+            Err(other) if k1 == 1 => return Err(PassRefusal::before_any_commit(other)),
             Err(other) => {
                 batch_failed(k1, &previous_commit_sha);
-                return Err(other);
+                return Err(PassRefusal::standing(other));
             }
         }
     }
 
     // Return the FINAL batch's response.
     Ok(last_completed.expect("at least one batch ran when n > 1"))
+}
+
+/// The hash-only paths a `MISSING_BLOBS` refusal's `missing` map names —
+/// the ones a resend pends for their content (SPEC u280 `smart_push` 5).
+fn named_hash_only(error: &CliError, hash_only: &[PushFileEntry]) -> Vec<String> {
+    let CliError::Api {
+        context: Some(ApiErrorContext::MissingBlobs { missing }),
+        ..
+    } = error
+    else {
+        return Vec::new();
+    };
+    hash_only
+        .iter()
+        .filter(|entry| missing.contains_key(&entry.path))
+        .map(|entry| entry.path.clone())
+        .collect()
 }
 
 /// Pick one human-readable most-likely cause for `PushEmpty`'s
@@ -943,7 +1176,7 @@ pub async fn smart_push(
         Some(deletes)
     };
 
-    let request = PushRequest {
+    let mut request = PushRequest {
         files: hash_only,
         deletions,
         message: Some(opts.message.clone()),
@@ -957,87 +1190,49 @@ pub async fn smart_push(
     };
     let sent_parent = request.parent_sha.clone();
 
-    // Phase 5 — Submit (with pre-flight chunker, 409 missing_blobs retry,
-    // and 413 fallback chunker per SPEC u225 § 4).
-    //
-    // Pre-flight: where the pending entries' serialised lengths carry the
-    // body past the per-batch budget, the chunker packs them before any
-    // wire call. This handles the FIRST-push of a large repo (no manifest
-    // exists; every entry is pending).
-    let pre_flight_oversize =
-        !pending.is_empty() && projected_body_bytes(&request, &pending) > CHUNK_BUDGET_BYTES;
-
-    macro_rules! chunk {
-        ($request:expr, $pending:expr) => {
-            chunked_push(
-                client,
-                token,
-                repo_id,
-                path,
-                $request,
-                $pending,
-                &local_files,
-                $request.parent_sha.clone(),
-                &opts.cache_dir,
-                owner,
-                name,
-                &record_base,
-            )
-            .await?
+    // Phase 5 — Submit (SPEC u280 `smart_push` 4–5): the pending entries
+    // beside every hash-only entry and deletion as one body, chunked
+    // where that body passes the budget or the edge refuses it, and a
+    // `MISSING_BLOBS` on the one request or on a chunked publication's
+    // first batch answered by one more pass carrying content for the
+    // hash-only paths its `missing` map names.
+    let target = Target {
+        client,
+        token,
+        repo_id,
+        root: path,
+        local_files: &local_files,
+        cache_dir: &opts.cache_dir,
+        owner,
+        name,
+        record_base: &record_base,
+    };
+    let mut pending = pending;
+    let mut resent = false;
+    let (response, raw) = loop {
+        let refusal = match publish_pass(&target, &request, &pending).await {
+            Ok(answered) => break answered,
+            Err(refusal) => refusal,
         };
-    }
-
-    let (response, raw) = if pre_flight_oversize {
-        let all = upgrade_to_full(path, &request.files, &pending, &local_files)?;
-        chunk!(&request, all)
-    } else {
-        let mut whole = request_frame(
-            &request,
-            request.message.clone(),
-            request.parent_sha.clone(),
-        );
-        whole.deletions = request.deletions.clone();
-        whole.files = request.files.clone();
-        whole
-            .files
-            .extend(fill_batch(path, &local_files, &pending)?);
-        whole.files.sort_by(|a, b| a.path.cmp(&b.path));
-        let answered = client.push(repo_id, token, &whole).await;
-        drop(whole);
-        match answered {
-            Ok((response, raw)) => (response, raw),
-            Err(CliError::Api {
-                status: Some(409),
-                ref error,
-                ..
-            }) if error == "missing_blobs" => {
-                // Existing 409 retry: every hash-only entry pended for
-                // its bytes. After the upgrade the body may exceed the
-                // budget — if so, invoke the chunker on the retry path.
-                let all = upgrade_to_full(path, &request.files, &pending, &local_files)?;
-                let mut retry = request_frame(
-                    &request,
-                    request.message.clone(),
-                    request.parent_sha.clone(),
-                );
-                retry.deletions = request.deletions.clone();
-                if projected_body_bytes(&retry, &all) > CHUNK_BUDGET_BYTES {
-                    chunk!(&retry, all)
-                } else {
-                    retry.files = fill_batch(path, &local_files, &all)?;
-                    client.push(repo_id, token, &retry).await?
-                }
-            }
-            Err(CliError::PayloadTooLarge { .. }) => {
-                // 413 fallback (per AC-2): invoke the chunker over the
-                // same entries. The chunker self-rewrites bytes_sent /
-                // file_count on a per-batch 413 — its return is verbatim
-                // (per AC-1). No outer rewrite is needed.
-                let all = upgrade_to_full(path, &request.files, &pending, &local_files)?;
-                chunk!(&request, all)
-            }
-            Err(e) => return Err(e),
+        if resent || !refusal.resendable {
+            return Err(refusal.error);
         }
+        let named = named_hash_only(&refusal.error, &request.files);
+        if named.is_empty() {
+            return Err(refusal.error);
+        }
+        resent = true;
+        for named_path in &named {
+            let file =
+                local_files
+                    .get(named_path)
+                    .ok_or_else(|| CliError::CollectedSetChanged {
+                        paths: vec![named_path.clone()],
+                    })?;
+            pending.push(pend(path, named_path, file)?);
+        }
+        pending.sort_by(|a, b| a.path.cmp(&b.path));
+        request.files = hash_only_entries(&local_files, &pending);
     };
 
     // Phase 6 — Manifest save (guarded per SPEC u213 § 4 Phase 6).
@@ -1388,10 +1583,10 @@ mod tests {
         // 409 response with higher priority, only once
         Mock::given(method("PUT"))
             .and(path("/api/v1/repos/owner/repo/push"))
-            .respond_with(
-                ResponseTemplate::new(409)
-                    .set_body_json(serde_json::json!({"error": "missing_blobs"})),
-            )
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "error": "missing_blobs",
+                "missing": {"b.txt": blob_sha1(b"old-b")},
+            })))
             .with_priority(1)
             .up_to_n_times(1)
             .mount(&mock_server)
@@ -2158,6 +2353,10 @@ mod tests {
             .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
                 "error": "missing_blobs",
                 "message": "some referenced blobs are missing on the server",
+                "missing": {
+                    "big1.txt": blob_sha1(&vec![b'a'; 14 * 1024 * 1024]),
+                    "big2.txt": blob_sha1(&vec![b'b'; 14 * 1024 * 1024]),
+                },
             })))
             .with_priority(1)
             .up_to_n_times(1)
@@ -2853,6 +3052,7 @@ mod unclaimed_parent_tests {
 #[cfg(test)]
 mod u280_publication_tests {
     use super::*;
+    use crate::push::hash::blob_sha1;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2885,6 +3085,35 @@ mod u280_publication_tests {
 
     // ---- u280: every content published, packed by its encoded length ----
 
+    /// A frame carrying nothing but a message, as a publication's is.
+    fn bare_frame() -> PushRequest {
+        PushRequest {
+            files: Vec::new(),
+            deletions: None,
+            message: Some("push".into()),
+            author: None,
+            parent_sha: None,
+            description: None,
+            tags: None,
+            status: None,
+            visibility: None,
+            provenance: None,
+        }
+    }
+
+    /// The entries of the one body `fill_batch` builds for `pending`
+    /// under a bare frame.
+    fn filled_entries(
+        root: &std::path::Path,
+        files: &HashMap<String, CollectedFile>,
+        pending: &[PendingEntry],
+    ) -> Vec<serde_json::Value> {
+        let mut scratch = scratch_for(files, pending);
+        let body = fill_batch(root, files, &bare_frame(), pending, &mut scratch).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        body["files"].as_array().unwrap().clone()
+    }
+
     #[test]
     fn nul_past_the_scan_bound_publishes_as_bytes() {
         let dir = tempfile::tempdir().unwrap();
@@ -2907,11 +3136,11 @@ mod u280_publication_tests {
 
         let (pending, _) =
             build_push_entries(dir.path(), &collected.files, &HashMap::new(), false, None).unwrap();
-        let filled = fill_batch(dir.path(), &collected.files, &pending).unwrap();
+        let filled = filled_entries(dir.path(), &collected.files, &pending);
         assert_eq!(filled.len(), 1);
-        assert!(filled[0].content.is_none());
+        assert!(filled[0].get("content").is_none());
         let decoded = base64::engine::general_purpose::STANDARD
-            .decode(filled[0].content_base64.as_deref().unwrap())
+            .decode(filled[0]["contentBase64"].as_str().unwrap())
             .unwrap();
         assert_eq!(decoded, bytes);
         assert_eq!(
@@ -2936,8 +3165,8 @@ mod u280_publication_tests {
         .unwrap();
         let (pending, _) =
             build_push_entries(dir.path(), &collected.files, &HashMap::new(), false, None).unwrap();
-        let filled = fill_batch(dir.path(), &collected.files, &pending).unwrap();
-        assert_eq!(filled[0].content.as_deref(), Some(text));
+        let filled = filled_entries(dir.path(), &collected.files, &pending);
+        assert_eq!(filled[0]["content"].as_str(), Some(text));
         assert_eq!(
             pending[0].encoded_len,
             serde_json::to_vec(&filled[0]).unwrap().len()
@@ -3010,5 +3239,190 @@ mod u280_publication_tests {
             bodies.push(puts);
         }
         assert!(bodies[0] == bodies[1], "the two runs' bodies differ");
+    }
+
+    /// SPEC u280 `fill_batch`, `D-094`: the body is allocated at its
+    /// projected length and ends at it, equal byte for byte to
+    /// `serde_json`'s serialisation of the same request, held bytes and
+    /// bytes read into the reused buffer alike.
+    #[test]
+    fn a_batch_body_is_its_projected_serialisation() {
+        let folder = tempfile::tempdir().unwrap();
+        let text = "quote \" back \\ tab \t line\n bell \u{7} esc \u{1b} del \u{7f} caf\u{e9}\n";
+        std::fs::write(folder.path().join("a-text.md"), text).unwrap();
+        std::fs::write(folder.path().join("latin1.txt"), b"caf\xe9\n").unwrap();
+        let big: Vec<u8> = (0..10 * 1024 * 1024u32)
+            .map(|i| (i as u8).wrapping_mul(37).wrapping_add(1))
+            .collect();
+        std::fs::write(folder.path().join("m.bin"), &big).unwrap();
+        let contents: HashMap<&str, &[u8]> = HashMap::from([
+            ("a-text.md", text.as_bytes()),
+            ("latin1.txt", &b"caf\xe9\n"[..]),
+            ("m.bin", &big[..]),
+        ]);
+        let hash_only = |path: &str| PushFileEntry {
+            path: path.into(),
+            sha: blob_sha1(path.as_bytes()),
+            content: None,
+            content_base64: None,
+        };
+        let frame = PushRequest {
+            files: vec![hash_only("b.md"), hash_only("z.md")],
+            deletions: Some(vec![PushDeleteEntry {
+                path: "gone.md".into(),
+            }]),
+            message: Some("a \"quoted\" message (part 1/2)".into()),
+            author: Some("alice".into()),
+            parent_sha: Some("p".repeat(40)),
+            description: None,
+            tags: Some(vec!["t".into()]),
+            status: None,
+            visibility: None,
+            provenance: Some(PushProvenance {
+                integration: "codex".into(),
+                run: "r".into(),
+                trigger: "manual".into(),
+                task_ref: None,
+            }),
+        };
+
+        for budget in [HELD_BYTES_BUDGET, 0] {
+            let collected = collect_files(
+                folder.path(),
+                &[],
+                CollectOptions::default(),
+                None,
+                &HeldBytes::new(budget),
+            )
+            .unwrap();
+            let held = collected
+                .files
+                .values()
+                .filter(|f| f.bytes.is_some())
+                .count();
+            assert_eq!(held, if budget == 0 { 0 } else { 3 }, "budget {budget}");
+            let (pending, _) = build_push_entries(
+                folder.path(),
+                &collected.files,
+                &HashMap::new(),
+                false,
+                None,
+            )
+            .unwrap();
+            let mut scratch = scratch_for(&collected.files, &pending);
+            let scratch_capacity = scratch.capacity();
+            assert_eq!(
+                scratch_capacity,
+                if budget == 0 { big.len() } else { 0 },
+                "budget {budget}: the one buffer a not-held file is read into"
+            );
+
+            let body = fill_batch(
+                folder.path(),
+                &collected.files,
+                &frame,
+                &pending,
+                &mut scratch,
+            )
+            .unwrap();
+
+            assert_eq!(
+                body.len(),
+                projected_body_bytes(&frame, &pending),
+                "budget {budget}"
+            );
+            assert_eq!(
+                body.capacity(),
+                body.len(),
+                "budget {budget}: allocated at its length"
+            );
+            assert_eq!(scratch.capacity(), scratch_capacity, "budget {budget}");
+            let mut expected = PushRequest {
+                files: frame.files.clone(),
+                ..request_frame_of(&frame)
+            };
+            for entry in &pending {
+                let bytes = contents[entry.path.as_str()];
+                expected.files.push(PushFileEntry {
+                    path: entry.path.clone(),
+                    sha: blob_sha1(bytes),
+                    content: entry
+                        .text
+                        .then(|| String::from_utf8(bytes.to_vec()).unwrap()),
+                    content_base64: (!entry.text)
+                        .then(|| base64::engine::general_purpose::STANDARD.encode(bytes)),
+                });
+            }
+            expected.files.sort_by(|a, b| a.path.cmp(&b.path));
+            assert!(
+                body == serde_json::to_vec(&expected).unwrap(),
+                "budget {budget}: the body is not the request's serialisation"
+            );
+        }
+    }
+
+    /// SPEC u280 `smart_push` 5: a `MISSING_BLOBS` naming no hash-only
+    /// path is returned as it stands, after the one `PUT`.
+    #[tokio::test]
+    async fn a_missing_blobs_naming_no_hash_only_path_ends_the_run() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/repos/alice/repo/push"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "error": "missing_blobs",
+                "missing": {"a.txt": blob_sha1(b"new-a"), "elsewhere.md": "0".repeat(40)},
+            })))
+            .mount(&server)
+            .await;
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(folder.path().join("a.txt"), "new-a").unwrap();
+        std::fs::write(folder.path().join("b.txt"), "old-b").unwrap();
+        std::fs::write(
+            folder.path().join(".syns.yaml"),
+            "owner: alice\nname: repo\n",
+        )
+        .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut manifest = Manifest::default();
+        manifest.update(
+            "base-sha".into(),
+            HashMap::from([
+                ("a.txt".into(), blob_sha1(b"old-a")),
+                ("b.txt".into(), blob_sha1(b"old-b")),
+                (
+                    ".syns.yaml".into(),
+                    blob_sha1(b"owner: alice\nname: repo\n"),
+                ),
+            ]),
+        );
+        manifest.save(cache.path(), "alice", "repo").unwrap();
+        let client = SynsClient::new(&server.uri()).unwrap();
+
+        let err = smart_push(
+            &client,
+            "t",
+            "alice/repo",
+            folder.path(),
+            opts(cache.path()),
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            CliError::Api {
+                status: Some(409),
+                error,
+                ..
+            } => assert_eq!(error, "missing_blobs"),
+            other => panic!("expected MISSING_BLOBS, got {other:?}"),
+        }
+        let puts = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.method == reqwest::Method::PUT)
+            .count();
+        assert_eq!(puts, 1);
     }
 }

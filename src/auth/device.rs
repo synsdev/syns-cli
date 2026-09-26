@@ -37,7 +37,7 @@ struct TokenErrorResponse {
 }
 
 async fn extract_api_error(response: reqwest::Response, status_code: u16) -> CliError {
-    let body = match read_body(response, ANSWER_STALL).await {
+    let body = match read_body(response, ANSWER_STALL, None).await {
         Ok(body) => body,
         Err(err) => return err,
     };
@@ -82,7 +82,7 @@ async fn decode<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
     refusal: &str,
 ) -> Result<T, CliError> {
-    let body = read_body(response, ANSWER_STALL).await?;
+    let body = read_body(response, ANSWER_STALL, None).await?;
     serde_json::from_slice(&body).map_err(|_| CliError::Io {
         message: refusal.into(),
     })

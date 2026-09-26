@@ -547,12 +547,23 @@ async fn read_one(
 ) -> Result<Blob, CliError> {
     match (hold, dest) {
         (Some(hold), _) => {
-            let raw = client.get_raw(repo_id, token, path, Some(at)).await?;
+            // The answer is read into a buffer of the size its hold
+            // counted, allocated before its first byte arrives (`D-094`).
+            let capacity = usize::try_from(counted).unwrap_or(usize::MAX);
+            let raw = client
+                .get_raw(repo_id, token, path, Some(at), Some(capacity))
+                .await?;
             let actual = blob_sha1(&raw.bytes);
             if actual != hash {
                 return Err(crate::client::hash_mismatch(path, hash, &actual));
             }
-            let len = raw.bytes.len() as u64;
+            let mut bytes = raw.bytes;
+            let len = bytes.len() as u64;
+            // A buffer sized for more than arrived — a `null` tree size
+            // counted as `MAX_FILE_BYTES` — gives the rest back with it.
+            if len < counted {
+                bytes.shrink_to_fit();
+            }
             // The hold is fitted to what arrived: the part past it given
             // back, or the rest taken where more arrived than counted.
             let hold = if len == counted {
@@ -573,7 +584,7 @@ async fn read_one(
                     }
                 }
             };
-            Ok(Blob::Held(raw.bytes, hold))
+            Ok(Blob::Held(bytes, hold))
         }
         (None, Some(dest)) => {
             let staged = client
