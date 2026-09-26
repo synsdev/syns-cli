@@ -12,7 +12,7 @@ use crate::config::Config;
 use crate::errors::{CliError, NotTextSurface};
 use crate::output::Output;
 use crate::write::{
-    Changeset, WriteOptions, commit_changeset, default_message, resolve_write_target,
+    Changeset, FileContent, WriteOptions, commit_changeset, default_message, resolve_write_target,
     text_or_refuse,
 };
 
@@ -117,13 +117,17 @@ pub async fn cmd_edit(
     // 3 — classify the answered content. A content the store already
     // replaced byte by byte classifies as text and passes
     // (`issues/082-engine-binary-content-corrupted-via-utf8-roundtrip`).
-    // A `content: null` answer is a content that is not text (SPEC u280).
-    let content = match &response.content {
-        Some(content) => text_or_refuse(&path, content.as_bytes())?,
+    // A `content: null` answer is a content that is not text (SPEC u280),
+    // and either refusal names the whole-file write (SPEC u283).
+    let content = match response.content {
+        Some(content) => match text_or_refuse(&path, content.into_bytes(), NotTextSurface::Edit)? {
+            FileContent::Text(text) => text,
+            FileContent::Encoded { .. } => unreachable!("text_or_refuse answers Text alone"),
+        },
         None => {
             return Err(CliError::NotText {
                 path,
-                surface: NotTextSurface::Write,
+                surface: NotTextSurface::Edit,
             });
         }
     };
@@ -133,7 +137,7 @@ pub async fn cmd_edit(
 
     // 6 — commit the one changed path.
     let changeset = Changeset {
-        files: vec![(path.clone(), edited)],
+        files: vec![(path.clone(), FileContent::Text(edited))],
         deletions: Vec::new(),
     };
     let message = default_message("edit", Some(&path));

@@ -314,7 +314,9 @@ fn cat_at_a_version_reads_that_version_and_reports_it() {
 fn cat_json_carries_the_resolved_reference_beside_the_served_body() {
     let d = Deployment::new();
     mount_version(&d, "2", 2, OLD_SHA);
-    mount_file(&d, "a.md", "old");
+    // SPEC u283 `cmd_cat` 2: `--json` reads the raw entry, and a text
+    // file's document carries a `null` `mediaType`.
+    mount_raw(&d, "a.md", b"old");
 
     let output = d.run(&["--json", "cat", "a.md", "--repo", REPO, "--version", "2"]);
     assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
@@ -325,10 +327,16 @@ fn cat_json_carries_the_resolved_reference_beside_the_served_body() {
     assert_eq!(body["size"], json!(3));
     assert_eq!(body["version"], json!(2));
     assert_eq!(body["commitSha"], json!(OLD_SHA));
+    assert_eq!(body["mediaType"], Value::Null);
+    assert!(body.get("contentBase64").is_none());
     assert_eq!(
         stderr_of(&output),
         "",
         "nothing stands on the diagnostic stream"
+    );
+    assert!(
+        d.paths().iter().all(|p| !p.contains("/files/")),
+        "no file read is made"
     );
 }
 

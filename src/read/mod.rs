@@ -13,7 +13,7 @@ use crate::auth::token::TokenStore;
 use crate::client::SynsClient;
 use crate::commands::pull::is_repository_shape;
 use crate::config::Config;
-use crate::errors::CliError;
+use crate::errors::{CliError, IdentityRemedy};
 use crate::output::Output;
 use crate::repo::if_repo::resolve_full_or_skip;
 
@@ -95,11 +95,18 @@ pub fn parse_repo_id(value: &str) -> Result<String, String> {
     }
 }
 
-/// `configuration error: version must be ≥ 1` for an all-digit value
-/// below `1`, raised before any request leaves. Every other spelling
-/// reaches the server unchecked.
-pub(crate) fn refuse_version_below_one(value: &str) -> Result<(), CliError> {
-    let all_digits = !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
+/// `configuration error: version cannot be empty` for the empty string
+/// and `configuration error: version must be ≥ 1` for an all-digit value
+/// below `1`, each raised before any request leaves (SPEC u283,
+/// `refuse_reference_spelling`). Every other spelling reaches the server
+/// unchecked.
+pub(crate) fn refuse_reference_spelling(value: &str) -> Result<(), CliError> {
+    if value.is_empty() {
+        return Err(CliError::Config {
+            message: "version cannot be empty".to_string(),
+        });
+    }
+    let all_digits = value.bytes().all(|b| b.is_ascii_digit());
     if all_digits && value.parse::<u64>().unwrap_or(u64::MAX) < 1 {
         return Err(CliError::Config {
             message: "version must be \u{2265} 1".to_string(),
@@ -126,7 +133,11 @@ pub async fn resolve_read_target(
             let current_dir = std::env::current_dir().map_err(|e| CliError::Io {
                 message: format!("could not determine current directory: {e}"),
             })?;
-            match resolve_full_or_skip(None, &current_dir, opts.if_repo, output)? {
+            // The ladder's refusal names `--repo`, which every read verb
+            // takes (SPEC u283, `IdentityRemedy::RepoOption`).
+            match resolve_full_or_skip(None, &current_dir, opts.if_repo, output)
+                .map_err(|e| e.with_identity_remedy(IdentityRemedy::RepoOption))?
+            {
                 Some((owner, name)) => format!("{owner}/{name}"),
                 None => return Ok(None),
             }
@@ -142,7 +153,7 @@ pub async fn resolve_read_target(
     // 2 — the reference to resolve.
     let reference = match opts.version.as_deref() {
         Some(value) => {
-            refuse_version_below_one(value)?;
+            refuse_reference_spelling(value)?;
             value.to_string()
         }
         None => {
@@ -222,7 +233,11 @@ pub async fn resolve_repo_scope(
             let current_dir = std::env::current_dir().map_err(|e| CliError::Io {
                 message: format!("could not determine current directory: {e}"),
             })?;
-            match resolve_full_or_skip(None, &current_dir, args.if_repo, output)? {
+            // The ladder's refusal names `--repo`, which both verbs take
+            // (SPEC u283, `IdentityRemedy::RepoOption`).
+            match resolve_full_or_skip(None, &current_dir, args.if_repo, output)
+                .map_err(|e| e.with_identity_remedy(IdentityRemedy::RepoOption))?
+            {
                 Some((owner, name)) => format!("{owner}/{name}"),
                 None => return Ok(None),
             }
@@ -334,11 +349,49 @@ mod tests {
 
     #[test]
     fn a_reference_spelling_reaches_the_server_unchecked() {
-        assert!(refuse_version_below_one("1").is_ok());
-        assert!(refuse_version_below_one("main").is_ok());
-        assert!(refuse_version_below_one(&"b".repeat(40)).is_ok());
-        assert!(refuse_version_below_one("00").is_err());
-        assert!(refuse_version_below_one("000000").is_err());
+        assert!(refuse_reference_spelling("1").is_ok());
+        assert!(refuse_reference_spelling("main").is_ok());
+        assert!(refuse_reference_spelling(" ").is_ok());
+        assert!(refuse_reference_spelling(&"b".repeat(40)).is_ok());
+        assert!(refuse_reference_spelling("00").is_err());
+        assert!(refuse_reference_spelling("000000").is_err());
+        // SPEC u283, `refuse_reference_spelling`: the empty value.
+        let empty = refuse_reference_spelling("").unwrap_err();
+        assert_eq!(
+            empty.to_string(),
+            "configuration error: version cannot be empty"
+        );
+        assert_eq!(empty.exit_code(), 1);
+    }
+
+    const REPO_OPTION_LINE: &str = "cannot determine repo identity \u{2014} pass --repo OWNER/NAME, or run inside a directory at or below one holding .syns.yaml";
+
+    // SPEC u283, `resolve_read_target` 1 and `resolve_repo_scope` 1: in
+    // a directory no identity reaches, each resolver's refusal names
+    // `--repo`, and no request is made.
+    #[tokio::test]
+    #[serial]
+    async fn each_read_resolver_names_repo_where_no_identity_reaches() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+        let server = MockServer::start().await;
+        let config = Config::new(Some(&server.uri())).unwrap();
+        let output = Output::new(false);
+
+        let read = resolve_read_target(&config, &output, &ReadOptions::default())
+            .await
+            .unwrap_err();
+        let scope = resolve_repo_scope(&config, &output, &RepoScopeArgs::default())
+            .await
+            .unwrap_err();
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        for err in [read, scope] {
+            assert_eq!(err.to_string(), REPO_OPTION_LINE);
+            assert_eq!(err.exit_code(), 2);
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     // SPEC u270 Contract Surface, `resolve_read_target`: a `--repo`

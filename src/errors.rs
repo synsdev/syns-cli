@@ -77,9 +77,10 @@ pub enum CliError {
         line: String,
     },
     /// SPEC u270: `syns read PATH` over a content that is not text, and
-    /// SPEC u271: a write verb handed one. `surface` picks the wording —
-    /// `syns cat PATH` keeps passing those bytes through (`D-080`), and a
-    /// write is refused because the repository holds UTF-8 text alone.
+    /// SPEC u271 and u283: a write verb handed one where it asked for
+    /// text. `surface` picks the wording — `syns cat PATH` keeps passing
+    /// those bytes through (`D-080`), and each write wording names the
+    /// way that verb publishes bytes exactly (`D-088`).
     NotText {
         path: String,
         surface: NotTextSurface,
@@ -105,6 +106,14 @@ pub enum CliError {
         path: String,
         entries: Vec<String>,
     },
+    /// SPEC u283, the too-large refusal: a content handed to `write` or
+    /// `commit` past `MAX_FILE_BYTES` on its decoded length, raised
+    /// before any push is composed. Code `PAYLOAD_TOO_LARGE` at exit `1`,
+    /// its document `error` alone.
+    FileTooLarge {
+        path: String,
+        size: u64,
+    },
 }
 
 /// Which of the two not-text wordings a refused content takes (SPEC
@@ -114,8 +123,12 @@ pub enum CliError {
 pub enum NotTextSurface {
     /// `syns read PATH` (SPEC u270).
     NumberedRead,
-    /// `syns edit`, `syns write` and `syns commit` (SPEC u271).
+    /// `syns write PATH` without `--bytes` (SPEC u283).
     Write,
+    /// A `content` member of a `syns commit` changeset (SPEC u283).
+    Commit,
+    /// `syns edit PATH` over a parent content that is not text (SPEC u283).
+    Edit,
 }
 
 /// The partial-answer refusal's truncated-tree arm (SPEC u270 Contract
@@ -142,6 +155,9 @@ pub enum IdentityRemedy {
     RepositoryPositional { path: Option<std::path::PathBuf> },
     /// Every other invocation: only an identity file answers it.
     IdentityFile,
+    /// Every invocation taking `--repo` (SPEC u283): the option names
+    /// the repository, or an identity file does.
+    RepoOption,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,6 +372,10 @@ impl std::fmt::Display for CliError {
                     f,
                     "cannot determine repo identity \u{2014} run inside a directory at or below one holding .syns.yaml"
                 ),
+                IdentityRemedy::RepoOption => write!(
+                    f,
+                    "cannot determine repo identity \u{2014} pass --repo OWNER/NAME, or run inside a directory at or below one holding .syns.yaml"
+                ),
             },
             CliError::PathBelongsToAnotherRepository {
                 path,
@@ -441,7 +461,21 @@ impl std::fmt::Display for CliError {
                 surface: NotTextSurface::Write,
             } => write!(
                 f,
-                "cannot write content that is not text: {path} \u{2014} this repository holds UTF-8 text alone"
+                "cannot write content that is not text: {path} \u{2014} pass --bytes to publish its bytes exactly"
+            ),
+            CliError::NotText {
+                path,
+                surface: NotTextSurface::Commit,
+            } => write!(
+                f,
+                "cannot write content that is not text: {path} \u{2014} send it as contentBase64 to publish its bytes exactly"
+            ),
+            CliError::NotText {
+                path,
+                surface: NotTextSurface::Edit,
+            } => write!(
+                f,
+                "cannot write content that is not text: {path} \u{2014} edit changes text alone; replace it whole with syns write {path} --bytes"
             ),
             CliError::WriteConflict {
                 parent,
@@ -458,6 +492,11 @@ impl std::fmt::Display for CliError {
                 f,
                 "could not write {path}: the folder there still holds {}, which no retrieval removes \u{2014} move or remove them, then run again",
                 entries.join(", ")
+            ),
+            CliError::FileTooLarge { path, size } => write!(
+                f,
+                "payload_too_large: {path} holds {size} bytes, past the {} MiB one file may hold; nothing was sent",
+                crate::push::collector::MAX_FILE_BYTES / (1024 * 1024)
             ),
         }
     }
@@ -628,9 +667,9 @@ mod tests {
         assert!(doc.get("totalWalked").is_none());
     }
 
-    // SPEC u271 Contract Surface, the not-text refusal: a second arm of
-    // the code the numbered read already raises, at exit `1`, naming the
-    // path it was raised on.
+    // SPEC u283 Contract Surface, the not-text refusals: arms of the
+    // code the numbered read already raises, at exit `1`, each naming the
+    // path it was raised on and the way its verb publishes bytes.
     #[test]
     fn the_write_not_text_refusal_is_a_second_arm_of_the_same_code() {
         let err = CliError::NotText {
@@ -639,8 +678,27 @@ mod tests {
         };
         assert_eq!(
             err.to_string(),
-            "cannot write content that is not text: b.bin \u{2014} this repository holds UTF-8 text alone"
+            "cannot write content that is not text: b.bin \u{2014} pass --bytes to publish its bytes exactly"
         );
+        for (surface, line) in [
+            (
+                NotTextSurface::Commit,
+                "cannot write content that is not text: b.bin \u{2014} send it as contentBase64 to publish its bytes exactly",
+            ),
+            (
+                NotTextSurface::Edit,
+                "cannot write content that is not text: b.bin \u{2014} edit changes text alone; replace it whole with syns write b.bin --bytes",
+            ),
+        ] {
+            let other = CliError::NotText {
+                path: "b.bin".to_string(),
+                surface,
+            };
+            assert_eq!(other.to_string(), line);
+            assert_eq!(other.exit_code(), 1);
+            assert!(other.json_value().is_none());
+            assert!(!line.contains("holds UTF-8 text alone"));
+        }
         assert_eq!(err.exit_code(), 1);
         assert!(err.json_value().is_none());
         assert_ne!(
@@ -747,12 +805,37 @@ mod tests {
                 IdentityRemedy::IdentityFile,
                 "cannot determine repo identity \u{2014} run inside a directory at or below one holding .syns.yaml",
             ),
+            (
+                IdentityRemedy::RepoOption,
+                "cannot determine repo identity \u{2014} pass --repo OWNER/NAME, or run inside a directory at or below one holding .syns.yaml",
+            ),
         ];
         for (remedy, line) in cases {
             let err = CliError::RepoIdentityUnknown { remedy };
             assert_eq!(err.to_string(), line);
             assert_eq!(err.exit_code(), 2);
         }
+    }
+
+    // SPEC u283 Contract Surface, the too-large refusal: code
+    // `PAYLOAD_TOO_LARGE` at exit `1`, its document `error` alone.
+    #[test]
+    fn the_too_large_refusal_names_the_path_its_size_and_the_bound() {
+        let size = crate::push::collector::MAX_FILE_BYTES + 1;
+        let err = CliError::FileTooLarge {
+            path: "big.bin".to_string(),
+            size,
+        };
+        assert_eq!(
+            err.to_string(),
+            "payload_too_large: big.bin holds 26214401 bytes, past the 25 MiB one file may hold; nothing was sent"
+        );
+        assert_eq!(err.exit_code(), 1);
+        assert!(err.json_value().is_none());
+        let rendered = crate::output::Output::new(true).format_error(&err);
+        let doc: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(doc.as_object().map(|m| m.len()), Some(1));
+        assert_eq!(doc["error"], serde_json::json!(err.to_string()));
     }
 
     #[test]

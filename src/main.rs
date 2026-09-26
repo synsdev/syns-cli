@@ -236,6 +236,9 @@ enum Commands {
         /// File path to write
         #[arg()]
         path: String,
+        /// Publish standard input's bytes exactly, whatever they hold
+        #[arg(long)]
+        bytes: bool,
         #[command(flatten)]
         write: WriteOpts,
     },
@@ -587,8 +590,8 @@ async fn run(
             commands::edit::cmd_edit(config, output, path, old, new, replace_all, write.into())
                 .await?
         }
-        Commands::Write { path, write } => {
-            commands::write::cmd_write(config, output, path, write.into()).await?
+        Commands::Write { path, bytes, write } => {
+            commands::write::cmd_write(config, output, path, bytes, write.into()).await?
         }
         Commands::Rm { path, write } => {
             commands::rm::cmd_rm(config, output, path, write.into()).await?

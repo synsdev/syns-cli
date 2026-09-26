@@ -301,12 +301,14 @@ pub struct FileResponse {
     pub size: u64,
 }
 
-/// A raw read's answer: the body exactly as it arrived, and the `ETag`
-/// with its quotes removed.
+/// A raw read's answer: the body exactly as it arrived, the `ETag` with
+/// its quotes removed, and the `Content-Type` lower-cased with its
+/// parameters dropped, `None` where the header is absent (SPEC u283).
 #[derive(Debug)]
 pub struct RawFile {
     pub bytes: Vec<u8>,
     pub etag: Option<String>,
+    pub media_type: Option<String>,
 }
 
 /// A raw read staged into a file: the blob hash of the bytes written, and
@@ -327,6 +329,22 @@ fn etag_of(response: &reqwest::Response) -> Option<String> {
                 .trim_start_matches("W/")
                 .trim_matches('"')
                 .to_string()
+        })
+}
+
+/// An answer's media type as `RawFile` takes it: `Content-Type`
+/// lower-cased, cut at its first `;` and trimmed.
+fn media_type_of(response: &reqwest::Response) -> Option<String> {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
         })
 }
 
@@ -1276,7 +1294,9 @@ impl SynsClient {
     /// stored bytes exactly, `ref` sent as `get_file` sends it, a refusal
     /// raised under the code `get_file` raises for the path. A given
     /// `capacity` is the size a retrieval's hold admitted, the buffer the
-    /// bytes are read into allocated at it (`D-094`).
+    /// bytes are read into allocated at it (`D-094`); with none, the
+    /// buffer is allocated once at the answer's declared `Content-Length`
+    /// wherever that stands at or under `MAX_FILE_BYTES` (SPEC u283).
     pub async fn get_raw(
         &self,
         repo_id: &str,
@@ -1291,8 +1311,19 @@ impl SynsClient {
             .await?;
         let response = check_response(response).await?;
         let etag = etag_of(&response);
+        let media_type = media_type_of(&response);
+        let capacity = capacity.or_else(|| {
+            response
+                .content_length()
+                .filter(|declared| *declared <= crate::push::collector::MAX_FILE_BYTES)
+                .map(|declared| declared as usize)
+        });
         let bytes = read_body(response, ANSWER_STALL, capacity).await?;
-        Ok(RawFile { bytes, etag })
+        Ok(RawFile {
+            bytes,
+            etag,
+            media_type,
+        })
     }
 
     /// The `GET` `get_raw` sends, its body written into a file created at
@@ -3820,6 +3851,67 @@ mod u280_transport_tests {
                 .and_then(|v| v.to_str().ok()),
             Some(USER_AGENT)
         );
+    }
+
+    /// SPEC u283 `RawFile`: the media type is `Content-Type` lower-cased
+    /// with its parameters dropped, and none where the header is absent.
+    #[tokio::test]
+    async fn a_raw_answer_carries_its_media_type() {
+        let server = MockServer::start().await;
+        for (name, header) in [
+            ("image.png", Some("image/png")),
+            ("a.md", Some("Text/Plain; charset=utf-8")),
+            ("bare.bin", None),
+        ] {
+            let mut template = ResponseTemplate::new(200).set_body_bytes(BYTES.to_vec());
+            if let Some(header) = header {
+                template = template.insert_header("Content-Type", header);
+            }
+            Mock::given(method("GET"))
+                .and(path(format!("/api/v1/repos/alice/r/raw/{name}")))
+                .respond_with(template)
+                .mount(&server)
+                .await;
+        }
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let media_type = |name: &'static str| {
+            let client = &client;
+            async move {
+                client
+                    .get_raw("alice/r", None, name, None, None)
+                    .await
+                    .unwrap()
+                    .media_type
+            }
+        };
+
+        assert_eq!(media_type("image.png").await.as_deref(), Some("image/png"));
+        assert_eq!(media_type("a.md").await.as_deref(), Some("text/plain"));
+        assert_eq!(media_type("bare.bin").await, None);
+    }
+
+    /// SPEC u283 `get_raw`: handed no capacity, a body past the 1 MiB
+    /// `read_body` would otherwise start at is read into one buffer
+    /// allocated at its declared length.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unsized_raw_read_allocates_its_declared_length_once() {
+        let len = 2 * 1024 * 1024 + 17;
+        let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/r/raw/big.bin"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.clone()))
+            .mount(&server)
+            .await;
+        let client = SynsClient::new(&server.uri()).unwrap();
+
+        let raw = client
+            .get_raw("alice/r", None, "big.bin", None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(raw.bytes, bytes);
+        assert_eq!(raw.bytes.capacity(), len);
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
 use crate::read::{
-    RepoScopeArgs, refuse_version_below_one, resolve_repo_scope, version_not_found_refusal,
+    RepoScopeArgs, refuse_reference_spelling, resolve_repo_scope, version_not_found_refusal,
 };
 use crate::repo::if_repo::resolve_full_or_skip;
 
@@ -61,12 +61,13 @@ pub async fn cmd_history_show(
     reference: String,
     args: RepoScopeArgs,
 ) -> Result<(), CliError> {
-    // 1 — resolve the scope, and refuse an all-digit reference below 1.
+    // 1 — resolve the scope, and refuse an empty reference or an
+    // all-digit one below 1 (SPEC u283).
     let scope = match resolve_repo_scope(config, output, &args).await? {
         Some(scope) => scope,
         None => return Ok(()),
     };
-    refuse_version_below_one(&reference)?;
+    refuse_reference_spelling(&reference)?;
 
     // 2 — ask the single-version entry for the reference as typed.
     let client = SynsClient::new(config.server_url())?;

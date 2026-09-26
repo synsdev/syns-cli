@@ -1,4 +1,6 @@
-//! u280's timing harness (SPEC u280 `perf run`, `perf compare`).
+//! u280's timing harness (SPEC u280 `perf run`, `perf compare`), and
+//! u283's suite of read and write operations (SPEC u283 `perf run --suite
+//! u283`).
 //!
 //! `perf run` times two binaries, each against its own running stack,
 //! sample by sample in one run, and writes one results document per side;
@@ -8,7 +10,8 @@
 //! ```text
 //! cargo run --release --manifest-path perf/Cargo.toml -- run --out DIR \
 //!     --baseline BINARY,URL,CONFIG_DIR,SERVER_SHA,ENGINE_SHA \
-//!     --after BINARY,URL,CONFIG_DIR,SERVER_SHA,ENGINE_SHA [--judged-only]
+//!     --after BINARY,URL,CONFIG_DIR,SERVER_SHA,ENGINE_SHA [--judged-only] \
+//!     [--suite u283]
 //! cargo run --release --manifest-path perf/Cargo.toml -- compare BASELINE AFTER
 //! ```
 
@@ -36,9 +39,60 @@ const INVOCATION_BOUND: Duration = Duration::from_secs(1_200);
 const FIXTURES: [&str; 3] = ["agent-text", "agent-mixed", "agent-large"];
 const OPERATIONS: [&str; 4] = ["push-first", "push-incremental", "pull", "sync"];
 
+/// u283's operations over `agent-mixed`, in the order they are timed
+/// (SPEC u283 Contract Surface, the u283 operations).
+const U283_OPERATIONS: [&str; 12] = [
+    "cat-text",
+    "cat-large",
+    "cat-json-text",
+    "cat-json-binary",
+    "read",
+    "ls",
+    "history-show",
+    "write-text",
+    "commit-text",
+    "edit-text",
+    "write-bytes",
+    "commit-bytes",
+];
+
+/// The u283 operations `perf compare` judges.
+const U283_JUDGED: [&str; 9] = [
+    "cat-text",
+    "cat-large",
+    "cat-json-text",
+    "read",
+    "ls",
+    "history-show",
+    "write-text",
+    "commit-text",
+    "edit-text",
+];
+
+/// The one fixture u283's operations run over.
+const U283_FIXTURE: &str = "agent-mixed";
+
+/// The paths u283's operations address.
+const U283_NOTE: &str = "docs/a0/b0/c0/note000.md";
+const U283_EDITED_NOTE: &str = "docs/a0/b0/c4/note080.md";
+const U283_LARGE: &str = "assets/doc/dlim.pdf";
+const U283_BINARY: &str = "assets/img/p8m.png";
+const U283_WRITTEN_BYTES: &str = "assets/img/p1m.png";
+const U283_COMMITTED_BYTES: &str = "assets/photo/j4m.jpg";
+
 /// Whether `perf compare` judges a pair; every other pair is reference.
 fn judged(fixture: &str, operation: &str) -> bool {
+    if U283_OPERATIONS.contains(&operation) {
+        return U283_JUDGED.contains(&operation);
+    }
     fixture == "agent-text" || matches!(operation, "push-incremental" | "sync")
+}
+
+/// Whether a pair is timed on the after side alone, because the released
+/// binary cannot perform it: it is written to the after document alone
+/// and never judged.
+fn after_only(operation: &str) -> bool {
+    matches!(operation, "write-bytes" | "commit-bytes")
 }
 
 /// Whether a fixture is timed on an operation: `agent-large` on
@@ -296,56 +350,65 @@ fn compare(baseline: &Results, after: &Results) -> Result<(Vec<String>, bool), S
     if baseline.machine != after.machine {
         return Err("machine".to_string());
     }
-    let pairs = |r: &Results| -> Vec<(String, String)> {
+    // Only the judged pairs must stand on both sides; an after-only pair
+    // counts toward neither (SPEC u283 `perf compare`).
+    let judged_pairs = |r: &Results| -> Vec<(String, String)> {
         let mut p: Vec<_> = r
             .runs
             .iter()
+            .filter(|run| judged(&run.fixture, &run.operation) && !after_only(&run.operation))
             .map(|run| (run.fixture.clone(), run.operation.clone()))
             .collect();
         p.sort();
         p
     };
-    if pairs(baseline) != pairs(after) {
+    if judged_pairs(baseline) != judged_pairs(after) {
         return Err("runs".to_string());
     }
     let mut lines = Vec::new();
     let mut any_slower = false;
-    for fixture in FIXTURES {
-        for operation in OPERATIONS {
-            let find = |r: &Results| {
-                r.runs
-                    .iter()
-                    .find(|run| run.fixture == fixture && run.operation == operation)
-                    .cloned()
-            };
-            let (Some(b), Some(a)) = (find(baseline), find(after)) else {
-                continue;
-            };
-            let measured: Vec<(f64, f64)> = b
-                .measurements
-                .iter()
-                .zip(a.measurements.iter())
-                .map(|(b, a)| (b.median_ms, a.median_ms))
-                .collect();
-            let Some(&(b0, a0)) = measured.first() else {
-                continue;
-            };
-            let verdict = if !judged(fixture, operation) {
-                "reference"
-            } else if measured.iter().all(|(b, a)| measurement_slower(*b, *a)) {
-                any_slower = true;
-                "slower"
-            } else {
-                "ok"
-            };
-            let mut line = format!("{fixture} {operation} {b0:.0} ms -> {a0:.0} ms");
-            if let Some(&(b1, a1)) = measured.get(1) {
-                line.push_str(&format!("; {b1:.0} ms -> {a1:.0} ms"));
+    for a in &after.runs {
+        let (fixture, operation) = (a.fixture.as_str(), a.operation.as_str());
+        if after_only(operation) {
+            if let Some(a0) = a.measurements.first() {
+                lines.push(format!(
+                    "{fixture} {operation} - -> {:.0} ms reference",
+                    a0.median_ms
+                ));
             }
-            line.push(' ');
-            line.push_str(verdict);
-            lines.push(line);
+            continue;
         }
+        let Some(b) = baseline
+            .runs
+            .iter()
+            .find(|run| run.fixture == fixture && run.operation == operation)
+        else {
+            continue;
+        };
+        let measured: Vec<(f64, f64)> = b
+            .measurements
+            .iter()
+            .zip(a.measurements.iter())
+            .map(|(b, a)| (b.median_ms, a.median_ms))
+            .collect();
+        let Some(&(b0, a0)) = measured.first() else {
+            continue;
+        };
+        let verdict = if !judged(fixture, operation) {
+            "reference"
+        } else if measured.iter().all(|(b, a)| measurement_slower(*b, *a)) {
+            any_slower = true;
+            "slower"
+        } else {
+            "ok"
+        };
+        let mut line = format!("{fixture} {operation} {b0:.0} ms -> {a0:.0} ms");
+        if let Some(&(b1, a1)) = measured.get(1) {
+            line.push_str(&format!("; {b1:.0} ms -> {a1:.0} ms"));
+        }
+        line.push(' ');
+        line.push_str(verdict);
+        lines.push(line);
     }
     Ok((lines, any_slower))
 }
@@ -433,20 +496,41 @@ struct Answer {
 
 /// Run the side's binary in `cwd` under its `SYNS_URL`, its
 /// `SYNS_CONFIG_DIR` and `cache`, bounded by `INVOCATION_BOUND`; only the
-/// invocation itself is timed.
-fn invoke(side: &Side, cwd: &Path, cache: &Path, args: &[&str]) -> Result<Answer, String> {
+/// invocation itself is timed. `stdin`, where it stands, is fed to the
+/// child's piped standard input from a thread of its own, and closed
+/// once written; otherwise standard input is null.
+fn invoke(
+    side: &Side,
+    cwd: &Path,
+    cache: &Path,
+    args: &[&str],
+    stdin: Option<Vec<u8>>,
+) -> Result<Answer, String> {
     let mut child = Command::new(&side.binary)
         .args(args)
         .current_dir(cwd)
         .env("SYNS_URL", &side.url)
         .env("SYNS_CONFIG_DIR", &side.config_dir)
         .env("SYNS_CACHE_DIR", cache)
-        .stdin(Stdio::null())
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("could not start {}: {e}", side.binary.display()))?;
     let started = Instant::now();
+    let feeder = match (stdin, child.stdin.take()) {
+        (Some(bytes), Some(mut pipe)) => Some(std::thread::spawn(move || {
+            use std::io::Write;
+            // A child refusing its input before reading it all closes the
+            // pipe; its exit, not this write, is the answer.
+            let _ = pipe.write_all(&bytes);
+        })),
+        _ => None,
+    };
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
     let out = std::thread::spawn(move || {
@@ -479,6 +563,9 @@ fn invoke(side: &Side, cwd: &Path, cache: &Path, args: &[&str]) -> Result<Answer
         std::thread::sleep(Duration::from_millis(2));
     };
     let took = started.elapsed();
+    if let Some(feeder) = feeder {
+        let _ = feeder.join();
+    }
     Ok(Answer {
         code: status.code(),
         stdout: out.join().unwrap_or_default(),
@@ -497,7 +584,22 @@ fn expect(
     args: &[&str],
     code: i32,
 ) -> Result<Answer, String> {
-    let answer = invoke(side, cwd, cache, args)
+    expect_fed(side, fixture, operation, cwd, cache, args, None, code)
+}
+
+/// `expect`, feeding `stdin` to the invocation.
+#[allow(clippy::too_many_arguments)]
+fn expect_fed(
+    side: &Side,
+    fixture: &str,
+    operation: &str,
+    cwd: &Path,
+    cache: &Path,
+    args: &[&str],
+    stdin: Option<Vec<u8>>,
+    code: i32,
+) -> Result<Answer, String> {
+    let answer = invoke(side, cwd, cache, args, stdin)
         .map_err(|e| format!("{} {fixture} {operation}: {e}", side.label))?;
     if answer.code != Some(code) {
         return Err(format!(
@@ -580,6 +682,151 @@ fn append(
     Ok(())
 }
 
+// ---- u283's helpers ----------------------------------------------------------
+
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard padded base64 of `bytes`, the harness's own, so the harness
+/// carries no dependency the binary's encoder could share a defect with.
+fn encode_base64(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(BASE64_ALPHABET[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// The bytes standard padded base64 `text` names, or `None` where it is
+/// not that form.
+fn decode_base64(text: &str) -> Option<Vec<u8>> {
+    let bytes = text.as_bytes();
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    let value = |c: u8| {
+        BASE64_ALPHABET
+            .iter()
+            .position(|&a| a == c)
+            .map(|v| v as u32)
+    };
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    let quads = bytes.len() / 4;
+    for (q, quad) in bytes.chunks(4).enumerate() {
+        let pad = quad.iter().rev().take_while(|&&c| c == b'=').count();
+        if pad > 2 || (pad > 0 && q + 1 != quads) {
+            return None;
+        }
+        let mut n = 0u32;
+        for &c in &quad[..4 - pad] {
+            n = (n << 6) | value(c)?;
+        }
+        n <<= 6 * pad as u32;
+        let decoded = [(n >> 16) as u8, (n >> 8) as u8, n as u8];
+        out.extend_from_slice(&decoded[..3 - pad]);
+    }
+    Some(out)
+}
+
+/// The line `edit-text`'s sample `n` replaces: the line at `n` modulo the
+/// note's line count, advancing to the next line the note holds once, so
+/// the replacement matches exactly one place.
+fn edit_line(content: &str, n: usize) -> Option<&str> {
+    let lines: Vec<&str> = content.split('\n').collect();
+    let count = lines.len();
+    (0..count)
+        .map(|k| lines[(n + k) % count])
+        .find(|line| !line.is_empty() && content.matches(*line).count() == 1)
+}
+
+/// `bytes` with their last eight bytes the sample index's little-endian
+/// bytes, so each sample publishes a content of its own.
+fn stamped(bytes: &[u8], n: usize) -> Vec<u8> {
+    let mut bytes = bytes.to_vec();
+    let at = bytes.len().saturating_sub(8);
+    let stamp = (n as u64).to_le_bytes();
+    let tail = bytes.len() - at;
+    bytes[at..].copy_from_slice(&stamp[..tail]);
+    bytes
+}
+
+/// One u283 write: its arguments before `--parent`, the standard input
+/// it is fed, and what each path it names holds once it lands.
+type WritePlan = (Vec<String>, Option<Vec<u8>>, Vec<(String, Vec<u8>)>);
+
+/// What one side keeps for u283's operations: the repository its reads
+/// address, the repository its writes publish to, the parent the next
+/// write claims, and what the write repository holds at it.
+struct U283Kept {
+    read_repo: String,
+    write_repo: String,
+    cache: PathBuf,
+    parent: String,
+    owed: BTreeMap<String, Vec<u8>>,
+}
+
+/// The answer a u283 read's check refuses, naming the operation and the
+/// sample.
+fn check_cat(
+    operation: &str,
+    n: usize,
+    stdout: &[u8],
+    expected: &[u8],
+    json: bool,
+) -> Result<(), String> {
+    let refused = |why: &str| format!("u283 {operation} sample {n}: {why}");
+    if !json {
+        return if stdout == expected {
+            Ok(())
+        } else {
+            Err(refused("the primary stream is not the fixture's bytes"))
+        };
+    }
+    let document: serde_json::Value =
+        serde_json::from_slice(stdout).map_err(|e| refused(&format!("no document: {e}")))?;
+    let matches = if let Some(sent) = document["contentBase64"].as_str() {
+        decode_base64(sent).as_deref() == Some(expected)
+    } else if let Some(text) = document["content"].as_str() {
+        text.as_bytes() == expected
+    } else {
+        // The released build answers a not-text file as `content: null`
+        // (`D-089`): its `sha` is what it can be checked by.
+        document["content"].is_null()
+            && document["sha"].as_str() == Some(blob_sha1(expected).as_str())
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(refused("the document does not carry the fixture's bytes"))
+    }
+}
+
+/// The commit a u283 write answered, refused unless it changed a file.
+fn written_commit(operation: &str, n: usize, stdout: &[u8]) -> Result<String, String> {
+    let refused = |why: &str| format!("u283 {operation} sample {n}: {why}");
+    let answer: serde_json::Value =
+        serde_json::from_slice(stdout).map_err(|e| refused(&format!("no answer: {e}")))?;
+    if answer["filesChanged"].as_u64().unwrap_or(0) == 0 {
+        return Err(refused("the answer changed no file"));
+    }
+    answer["commitSha"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| refused("the answer names no commitSha"))
+}
+
 /// Everything one side keeps for one fixture across its samples: the seed
 /// repository's copy and, but for `agent-large`, the two copies of the
 /// sync repository, with what each flow owes every fixture path.
@@ -612,6 +859,8 @@ struct Harness {
     nonce: String,
     fixtures: BTreeMap<String, BTreeMap<String, Vec<u8>>>,
     kept: BTreeMap<(String, String), Kept>,
+    /// u283's repositories and write state, per side label.
+    u283: BTreeMap<String, U283Kept>,
     /// Every repository made and not yet deleted: side, name, copy, cache.
     made: Vec<(Side, String, PathBuf, PathBuf)>,
     counter: usize,
@@ -724,7 +973,223 @@ impl Harness {
         })
     }
 
+    /// Publish, per side, the read repository from `agent-mixed` and the
+    /// write repository from its notes alone, each through that side's
+    /// binary, each registered before its push (SPEC u283 `perf run
+    /// --suite u283` 1).
+    fn keep_u283(&mut self, side: &Side) -> Result<(), String> {
+        if self.u283.contains_key(&side.label) {
+            return Ok(());
+        }
+        let files = self.fixtures[U283_FIXTURE].clone();
+        let notes: BTreeMap<String, Vec<u8>> = files
+            .iter()
+            .filter(|(path, _)| path.ends_with(".md"))
+            .map(|(path, bytes)| (path.clone(), bytes.clone()))
+            .collect();
+        let label = &side.label;
+        let mut parent = String::new();
+        let mut names = Vec::new();
+        for (kind, tree) in [("read", &files), ("write", &notes)] {
+            let name = format!("u283-perf-{label}-{kind}-{}", self.nonce);
+            let copy = self.fresh_dir(&format!("u283-{kind}"))?;
+            let cache = self.fresh_dir(&format!("u283-{kind}-cache"))?;
+            write_tree(&copy, tree)?;
+            self.made
+                .push((side.clone(), name.clone(), copy.clone(), cache.clone()));
+            let pushed = expect(
+                side,
+                U283_FIXTURE,
+                "setup",
+                &copy,
+                &cache,
+                &["--json", "push", "--name", &name],
+                0,
+            )?;
+            if kind == "write" {
+                let answer: serde_json::Value = serde_json::from_slice(&pushed.stdout)
+                    .map_err(|e| format!("{label} u283 setup: the push answer: {e}"))?;
+                parent = answer["commitSha"]
+                    .as_str()
+                    .ok_or_else(|| format!("{label} u283 setup: the push named no commitSha"))?
+                    .to_string();
+            }
+            names.push(format!("{}/{name}", side.owner));
+        }
+        let cache = self.fresh_dir("u283-cache")?;
+        self.u283.insert(
+            label.clone(),
+            U283Kept {
+                read_repo: names[0].clone(),
+                write_repo: names[1].clone(),
+                cache,
+                parent,
+                owed: notes,
+            },
+        );
+        Ok(())
+    }
+
+    /// One sample of a u283 operation (SPEC u283 `perf run --suite u283`
+    /// 2 and 3): the invocation alone timed, its content prepared and its
+    /// answer checked outside the window.
+    fn sample_u283(&mut self, side: &Side, operation: &str) -> Result<Sample, String> {
+        self.keep_u283(side)?;
+        self.counter += 1;
+        let n = self.counter;
+        let fixture = &self.fixtures[U283_FIXTURE];
+        let scratch = self.scratch.clone();
+        let kept = self.u283.get_mut(&side.label).expect("kept above");
+        let (read_repo, write_repo) = (kept.read_repo.clone(), kept.write_repo.clone());
+        let cache = kept.cache.clone();
+        let parent = kept.parent.clone();
+        let line = format!("\nsample {n}\n");
+        let with_line = |path: &str| {
+            let mut bytes = fixture[path].clone();
+            bytes.extend_from_slice(line.as_bytes());
+            bytes
+        };
+
+        // The reads: the invocation, then its check.
+        let read = |args: &[&str]| expect(side, U283_FIXTURE, operation, &scratch, &cache, args, 0);
+        let checked = |answer: &Answer, path: &str, json: bool| {
+            check_cat(operation, n, &answer.stdout, &fixture[path], json)
+        };
+        let answer = match operation {
+            "cat-text" => {
+                let a = read(&["cat", U283_NOTE, "--repo", &read_repo])?;
+                checked(&a, U283_NOTE, false)?;
+                a
+            }
+            "cat-large" => {
+                let a = read(&["cat", U283_LARGE, "--repo", &read_repo])?;
+                checked(&a, U283_LARGE, false)?;
+                a
+            }
+            "cat-json-text" => {
+                let a = read(&["--json", "cat", U283_NOTE, "--repo", &read_repo])?;
+                checked(&a, U283_NOTE, true)?;
+                a
+            }
+            "cat-json-binary" => {
+                let a = read(&["--json", "cat", U283_BINARY, "--repo", &read_repo])?;
+                checked(&a, U283_BINARY, true)?;
+                a
+            }
+            "read" => read(&["read", U283_NOTE, "--repo", &read_repo])?,
+            "ls" => read(&["ls", "--recursive", "--repo", &read_repo])?,
+            "history-show" => read(&["history", "show", "1", "--repo", &read_repo])?,
+            _ => {
+                // The writes: the content prepared, the invocation, then
+                // the answer read for a changed file and its commit
+                // carried as the next write's parent.
+                let (args, stdin, wrote): WritePlan = match operation {
+                    "write-text" => {
+                        let bytes = with_line(U283_NOTE);
+                        (
+                            vec!["write".into(), U283_NOTE.into()],
+                            Some(bytes.clone()),
+                            vec![(U283_NOTE.to_string(), bytes)],
+                        )
+                    }
+                    "commit-text" => {
+                        let ten: Vec<(String, Vec<u8>)> = notes(fixture)
+                            .into_iter()
+                            .take(10)
+                            .map(|path| {
+                                let bytes = with_line(&path);
+                                (path, bytes)
+                            })
+                            .collect();
+                        let files: Vec<serde_json::Value> = ten
+                            .iter()
+                            .map(|(path, bytes)| {
+                                serde_json::json!({
+                                    "path": path,
+                                    "content": String::from_utf8_lossy(bytes),
+                                })
+                            })
+                            .collect();
+                        let document = serde_json::json!({ "files": files }).to_string();
+                        (vec!["commit".into()], Some(document.into_bytes()), ten)
+                    }
+                    "edit-text" => {
+                        let current =
+                            String::from_utf8_lossy(&kept.owed[U283_EDITED_NOTE]).to_string();
+                        let old = edit_line(&current, n)
+                            .ok_or_else(|| {
+                                format!("u283 edit-text sample {n}: no line is held once")
+                            })?
+                            .to_string();
+                        let new = format!("{old} edit {n}");
+                        let edited = current.replacen(&old, &new, 1).into_bytes();
+                        (
+                            vec![
+                                "edit".into(),
+                                U283_EDITED_NOTE.into(),
+                                format!("--old={old}"),
+                                format!("--new={new}"),
+                            ],
+                            None,
+                            vec![(U283_EDITED_NOTE.to_string(), edited)],
+                        )
+                    }
+                    "write-bytes" => {
+                        let bytes = stamped(&fixture[U283_WRITTEN_BYTES], n);
+                        (
+                            vec!["write".into(), U283_WRITTEN_BYTES.into(), "--bytes".into()],
+                            Some(bytes.clone()),
+                            vec![(U283_WRITTEN_BYTES.to_string(), bytes)],
+                        )
+                    }
+                    "commit-bytes" => {
+                        let note = with_line(U283_NOTE);
+                        let photo = stamped(&fixture[U283_COMMITTED_BYTES], n);
+                        let document = serde_json::json!({ "files": [
+                                { "path": U283_NOTE, "content": String::from_utf8_lossy(&note) },
+                                { "path": U283_COMMITTED_BYTES, "contentBase64": encode_base64(&photo) },
+                            ]})
+                            .to_string();
+                        (
+                            vec!["commit".into()],
+                            Some(document.into_bytes()),
+                            vec![
+                                (U283_NOTE.to_string(), note),
+                                (U283_COMMITTED_BYTES.to_string(), photo),
+                            ],
+                        )
+                    }
+                    other => return Err(format!("u283: no operation {other}")),
+                };
+                let mut full: Vec<&str> = vec!["--json"];
+                full.extend(args.iter().map(String::as_str));
+                full.extend(["--parent", &parent, "--repo", &write_repo]);
+                let a = expect_fed(
+                    side,
+                    U283_FIXTURE,
+                    operation,
+                    &scratch,
+                    &cache,
+                    &full,
+                    stdin,
+                    0,
+                )?;
+                kept.parent = written_commit(operation, n, &a.stdout)?;
+                kept.owed.extend(wrote);
+                a
+            }
+        };
+        Ok(Sample {
+            ms: answer.took.as_secs_f64() * 1000.0,
+            matched: None,
+            published: None,
+        })
+    }
+
     fn sample(&mut self, side: &Side, fixture: &str, operation: &str) -> Result<Sample, String> {
+        if U283_OPERATIONS.contains(&operation) {
+            return self.sample_u283(side, operation);
+        }
         self.keep(side, fixture)?;
         self.counter += 1;
         let n = self.counter;
@@ -964,6 +1429,24 @@ impl Harness {
         }))
     }
 
+    /// Five unrecorded samples, then thirty recorded ones, of the after
+    /// side alone: a pair the released binary cannot perform.
+    fn measure_after(&mut self, after: &Side, operation: &str) -> Result<Measurement, String> {
+        let mut recorded = Vec::new();
+        for n in 0..WARMUP + RECORDED {
+            let sample = self.sample(after, U283_FIXTURE, operation)?;
+            if n >= WARMUP {
+                recorded.push((sample.ms * 10.0).round() / 10.0);
+            }
+        }
+        Ok(Measurement {
+            median_ms: median(&recorded),
+            matched_files: vec![],
+            published_files: vec![],
+            samples_ms: recorded,
+        })
+    }
+
     /// Delete every repository the run made, and remove the scratch
     /// directory.
     /// Every step is taken whatever an earlier one answered; the first
@@ -1020,6 +1503,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
     let mut baseline = None;
     let mut after = None;
     let mut judged_only = false;
+    let mut suite: Option<String> = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -1027,15 +1511,28 @@ fn cmd_run(args: &[String]) -> ExitCode {
             "--baseline" => baseline = it.next().cloned(),
             "--after" => after = it.next().cloned(),
             "--judged-only" => judged_only = true,
+            "--suite" => suite = Some(it.next().cloned().unwrap_or_default()),
             other => {
                 eprintln!("unknown argument {other}");
                 return ExitCode::from(2);
             }
         }
     }
+    let usage =
+        "usage: perf run --out DIR --baseline SIDE --after SIDE [--judged-only] [--suite u283]";
     let (Some(out), Some(baseline), Some(after)) = (out, baseline, after) else {
-        eprintln!("usage: perf run --out DIR --baseline SIDE --after SIDE [--judged-only]");
+        eprintln!("{usage}");
         return ExitCode::from(2);
+    };
+    // Absent, the suite times u280's set as it stands; `u283` times this
+    // unit's operations alone, and any other value is refused.
+    let u283 = match suite.as_deref() {
+        None => false,
+        Some("u283") => true,
+        Some(_) => {
+            eprintln!("{usage}");
+            return ExitCode::from(2);
+        }
     };
     let sides = match (
         parse_side("baseline", &baseline),
@@ -1047,7 +1544,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match run(&out, &sides, judged_only) {
+    match run(&out, &sides, judged_only, u283) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{e}");
@@ -1056,21 +1553,30 @@ fn cmd_run(args: &[String]) -> ExitCode {
     }
 }
 
-fn run(out: &str, sides: &[Side; 2], judged_only: bool) -> Result<(), String> {
-    // 1 — both fixtures, under a directory `mktemp -d` made for the run.
+fn run(out: &str, sides: &[Side; 2], judged_only: bool, u283: bool) -> Result<(), String> {
+    // 1 — the fixtures the suite times, under a directory `mktemp -d` made
+    // for the run.
     let scratch = scratch_dir()?;
+    let names: Vec<&str> = if u283 {
+        vec![U283_FIXTURE]
+    } else {
+        FIXTURES.to_vec()
+    };
     let mut harness = Harness {
         scratch: scratch.clone(),
         nonce: nonce(),
-        fixtures: FIXTURES
-            .iter()
-            .map(|f| (f.to_string(), fixture(f)))
-            .collect(),
+        fixtures: names.iter().map(|f| (f.to_string(), fixture(f))).collect(),
         kept: BTreeMap::new(),
+        u283: BTreeMap::new(),
         made: Vec::new(),
         counter: 0,
     };
-    let measured = measure_all(&mut harness, sides, judged_only).and_then(|runs| {
+    let measured = if u283 {
+        measure_u283(&mut harness, sides, judged_only)
+    } else {
+        measure_all(&mut harness, sides, judged_only)
+    };
+    let measured = measured.and_then(|runs| {
         let versions = sides
             .iter()
             .map(|side| harness.cli_version(side))
@@ -1100,13 +1606,19 @@ fn run(out: &str, sides: &[Side; 2], judged_only: bool) -> Result<(), String> {
             server_commit: side.server_sha.clone(),
             engine_commit: side.engine_sha.clone(),
             machine: this_machine(),
+            // A pair measured on the after side alone is written to the
+            // after document alone.
             runs: runs
                 .iter()
                 .map(|(fixture, operation, measurements)| Run {
                     fixture: fixture.clone(),
                     operation: operation.clone(),
-                    measurements: measurements.iter().map(|pair| pair[i].clone()).collect(),
+                    measurements: measurements
+                        .iter()
+                        .filter_map(|pair| pair[i].clone())
+                        .collect(),
                 })
+                .filter(|run| !run.measurements.is_empty())
                 .collect(),
         };
         let path = Path::new(out).join(format!("{}.json", side.label));
@@ -1120,7 +1632,9 @@ fn run(out: &str, sides: &[Side; 2], judged_only: bool) -> Result<(), String> {
     harness.tear_down()
 }
 
-type Measured = Vec<(String, String, Vec<[Measurement; 2]>)>;
+/// Each timed pair and its measurements, baseline first; a side standing
+/// `None` was not timed on that pair.
+type Measured = Vec<(String, String, Vec<[Option<Measurement>; 2]>)>;
 
 fn measure_all(
     harness: &mut Harness,
@@ -1140,25 +1654,75 @@ fn measure_all(
                 "  {fixture} {operation} {:.0} ms -> {:.0} ms",
                 pair[0].median_ms, pair[1].median_ms
             );
-            runs.push((fixture.to_string(), operation.to_string(), vec![pair]));
+            runs.push((
+                fixture.to_string(),
+                operation.to_string(),
+                vec![pair.map(Some)],
+            ));
         }
     }
-    // 4 — a second measurement of each judged pair whose first stands
-    // `slower`.
+    measure_slower_again(harness, sides, runs)
+}
+
+/// A second measurement of each judged pair whose first stands `slower`
+/// (SPEC u280 `perf run` 4), a pair measured on one side alone never
+/// standing so.
+fn measure_slower_again(
+    harness: &mut Harness,
+    sides: &[Side; 2],
+    mut runs: Measured,
+) -> Result<Measured, String> {
     for (fixture, operation, measurements) in runs.iter_mut() {
-        let first = &measurements[0];
+        let [Some(b), Some(a)] = &measurements[0] else {
+            continue;
+        };
         let as_run = |m: &Measurement| Run {
             fixture: fixture.clone(),
             operation: operation.clone(),
             measurements: vec![m.clone()],
         };
-        if first_slower(fixture, operation, &as_run(&first[0]), &as_run(&first[1])) {
+        if first_slower(fixture, operation, &as_run(b), &as_run(a)) {
             eprintln!("measuring {fixture} {operation} a second time");
             let second = harness.measure(sides, fixture, operation)?;
-            measurements.push(second);
+            measurements.push(second.map(Some));
         }
     }
     Ok(runs)
+}
+
+/// The u283 operations (SPEC u283 `perf run --suite u283` 2): each pair
+/// both sides perform timed as u280 times a pair, each after-only pair
+/// on the after side alone, then a second measurement of each judged
+/// pair whose first stands `slower`.
+fn measure_u283(
+    harness: &mut Harness,
+    sides: &[Side; 2],
+    judged_only: bool,
+) -> Result<Measured, String> {
+    let mut runs: Measured = Vec::new();
+    for operation in U283_OPERATIONS {
+        if judged_only && !judged(U283_FIXTURE, operation) {
+            continue;
+        }
+        eprintln!("measuring {U283_FIXTURE} {operation}");
+        let pair = if after_only(operation) {
+            let after = harness.measure_after(&sides[1], operation)?;
+            eprintln!(
+                "  {U283_FIXTURE} {operation} - -> {:.0} ms",
+                after.median_ms
+            );
+            [None, Some(after)]
+        } else {
+            let pair = harness.measure(sides, U283_FIXTURE, operation)?;
+            eprintln!(
+                "  {U283_FIXTURE} {operation} {:.0} ms -> {:.0} ms",
+                pair[0].median_ms, pair[1].median_ms
+            );
+            pair.map(Some)
+        };
+        runs.push((U283_FIXTURE.to_string(), operation.to_string(), vec![pair]));
+    }
+    measure_slower_again(harness, sides, runs)
 }
 
 fn main() -> ExitCode {
@@ -1322,6 +1886,153 @@ mod tests {
         let code = cmd_compare(&[bp.display().to_string(), ap.display().to_string()]);
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(code, ExitCode::from(2));
+    }
+
+    // SPEC u283 `perf compare`: an after-only pair prints its after
+    // median as reference, and never stands the run `slower`.
+    #[test]
+    fn an_after_only_pair_prints_as_reference_and_is_never_slower() {
+        let b = results("baseline", &[("agent-mixed", "cat-text", &[100.0])]);
+        let a = results(
+            "after",
+            &[
+                ("agent-mixed", "cat-text", &[101.0]),
+                ("agent-mixed", "write-bytes", &[5000.0]),
+            ],
+        );
+        let (lines, slower) = compare(&b, &a).unwrap();
+        assert!(!slower);
+        assert_eq!(
+            lines,
+            vec![
+                "agent-mixed cat-text 100 ms -> 101 ms ok",
+                "agent-mixed write-bytes - -> 5000 ms reference",
+            ]
+        );
+    }
+
+    // `perf compare`: a judged pair standing on one side alone makes the
+    // two documents incomparable.
+    #[test]
+    fn a_judged_pair_missing_from_one_side_is_refused() {
+        let b = results(
+            "baseline",
+            &[
+                ("agent-mixed", "cat-text", &[100.0]),
+                ("agent-mixed", "edit-text", &[100.0]),
+            ],
+        );
+        let a = results("after", &[("agent-mixed", "cat-text", &[100.0])]);
+        assert_eq!(compare(&b, &a), Err("runs".to_string()));
+        assert_eq!(compare(&a, &b), Err("runs".to_string()));
+    }
+
+    // SPEC u283 Contract Surface, the u283 operations: nine judged, one
+    // reference both sides perform, and two after-only; every path they
+    // address stands in `agent-mixed`.
+    #[test]
+    fn the_u283_suite_times_its_operations_over_agent_mixed() {
+        let judged_ops: Vec<&str> = U283_OPERATIONS
+            .iter()
+            .copied()
+            .filter(|op| judged(U283_FIXTURE, op))
+            .collect();
+        assert_eq!(judged_ops, U283_JUDGED.to_vec());
+        let after: Vec<&str> = U283_OPERATIONS
+            .iter()
+            .copied()
+            .filter(|op| after_only(op))
+            .collect();
+        assert_eq!(after, vec!["write-bytes", "commit-bytes"]);
+        assert!(!judged(U283_FIXTURE, "cat-json-binary"));
+        let mixed = agent_mixed();
+        for path in [
+            U283_NOTE,
+            U283_EDITED_NOTE,
+            U283_LARGE,
+            U283_BINARY,
+            U283_WRITTEN_BYTES,
+            U283_COMMITTED_BYTES,
+        ] {
+            assert!(mixed.contains_key(path), "{path}");
+        }
+        // u280's pairs are judged as they were.
+        assert!(judged("agent-text", "pull") && !judged("agent-mixed", "pull"));
+    }
+
+    #[test]
+    fn a_suite_other_than_u283_is_refused_at_exit_two() {
+        let args: Vec<String> = [
+            "--out",
+            "/nonexistent",
+            "--baseline",
+            "b",
+            "--after",
+            "a",
+            "--suite",
+            "u999",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(cmd_run(&args), ExitCode::from(2));
+    }
+
+    #[test]
+    fn base64_round_trips_and_refuses_what_the_standard_form_does_not_admit() {
+        for len in 0..40 {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 37 % 256) as u8).collect();
+            let text = encode_base64(&bytes);
+            assert_eq!(decode_base64(&text), Some(bytes), "{len}");
+        }
+        assert_eq!(encode_base64(b"hello\n"), "aGVsbG8K");
+        assert_eq!(
+            encode_base64(b"\x89PNG\r\n\x1a\n\x00\xff"),
+            "iVBORw0KGgoA/w=="
+        );
+        assert_eq!(
+            decode_base64("aGVsbG8K").as_deref(),
+            Some(b"hello\n".as_slice())
+        );
+        for bad in ["aGVsbG8", "aGVs bG8K", "a===", "aG==aGVs", "aGV!"] {
+            assert_eq!(decode_base64(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_edit_line_advances_past_a_line_held_more_than_once() {
+        let content = "# note\n\nsame\nsame\nlast";
+        assert_eq!(edit_line(content, 0), Some("# note"));
+        // Index 1 is empty, and 2 and 3 are held twice.
+        assert_eq!(edit_line(content, 1), Some("last"));
+        assert_eq!(edit_line(content, 3), Some("last"));
+        assert_eq!(edit_line(content, 5), Some("# note"));
+        assert_eq!(edit_line("same\nsame", 0), None);
+    }
+
+    #[test]
+    fn a_stamp_rewrites_the_last_eight_bytes_alone() {
+        let stamped_bytes = stamped(&[1u8; 12], 0x0102);
+        assert_eq!(&stamped_bytes[..4], &[1, 1, 1, 1]);
+        assert_eq!(&stamped_bytes[4..], &0x0102u64.to_le_bytes());
+    }
+
+    // SPEC u283 `perf run --suite u283` 3: the released build's
+    // `content: null` document is checked by its `sha`.
+    #[test]
+    fn each_cat_answer_is_checked_against_the_fixture() {
+        let bytes = b"\x89PNG\x00".to_vec();
+        let raw = check_cat("cat-text", 1, &bytes, &bytes, false);
+        assert!(raw.is_ok());
+        assert!(check_cat("cat-text", 1, b"other", &bytes, false).is_err());
+        let encoded = serde_json::json!({ "contentBase64": encode_base64(&bytes) }).to_string();
+        assert!(check_cat("cat-json-binary", 1, encoded.as_bytes(), &bytes, true).is_ok());
+        let released = serde_json::json!({ "content": null, "sha": blob_sha1(&bytes) }).to_string();
+        assert!(check_cat("cat-json-binary", 1, released.as_bytes(), &bytes, true).is_ok());
+        let wrong = serde_json::json!({ "content": null, "sha": "0" }).to_string();
+        assert!(check_cat("cat-json-binary", 1, wrong.as_bytes(), &bytes, true).is_err());
+        let text = serde_json::json!({ "content": "# a\n" }).to_string();
+        assert!(check_cat("cat-json-text", 1, text.as_bytes(), b"# a\n", true).is_ok());
     }
 
     #[test]

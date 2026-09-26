@@ -16,6 +16,9 @@ use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+
 use crate::auth::token::TokenStore;
 use crate::client::{
     PushDeleteEntry, PushFileEntry, PushProvenance, PushRequest, PushResponse, SynsClient,
@@ -24,7 +27,7 @@ use crate::commands::sync::provenance_from;
 use crate::config::Config;
 use crate::errors::{ApiErrorContext, CliError, IdentityRemedy, NotTextSurface};
 use crate::output::Output;
-use crate::push::collector::{CollectOptions, HeldBytes, collect_files};
+use crate::push::collector::{CollectOptions, HeldBytes, MAX_FILE_BYTES, collect_files, is_text};
 use crate::push::converge::{excluded_local_files, is_partial_write};
 use crate::push::hash::blob_sha1;
 use crate::push::working_copy::WorkingCopy;
@@ -124,11 +127,22 @@ pub struct WriteTarget {
     pub checkout: Option<PathBuf>,
 }
 
+/// One content a commit carries (SPEC u283 Contract Surface,
+/// `FileContent`): `Text` holds content passing `is_text`, and `Encoded`
+/// the standard padded base64 of bytes failing it beside their blob hash
+/// — never the decoded bytes, which are dropped once classified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileContent {
+    Text(String),
+    Encoded { base64: String, sha: String },
+}
+
 /// What one commit carries: every content has already been answered by
-/// `text_or_refuse`, and no path stands in both members.
+/// `classify_content` or `text_or_refuse`, and no path stands in both
+/// members.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Changeset {
-    pub files: Vec<(String, String)>,
+    pub files: Vec<(String, FileContent)>,
     pub deletions: Vec<String>,
 }
 
@@ -313,17 +327,65 @@ pub fn read_standard_input(what: &str) -> Result<Vec<u8>, CliError> {
     Ok(bytes)
 }
 
-/// The decoded content where the bytes are valid UTF-8 and carry no NUL
-/// byte, and otherwise the not-text refusal naming the path — so no run
-/// of these verbs hands the wire a content the repository cannot hold.
-pub fn text_or_refuse(path: &str, bytes: &[u8]) -> Result<String, CliError> {
-    match std::str::from_utf8(bytes) {
-        Ok(text) if !text.contains('\0') => Ok(text.to_string()),
-        _ => Err(CliError::NotText {
+/// The too-large refusal for a content of `size` bytes past
+/// `MAX_FILE_BYTES`, bounded on the decoded length (`LIM-file-size`).
+fn refuse_past_the_bound(path: &str, size: usize) -> Result<(), CliError> {
+    let size = size as u64;
+    if size > MAX_FILE_BYTES {
+        return Err(CliError::FileTooLarge {
             path: path.to_string(),
-            surface: NotTextSurface::Write,
-        }),
+            size,
+        });
     }
+    Ok(())
+}
+
+/// `bytes` known to pass `is_text` as the `String` they already are,
+/// taken without a copy.
+fn text_of(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes).expect("is_text admits valid UTF-8 alone")
+}
+
+/// Classifies one content a caller declared as bytes (SPEC u283 Contract
+/// Surface, `classify_content`): refused past `MAX_FILE_BYTES`, `Text`
+/// where the bytes pass `is_text`, and `Encoded` otherwise — carrying
+/// `sent`, the base64 the caller already handed over, where it stands,
+/// and encoding the bytes only where it does not.
+pub fn classify_content(
+    path: &str,
+    bytes: Vec<u8>,
+    sent: Option<String>,
+) -> Result<FileContent, CliError> {
+    refuse_past_the_bound(path, bytes.len())?;
+    if is_text(&bytes) {
+        return Ok(FileContent::Text(text_of(bytes)));
+    }
+    let sha = blob_sha1(&bytes);
+    let base64 = match sent {
+        Some(sent) => sent,
+        None => STANDARD.encode(&bytes),
+    };
+    Ok(FileContent::Encoded { base64, sha })
+}
+
+/// Classifies one content a caller handed over as text (SPEC u283
+/// Contract Surface, `text_or_refuse`): refused past the bound as
+/// `classify_content` refuses it, `Text` where the bytes pass `is_text`,
+/// and otherwise the not-text refusal `surface` names — so no run hands
+/// the wire bytes its caller never declared.
+pub fn text_or_refuse(
+    path: &str,
+    bytes: Vec<u8>,
+    surface: NotTextSurface,
+) -> Result<FileContent, CliError> {
+    refuse_past_the_bound(path, bytes.len())?;
+    if is_text(&bytes) {
+        return Ok(FileContent::Text(text_of(bytes)));
+    }
+    Err(CliError::NotText {
+        path: path.to_string(),
+        surface,
+    })
 }
 
 // ---- the target -------------------------------------------------------
@@ -406,12 +468,16 @@ pub async fn resolve_write_target(
             // `if_repo: false` refuses rather than skipping — these
             // verbs register no skip, a skipped write being a change its
             // caller believes landed.
+            // The ladder's refusal names `--repo`, which this verb takes
+            // (SPEC u283, `IdentityRemedy::RepoOption`).
             let quiet = Output::new(false);
-            match resolve_full_or_skip(None, cwd, false, &quiet)? {
+            match resolve_full_or_skip(None, cwd, false, &quiet)
+                .map_err(|e| e.with_identity_remedy(IdentityRemedy::RepoOption))?
+            {
                 Some((owner, name)) => format!("{owner}/{name}"),
                 None => {
                     return Err(CliError::RepoIdentityUnknown {
-                        remedy: IdentityRemedy::IdentityFile,
+                        remedy: IdentityRemedy::RepoOption,
                     });
                 }
             }
@@ -457,22 +523,32 @@ fn caption(opts: &WriteOptions, default: &str) -> Result<String, CliError> {
     }
 }
 
-/// The body this run sends (`commit_changeset` 2 and 3).
+/// The body this run sends (`commit_changeset` 2 and 3). Each content
+/// is moved into its entry rather than copied, riding as `content` where
+/// it is `Text` and as `contentBase64` where it is `Encoded` (SPEC u283).
 fn push_body(
     target: &WriteTarget,
-    changeset: &Changeset,
+    changeset: Changeset,
     opts: &WriteOptions,
     message: String,
 ) -> PushRequest {
     PushRequest {
         files: changeset
             .files
-            .iter()
-            .map(|(path, content)| PushFileEntry {
-                path: path.clone(),
-                sha: blob_sha1(content.as_bytes()),
-                content: Some(content.clone()),
-                content_base64: None,
+            .into_iter()
+            .map(|(path, content)| match content {
+                FileContent::Text(text) => PushFileEntry {
+                    path,
+                    sha: blob_sha1(text.as_bytes()),
+                    content: Some(text),
+                    content_base64: None,
+                },
+                FileContent::Encoded { base64, sha } => PushFileEntry {
+                    path,
+                    sha,
+                    content: None,
+                    content_base64: Some(base64),
+                },
             })
             .collect(),
         deletions: if changeset.deletions.is_empty() {
@@ -481,8 +557,8 @@ fn push_body(
             Some(
                 changeset
                     .deletions
-                    .iter()
-                    .map(|path| PushDeleteEntry { path: path.clone() })
+                    .into_iter()
+                    .map(|path| PushDeleteEntry { path })
                     .collect(),
             )
         },
@@ -592,7 +668,7 @@ pub async fn commit_changeset(
 ) -> Result<(), CliError> {
     // 1 and 2 — the caption, and each content's blob hash beside its path.
     let message = caption(opts, default_message)?;
-    let request = push_body(target, &changeset, opts, message);
+    let request = push_body(target, changeset, opts, message);
 
     // 3 — the one call of `EP-push`, its body serialised once and sent
     // through the one sender of every publication's body (SPEC u280
@@ -877,20 +953,137 @@ mod tests {
         .hashes()
     }
 
-    // SPEC u271 Contract Surface, `text_or_refuse`.
+    // SPEC u283 Contract Surface, `text_or_refuse`.
     #[test]
     fn a_nul_bearing_or_undecodable_content_is_refused_by_path() {
-        assert_eq!(text_or_refuse("a.md", b"keep one").unwrap(), "keep one");
-        assert_eq!(text_or_refuse("a.md", b"").unwrap(), "");
+        assert_eq!(
+            text_or_refuse("a.md", b"keep one".to_vec(), NotTextSurface::Write).unwrap(),
+            FileContent::Text("keep one".to_string())
+        );
+        assert_eq!(
+            text_or_refuse("a.md", Vec::new(), NotTextSurface::Write).unwrap(),
+            FileContent::Text(String::new())
+        );
 
-        let nul = text_or_refuse("b.bin", b"ab\0cd").unwrap_err();
+        let nul = text_or_refuse("b.bin", b"ab\0cd".to_vec(), NotTextSurface::Write).unwrap_err();
         assert_eq!(
             nul.to_string(),
-            "cannot write content that is not text: b.bin \u{2014} this repository holds UTF-8 text alone"
+            "cannot write content that is not text: b.bin \u{2014} pass --bytes to publish its bytes exactly"
         );
-        let invalid = text_or_refuse("b.bin", &[0xff, 0xfe, 0x00]).unwrap_err();
+        let invalid =
+            text_or_refuse("b.bin", vec![0xff, 0xfe, 0x00], NotTextSurface::Write).unwrap_err();
         assert_eq!(invalid.to_string(), nul.to_string());
         assert_eq!(invalid.exit_code(), 1);
+
+        // The surface picks the wording.
+        let edit = text_or_refuse("b.bin", b"ab\0cd".to_vec(), NotTextSurface::Edit).unwrap_err();
+        assert!(matches!(
+            edit,
+            CliError::NotText {
+                surface: NotTextSurface::Edit,
+                ..
+            }
+        ));
+    }
+
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\xff";
+
+    // SPEC u283 Contract Surface, `classify_content`: bytes failing
+    // `is_text` are `Encoded` as standard padded base64 beside their
+    // blob hash.
+    #[test]
+    fn bytes_that_are_not_text_classify_as_encoded_with_their_hash() {
+        assert_eq!(
+            classify_content("image.png", PNG.to_vec(), None).unwrap(),
+            FileContent::Encoded {
+                base64: STANDARD.encode(PNG),
+                sha: blob_sha1(PNG),
+            }
+        );
+    }
+
+    // `classify_content`: the string the caller sent is carried as it
+    // was sent, never encoded a second time.
+    #[test]
+    fn a_sent_string_is_carried_unencoded() {
+        let sent = "iVBORw0KGgoA/w==".to_string();
+        match classify_content("image.png", PNG.to_vec(), Some(sent.clone())).unwrap() {
+            FileContent::Encoded { base64, sha } => {
+                assert_eq!(base64, sent);
+                assert_eq!(sha, blob_sha1(PNG));
+            }
+            other => panic!("expected Encoded, got {other:?}"),
+        }
+    }
+
+    // `classify_content`: bytes that pass `is_text` ride as text however
+    // the caller handed them over.
+    #[test]
+    fn declared_bytes_that_are_text_classify_as_text() {
+        assert_eq!(
+            classify_content("a.md", b"hello\n".to_vec(), Some("aGVsbG8K".to_string())).unwrap(),
+            FileContent::Text("hello\n".to_string())
+        );
+        assert_eq!(
+            classify_content("a.md", b"hello\n".to_vec(), None).unwrap(),
+            FileContent::Text("hello\n".to_string())
+        );
+    }
+
+    // `LIM-file-size`: `MAX_FILE_BYTES` is admitted and one byte past it
+    // refused, on both classifiers.
+    #[test]
+    fn the_bound_admits_its_own_size_and_refuses_one_byte_past_it() {
+        let at = MAX_FILE_BYTES as usize;
+        assert!(matches!(
+            classify_content("big.md", vec![b'a'; at], None).unwrap(),
+            FileContent::Text(ref text) if text.len() == at
+        ));
+        let past = classify_content("big.bin", vec![0u8; at + 1], None).unwrap_err();
+        assert_eq!(
+            past.to_string(),
+            format!(
+                "payload_too_large: big.bin holds {} bytes, past the 25 MiB one file may hold; nothing was sent",
+                at + 1
+            )
+        );
+        assert_eq!(past.exit_code(), 1);
+        let text_past =
+            text_or_refuse("big.md", vec![b'a'; at + 1], NotTextSurface::Commit).unwrap_err();
+        assert!(
+            matches!(text_past, CliError::FileTooLarge { size, .. } if size == MAX_FILE_BYTES + 1)
+        );
+    }
+
+    // SPEC u283 Contract Surface, `commit_changeset`: an `Encoded` entry
+    // rides as `contentBase64` beside its carried hash, and no `content`.
+    #[test]
+    fn an_encoded_entry_rides_as_content_base64_alone() {
+        let changeset = Changeset {
+            files: vec![
+                ("a.md".to_string(), FileContent::Text("a".to_string())),
+                (
+                    "image.png".to_string(),
+                    classify_content("image.png", PNG.to_vec(), None).unwrap(),
+                ),
+            ],
+            deletions: vec![],
+        };
+        let request = super::push_body(
+            &target_at(None),
+            changeset,
+            &write_options(HEAD_SHA),
+            "m".to_string(),
+        );
+        let body = serde_json::to_value(&request).unwrap();
+        assert_eq!(body["files"][0]["content"], serde_json::json!("a"));
+        assert!(body["files"][0].get("contentBase64").is_none());
+        assert_eq!(
+            body["files"][1]["contentBase64"],
+            serde_json::json!(STANDARD.encode(PNG))
+        );
+        assert!(body["files"][1].get("content").is_none());
+        assert_eq!(body["files"][1]["sha"], serde_json::json!(blob_sha1(PNG)));
     }
 
     // SPEC u271 Contract Surface, `ProvenanceOptions`: each option
@@ -1068,6 +1261,29 @@ mod tests {
         assert_eq!(paths, vec!["/api/v1/repos/alice/absent".to_string()]);
     }
 
+    // SPEC u283, `resolve_write_target` 1: in a directory no identity
+    // reaches and with no `--repo`, the refusal names `--repo`, before
+    // any request.
+    #[tokio::test]
+    #[serial]
+    async fn the_write_resolver_names_repo_where_no_identity_reaches() {
+        let server = MockServer::start().await;
+        let env = env_for(&server.uri());
+        let work = tempfile::tempdir().unwrap();
+        let mut opts = write_options(HEAD_SHA);
+        opts.repo = None;
+
+        let err = resolve_write_target(&env.config, work.path(), &opts)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "cannot determine repo identity \u{2014} pass --repo OWNER/NAME, or run inside a directory at or below one holding .syns.yaml"
+        );
+        assert_eq!(err.exit_code(), 2);
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
     // `resolve_write_target` 2: the credential is read before any
     // request.
     #[tokio::test]
@@ -1183,7 +1399,10 @@ mod tests {
             &Output::new(true),
             &target_at(None),
             Changeset {
-                files: vec![("a.md".to_string(), "keep two".to_string())],
+                files: vec![(
+                    "a.md".to_string(),
+                    FileContent::Text("keep two".to_string()),
+                )],
                 deletions: vec![],
             },
             &write_options(HEAD_SHA),
@@ -1248,7 +1467,10 @@ mod tests {
             &Output::new(true),
             &target_at(None),
             Changeset {
-                files: vec![("a.md".to_string(), "keep two".to_string())],
+                files: vec![(
+                    "a.md".to_string(),
+                    FileContent::Text("keep two".to_string()),
+                )],
                 deletions: vec!["gone.md".to_string()],
             },
             &write_options(HEAD_SHA),
