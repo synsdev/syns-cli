@@ -70,8 +70,214 @@ mod tests {
     use super::*;
     use crate::commands::repo::CliRepoStatus;
     use serial_test::serial;
+    use std::collections::BTreeSet;
     use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    /// An `EP-explore` mock answering an empty page to any `GET`, so a
+    /// request reaches it whatever query keys it carries.
+    async fn empty_page_server() -> MockServer {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/explore"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [],
+                "total": 0,
+                "limit": 20,
+                "offset": 0
+            })))
+            .mount(&mock_server)
+            .await;
+        mock_server
+    }
+
+    /// The one request the mock recorded, asserted to be the only one.
+    async fn only_request(mock_server: &MockServer) -> Request {
+        let mut received = mock_server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1, "exactly one request is sent");
+        received.remove(0)
+    }
+
+    /// A request's decoded query pairs, compared as a set so the order
+    /// they are sent in decides nothing.
+    fn pairs_of(request: &Request) -> BTreeSet<(String, String)> {
+        request
+            .url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect()
+    }
+
+    fn pairs(expected: &[(&str, &str)]) -> BTreeSet<(String, String)> {
+        expected
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn client_sends_tags_under_the_registered_key() {
+        let mock_server = empty_page_server().await;
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+
+        client
+            .explore(None, Some("syns-app,cli"), None, 20, 0)
+            .await
+            .unwrap();
+
+        let request = only_request(&mock_server).await;
+        assert_eq!(
+            pairs_of(&request),
+            pairs(&[("limit", "20"), ("offset", "0"), ("tags", "syns-app,cli")])
+        );
+    }
+
+    #[tokio::test]
+    async fn client_sends_query_under_the_registered_key() {
+        let mock_server = empty_page_server().await;
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+
+        client
+            .explore(Some("templates"), None, None, 20, 0)
+            .await
+            .unwrap();
+
+        let request = only_request(&mock_server).await;
+        assert_eq!(
+            pairs_of(&request),
+            pairs(&[("limit", "20"), ("offset", "0"), ("q", "templates")])
+        );
+    }
+
+    #[tokio::test]
+    async fn client_sends_every_filter_under_its_registered_key() {
+        let mock_server = empty_page_server().await;
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+
+        client
+            .explore(Some("tmpl"), Some("a,b"), Some(&RepoStatus::Active), 5, 10)
+            .await
+            .unwrap();
+
+        let request = only_request(&mock_server).await;
+        assert_eq!(
+            pairs_of(&request),
+            pairs(&[
+                ("q", "tmpl"),
+                ("tags", "a,b"),
+                ("status", "active"),
+                ("limit", "5"),
+                ("offset", "10"),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn client_without_filters_sends_only_paging() {
+        let mock_server = empty_page_server().await;
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+
+        client.explore(None, None, None, 20, 0).await.unwrap();
+
+        let request = only_request(&mock_server).await;
+        assert_eq!(
+            pairs_of(&request),
+            pairs(&[("limit", "20"), ("offset", "0")])
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn repeated_tags_reach_the_endpoint_as_one_joined_value() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+
+        let mock_server = empty_page_server().await;
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(true);
+
+        let result = cmd_explore(
+            &config,
+            &output,
+            None,
+            vec!["syns-app".to_string(), "cli".to_string()],
+            None,
+            20,
+            0,
+        )
+        .await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        assert!(result.is_ok(), "{result:?}");
+        let request = only_request(&mock_server).await;
+        // Read the raw pairs rather than the set, so two identical
+        // `tags` pairs would count twice.
+        let tags: Vec<String> = request
+            .url
+            .query_pairs()
+            .filter(|(k, _)| k == "tags")
+            .map(|(_, v)| v.into_owned())
+            .collect();
+        assert_eq!(tags, vec!["syns-app,cli".to_string()]);
+        assert!(
+            !request.url.query_pairs().any(|(k, _)| k == "tag"),
+            "no tag key is sent: {}",
+            request.url
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn short_query_reaches_the_endpoint_and_its_refusal_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/explore"))
+            .respond_with(ResponseTemplate::new(422).set_body_json(serde_json::json!({
+                "error": "validation_error",
+                "message": "q must be at least 3 characters"
+            })))
+            .mount(&mock_server)
+            .await;
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(true);
+
+        let result = cmd_explore(
+            &config,
+            &output,
+            Some("ab".to_string()),
+            vec![],
+            None,
+            20,
+            0,
+        )
+        .await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        let err = result.expect_err("the endpoint's refusal answers the run");
+        match &err {
+            CliError::Api { status, error, .. } => {
+                assert_eq!(*status, Some(422));
+                assert_eq!(error, "validation_error");
+            }
+            other => panic!("expected the API refusal, got {other:?}"),
+        }
+        assert_eq!(err.exit_code(), 1);
+        let request = only_request(&mock_server).await;
+        let sent = pairs_of(&request);
+        assert!(
+            sent.contains(&("q".to_string(), "ab".to_string())),
+            "q=ab is sent: {}",
+            request.url
+        );
+        assert!(
+            !sent.iter().any(|(k, _)| k == "search"),
+            "no search key is sent: {}",
+            request.url
+        );
+    }
 
     #[tokio::test]
     #[serial]

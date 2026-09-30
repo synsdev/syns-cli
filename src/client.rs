@@ -1564,7 +1564,7 @@ impl SynsClient {
     pub async fn explore(
         &self,
         query: Option<&str>,
-        tag: Option<&str>,
+        tags: Option<&str>,
         status: Option<&RepoStatus>,
         limit: u32,
         offset: u32,
@@ -1574,11 +1574,13 @@ impl SynsClient {
             .client
             .get(&url)
             .query(&[("limit", limit.to_string()), ("offset", offset.to_string())]);
+        // SPEC u294: each filter goes under the key EP-explore registers
+        // for it; an unregistered key is silently ignored by the endpoint.
         if let Some(q) = query {
-            req = req.query(&[("search", q)]);
+            req = req.query(&[("q", q)]);
         }
-        if let Some(t) = tag {
-            req = req.query(&[("tag", t)]);
+        if let Some(t) = tags {
+            req = req.query(&[("tags", t)]);
         }
         if let Some(s) = status {
             req = req.query(&[("status", s.as_query_str())]);
