@@ -10,12 +10,14 @@ use tempfile::TempDir;
 use wiremock::matchers::{method, path as path_matcher};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-/// One mock deployment and one config directory holding no credential,
-/// both derived from the test that made them.
+/// One mock deployment, one config directory holding no credential, one
+/// cache directory and one working directory, all derived from the test
+/// that made them.
 struct Deployment {
     rt: tokio::runtime::Runtime,
     server: MockServer,
     home: TempDir,
+    cache: TempDir,
     work: TempDir,
 }
 
@@ -30,6 +32,7 @@ impl Deployment {
             rt,
             server,
             home: tempfile::tempdir().expect("config dir"),
+            cache: tempfile::tempdir().expect("cache dir"),
             work: tempfile::tempdir().expect("working dir"),
         }
     }
@@ -48,6 +51,7 @@ impl Deployment {
             .expect("syns binary")
             .current_dir(self.work.path())
             .env("SYNS_CONFIG_DIR", self.home.path())
+            .env("SYNS_CACHE_DIR", self.cache.path())
             .env_remove("SYNS_URL")
             .arg("--server")
             .arg(self.server.uri())
