@@ -15,6 +15,7 @@ use crate::commands::pull::is_repository_shape;
 use crate::config::Config;
 use crate::errors::{CliError, IdentityRemedy};
 use crate::output::Output;
+use crate::repo::folder::{FolderScope, current_dir, resolve_folder_scope, resolve_scoped_or_skip};
 use crate::repo::if_repo::resolve_full_or_skip;
 
 /// The three options every read verb carries, spelt and bound
@@ -42,6 +43,9 @@ pub struct ReadTarget {
     pub repo_id: String,
     pub token: Option<String>,
     pub reference: ResolvedRef,
+    /// The scoped folder the run stands in, none wherever `--repo`
+    /// stood (SPEC u290 Contract Surface, `ReadTarget.folder`).
+    pub folder: Option<FolderScope>,
 }
 
 impl ReadTarget {
@@ -126,22 +130,10 @@ pub async fn resolve_read_target(
     output: &Output,
     opts: &ReadOptions,
 ) -> Result<Option<ReadTarget>, CliError> {
-    // 1 — bind the repository.
-    let repo_id = match opts.repo.as_deref() {
-        Some(named) => named.to_ascii_lowercase(),
-        None => {
-            let current_dir = std::env::current_dir().map_err(|e| CliError::Io {
-                message: format!("could not determine current directory: {e}"),
-            })?;
-            // The ladder's refusal names `--repo`, which every read verb
-            // takes (SPEC u283, `IdentityRemedy::RepoOption`).
-            match resolve_full_or_skip(None, &current_dir, opts.if_repo, output)
-                .map_err(|e| e.with_identity_remedy(IdentityRemedy::RepoOption))?
-            {
-                Some((owner, name)) => format!("{owner}/{name}"),
-                None => return Ok(None),
-            }
-        }
+    // 1 — bind the repository and the folder (SPEC u290).
+    let Some((repo_id, folder)) = bind_repository(opts.repo.as_deref(), opts.if_repo, output)?
+    else {
+        return Ok(None);
     };
 
     let token = TokenStore::new(config.credentials_path())
@@ -190,7 +182,77 @@ pub async fn resolve_read_target(
             version: entry.version,
             commit_sha: entry.sha,
         },
+        folder,
     }))
+}
+
+/// Binds the repository and the folder a read runs against (SPEC u290
+/// Behaviour, `resolve_read_target` 1): a `--repo` value lower-cased
+/// with no folder and no identity file read, and `resolve_scoped_or_skip`
+/// from the working directory otherwise, its refusal naming `--repo`.
+/// Answers `None` only where the skip envelope was written.
+fn bind_repository(
+    repo: Option<&str>,
+    if_repo: bool,
+    output: &Output,
+) -> Result<Option<(String, Option<FolderScope>)>, CliError> {
+    if let Some(named) = repo {
+        return Ok(Some((named.to_ascii_lowercase(), None)));
+    }
+    // The ladder's refusal names `--repo`, which every read verb takes
+    // (SPEC u283, `IdentityRemedy::RepoOption`).
+    Ok(resolve_scoped_or_skip(&current_dir()?, if_repo, output)
+        .map_err(|e| e.with_identity_remedy(IdentityRemedy::RepoOption))?
+        .map(|(owner, name, folder)| (format!("{owner}/{name}"), folder)))
+}
+
+/// The folder a read verb's step 1 binds (SPEC u290 Behaviour, `cmd_ls`
+/// 1): none where `--repo` stands, and `resolve_folder_scope` from the
+/// working directory otherwise.
+pub fn bind_read_folder(opts: &ReadOptions) -> Result<Option<FolderScope>, CliError> {
+    if opts.repo.is_some() {
+        return Ok(None);
+    }
+    resolve_folder_scope(&current_dir()?)
+}
+
+/// A served path counted from the run's folder, and the path as served
+/// where the run stands in none or the path lies outside it.
+pub fn counted_from(folder: Option<&FolderScope>, served: &str) -> String {
+    folder
+        .and_then(|f| f.folder_path(served))
+        .unwrap_or_else(|| served.to_string())
+}
+
+/// The leaving-folder refusal (SPEC u290 Contract Surface).
+fn leaving_folder(typed: &str, folder: &FolderScope) -> CliError {
+    CliError::Config {
+        message: format!(
+            "{typed} names no path inside the folder {}; name one counted from it",
+            folder.dir.display()
+        ),
+    }
+}
+
+/// A typed path argument as a path in the repository (SPEC u290
+/// Contract Surface, `repository_argument`): with no folder the typed
+/// value unchanged; inside a folder the folder's path where nothing was
+/// typed and the typed value joined under it otherwise, a value opening
+/// with `/` or holding a `.` or `..` segment refused before any request.
+pub fn repository_argument(
+    folder: Option<&FolderScope>,
+    typed: Option<&str>,
+) -> Result<Option<String>, CliError> {
+    let Some(folder) = folder else {
+        return Ok(typed.map(str::to_string));
+    };
+    let Some(typed) = typed else {
+        return Ok(Some(folder.path.clone()));
+    };
+    if typed.starts_with('/') || typed.split('/').any(|seg| seg == "." || seg == "..") {
+        return Err(leaving_folder(typed, folder));
+    }
+    Ok(Some(folder.repository_path(typed)))
 }
 
 /// The two options the repository-scoped verbs this unit adds carry,
@@ -213,6 +275,9 @@ pub struct RepoScopeArgs {
 pub struct RepoScope {
     pub repo_id: String,
     pub token: Option<String>,
+    /// The scoped folder `resolve_scoped_repo_scope` bound, none on
+    /// every scope `resolve_repo_scope` answers (SPEC u290).
+    pub folder: Option<FolderScope>,
 }
 
 /// Binds the repository and reads the stored credential, pinning the
@@ -230,9 +295,7 @@ pub async fn resolve_repo_scope(
     let repo_id = match args.repo.as_deref() {
         Some(named) => named.to_ascii_lowercase(),
         None => {
-            let current_dir = std::env::current_dir().map_err(|e| CliError::Io {
-                message: format!("could not determine current directory: {e}"),
-            })?;
+            let current_dir = current_dir()?;
             // The ladder's refusal names `--repo`, which both verbs take
             // (SPEC u283, `IdentityRemedy::RepoOption`).
             match resolve_full_or_skip(None, &current_dir, args.if_repo, output)
@@ -253,7 +316,37 @@ pub async fn resolve_repo_scope(
         .flatten();
 
     // 3 — pin the pair.
-    Ok(Some(RepoScope { repo_id, token }))
+    Ok(Some(RepoScope {
+        repo_id,
+        token,
+        folder: None,
+    }))
+}
+
+/// `syns history show REF`'s binding (SPEC u290 Behaviour,
+/// `resolve_scoped_repo_scope`): the repository and the folder bound as
+/// `resolve_read_target` binds them, then the credential read as
+/// `resolve_repo_scope` reads it. `resolve_repo_scope` stands as it
+/// was, so a verb built on it meets the malformed-file refusal inside a
+/// folder.
+pub async fn resolve_scoped_repo_scope(
+    config: &Config,
+    output: &Output,
+    args: &RepoScopeArgs,
+) -> Result<Option<RepoScope>, CliError> {
+    let Some((repo_id, folder)) = bind_repository(args.repo.as_deref(), args.if_repo, output)?
+    else {
+        return Ok(None);
+    };
+    let token = TokenStore::new(config.credentials_path())
+        .read()
+        .ok()
+        .flatten();
+    Ok(Some(RepoScope {
+        repo_id,
+        token,
+        folder,
+    }))
 }
 
 /// Writes the reference on the diagnostic stream outside
@@ -298,6 +391,46 @@ pub fn mark_partial(document: serde_json::Value, refusal: &str) -> serde_json::V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn q3() -> FolderScope {
+        FolderScope {
+            dir: std::path::PathBuf::from("/w/clients/q3"),
+            owner: "alice".into(),
+            name: "work".into(),
+            path: "clients/q3".into(),
+        }
+    }
+
+    // SPEC u290 Contract Surface, `repository_argument`.
+    #[test]
+    fn repository_argument_maps_a_typed_path_under_the_folder() {
+        assert_eq!(repository_argument(None, None).unwrap(), None);
+        assert_eq!(
+            repository_argument(None, Some("../x")).unwrap().as_deref(),
+            Some("../x")
+        );
+        let folder = q3();
+        assert_eq!(
+            repository_argument(Some(&folder), None).unwrap().as_deref(),
+            Some("clients/q3")
+        );
+        assert_eq!(
+            repository_argument(Some(&folder), Some("notes/a.md"))
+                .unwrap()
+                .as_deref(),
+            Some("clients/q3/notes/a.md")
+        );
+        for typed in ["/x", "../x", "a/./b"] {
+            let err = repository_argument(Some(&folder), Some(typed)).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "configuration error: {typed} names no path inside the folder /w/clients/q3; name one counted from it"
+                )
+            );
+            assert_eq!(err.exit_code(), 1);
+        }
+    }
     use serial_test::serial;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

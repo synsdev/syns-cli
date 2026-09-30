@@ -1,12 +1,14 @@
 use crate::auth::token::TokenStore;
-use crate::client::{CommitProvenance, SynsClient};
+use crate::client::{CommitProvenance, SynsClient, VersionEntry, VersionListResponse, undecodable};
+use crate::commands::repos::{LIMIT_MAX, LIMIT_MIN, refuse_limit_outside};
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
 use crate::read::{
-    RepoScopeArgs, refuse_reference_spelling, resolve_repo_scope, version_not_found_refusal,
+    RepoScopeArgs, refuse_reference_spelling, repository_argument, resolve_scoped_repo_scope,
+    version_not_found_refusal,
 };
-use crate::repo::if_repo::resolve_full_or_skip;
+use crate::repo::folder::{FolderScope, current_dir, lies_under, resolve_scoped_or_skip};
 
 /// A version row's provenance cell: the publisher and each asserted
 /// field under its label, where the commit recorded provenance and either
@@ -61,9 +63,9 @@ pub async fn cmd_history_show(
     reference: String,
     args: RepoScopeArgs,
 ) -> Result<(), CliError> {
-    // 1 — resolve the scope, and refuse an empty reference or an
-    // all-digit one below 1 (SPEC u283).
-    let scope = match resolve_repo_scope(config, output, &args).await? {
+    // 1 — resolve the scope, the folder among it (SPEC u290), and refuse
+    // an empty reference or an all-digit one below 1 (SPEC u283).
+    let scope = match resolve_scoped_repo_scope(config, output, &args).await? {
         Some(scope) => scope,
         None => return Ok(()),
     };
@@ -71,18 +73,34 @@ pub async fn cmd_history_show(
 
     // 2 — ask the single-version entry for the reference as typed.
     let client = SynsClient::new(config.server_url())?;
-    let (entry, raw) = client
+    let (mut entry, mut raw) = client
         .get_version(&scope.repo_id, scope.token.as_deref(), &reference)
         .await
         .map_err(|e| e.with_versioned_read_context(version_not_found_refusal(&reference)))?;
 
-    // 3 — render the record, or write the served body.
+    // 3 — inside a folder, narrow the changed paths to those under it,
+    // counted from it; then render the record, or write the served body.
+    if let Some(folder) = &scope.folder {
+        entry.files_changed = counted_paths(folder, &entry.files_changed);
+        if let Some(map) = raw.as_object_mut() {
+            map.insert(
+                "filesChanged".to_string(),
+                serde_json::Value::from(entry.files_changed.clone()),
+            );
+        }
+    }
     if output.is_json() {
         output.json(&raw);
         return Ok(());
     }
     output.table(&["Property", "Value"], version_rows(&entry));
     Ok(())
+}
+
+/// The changed paths lying under the folder, counted from it, in the
+/// order served.
+fn counted_paths(folder: &FolderScope, paths: &[String]) -> Vec<String> {
+    paths.iter().filter_map(|p| folder.folder_path(p)).collect()
 }
 
 /// The version block (SPEC u272 Behaviour, `cmd_history_show` 3): the
@@ -111,19 +129,102 @@ pub(crate) fn version_rows(entry: &crate::client::VersionEntry) -> Vec<Vec<Strin
     rows
 }
 
+/// The history count line (SPEC u290 Contract Surface), written to the
+/// diagnostic stream after a rendered block wherever `total` exceeds the
+/// rows shown, and withheld otherwise and under `--json`.
+fn write_count_line(output: &Output, shown: usize, total: u32) {
+    if !output.is_json() && total as usize > shown {
+        eprintln!("Showing {shown} of {total} versions.");
+    }
+}
+
+/// `CS-history-blk-versions` over a version list — the whole list's and
+/// a folder's page alike, `Files` counting each entry's changed paths.
+fn render_version_list(output: &Output, entries: &[VersionEntry]) {
+    let rows = entries
+        .iter()
+        .map(|entry| {
+            let n = entry.files_changed.len();
+            vec![
+                entry.version.to_string(),
+                entry.sha[..entry.sha.len().min(8)].to_string(),
+                entry.message.clone(),
+                entry.author.clone(),
+                entry.created_at.clone(),
+                if n == 1 {
+                    "1 file".to_string()
+                } else {
+                    format!("{n} files")
+                },
+                provenance_cell(entry.provenance.as_ref(), &entry.author),
+            ]
+        })
+        .collect();
+    output.table(
+        &[
+            "Version",
+            "SHA",
+            "Message",
+            "Author",
+            "Date",
+            "Files",
+            "Provenance",
+        ],
+        rows,
+    );
+}
+
+/// A folder's history (SPEC u290 Behaviour, `folder_history`): the one
+/// page `EP-versions` answers asked with `path` the folder at `limit`
+/// and `offset`, reading no whole version list (`D-103`). A page on which
+/// a version names no changed path equal to the folder or under it is
+/// refused as undecodable, as a server dropping the query answers.
+pub async fn folder_history(
+    client: &SynsClient,
+    repo_id: &str,
+    token: Option<&str>,
+    folder: &str,
+    limit: u32,
+    offset: u32,
+) -> Result<VersionListResponse, CliError> {
+    // 1 — the one page.
+    let (page, _raw) = client
+        .list_versions(repo_id, token, limit, offset, Some(folder))
+        .await?;
+
+    // 2 — every version on it changed the folder.
+    if let Some(stray) = page.data.iter().find(|entry| {
+        !entry
+            .files_changed
+            .iter()
+            .any(|p| p == folder || lies_under(p, folder))
+    }) {
+        return Err(undecodable(
+            reqwest::StatusCode::OK,
+            format!("version {} changed no path under {folder}", stray.version),
+        ));
+    }
+    Ok(page)
+}
+
+/// `syns history` (SPEC u290 Behaviour, `cmd_history`): the whole
+/// version list, a file's history, or a folder's, each at `--limit` and
+/// `--offset`.
 pub async fn cmd_history(
     config: &Config,
     output: &Output,
     file: Option<String>,
     limit: u32,
+    offset: u32,
     if_repo: bool,
 ) -> Result<(), CliError> {
-    let current_dir = std::env::current_dir().map_err(|e| CliError::Io {
-        message: format!("could not determine current directory: {e}"),
-    })?;
-    let (owner, name) = match resolve_full_or_skip(None, &current_dir, if_repo, output)? {
-        Some(pair) => pair,
-        None => return Ok(()),
+    // 1 — the page bound, before any request.
+    refuse_limit_outside(limit, LIMIT_MIN, LIMIT_MAX)?;
+
+    // 2 — the repository and the folder.
+    let Some((owner, name, folder)) = resolve_scoped_or_skip(&current_dir()?, if_repo, output)?
+    else {
+        return Ok(());
     };
     let repo_id = format!("{owner}/{name}");
     let token = TokenStore::new(config.credentials_path())
@@ -132,80 +233,102 @@ pub async fn cmd_history(
         .flatten();
     let client = SynsClient::new(config.server_url())?;
 
-    if let Some(path) = file {
+    // 3 — the path to answer; with none, the whole version list.
+    let typed = file.as_deref().map(|f| f.trim_end_matches('/').to_string());
+    let Some(path) = repository_argument(folder.as_ref(), typed.as_deref())? else {
         let (response, raw) = client
-            .get_file_history(&repo_id, token.as_deref(), &path, limit)
+            .list_versions(&repo_id, token.as_deref(), limit, offset, None)
             .await?;
-
         if output.is_json() {
             output.json(&raw);
         } else {
-            let rows = response
-                .data
-                .iter()
-                .map(|entry| {
-                    // A removal entry — the commit that removed the path —
-                    // serves neither a blob hash nor content.
-                    let message = if entry.blob_sha.is_none() && entry.content.is_none() {
-                        format!("(removed) {}", entry.message)
-                    } else {
-                        entry.message.clone()
-                    };
-                    vec![
-                        entry.sha[..entry.sha.len().min(8)].to_string(),
-                        message,
-                        entry.author.clone(),
-                        entry.created_at.clone(),
-                        provenance_cell(entry.provenance.as_ref(), &entry.author),
-                    ]
-                })
-                .collect();
-            output.table(&["SHA", "Message", "Author", "Date", "Provenance"], rows);
+            render_version_list(output, &response.data);
+            write_count_line(output, response.data.len(), response.total);
         }
-    } else {
-        let (response, raw) = client
-            .list_versions(&repo_id, token.as_deref(), limit, 0)
-            .await?;
+        return Ok(());
+    };
 
-        if output.is_json() {
-            output.json(&raw);
-        } else {
-            let rows = response
-                .data
-                .iter()
-                .map(|entry| {
-                    let n = entry.files_changed.len();
-                    vec![
-                        entry.version.to_string(),
-                        entry.sha[..entry.sha.len().min(8)].to_string(),
-                        entry.message.clone(),
-                        entry.author.clone(),
-                        entry.created_at.clone(),
-                        if n == 1 {
-                            "1 file".to_string()
-                        } else {
-                            format!("{n} files")
-                        },
-                        provenance_cell(entry.provenance.as_ref(), &entry.author),
-                    ]
-                })
-                .collect();
-            output.table(
-                &[
-                    "Version",
-                    "SHA",
-                    "Message",
-                    "Author",
-                    "Date",
-                    "Files",
-                    "Provenance",
-                ],
-                rows,
-            );
+    // 4 — a path typed as `--file` naming a file answers its history.
+    if file.is_some() {
+        let (response, mut raw) = client
+            .get_file_history(&repo_id, token.as_deref(), &path, limit, offset)
+            .await?;
+        if response.total > 0 {
+            if output.is_json() {
+                if let Some(folder) = &folder {
+                    rebase_file_history(folder, &mut raw);
+                }
+                output.json(&raw);
+            } else {
+                render_file_history(output, &response.data);
+                write_count_line(output, response.data.len(), response.total);
+            }
+            return Ok(());
         }
     }
 
+    // 5 — every other path is a folder's.
+    let mut page =
+        folder_history(&client, &repo_id, token.as_deref(), &path, limit, offset).await?;
+
+    // 6 — the paths counted from the folder inside one, then the block or
+    // the folder history document.
+    if let Some(folder) = &folder {
+        for entry in &mut page.data {
+            entry.files_changed = counted_paths(folder, &entry.files_changed);
+        }
+    }
+    if output.is_json() {
+        output.json(&serde_json::json!({
+            "data": page.data,
+            "total": page.total,
+            "limit": page.limit,
+            "offset": page.offset,
+        }));
+    } else {
+        render_version_list(output, &page.data);
+        write_count_line(output, page.data.len(), page.total);
+    }
     Ok(())
+}
+
+/// Each served entry's `diff` with its header paths counted from the
+/// folder, every other key as served.
+fn rebase_file_history(folder: &FolderScope, raw: &mut serde_json::Value) {
+    let Some(entries) = raw.get_mut("data").and_then(|d| d.as_array_mut()) else {
+        return;
+    };
+    for entry in entries {
+        if let Some(diff) = entry.get_mut("diff")
+            && let Some(text) = diff.as_str()
+        {
+            *diff = serde_json::Value::from(folder.rebase_diff_headers(text));
+        }
+    }
+}
+
+/// `CS-history-blk-versions` under `--file`, as `u24` renders it.
+fn render_file_history(output: &Output, entries: &[crate::client::FileVersionEntry]) {
+    let rows = entries
+        .iter()
+        .map(|entry| {
+            // A removal entry — the commit that removed the path —
+            // serves neither a blob hash nor content.
+            let message = if entry.blob_sha.is_none() && entry.content.is_none() {
+                format!("(removed) {}", entry.message)
+            } else {
+                entry.message.clone()
+            };
+            vec![
+                entry.sha[..entry.sha.len().min(8)].to_string(),
+                message,
+                entry.author.clone(),
+                entry.created_at.clone(),
+                provenance_cell(entry.provenance.as_ref(), &entry.author),
+            ]
+        })
+        .collect();
+    output.table(&["SHA", "Message", "Author", "Date", "Provenance"], rows);
 }
 
 #[cfg(test)]
@@ -300,7 +423,7 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_history(&config, &output, None, 50, false).await;
+        let result = cmd_history(&config, &output, None, 50, 0, false).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
@@ -358,8 +481,15 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result =
-            cmd_history(&config, &output, Some("src/main.ts".to_string()), 50, false).await;
+        let result = cmd_history(
+            &config,
+            &output,
+            Some("src/main.ts".to_string()),
+            50,
+            0,
+            false,
+        )
+        .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
@@ -394,7 +524,7 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_history(&config, &output, None, 50, true).await;
+        let result = cmd_history(&config, &output, None, 50, 0, true).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
@@ -411,7 +541,7 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_history(&config, &output, None, 50, true).await;
+        let result = cmd_history(&config, &output, None, 50, 0, true).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
@@ -432,7 +562,7 @@ mod tests {
 
         let client = SynsClient::new(&mock_server.uri()).unwrap();
         let (typed, raw) = client
-            .list_versions("alice/my-project", None, 50, 0)
+            .list_versions("alice/my-project", None, 50, 0, None)
             .await
             .unwrap();
 
@@ -465,7 +595,7 @@ mod tests {
 
         let client = SynsClient::new(&mock_server.uri()).unwrap();
         let (typed, raw) = client
-            .get_file_history("alice/my-project", None, "src/main.ts", 50)
+            .get_file_history("alice/my-project", None, "src/main.ts", 50, 0)
             .await
             .unwrap();
 
@@ -537,7 +667,7 @@ mod tests {
 
         let client = SynsClient::new(&mock_server.uri()).unwrap();
         let (typed, raw) = client
-            .get_file_history("alice/my-project", None, "CLAUDE.md", 3)
+            .get_file_history("alice/my-project", None, "CLAUDE.md", 3, 0)
             .await
             .unwrap();
 

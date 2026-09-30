@@ -1,9 +1,10 @@
 use crate::auth::token::TokenStore;
-use crate::client::{DiffStatus, SynsClient};
+use crate::client::{DiffStatus, SynsClient, undecodable};
+use crate::commands::history::folder_history;
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
-use crate::repo::if_repo::resolve_full_or_skip;
+use crate::repo::folder::{FolderScope, current_dir, resolve_scoped_or_skip};
 use console::style;
 
 fn style_status(status: &DiffStatus) -> console::StyledObject<&'static str> {
@@ -11,8 +12,54 @@ fn style_status(status: &DiffStatus) -> console::StyledObject<&'static str> {
         DiffStatus::Added => style("added").green(),
         DiffStatus::Modified => style("modified").yellow(),
         DiffStatus::Deleted => style("deleted").red(),
+        DiffStatus::Renamed => style("renamed").cyan(),
         DiffStatus::Unknown => style("unknown").dim(),
     }
+}
+
+/// One served diff entry as the folder sees it (SPEC u290 Contract
+/// Surface, the scoped diff entry), none where it changed nothing under
+/// the folder.
+fn scoped_entry(folder: &FolderScope, entry: &serde_json::Value) -> Option<serde_json::Value> {
+    let path = entry.get("path").and_then(|p| p.as_str())?;
+    let old_path = entry.get("oldPath").and_then(|p| p.as_str());
+    let renamed = entry.get("status").and_then(|s| s.as_str()) == Some("renamed");
+    let mut kept = entry.clone();
+    let map = kept.as_object_mut()?;
+    let rebase = |map: &mut serde_json::Map<String, serde_json::Value>| {
+        if let Some(text) = map.get("diff").and_then(|d| d.as_str()) {
+            let rebased = folder.rebase_diff_headers(text);
+            map.insert("diff".to_string(), serde_json::Value::from(rebased));
+        }
+    };
+    match (old_path, renamed) {
+        (None, _) => {
+            map.insert("path".to_string(), folder.folder_path(path)?.into());
+            rebase(map);
+        }
+        (Some(old), true) => match (folder.folder_path(path), folder.folder_path(old)) {
+            (Some(new), Some(old)) => {
+                map.insert("path".to_string(), new.into());
+                map.insert("oldPath".to_string(), old.into());
+                rebase(map);
+            }
+            (Some(new), None) => {
+                map.insert("path".to_string(), new.into());
+                map.remove("oldPath");
+                map.insert("status".to_string(), "added".into());
+                map.insert("diff".to_string(), serde_json::Value::Null);
+            }
+            (None, Some(old)) => {
+                map.insert("path".to_string(), old.into());
+                map.remove("oldPath");
+                map.insert("status".to_string(), "deleted".into());
+                map.insert("diff".to_string(), serde_json::Value::Null);
+            }
+            (None, None) => return None,
+        },
+        (Some(_), false) => return None,
+    }
+    Some(kept)
 }
 
 pub async fn cmd_diff(
@@ -22,12 +69,10 @@ pub async fn cmd_diff(
     to: Option<String>,
     if_repo: bool,
 ) -> Result<(), CliError> {
-    let current_dir = std::env::current_dir().map_err(|e| CliError::Io {
-        message: format!("could not determine current directory: {e}"),
-    })?;
-    let (owner, name) = match resolve_full_or_skip(None, &current_dir, if_repo, output)? {
-        Some(pair) => pair,
-        None => return Ok(()),
+    // 1 — the repository and the folder (SPEC u290).
+    let Some((owner, name, folder)) = resolve_scoped_or_skip(&current_dir()?, if_repo, output)?
+    else {
+        return Ok(());
     };
     let repo_id = format!("{owner}/{name}");
     let token = TokenStore::new(config.credentials_path())
@@ -36,11 +81,32 @@ pub async fn cmd_diff(
         .flatten();
     let client = SynsClient::new(config.server_url())?;
 
-    let (from_val, to_val) = match (from, to) {
-        (Some(f), Some(t)) => (f, t),
-        (None, None) => {
+    // 2 — the endpoints.
+    let (from_val, to_val) = match (from, to, &folder) {
+        (Some(f), Some(t), _) => (f, t),
+        // Inside a folder with neither endpoint, the newest version that
+        // changed the folder against the one numbered below it.
+        (None, None, Some(folder)) => {
+            let page =
+                folder_history(&client, &repo_id, token.as_deref(), &folder.path, 1, 0).await?;
+            match page.data.first() {
+                Some(newest) if newest.version > 1 => {
+                    ((newest.version - 1).to_string(), newest.version.to_string())
+                }
+                _ => {
+                    return Err(CliError::Config {
+                        message: format!(
+                            "no version of {} changed {} beyond its first \u{2014} name --from and --to",
+                            folder.holder(),
+                            folder.path
+                        ),
+                    });
+                }
+            }
+        }
+        (None, None, None) => {
             let (response, _raw) = client
-                .list_versions(&repo_id, token.as_deref(), 2, 0)
+                .list_versions(&repo_id, token.as_deref(), 2, 0, None)
                 .await?;
             if response.data.len() < 2 {
                 return Err(CliError::Api {
@@ -61,9 +127,29 @@ pub async fn cmd_diff(
         }
     };
 
-    let (response, raw) = client
+    // 3 — the difference between the two, whatever paths either changed.
+    let (mut response, mut raw) = client
         .get_diff(&repo_id, token.as_deref(), &from_val, &to_val)
         .await?;
+
+    // 4 — inside a folder, the scoped diff entries alone.
+    if let Some(folder) = &folder {
+        let scoped: Vec<serde_json::Value> = raw
+            .get("files")
+            .and_then(|f| f.as_array())
+            .map(|files| {
+                files
+                    .iter()
+                    .filter_map(|entry| scoped_entry(folder, entry))
+                    .collect()
+            })
+            .unwrap_or_default();
+        response.files = serde_json::from_value(serde_json::Value::Array(scoped.clone()))
+            .map_err(|e| undecodable(reqwest::StatusCode::OK, e))?;
+        if let Some(map) = raw.as_object_mut() {
+            map.insert("files".to_string(), serde_json::Value::Array(scoped));
+        }
+    }
 
     if output.is_json() {
         output.json(&raw);

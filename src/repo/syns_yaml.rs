@@ -16,6 +16,88 @@ struct SynsYaml {
     /// carrying them unchanged, extra keys being tolerated.
     #[serde(default)]
     checks: Vec<String>,
+    /// The folder form's key (SPEC u290 Contract Surface, the folder
+    /// form). Decoded only so a file carrying it beside `owner` and
+    /// `name` is refused as malformed rather than read as the root form.
+    #[serde(default)]
+    holder: Option<serde_yaml::Value>,
+}
+
+/// The refusal a file mixing the two forms takes (SPEC u290 Contract
+/// Surface, the folder form): `holder` beside `owner` or `name`.
+const MIXED_FORMS: &str = "holder cannot stand beside owner or name";
+
+/// The root form's parse of one identity file's text: the missing-field
+/// error a folder form raises stands as it did, and a file carrying
+/// `holder` beside `owner` and `name` is refused as mixing the forms.
+fn parse_root_text(contents: &str) -> Result<SynsYaml, String> {
+    let yaml: SynsYaml = serde_yaml::from_str(contents).map_err(|err| err.to_string())?;
+    if yaml.holder.is_some() {
+        return Err(MIXED_FORMS.to_string());
+    }
+    Ok(yaml)
+}
+
+/// One identity file read as the form it is written in (SPEC u290
+/// Contract Surface, the folder form): the root form carrying `owner`
+/// and `name`, any `path` key ignored, or the folder form carrying
+/// `holder` and `path` as written. The `holder` key tells them apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentityForm {
+    Root { owner: String, name: String },
+    Folder { holder: String, path: String },
+}
+
+#[derive(Deserialize)]
+struct FolderYaml {
+    holder: String,
+    path: String,
+}
+
+fn parse_form_text(contents: &str) -> Result<IdentityForm, String> {
+    let value: serde_yaml::Value = serde_yaml::from_str(contents).map_err(|err| err.to_string())?;
+    if value.get("holder").is_none() {
+        let yaml = parse_root_text(contents)?;
+        return Ok(IdentityForm::Root {
+            owner: yaml.owner,
+            name: yaml.name,
+        });
+    }
+    if value.get("owner").is_some() || value.get("name").is_some() {
+        return Err(MIXED_FORMS.to_string());
+    }
+    let folder: FolderYaml = serde_yaml::from_value(value).map_err(|err| err.to_string())?;
+    Ok(IdentityForm::Folder {
+        holder: folder.holder,
+        path: folder.path,
+    })
+}
+
+fn invalid(reason: impl std::fmt::Display) -> CliError {
+    CliError::Io {
+        message: format!("invalid .syns.yaml: {reason}"),
+    }
+}
+
+fn read_contents(file_path: &Path) -> Result<String, CliError> {
+    std::fs::read_to_string(file_path).map_err(|err| CliError::Io {
+        message: format!("could not read .syns.yaml: {err}"),
+    })
+}
+
+/// The identity file at `file_path` read as either form, raw and then by
+/// its local side where it carries collision markers, as
+/// `read_identity_by_local_side` reads it, the raw parse error raised
+/// where both fail.
+pub fn read_identity_form(file_path: &Path) -> Result<IdentityForm, CliError> {
+    let contents = read_contents(file_path)?;
+    match parse_form_text(&contents) {
+        Ok(form) => Ok(form),
+        Err(raw) => match local_side_of_collision(&contents) {
+            Some(local) => parse_form_text(&local).map_err(|_| invalid(&raw)),
+            None => Err(invalid(raw)),
+        },
+    }
 }
 
 /// The required checks the identity file standing at `root` declares,
@@ -28,7 +110,7 @@ pub fn read_required_checks(root: &Path) -> Result<Vec<String>, CliError> {
     Ok(parse_syns_yaml(&file_path)?.checks)
 }
 
-fn find_syns_yaml(path: &Path) -> Option<PathBuf> {
+pub(crate) fn find_syns_yaml(path: &Path) -> Option<PathBuf> {
     let mut current = Some(path);
     while let Some(dir) = current {
         let candidate = dir.join(SYNS_YAML_FILENAME);
@@ -41,13 +123,8 @@ fn find_syns_yaml(path: &Path) -> Option<PathBuf> {
 }
 
 fn parse_syns_yaml(file_path: &Path) -> Result<SynsYaml, CliError> {
-    let contents = std::fs::read_to_string(file_path).map_err(|err| CliError::Io {
-        message: format!("could not read .syns.yaml: {err}"),
-    })?;
-
-    serde_yaml::from_str(&contents).map_err(|err| CliError::Io {
-        message: format!("invalid .syns.yaml: {err}"),
-    })
+    let contents = read_contents(file_path)?;
+    parse_root_text(&contents).map_err(invalid)
 }
 
 pub fn read_syns_yaml(path: &Path) -> Result<Option<RepoIdentity>, CliError> {
@@ -158,7 +235,7 @@ fn read_identity_by_local_side(file_path: &Path) -> Result<SynsYaml, CliError> {
                 message: format!("could not read .syns.yaml: {e}"),
             })?;
             match local_side_of_collision(&contents) {
-                Some(local) => serde_yaml::from_str::<SynsYaml>(&local).map_err(|_| err),
+                Some(local) => parse_root_text(&local).map_err(|_| err),
                 None => Err(err),
             }
         }
@@ -518,6 +595,96 @@ mod tests {
             fs::read_to_string(dir.path().join(".syns.yaml")).unwrap(),
             markers
         );
+    }
+
+    // SPEC u290 Contract Surface, the folder form: a file carrying
+    // `holder` beside `owner` and `name` is malformed under every reader
+    // of the identity file.
+    #[test]
+    fn a_file_mixing_both_forms_is_refused_by_every_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(
+            dir.path().join(".syns.yaml"),
+            "owner: alice\nname: work\nholder: alice/work\npath: x\n",
+        )
+        .unwrap();
+
+        let refused = |result: Result<(), CliError>| match result {
+            Err(CliError::Io { message }) => {
+                assert!(message.starts_with("invalid .syns.yaml: "), "{message}")
+            }
+            other => panic!("expected the malformed-file error, got {other:?}"),
+        };
+        refused(read_syns_yaml(&sub).map(|_| ()));
+        refused(find_repo_root_for(&sub, "alice", "work").map(|_| ()));
+        refused(read_required_checks(dir.path()).map(|_| ()));
+        refused(nearest_identity(&sub).map(|_| ()));
+        refused(read_identity_form(&dir.path().join(".syns.yaml")).map(|_| ()));
+    }
+
+    #[test]
+    fn the_root_readers_keep_refusing_the_folder_form_as_missing_its_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".syns.yaml"),
+            "holder: alice/work\npath: x\n",
+        )
+        .unwrap();
+        match nearest_identity(dir.path()) {
+            Err(CliError::Io { message }) => {
+                assert!(message.starts_with("invalid .syns.yaml: "), "{message}");
+                assert!(message.contains("owner"), "{message}");
+            }
+            other => panic!("expected the malformed-file error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_identity_form_tells_the_two_forms_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".syns.yaml");
+        fs::write(&file, "owner: Alice\nname: work\npath: ignored\n").unwrap();
+        assert_eq!(
+            read_identity_form(&file).unwrap(),
+            IdentityForm::Root {
+                owner: "Alice".into(),
+                name: "work".into()
+            }
+        );
+
+        fs::write(
+            &file,
+            "holder: alice/work\npath: clients/vela/q3-board\nextra: kept\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_identity_form(&file).unwrap(),
+            IdentityForm::Folder {
+                holder: "alice/work".into(),
+                path: "clients/vela/q3-board".into()
+            }
+        );
+
+        fs::write(
+            &file,
+            "<<<<<<< local\nholder: alice/work\npath: q3\n=======\nowner: bob\nname: other\n>>>>>>> remote\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_identity_form(&file).unwrap(),
+            IdentityForm::Folder {
+                holder: "alice/work".into(),
+                path: "q3".into()
+            }
+        );
+
+        fs::write(&file, "holder: alice/work\n").unwrap();
+        assert!(matches!(
+            read_identity_form(&file),
+            Err(CliError::Io { .. })
+        ));
     }
 
     #[test]

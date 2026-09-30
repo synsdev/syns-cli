@@ -11,7 +11,8 @@ use crate::output::Output;
 use crate::push::collector::is_text;
 use crate::push::hash::blob_sha1;
 use crate::read::{
-    ReadOptions, ResolvedRef, read_not_found, report_reference, resolve_read_target,
+    ReadOptions, ResolvedRef, bind_read_folder, read_not_found, report_reference,
+    repository_argument, resolve_read_target,
 };
 
 /// The generic byte type, which a `--json` document never names.
@@ -90,7 +91,13 @@ pub async fn cmd_cat(
     path: String,
     opts: ReadOptions,
 ) -> Result<(), CliError> {
-    // 1 — resolve the target.
+    // 1 — bind the folder and map the positional under it (SPEC u290);
+    // the positional as typed names the path in every refusal and in
+    // the document.
+    let folder = bind_read_folder(&opts)?;
+    let mapped = repository_argument(folder.as_ref(), Some(&path))?.unwrap_or_default();
+
+    // 2 — resolve the target.
     let Some(target) = resolve_read_target(config, output, &opts).await? else {
         return Ok(());
     };
@@ -113,7 +120,7 @@ pub async fn cmd_cat(
         .get_raw(
             &target.repo_id,
             target.token.as_deref(),
-            &path,
+            &mapped,
             Some(&version_ref),
             None,
         )

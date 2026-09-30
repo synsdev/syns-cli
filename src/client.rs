@@ -54,6 +54,7 @@ pub enum DiffStatus {
     Added,
     Modified,
     Deleted,
+    Renamed,
     #[serde(other)]
     Unknown,
 }
@@ -431,7 +432,10 @@ pub struct VersionListResponse {
     pub offset: u32,
 }
 
-#[derive(Deserialize, Debug)]
+/// One version as `EP-versions` and `EP-get-version` serve it
+/// (`RepoVersion`), written back out under the same field names — the
+/// folder history document carries each one whole (SPEC u290).
+#[derive(Deserialize, Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct VersionEntry {
     pub version: u32,
@@ -472,6 +476,10 @@ pub struct DiffResponse {
 #[serde(rename_all = "camelCase")]
 pub struct DiffEntry {
     pub path: String,
+    /// The path a kept rename left, none on every other entry (SPEC
+    /// u290, the client models).
+    #[serde(default)]
+    pub old_path: Option<String>,
     pub status: DiffStatus,
     pub diff: Option<String>,
 }
@@ -1042,7 +1050,7 @@ async fn check_response(response: reqwest::Response) -> Result<reqwest::Response
     Ok(response)
 }
 
-fn undecodable(status: reqwest::StatusCode, e: impl std::fmt::Display) -> CliError {
+pub(crate) fn undecodable(status: reqwest::StatusCode, e: impl std::fmt::Display) -> CliError {
     CliError::Api {
         status: Some(status.as_u16()),
         error: format!("invalid response body: {e}"),
@@ -1394,6 +1402,7 @@ impl SynsClient {
         token: Option<&str>,
         path: &str,
         limit: u32,
+        offset: u32,
     ) -> Result<(FileHistoryResponse, serde_json::Value), CliError> {
         let url = format!(
             "{}/api/v1/repos/{}/files/{}/history",
@@ -1401,7 +1410,10 @@ impl SynsClient {
             repo_id,
             encode_path_segments(path)
         );
-        let mut req = self.client.get(&url).query(&[("limit", limit.to_string())]);
+        let mut req = self
+            .client
+            .get(&url)
+            .query(&[("limit", limit.to_string()), ("offset", offset.to_string())]);
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
@@ -1415,12 +1427,16 @@ impl SynsClient {
         token: Option<&str>,
         limit: u32,
         offset: u32,
+        path: Option<&str>,
     ) -> Result<(VersionListResponse, serde_json::Value), CliError> {
         let url = format!("{}/api/v1/repos/{}/versions", self.base_url, repo_id);
         let mut req = self
             .client
             .get(&url)
             .query(&[("limit", limit.to_string()), ("offset", offset.to_string())]);
+        if let Some(p) = path {
+            req = req.query(&[("path", p)]);
+        }
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
@@ -3963,5 +3979,87 @@ mod u280_transport_tests {
         assert_eq!(std::fs::read(&dest).unwrap(), BYTES);
         assert_eq!(staged.sha, blob_sha1(BYTES));
         assert_eq!(staged.etag.as_deref(), Some(blob_sha1(BYTES).as_str()));
+    }
+
+    // SPEC u290, the client models: the file history is asked at an
+    // offset, and the version list under a path where one stands.
+    #[tokio::test]
+    async fn the_history_windows_send_their_offset_and_path() {
+        use wiremock::matchers::{query_param, query_param_is_missing};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/r/files/a.md/history"))
+            .and(query_param("limit", "5"))
+            .and(query_param("offset", "5"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [], "total": 12, "limit": 5, "offset": 5,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/r/versions"))
+            .and(query_param("path", "q3 plan"))
+            .and(query_param("limit", "1"))
+            .and(query_param("offset", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [], "total": 3, "limit": 1, "offset": 2,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/r/versions"))
+            .and(query_param_is_missing("path"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [], "total": 9, "limit": 1, "offset": 0,
+            })))
+            .mount(&server)
+            .await;
+        let client = SynsClient::new(&server.uri()).unwrap();
+
+        let (file, _) = client
+            .get_file_history("alice/r", None, "a.md", 5, 5)
+            .await
+            .unwrap();
+        assert_eq!(file.total, 12);
+        let (folder, _) = client
+            .list_versions("alice/r", None, 1, 2, Some("q3 plan"))
+            .await
+            .unwrap();
+        assert_eq!(folder.total, 3);
+        let (whole, _) = client
+            .list_versions("alice/r", None, 1, 0, None)
+            .await
+            .unwrap();
+        assert_eq!(whole.total, 9);
+    }
+
+    #[test]
+    fn a_renamed_entry_decodes_both_its_paths() {
+        let entry: DiffEntry = serde_json::from_value(serde_json::json!({
+            "path": "b.md", "oldPath": "a.md", "status": "renamed", "diff": null,
+        }))
+        .unwrap();
+        assert_eq!(entry.old_path.as_deref(), Some("a.md"));
+        assert_eq!(entry.status, DiffStatus::Renamed);
+        let plain: DiffEntry = serde_json::from_value(serde_json::json!({
+            "path": "b.md", "status": "modified", "diff": "d",
+        }))
+        .unwrap();
+        assert_eq!(plain.old_path, None);
+    }
+
+    #[test]
+    fn a_served_version_is_written_back_with_every_key_it_was_served_with() {
+        let served = serde_json::json!({
+            "version": 5, "sha": "h5", "parentSha": "p4", "message": "m",
+            "messageBody": "b", "author": "alice", "createdAt": "2026-01-01T00:00:00Z",
+            "filesChanged": ["a.md"],
+            "provenance": {
+                "publisher": "alice", "integration": "bb", "run": "r1",
+                "trigger": null, "taskRef": null,
+            },
+        });
+        let entry: VersionEntry = serde_json::from_value(served.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&entry).unwrap(), served);
     }
 }

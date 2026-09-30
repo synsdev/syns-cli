@@ -3,8 +3,8 @@ use crate::config::Config;
 use crate::errors::{CliError, partial_truncated_tree};
 use crate::output::Output;
 use crate::read::{
-    ReadOptions, mark_partial, read_not_found, report_reference, resolve_read_target,
-    with_reference,
+    ReadOptions, bind_read_folder, counted_from, mark_partial, read_not_found, report_reference,
+    repository_argument, resolve_read_target, with_reference,
 };
 
 /// `syns ls [PATH]` — the listing's columns and its ordering stand as
@@ -17,19 +17,28 @@ pub async fn cmd_ls(
     recursive: bool,
     opts: ReadOptions,
 ) -> Result<(), CliError> {
-    // 1 — resolve the target.
+    // 1 — bind the folder and map the path positional under it (SPEC
+    // u290), the typed path kept for every not-found refusal and the
+    // folder's recorded path standing for it where nothing was typed.
+    let folder = bind_read_folder(&opts)?;
+    let mapped = repository_argument(folder.as_ref(), path.as_deref())?;
+    let named = path
+        .clone()
+        .or_else(|| folder.as_ref().map(|f| f.path.clone()));
+
+    // 2 — resolve the target.
     let Some(target) = resolve_read_target(config, output, &opts).await? else {
         return Ok(());
     };
     let client = SynsClient::new(config.server_url())?;
 
-    // 2 — read the tree at that reference under the path positional.
+    // 3 — read the tree at that reference under the mapped path.
     let version_ref = target.version_ref();
-    let (mut response, raw) = match client
+    let (mut response, mut raw) = match client
         .get_tree(
             &target.repo_id,
             target.token.as_deref(),
-            path.as_deref(),
+            mapped.as_deref(),
             recursive,
             Some(&version_ref),
         )
@@ -37,7 +46,7 @@ pub async fn cmd_ls(
     {
         Ok(tuple) => tuple,
         Err(e) => {
-            if let Some(p) = path.as_ref() {
+            if let Some(p) = named.as_ref() {
                 if opts.version.is_some() {
                     return Err(read_not_found(e, &opts, &target.reference, p));
                 }
@@ -48,6 +57,21 @@ pub async fn cmd_ls(
             return Err(e);
         }
     };
+
+    // 4 — every entry's path counted from the folder, in the listing and
+    // in the served body alike.
+    let scope = target.folder.as_ref();
+    for entry in &mut response.entries {
+        entry.path = counted_from(scope, &entry.path);
+    }
+    if let Some(entries) = raw.get_mut("entries").and_then(|e| e.as_array_mut()) {
+        for entry in entries {
+            if let Some(served) = entry.get("path").and_then(|p| p.as_str()) {
+                let counted = counted_from(scope, served);
+                entry["path"] = serde_json::Value::from(counted);
+            }
+        }
+    }
 
     response.entries.sort_by(|a, b| {
         let type_order = |t: &EntryType| match t {
@@ -66,7 +90,7 @@ pub async fn cmd_ls(
             })
     });
 
-    // 3 — render the listing, or the served body carrying the reference
+    // Render the listing, or the served body carrying the reference
     // and, where the tree arrived truncated, the partial mark.
     let truncated = response.truncated;
     let body = with_reference(raw, &target.reference);
@@ -98,7 +122,7 @@ pub async fn cmd_ls(
             })
             .collect();
         output.table(&["Name", "Type", "Size"], rows);
-        // 4 — report the reference.
+        // Report the reference.
         report_reference(output, &target.reference);
     } else if !truncated {
         output.json(&body);

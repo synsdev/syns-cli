@@ -13,7 +13,8 @@ use crate::config::Config;
 use crate::errors::{CliError, partial_truncated_tree};
 use crate::output::Output;
 use crate::read::{
-    ReadOptions, mark_partial, read_not_found, report_reference, resolve_read_target,
+    ReadOptions, bind_read_folder, counted_from, mark_partial, read_not_found, report_reference,
+    repository_argument, resolve_read_target,
 };
 
 /// Compiles one pattern against a whole repository-relative path:
@@ -39,8 +40,14 @@ pub async fn cmd_glob(
     path: Option<String>,
     opts: ReadOptions,
 ) -> Result<(), CliError> {
-    // 1 — compile the pattern, before any request.
+    // 1 — compile the pattern, then bind the folder and map `--path`
+    // under it (SPEC u290), all before any request.
     let matcher = compile_whole_path(&pattern)?;
+    let folder = bind_read_folder(&opts)?;
+    let mapped = repository_argument(folder.as_ref(), path.as_deref())?;
+    let named = path
+        .clone()
+        .or_else(|| folder.as_ref().map(|f| f.path.clone()));
 
     // 2 — resolve the target.
     let Some(target) = resolve_read_target(config, output, &opts).await? else {
@@ -54,7 +61,7 @@ pub async fn cmd_glob(
         .get_tree(
             &target.repo_id,
             target.token.as_deref(),
-            path.as_deref(),
+            mapped.as_deref(),
             true,
             Some(&version_ref),
         )
@@ -62,7 +69,7 @@ pub async fn cmd_glob(
     {
         Ok(tuple) => tuple,
         Err(e) => {
-            if let Some(p) = path.as_ref() {
+            if let Some(p) = named.as_ref() {
                 if opts.version.is_some() {
                     return Err(read_not_found(e, &opts, &target.reference, p));
                 }
@@ -74,11 +81,17 @@ pub async fn cmd_glob(
         }
     };
 
-    // 4 — keep every entry of kind file whose whole path the pattern
+    // 4 — count every entry's path from the folder (SPEC u290), keep
+    // every entry of kind file whose whole counted path the pattern
     // matches, and 5 — order the kept set by ascending path.
+    let scope = target.folder.as_ref();
     let mut matches: Vec<_> = response
         .entries
         .into_iter()
+        .map(|mut e| {
+            e.path = counted_from(scope, &e.path);
+            e
+        })
         .filter(|e| e.entry_type == EntryType::File && matcher.is_match(&e.path))
         .collect();
     matches.sort_by(|a, b| a.path.cmp(&b.path));

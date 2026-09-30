@@ -22,7 +22,8 @@ use crate::errors::{CliError, partial_truncated_tree, partial_unread_paths};
 use crate::output::Output;
 use crate::read::cache::{BlobCache, BlobContent};
 use crate::read::{
-    ReadOptions, ReadTarget, mark_partial, read_not_found, report_reference, resolve_read_target,
+    ReadOptions, ReadTarget, bind_read_folder, counted_from, mark_partial, read_not_found,
+    report_reference, repository_argument, resolve_read_target,
 };
 
 /// The grep fan-out cap: the count of kept paths whose content is
@@ -85,6 +86,15 @@ pub struct MatchRow {
 pub struct ContextRow {
     pub line: u64,
     pub text: String,
+}
+
+/// One path the search keeps: `path` in the repository, fetched, and
+/// `shown` counted from the run's folder, written.
+#[derive(Debug)]
+struct Kept {
+    path: String,
+    shown: String,
+    sha: Option<String>,
 }
 
 /// What one path's search came to.
@@ -304,6 +314,13 @@ pub async fn cmd_grep(
         .map(|value| compile_glob(value))
         .collect::<Result<_, _>>()?;
     let (before, after) = context_window(&args);
+    // Then bind the folder and map `--path` under it (SPEC u290).
+    let folder = bind_read_folder(&opts)?;
+    let mapped = repository_argument(folder.as_ref(), args.path.as_deref())?;
+    let named = args
+        .path
+        .clone()
+        .or_else(|| folder.as_ref().map(|f| f.path.clone()));
 
     // 2 — resolve the target.
     let Some(target) = resolve_read_target(config, output, &opts).await? else {
@@ -317,7 +334,7 @@ pub async fn cmd_grep(
         .get_tree(
             &target.repo_id,
             target.token.as_deref(),
-            args.path.as_deref(),
+            mapped.as_deref(),
             true,
             Some(&version_ref),
         )
@@ -325,7 +342,7 @@ pub async fn cmd_grep(
     {
         Ok(tuple) => tuple,
         Err(e) => {
-            if let Some(p) = args.path.as_ref() {
+            if let Some(p) = named.as_ref() {
                 if opts.version.is_some() {
                     return Err(read_not_found(e, &opts, &target.reference, p));
                 }
@@ -338,15 +355,23 @@ pub async fn cmd_grep(
     };
     let tree_truncated = response.truncated;
 
-    // 4 — keep every entry of kind file matching some `--glob`, ordered
-    // by ascending path.
-    let mut kept: Vec<(String, Option<String>)> = response
+    // 4 — keep every entry of kind file matching some `--glob` over its
+    // path counted from the folder (SPEC u290), ordered by ascending
+    // path: each kept entry carries its repository path for the fetch
+    // beside its counted path for every write.
+    let scope = target.folder.as_ref();
+    let mut kept: Vec<Kept> = response
         .entries
         .into_iter()
-        .filter(|e| e.entry_type == EntryType::File && glob_admits(&rules, &e.path))
-        .map(|e| (e.path, e.sha))
+        .filter(|e| e.entry_type == EntryType::File)
+        .map(|e| Kept {
+            shown: counted_from(scope, &e.path),
+            path: e.path,
+            sha: e.sha,
+        })
+        .filter(|k| glob_admits(&rules, &k.shown))
         .collect();
-    kept.sort_by(|a, b| a.0.cmp(&b.0));
+    kept.sort_by(|a, b| a.shown.cmp(&b.shown));
     let capped = kept.len() > FAN_OUT_CAP;
     kept.truncate(FAN_OUT_CAP);
 
@@ -376,9 +401,9 @@ pub async fn cmd_grep(
                 let matcher = Arc::clone(&matcher);
                 let kept = Arc::clone(&kept);
                 set.spawn(async move {
-                    let (path, sha) = &kept[index];
+                    let entry = &kept[index];
                     let answer = cache
-                        .get_or_fetch(&client, &target, path, sha.as_deref())
+                        .get_or_fetch(&client, &target, &entry.path, entry.sha.as_deref())
                         .await;
                     let outcome = match answer {
                         Err(e) => return (index, Err(e)),
@@ -447,7 +472,7 @@ pub async fn cmd_grep(
     let mut hits: Vec<(String, Vec<MatchRow>)> = Vec::new();
     for (index, outcome) in results.into_iter().enumerate() {
         let Some(outcome) = outcome else { continue };
-        let path = kept[index].0.clone();
+        let path = kept[index].shown.clone();
         match outcome {
             PathOutcome::Binary => skipped.push((path, "binary")),
             PathOutcome::Refused => {

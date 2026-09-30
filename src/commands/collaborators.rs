@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
 use crate::prompts::{ConfirmOutcome, confirm_or_yes};
+use crate::repo::folder::{current_dir, refuse_holder_change};
 use crate::repo::if_repo::resolve_full_or_skip;
 use clap::Subcommand;
 use serde_json::json;
@@ -187,6 +188,17 @@ pub async fn cmd_collaborators(
     limit: u32,
     offset: u32,
 ) -> Result<(), CliError> {
+    // Inside a scoped folder the listing and every verb act on the
+    // holder, so each is refused before its identity, credential,
+    // confirmation and request (SPEC u290, `D-102`).
+    let command = match &action {
+        None => "syns collaborators",
+        Some(CollaboratorsAction::Add { .. }) => "syns collaborators add",
+        Some(CollaboratorsAction::Role { .. }) => "syns collaborators role",
+        Some(CollaboratorsAction::Remove { .. }) => "syns collaborators remove",
+    };
+    refuse_holder_change(&current_dir()?, command)?;
+
     match action {
         // The role change binds the repository itself (SPEC u272
         // Behaviour, `cmd_collaborators_role` 1), so it is one arm of
@@ -320,6 +332,81 @@ mod tests {
     use serial_test::serial;
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A checkout `W` naming `alice/work` with the folder
+    /// `W/clients/q3` recording its place, a stored credential in `W`,
+    /// and the run standing inside the folder.
+    fn inside_a_folder() -> (tempfile::TempDir, std::path::PathBuf) {
+        let w = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(w.path()).unwrap();
+        std::fs::write(root.join(".syns.yaml"), "owner: alice\nname: work\n").unwrap();
+        let folder = root.join("clients").join("q3");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join(".syns.yaml"),
+            "holder: alice/work\npath: clients/q3\n",
+        )
+        .unwrap();
+        TokenStore::new(root.join("credentials.json"))
+            .write("test-token")
+            .unwrap();
+        std::env::set_current_dir(&folder).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", &root) };
+        (w, folder)
+    }
+
+    // SPEC u290 Behaviour, `cmd_collaborators` 1 (`D-102`): the listing
+    // and every verb, the role change among them.
+    #[tokio::test]
+    #[serial]
+    async fn every_collaborators_route_inside_a_folder_is_refused_before_any_request() {
+        let (_w, _folder) = inside_a_folder();
+        let server = MockServer::start().await;
+        let config = Config::new(Some(&server.uri())).unwrap();
+        let output = Output::new(false);
+
+        let routes = [
+            (None, "syns collaborators"),
+            (
+                Some(CollaboratorsAction::Add {
+                    target: "bob".into(),
+                    role: AssignableRole::Read,
+                    if_repo: false,
+                }),
+                "syns collaborators add",
+            ),
+            (
+                Some(CollaboratorsAction::Role {
+                    user_id: "u1".into(),
+                    role: AssignableRole::Write,
+                    if_repo: false,
+                }),
+                "syns collaborators role",
+            ),
+            (
+                Some(CollaboratorsAction::Remove {
+                    user_id: "u1".into(),
+                    yes: true,
+                    if_repo: false,
+                }),
+                "syns collaborators remove",
+            ),
+        ];
+        let mut refused = Vec::new();
+        for (action, expected) in routes {
+            match cmd_collaborators(&config, &output, action, true, 20, 0).await {
+                Err(CliError::HolderActing { command, .. }) => {
+                    assert_eq!(command, expected);
+                    refused.push(command);
+                }
+                other => panic!("expected the holder-acting refusal, got {other:?}"),
+            }
+        }
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+
+        assert_eq!(refused.len(), 4);
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
 
     #[tokio::test]
     #[serial]

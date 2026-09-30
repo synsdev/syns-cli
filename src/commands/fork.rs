@@ -3,7 +3,7 @@ use crate::client::{ForkRequest, SynsClient};
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
-use crate::repo::syns_yaml::write_syns_yaml;
+use crate::repo::syns_yaml::{nearest_identity, write_syns_yaml};
 use console::style;
 
 fn validate_repo_id(repo: &str) -> Result<(), CliError> {
@@ -33,6 +33,14 @@ pub async fn cmd_fork(
     name: Option<String>,
 ) -> Result<(), CliError> {
     validate_repo_id(&repo)?;
+
+    // The identity file nearest the working directory, read before the
+    // credential and the request: the folder form, and a file parsing as
+    // neither form, end the run with nothing requested and no file
+    // written (SPEC u290 Behaviour, `cmd_fork` 1).
+    if let Ok(cwd) = std::env::current_dir() {
+        nearest_identity(&cwd)?;
+    }
 
     let token = TokenStore::new(config.credentials_path())
         .read()?

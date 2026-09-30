@@ -10,7 +10,10 @@ use crate::config::Config;
 use crate::errors::{CliError, NotTextSurface};
 use crate::output::Output;
 use crate::push::collector::is_text;
-use crate::read::{ReadOptions, read_not_found, report_reference, resolve_read_target};
+use crate::read::{
+    ReadOptions, bind_read_folder, counted_from, read_not_found, report_reference,
+    repository_argument, resolve_read_target,
+};
 
 /// The default window: `--offset` counts from `1`, `--limit` from
 /// `2000` (SPEC u270 Contract Surface, `cmd_read`).
@@ -47,18 +50,21 @@ pub async fn cmd_read(
             message: "--limit must be \u{2265} 1".to_string(),
         });
     }
+    // Bind the folder and map the positional under it (SPEC u290).
+    let folder = bind_read_folder(&opts)?;
+    let mapped = repository_argument(folder.as_ref(), Some(&path))?.unwrap_or_default();
     let Some(target) = resolve_read_target(config, output, &opts).await? else {
         return Ok(());
     };
     let client = SynsClient::new(config.server_url())?;
 
-    // 2 — read the path at that reference.
+    // 2 — read the mapped path at that reference.
     let version_ref = target.version_ref();
     let (response, raw) = match client
         .get_file(
             &target.repo_id,
             target.token.as_deref(),
-            &path,
+            &mapped,
             Some(&version_ref),
         )
         .await
@@ -96,7 +102,13 @@ pub async fn cmd_read(
     // 4 — write the numbered lines, or the read document.
     if output.is_json() {
         let document = serde_json::json!({
-            "path": raw.get("path").cloned().unwrap_or(serde_json::Value::from(path.as_str())),
+            "path": match raw.get("path").and_then(|p| p.as_str()) {
+                Some(served) => serde_json::Value::from(counted_from(target.folder.as_ref(), served)),
+                None => raw
+                    .get("path")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::from(path.as_str())),
+            },
             "sha": response.sha,
             "size": response.size,
             "version": target.reference.version,

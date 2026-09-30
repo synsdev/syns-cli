@@ -4,6 +4,7 @@ use crate::commands::repos::ReposArgs;
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
+use crate::repo::folder::{FolderScope, current_dir, refuse_holder_change, resolve_scoped_or_skip};
 use crate::repo::if_repo::resolve_full_or_skip;
 
 #[derive(clap::ValueEnum, Debug, Clone)]
@@ -98,20 +99,43 @@ pub async fn cmd_repo_create(
     if output.is_json() {
         output.json(&raw);
     } else {
-        display_repo(output, &created);
+        display_repo(output, &created, None);
     }
     Ok(())
 }
 
-fn display_repo(output: &Output, response: &RepoResponse) {
+/// The scoped folder a record is answered inside, beside the number of
+/// the version the holder's head names (SPEC u290).
+struct FolderAnswer<'a> {
+    folder: &'a FolderScope,
+    version: Option<u32>,
+}
+
+fn display_repo(output: &Output, response: &RepoResponse, inside: Option<FolderAnswer<'_>>) {
     if output.is_json() {
-        output.json(&response);
+        match inside {
+            // The folder repository document: the holder's record with
+            // the head's number, the holder and the recorded path added.
+            Some(FolderAnswer { folder, version }) => {
+                let mut document = serde_json::to_value(response).unwrap_or_default();
+                if let Some(map) = document.as_object_mut() {
+                    map.insert("version".to_string(), serde_json::Value::from(version));
+                    map.insert("holder".to_string(), folder.holder().into());
+                    map.insert("path".to_string(), folder.path.clone().into());
+                }
+                output.json(&document);
+            }
+            None => output.json(&response),
+        }
     } else {
-        let rows = vec![
-            vec![
-                "Repository".into(),
-                format!("{}/{}", response.owner, response.name),
-            ],
+        let mut rows = vec![vec![
+            "Repository".into(),
+            format!("{}/{}", response.owner, response.name),
+        ]];
+        if let Some(FolderAnswer { folder, .. }) = &inside {
+            rows.push(vec!["Path".into(), folder.path.clone()]);
+        }
+        rows.extend([
             vec![
                 "Description".into(),
                 response
@@ -147,7 +171,7 @@ fn display_repo(output: &Output, response: &RepoResponse) {
             ],
             vec!["Created".into(), response.created_at.clone()],
             vec!["Updated".into(), response.updated_at.clone()],
-        ];
+        ]);
         output.table(&["Property", "Value"], rows);
     }
 }
@@ -197,17 +221,28 @@ pub async fn cmd_repo(
         None => {}
     }
 
-    let current_dir = std::env::current_dir().map_err(|e| CliError::Io {
-        message: format!("could not determine current directory: {e}"),
-    })?;
-    let (owner, name) = match resolve_full_or_skip(None, &current_dir, if_repo, output)? {
-        Some(pair) => pair,
-        None => return Ok(()),
-    };
-    let repo_id = format!("{owner}/{name}");
-    let client = SynsClient::new(config.server_url())?;
+    let current_dir = current_dir()?;
 
     if names_update_options {
+        // Inside a scoped folder an update acts on the holder, so it is
+        // refused before any identity, credential or request (SPEC u290
+        // Behaviour, `cmd_repo` 1, `D-102`).
+        let option = if description.is_some() {
+            "--description"
+        } else if status.is_some() {
+            "--status"
+        } else if visibility.is_some() {
+            "--visibility"
+        } else {
+            "--tag"
+        };
+        refuse_holder_change(&current_dir, &format!("syns repo {option}"))?;
+        let (owner, name) = match resolve_full_or_skip(None, &current_dir, if_repo, output)? {
+            Some(pair) => pair,
+            None => return Ok(()),
+        };
+        let repo_id = format!("{owner}/{name}");
+        let client = SynsClient::new(config.server_url())?;
         let token = TokenStore::new(config.credentials_path())
             .read()?
             .ok_or(CliError::AuthRequired)?;
@@ -219,16 +254,52 @@ pub async fn cmd_repo(
             tags: if tags.is_empty() { None } else { Some(tags) },
         };
         let response = client.update_repo(&repo_id, &token, &update).await?;
-        display_repo(output, &response);
-    } else {
-        let token = TokenStore::new(config.credentials_path())
-            .read()
-            .ok()
-            .flatten();
-        let response = client.get_repo(&repo_id, token.as_deref()).await?;
-        display_repo(output, &response);
+        display_repo(output, &response, None);
+        return Ok(());
     }
 
+    // 2 — the repository and the folder.
+    let Some((owner, name, folder)) = resolve_scoped_or_skip(&current_dir, if_repo, output)? else {
+        return Ok(());
+    };
+    let repo_id = format!("{owner}/{name}");
+    let client = SynsClient::new(config.server_url())?;
+    let token = TokenStore::new(config.credentials_path())
+        .read()
+        .ok()
+        .flatten();
+
+    // 3 — the holder's record.
+    let response = client.get_repo(&repo_id, token.as_deref()).await?;
+
+    // 4 — inside a folder, the number of the version the head names: the
+    // newest row of the version list where its hash is the head's, and
+    // the single version at the head only where it is not.
+    let inside = match &folder {
+        None => None,
+        Some(folder) => {
+            let version = match response.commit_sha.as_deref() {
+                None => None,
+                Some(head) => {
+                    let (page, _raw) = client
+                        .list_versions(&repo_id, token.as_deref(), 1, 0, None)
+                        .await?;
+                    match page.data.first() {
+                        Some(newest) if newest.sha == head => Some(newest.version),
+                        _ => {
+                            let (entry, _raw) =
+                                client.get_version(&repo_id, token.as_deref(), head).await?;
+                            Some(entry.version)
+                        }
+                    }
+                }
+            };
+            Some(FolderAnswer { folder, version })
+        }
+    };
+
+    // 5 — the record, inside a folder as the folder repository document.
+    display_repo(output, &response, inside);
     Ok(())
 }
 

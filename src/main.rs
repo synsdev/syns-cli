@@ -269,6 +269,9 @@ enum Commands {
         /// Maximum number of entries to show
         #[arg(long, default_value_t = 50)]
         limit: u32,
+        /// Number of versions to skip before the first one shown
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
         /// Silently skip (exit 0) when no Syns repo identity resolves
         #[arg(long)]
         if_repo: bool,
@@ -605,6 +608,7 @@ async fn run(
         Commands::History {
             file,
             limit,
+            offset,
             if_repo,
             action,
         } => match action {
@@ -618,7 +622,9 @@ async fn run(
                 scope.if_repo = scope.if_repo || if_repo;
                 commands::history::cmd_history_show(config, output, reference, scope).await?
             }
-            None => commands::history::cmd_history(config, output, file, limit, if_repo).await?,
+            None => {
+                commands::history::cmd_history(config, output, file, limit, offset, if_repo).await?
+            }
         },
         Commands::Diff { from, to, if_repo } => {
             commands::diff::cmd_diff(config, output, from, to, if_repo).await?

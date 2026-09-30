@@ -25,6 +25,35 @@ pub enum CliError {
         standing: String,
         requested: String,
     },
+    /// SPEC u290, the holder-acting refusal (`D-102`): a command that
+    /// would change the holding repository, run inside a scoped folder,
+    /// refused before any request, credential read or prompt. `command`
+    /// is the command as typed up to its verb or first update option,
+    /// `holder` the pair lower-cased, `dir` the folder's absolute path.
+    HolderActing {
+        command: String,
+        holder: String,
+        dir: std::path::PathBuf,
+    },
+    /// SPEC u290, the misplaced-folder refusal (`D-101`): a folder whose
+    /// place under its holder's checkout at `checkout` differs from the
+    /// path it records.
+    FolderMoved {
+        dir: std::path::PathBuf,
+        holder: String,
+        recorded: String,
+        actual: String,
+        checkout: std::path::PathBuf,
+    },
+    /// SPEC u290, the misplaced-folder refusal (`D-101`): a folder
+    /// standing inside `checkout`, a checkout of `standing`, spelt as its
+    /// file spells it.
+    FolderInAnotherCheckout {
+        dir: std::path::PathBuf,
+        holder: String,
+        checkout: std::path::PathBuf,
+        standing: String,
+    },
     ServerUnreachable {
         url: String,
     },
@@ -204,6 +233,9 @@ impl CliError {
         match self {
             CliError::RepoIdentityUnknown { .. } => 2,
             CliError::PathBelongsToAnotherRepository { .. } => 2,
+            CliError::HolderActing { .. } => 2,
+            CliError::FolderMoved { .. } => 2,
+            CliError::FolderInAnotherCheckout { .. } => 2,
             CliError::ServerUnreachable { .. } => 3,
             CliError::PushPartial { .. } => 3,
             CliError::PushEmpty { .. } => 6,
@@ -386,6 +418,40 @@ impl std::fmt::Display for CliError {
                 "{} already belongs to {standing} \u{2014} pull {requested} into another directory, or remove {}",
                 path.display(),
                 path.join(".syns.yaml").display()
+            ),
+            CliError::HolderActing {
+                command,
+                holder,
+                dir,
+            } => write!(
+                f,
+                "holder root required: {command} acts on the holding repository {holder}, not on the folder {} \u{2014} run it from the root of a checkout of {holder}",
+                dir.display()
+            ),
+            CliError::FolderMoved {
+                dir,
+                holder,
+                recorded,
+                actual,
+                checkout,
+            } => write!(
+                f,
+                "folder out of place: {} records {recorded} in {holder} but stands at {actual} in its checkout at {} \u{2014} move the folder back to {}/{recorded}, or correct the path its .syns.yaml records to {actual}",
+                dir.display(),
+                checkout.display(),
+                checkout.display()
+            ),
+            CliError::FolderInAnotherCheckout {
+                dir,
+                holder,
+                checkout,
+                standing,
+            } => write!(
+                f,
+                "folder out of place: {} is a folder of {holder} but stands inside {}, a checkout of {standing} \u{2014} move it into a checkout of {holder}, or remove {}/.syns.yaml",
+                dir.display(),
+                checkout.display(),
+                dir.display()
             ),
             CliError::ServerUnreachable { url } => write!(f, "could not reach server at {url}"),
             CliError::Io { message } => write!(f, "{message}"),
@@ -850,6 +916,47 @@ mod tests {
             "/w/c already belongs to bob/other \u{2014} pull alice/notes into another directory, or remove /w/c/.syns.yaml"
         );
         assert_eq!(err.exit_code(), 2);
+    }
+
+    // SPEC u290 Contract Surface, the holder-acting refusal and the
+    // misplaced-folder lines: each line whole, at exit `2`, under the
+    // generic error document.
+    #[test]
+    fn the_folder_refusals_render_their_lines_whole() {
+        let acting = CliError::HolderActing {
+            command: "syns collaborators add".into(),
+            holder: "alice/work".into(),
+            dir: std::path::PathBuf::from("/w/clients/q3"),
+        };
+        assert_eq!(
+            acting.to_string(),
+            "holder root required: syns collaborators add acts on the holding repository alice/work, not on the folder /w/clients/q3 \u{2014} run it from the root of a checkout of alice/work"
+        );
+        let moved = CliError::FolderMoved {
+            dir: std::path::PathBuf::from("/w/archive/q3"),
+            holder: "alice/work".into(),
+            recorded: "clients/q3".into(),
+            actual: "archive/q3".into(),
+            checkout: std::path::PathBuf::from("/w"),
+        };
+        assert_eq!(
+            moved.to_string(),
+            "folder out of place: /w/archive/q3 records clients/q3 in alice/work but stands at archive/q3 in its checkout at /w \u{2014} move the folder back to /w/clients/q3, or correct the path its .syns.yaml records to archive/q3"
+        );
+        let other = CliError::FolderInAnotherCheckout {
+            dir: std::path::PathBuf::from("/v/x"),
+            holder: "alice/work".into(),
+            checkout: std::path::PathBuf::from("/v"),
+            standing: "bob/other".into(),
+        };
+        assert_eq!(
+            other.to_string(),
+            "folder out of place: /v/x is a folder of alice/work but stands inside /v, a checkout of bob/other \u{2014} move it into a checkout of alice/work, or remove /v/x/.syns.yaml"
+        );
+        for err in [acting, moved, other] {
+            assert_eq!(err.exit_code(), 2);
+            assert!(err.json_value().is_none());
+        }
     }
 
     #[test]

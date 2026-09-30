@@ -283,6 +283,7 @@ mod tests {
                 version: 2,
                 commit_sha: "b".repeat(40),
             },
+            folder: None,
         }
     }
 
