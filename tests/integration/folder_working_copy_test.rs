@@ -2401,8 +2401,65 @@ fn a_folder_publication_refused_by_a_push_outside_sends_again_without_waiting() 
                 "{}",
                 stdout_of(&status)
             );
+
+            // CR1-1: the folder copy's base followed the publication that
+            // landed at the named head, so a write at that commit finds
+            // the folder clean.
+            let landed = d.state().commits.last().unwrap().0.clone();
+            let parent_arg = format!("--parent={landed}");
+            let mark = d.mark();
+            let note = d.run_in(
+                &d.folder(),
+                b"noted",
+                &["write", &parent_arg, "--", "notes.md"],
+            );
+            assert_eq!(exit_of(&note), 0, "{}", stderr_of(&note));
+            let pushes = d.pushes_since(mark);
+            assert_eq!(pushes.len(), 1, "{pushes:?}");
+            assert_eq!(pushes[0]["parentSha"], json!(landed));
         }
     }
+}
+
+/// CR1-2: a path-scoped folder push whose holder takes a push elsewhere
+/// before each send stops at the send bound.
+#[test]
+#[serial]
+fn a_scoped_folder_push_stops_at_the_bound() {
+    let d = Deployment::converged_over(u292_h1());
+    d.state().race_each_push = true;
+    write(&d.folder().join("board.json"), "{\"cards\":[9]}\n");
+    let mark = d.mark();
+    let out = d.run_in(&d.folder(), b"", &["push", "board.json"]);
+    assert_eq!(exit_of(&out), 1, "{}", stderr_of(&out));
+    let parents: Vec<Value> = d
+        .pushes_since(mark)
+        .iter()
+        .map(|p| p["parentSha"].clone())
+        .collect();
+    assert_eq!(parents, vec![json!(h(1)), json!(h(2)), json!(h(3))]);
+    assert_eq!(d.version_lists_since(mark).len(), 2);
+}
+
+/// CR1-3: a folder sync whose holder takes a push elsewhere before each
+/// send stops sending at the bound and prepares the review.
+#[test]
+#[serial]
+fn a_folder_sync_stops_sending_at_the_bound() {
+    let d = Deployment::converged_over(u292_h1());
+    d.state().race_each_push = true;
+    write(&d.folder().join("board.json"), "{\"cards\":[9]}\n");
+    let mark = d.mark();
+    let out = d.run_in(&d.folder(), b"", &["--json", "sync"]);
+    assert_eq!(exit_of(&out), 4, "{}", stderr_of(&out));
+    assert_eq!(one_document(&out)["outcome"], "resolution_required");
+    let parents: Vec<Value> = d
+        .pushes_since(mark)
+        .iter()
+        .map(|p| p["parentSha"].clone())
+        .collect();
+    assert_eq!(parents, vec![json!(h(1)), json!(h(2)), json!(h(3))]);
+    assert_eq!(d.version_lists_since(mark).len(), 2);
 }
 
 #[test]
