@@ -314,19 +314,35 @@ fn lay_turned_on(
 mod tests {
     use super::*;
 
-    fn recorded(copy: &WorkingCopy) -> (Option<String>, Vec<(String, String)>) {
+    type Recorded = (Option<String>, Vec<(String, String)>, Option<u64>);
+
+    fn recorded(copy: &WorkingCopy) -> Recorded {
         let base = copy.base().expect("a base");
         let mut files: Vec<(String, String)> = base
             .file_paths()
             .map(|p| (p.to_string(), base.file_sha(p).unwrap().to_string()))
             .collect();
         files.sort();
-        (base.commit_sha().map(str::to_string), files)
+        (
+            base.commit_sha().map(str::to_string),
+            files,
+            base.recorded_at(),
+        )
     }
 
-    // CR1-2: `lay_turned_on` lays over no holder copy holding an outbox,
-    // none standing at another commit than the claimed parent, and no
-    // folder copy standing at neither the parent nor the claimed one.
+    fn standing(commit: &str, path: &str, sha: &str, at: Option<u64>) -> Recorded {
+        (
+            Some(commit.to_string()),
+            vec![(path.to_string(), sha.to_string())],
+            at,
+        )
+    }
+
+    // CR1-2, CR2-1: `lay_turned_on` lays over no holder copy holding an
+    // outbox or a resolution, none standing at another commit than the
+    // claimed parent, and no folder copy standing at neither the parent
+    // nor the claimed one; a holder copy it lays keeps its recorded time,
+    // and the folder copy's is stamped anew.
     #[test]
     fn turning_checks_on_lays_only_over_clean_bases_at_the_parent() {
         let cache = tempfile::tempdir().unwrap();
@@ -344,7 +360,9 @@ mod tests {
         };
         let holder = WorkingCopy::open(cache.path(), "alice", "work", &w).unwrap();
         let held = HashMap::from([("q3/.syns.yaml".to_string(), "old".to_string())]);
-        holder.record_base("h3", held.clone()).unwrap();
+        holder
+            .record_laid_base("h3", held.clone(), Some(7))
+            .unwrap();
         holder
             .write_outbox(&crate::push::working_copy::Outbox {
                 parent_commit: Some("h3".to_string()),
@@ -353,45 +371,58 @@ mod tests {
             .unwrap();
         let own = WorkingCopy::open_folder(cache.path(), &scope).unwrap();
         let mine = HashMap::from([(".syns.yaml".to_string(), "old".to_string())]);
-        own.record_base("h1", mine).unwrap();
+        own.record_laid_base("h1", mine, Some(5)).unwrap();
 
         lay_turned_on(cache.path(), &scope, "new", "h2", "h3", "h4").unwrap();
 
         assert_eq!(
             recorded(&holder),
-            (
-                Some("h3".to_string()),
-                vec![("q3/.syns.yaml".to_string(), "old".to_string())]
-            )
+            standing("h3", "q3/.syns.yaml", "old", Some(7)),
+            "an outbox standing"
         );
-        assert_eq!(
-            recorded(&own),
-            (
-                Some("h1".to_string()),
-                vec![(".syns.yaml".to_string(), "old".to_string())]
-            )
-        );
+        assert_eq!(recorded(&own), standing("h1", ".syns.yaml", "old", Some(5)));
 
         holder.remove_outbox().unwrap();
-        holder.record_base("h2", held).unwrap();
+        holder
+            .write_resolution(&crate::push::working_copy::Resolution {
+                recovery_id: "r".into(),
+                base_commit: Some("h3".into()),
+                head_commit: "h0".into(),
+                round: 1,
+                local_paths: Vec::new(),
+                remote_paths: Vec::new(),
+                collisions: Vec::new(),
+                combined_paths: Vec::new(),
+                reviewed_tree: None,
+                pending_writes: None,
+            })
+            .unwrap();
+        lay_turned_on(cache.path(), &scope, "new", "h2", "h3", "h4").unwrap();
+        assert_eq!(
+            recorded(&holder),
+            standing("h3", "q3/.syns.yaml", "old", Some(7)),
+            "a resolution standing"
+        );
+
+        holder.remove_resolution().unwrap();
+        holder.record_laid_base("h2", held, Some(7)).unwrap();
         lay_turned_on(cache.path(), &scope, "new", "h2", "h3", "h4").unwrap();
         assert_eq!(recorded(&holder).0.as_deref(), Some("h2"));
 
         lay_turned_on(cache.path(), &scope, "new", "h1", "h2", "h4").unwrap();
         assert_eq!(
             recorded(&holder),
-            (
-                Some("h4".to_string()),
-                vec![("q3/.syns.yaml".to_string(), "new".to_string())]
-            )
+            standing("h4", "q3/.syns.yaml", "new", Some(7))
         );
+        let (commit, files, at) = recorded(&own);
         assert_eq!(
-            recorded(&own),
+            (commit, files),
             (
                 Some("h4".to_string()),
                 vec![(".syns.yaml".to_string(), "new".to_string())]
             )
         );
+        assert_ne!(at, Some(5), "the folder copy's record is stamped anew");
     }
 
     #[test]

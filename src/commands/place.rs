@@ -810,8 +810,24 @@ mod tests {
         )
     }
 
-    // CR1-1: `lay_placed` lays over a base standing at the claimed parent
-    // alone, and over none holding an outbox.
+    /// A review standing over `h1` and `h0`, prepared and not continued.
+    fn a_resolution() -> crate::push::working_copy::Resolution {
+        crate::push::working_copy::Resolution {
+            recovery_id: "r".into(),
+            base_commit: Some("h1".into()),
+            head_commit: "h0".into(),
+            round: 1,
+            local_paths: Vec::new(),
+            remote_paths: Vec::new(),
+            collisions: Vec::new(),
+            combined_paths: Vec::new(),
+            reviewed_tree: None,
+            pending_writes: None,
+        }
+    }
+
+    // CR1-1: `lay_placed` lays over a base standing at the claimed
+    // parent alone, and over none holding an outbox or a resolution.
     #[test]
     fn a_placement_lays_only_over_a_clean_base_at_the_claimed_parent() {
         let placed = HashMap::from([(".syns.yaml".to_string(), "y".to_string())]);
@@ -830,6 +846,11 @@ mod tests {
         .unwrap();
         lay_placed(&copy, &placed, counted, Some("h1"), "h2").unwrap();
         assert_eq!(recorded(&copy), standing);
+
+        let (_c, _r, copy) = copy_at_h1();
+        copy.write_resolution(&a_resolution()).unwrap();
+        lay_placed(&copy, &placed, counted, Some("h1"), "h2").unwrap();
+        assert_eq!(recorded(&copy), standing, "a resolution standing");
 
         for claimed in [Some("h0"), None] {
             let (_c, _r, copy) = copy_at_h1();
