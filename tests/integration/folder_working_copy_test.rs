@@ -2564,6 +2564,8 @@ fn rm_of_an_empty_path_is_refused_before_any_request_wherever_it_runs() {
         assert_eq!(stderr_of(&out).trim_end(), EMPTY_PATH, "{args:?}");
     };
     refused(&q3, &[], &["rm", "", "--parent", &parent]);
+    // CR1-1: ahead of the `--parent` spelling refusals.
+    refused(&q3, &[], &["rm", "", "--parent", "0"]);
     refused(&q3, &[], &["rm", " ", "--parent", &parent]);
     refused(&d.w, &[], &["rm", "", "--parent", &parent]);
     refused(
@@ -2584,6 +2586,18 @@ fn rm_of_an_empty_path_is_refused_before_any_request_wherever_it_runs() {
     );
     assert_eq!(snapshot(&q3), before_q3);
     assert_eq!(snapshot(&d.w), before_w);
+
+    // CR1-1: ahead of the misplaced-folder refusals.
+    let moved = d.w.join("clients/vela/archive/q3-board");
+    std::fs::create_dir_all(moved.parent().unwrap()).expect("archive");
+    std::fs::rename(d.folder(), &moved).expect("move the folder");
+    let mark = d.mark();
+    refused(&moved, &[], &["rm", "", "--parent", &parent]);
+    assert!(
+        d.requests_since(mark).is_empty(),
+        "{:?}",
+        d.requests_since(mark)
+    );
 }
 
 #[test]
