@@ -4629,4 +4629,55 @@ mod tests {
         assert!(returned >= released);
         std::fs::set_permissions(&default, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
+
+    // SPEC u298 Behaviour, `review_lock` 1: where the default root refuses
+    // writes, the holder's standing review lock there is opened for
+    // reading where it refuses writing, and queued on.
+    #[cfg(unix)]
+    #[test]
+    fn review_lock_queues_on_a_read_only_standing_default_lock() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(scratch.path()).unwrap();
+        let default = base.join("default");
+        let fallback = base.join("fallback");
+        let root = base.join("root");
+        for dir in [&default, &fallback, &root] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let standing = default.join("working-copies/alice/r/review.lock");
+        std::fs::create_dir_all(standing.parent().unwrap()).unwrap();
+        std::fs::write(&standing, b"").unwrap();
+        std::fs::set_permissions(&standing, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let stores = crate::config::StoreRoots {
+            default: default.clone(),
+            write: fallback.clone(),
+            default_refused: true,
+        };
+        let copy = WorkingCopy::open(&stores, "alice", "r", &root).unwrap();
+        let holder = std::fs::File::open(&standing).unwrap();
+        holder.lock().unwrap();
+
+        let (taken, waited) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let lock = review_lock(&copy).unwrap();
+            taken.send(()).unwrap();
+            drop(lock);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            waited.try_recv().is_err(),
+            "the review lock did not queue on the standing default lock"
+        );
+        holder.unlock().unwrap();
+        waited.recv().unwrap();
+        waiter.join().unwrap();
+        assert!(
+            !fallback.join("working-copies").exists(),
+            "the review lock fell to the fallback root with the default's standing"
+        );
+    }
 }

@@ -358,9 +358,10 @@ pub struct StateLock {
     _other: Option<File>,
 }
 
+#[cfg(test)]
 impl StateLock {
     /// Whether the other home's lock was taken beside the write home's.
-    pub fn holds_other(&self) -> bool {
+    fn holds_other(&self) -> bool {
         self._other.is_some()
     }
 }
