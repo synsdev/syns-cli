@@ -2430,7 +2430,14 @@ fn a_scoped_folder_push_stops_at_the_bound() {
     d.state().race_each_push = true;
     write(&d.folder().join("board.json"), "{\"cards\":[9]}\n");
     let mark = d.mark();
-    let out = d.run_in(&d.folder(), b"", &["push", "board.json"]);
+    // A run the bound no longer stops is killed here rather than holding
+    // the serial suite, so the case fails on its missing exit code.
+    let out = d
+        .command(&d.folder(), &[], &["push", "board.json"])
+        .write_stdin(Vec::new())
+        .timeout(Duration::from_secs(30))
+        .output()
+        .expect("run syns");
     assert_eq!(exit_of(&out), 1, "{}", stderr_of(&out));
     let parents: Vec<Value> = d
         .pushes_since(mark)
