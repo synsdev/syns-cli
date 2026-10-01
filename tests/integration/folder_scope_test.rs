@@ -1305,3 +1305,85 @@ fn the_file_and_folder_blocks_write_their_count_and_the_record_its_folder_paths(
     assert!(!text.contains(FOLDER), "{text}");
     assert!(!text.contains("outside.md"), "{text}");
 }
+
+#[test]
+#[serial]
+fn diff_inside_a_folder_keeps_a_rename_within_it() {
+    let d = Deployment::new();
+    let served = format!(
+        "diff --git a/{FOLDER}/notes/a.md b/{FOLDER}/notes/b.md\nsimilarity index 100%\nrename from {FOLDER}/notes/a.md\nrename to {FOLDER}/notes/b.md\n"
+    );
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path_matcher(format!("/api/v1/repos/{REPO}/diff")))
+            .and(query_param("from", "4"))
+            .and(query_param("to", "5"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "from": { "version": 4, "sha": "4".repeat(40) },
+                "to": { "version": 5, "sha": "5".repeat(40) },
+                "files": [{
+                    "path": format!("{FOLDER}/notes/b.md"),
+                    "oldPath": format!("{FOLDER}/notes/a.md"),
+                    "status": "renamed",
+                    "diff": served,
+                }],
+            }))),
+    );
+
+    let out = d.run_in(
+        &d.folder(),
+        b"",
+        &["--json", "diff", "--from", "4", "--to", "5"],
+    );
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    let document = one_document(&out);
+    let files = document["files"].as_array().expect("files");
+    assert_eq!(files.len(), 1, "{document}");
+    assert_eq!(files[0]["path"], json!("notes/b.md"));
+    assert_eq!(files[0]["oldPath"], json!("notes/a.md"));
+    assert_eq!(files[0]["status"], json!("renamed"));
+    assert_eq!(
+        files[0]["diff"],
+        json!(served.replace(&format!("{FOLDER}/"), ""))
+    );
+}
+
+#[test]
+#[serial]
+fn repo_inside_a_folder_numbers_the_head_when_the_list_has_moved_past_it() {
+    let d = Deployment::new();
+    let mut record = repo_body();
+    record["commitSha"] = json!("h42");
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path_matcher(format!("/api/v1/repos/{REPO}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(record)),
+    );
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path_matcher(format!("/api/v1/repos/{REPO}/versions")))
+            .and(query_param("limit", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [version_body(43, "h43", &["a.md"])],
+                "total": 43, "limit": 1, "offset": 0,
+            }))),
+    );
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path_matcher(format!("/api/v1/repos/{REPO}/versions/h42")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(version_body(
+                42,
+                "h42",
+                &["a.md"],
+            ))),
+    );
+
+    let out = d.run_in(&d.folder(), b"", &["--json", "repo"]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(d.requests_to("/versions/h42").len(), 1);
+    let document = one_document(&out);
+    assert_eq!(document["commitSha"], json!("h42"));
+    assert_eq!(document["version"], json!(42));
+}
