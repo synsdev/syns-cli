@@ -113,7 +113,7 @@ pub fn ensure_identity_file(root: &Path, owner: &str, name: &str) -> Result<(), 
 // ---- the error classes a failure outcome follows ----------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ErrorClass {
+pub(crate) enum ErrorClass {
     Transient,
     Authentication,
     Authorization,
@@ -125,8 +125,10 @@ enum ErrorClass {
 }
 
 /// The class `ERRORS.md` registers for the code a failure carries, none
-/// where it carries no registered code.
-fn error_class(err: &CliError) -> Option<ErrorClass> {
+/// where it carries no registered code. SPEC u292: reachable from the
+/// folder check, which answers a `transient` refusal as a folder that
+/// moved and ends on any other.
+pub(crate) fn error_class(err: &CliError) -> Option<ErrorClass> {
     match err {
         CliError::ServerUnreachable { .. } => Some(ErrorClass::Transient),
         CliError::AuthRequired => Some(ErrorClass::Authentication),
@@ -138,6 +140,10 @@ fn error_class(err: &CliError) -> Option<ErrorClass> {
         | CliError::FolderMoved { .. }
         | CliError::FolderInAnotherCheckout { .. } => Some(ErrorClass::Local),
         CliError::PayloadTooLarge { .. } => Some(ErrorClass::Validation),
+        // SPEC u292 `error_class`: a server that cannot narrow the
+        // version list to a folder refuses a write inside it as a
+        // validation failure, never as a folder that moved.
+        CliError::FolderWriteUnsupported { .. } => Some(ErrorClass::Validation),
         CliError::Api {
             status: Some(_),
             error,
@@ -765,6 +771,12 @@ mod tests {
                     holder: "alice/work".into(),
                     checkout: "/v".into(),
                     standing: "bob/other".into(),
+                },
+                "validation",
+            ),
+            (
+                CliError::FolderWriteUnsupported {
+                    folder: "clients/vela/q3-board".into(),
                 },
                 "validation",
             ),

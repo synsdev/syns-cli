@@ -156,7 +156,7 @@ async fn dropped_push_connection_classifies_as_server_unreachable() {
         .push_body(
             "alice/proj",
             "t",
-            serde_json::to_vec(&empty_push_request()).unwrap(),
+            bytes::Bytes::from(serde_json::to_vec(&empty_push_request()).unwrap()),
         )
         .await
         .expect_err("fresh connection");
@@ -170,7 +170,7 @@ async fn dropped_push_connection_classifies_as_server_unreachable() {
         .push_body(
             "alice/proj",
             "t",
-            serde_json::to_vec(&empty_push_request()).unwrap(),
+            bytes::Bytes::from(serde_json::to_vec(&empty_push_request()).unwrap()),
         )
         .await
         .expect_err("kept-alive connection");

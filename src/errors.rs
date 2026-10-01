@@ -126,6 +126,14 @@ pub enum CliError {
         parent: String,
         current_sha: String,
     },
+    /// SPEC u292, the unsupported-server refusal (`D-107`): a folder
+    /// check whose version-list page the server did not narrow to the
+    /// folder. `FOLDER_WRITE_UNSUPPORTED` (`unregistered`) at exit `1`,
+    /// its document `error` alone, and never answered as a folder that
+    /// moved. `folder` is the folder's recorded path.
+    FolderWriteUnsupported {
+        folder: String,
+    },
     /// SPEC u271: `syns commit` over a changeset naming neither a file
     /// nor a deletion, at exit `6` before any request. Its document is
     /// `error` alone — none of the three keys a collected publication's
@@ -555,6 +563,10 @@ impl std::fmt::Display for CliError {
                 f,
                 "conflict: the repository moved past {parent}; its head is now {current_sha}"
             ),
+            CliError::FolderWriteUnsupported { folder } => write!(
+                f,
+                "folder_write_unsupported: the server does not support writes inside a folder yet, so {folder} cannot be written from inside it"
+            ),
             CliError::ChangesetEmpty => write!(
                 f,
                 "push_empty: the changeset names neither a file nor a deletion"
@@ -713,6 +725,22 @@ mod tests {
             Some(2),
             "the document carries `error` and `currentSha` and nothing else"
         );
+    }
+
+    // SPEC u292 Contract Surface, `CliError::FolderWriteUnsupported`: its
+    // one line names the folder, it stands at exit `1`, and its document
+    // is `error` alone.
+    #[test]
+    fn the_unsupported_server_refusal_names_the_folder_at_exit_one() {
+        let err = CliError::FolderWriteUnsupported {
+            folder: "clients/vela/q3-board".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "folder_write_unsupported: the server does not support writes inside a folder yet, so clients/vela/q3-board cannot be written from inside it"
+        );
+        assert_eq!(err.exit_code(), 1);
+        assert!(err.json_value().is_none());
     }
 
     // SPEC u271 Contract Surface, the empty-changeset refusal: exit `6`

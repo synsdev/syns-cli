@@ -2241,6 +2241,7 @@ version = "0.3.5"
 dependencies = [
  "assert_cmd",
  "base64",
+ "bytes",
  "clap",
  "comfy-table",
  "console",

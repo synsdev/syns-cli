@@ -1146,11 +1146,18 @@ impl SynsClient {
     /// One `EP-push` request carrying `body` as it stands (SPEC u280
     /// `push_body`, `D-094`): the one sender of every publication's body,
     /// which `fill_batch` built at its final length.
+    ///
+    /// SPEC u292: the body is the buffer it goes out in, handed to the
+    /// request with no copy. Wherever the server answered after reading
+    /// the whole body, no handle to it stands once this answers, so a
+    /// caller keeping one takes the buffer back for a further send; an
+    /// answer given before the rest was read leaves the transport's
+    /// handle standing until the server has read it.
     pub async fn push_body(
         &self,
         repo_id: &str,
         token: &str,
-        body: Vec<u8>,
+        body: bytes::Bytes,
     ) -> Result<(PushResponse, serde_json::Value), CliError> {
         let url = format!("{}/api/v1/repos/{}/push", self.base_url, repo_id);
         let len = body.len();
@@ -2952,8 +2959,8 @@ mod head_moved_tests {
         }
     }
 
-    fn push_body_bytes() -> Vec<u8> {
-        serde_json::to_vec(&push_request()).unwrap()
+    fn push_body_bytes() -> bytes::Bytes {
+        bytes::Bytes::from(serde_json::to_vec(&push_request()).unwrap())
     }
 
     /// SPEC u271, `src/client.rs`: the `409` fold carries the refused
@@ -3081,6 +3088,52 @@ mod head_moved_tests {
         }
     }
 
+    /// SPEC u292 Tests, `push_body_hands_its_buffer_back`: against a
+    /// server reading the whole body before it answers, the handle the
+    /// caller kept beside the send stands alone the moment the refusal
+    /// returns, so the buffer is taken back with no copy.
+    #[tokio::test]
+    async fn push_body_hands_its_buffer_back() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/repos/alice/notes/push"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "error": "conflict",
+                "message": "Head mismatch",
+                "currentSha": "c".repeat(40),
+            })))
+            .mount(&server)
+            .await;
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let mut payload = serde_json::to_vec(&push_request()).unwrap();
+        payload.resize(payload.len() + (1 << 20), b' ');
+        let kept = bytes::Bytes::from(payload);
+        let len = kept.len();
+
+        let err = client
+            .push_body("alice/notes", "t", kept.clone())
+            .await
+            .unwrap_err();
+        let taken = kept.try_into_mut();
+
+        assert!(matches!(
+            err,
+            CliError::Api {
+                status: Some(409),
+                context: Some(ApiErrorContext::HeadMoved { .. }),
+                ..
+            }
+        ));
+        let taken = taken.expect("no other handle to the body stands");
+        assert_eq!(taken.len(), len);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests[0].body.len(),
+            len,
+            "the server read the body whole"
+        );
+    }
+
     /// SPEC u280 `push_body`: one `EP-push` request carrying the body it
     /// is handed byte for byte, under the bearer token and JSON type.
     #[tokio::test]
@@ -3099,7 +3152,9 @@ mod head_moved_tests {
         let client = SynsClient::new(&server.uri()).unwrap();
         // Bytes no serialiser of this crate would write: key order and
         // spacing of their own.
-        let body = br#"{ "message":"m",  "files":[{"sha":"s","path":"a.md"}] }"#.to_vec();
+        let body = bytes::Bytes::from_static(
+            br#"{ "message":"m",  "files":[{"sha":"s","path":"a.md"}] }"#,
+        );
 
         let (response, raw) = client
             .push_body("alice/notes", "t", body.clone())

@@ -29,6 +29,7 @@ use crate::push::collector::{
     MAX_FILE_BYTES, SkippedFile, collect_files, is_text, is_text_reader, read_collected,
     too_large_line,
 };
+use crate::push::folder_check::{FOLDER_SEND_BOUND, FolderCheck};
 use crate::push::hash::blob_sha1;
 use crate::push::manifest::Manifest;
 use crate::push::reconcile::{
@@ -2498,6 +2499,7 @@ async fn converge_locked(
                     &staging,
                     Some(parent),
                     Some(folder),
+                    None,
                     &root,
                 )
                 .await
@@ -2570,8 +2572,10 @@ async fn converge_from_resolution(
         match mode {
             ConvergeMode::Publish if standing.reviewed_tree.is_some() => {
                 let token = token.ok_or(CliError::AuthRequired)?;
-                return publish_reviewed(client, token, copy, opts, staging, None, folder, root)
-                    .await;
+                return publish_reviewed(
+                    client, token, copy, opts, staging, None, folder, None, root,
+                )
+                .await;
             }
             ConvergeMode::Retrieve { overwrite: true } => {}
             _ => return Ok(SyncOutcome::ResolutionRequired(standing.clone(), None)),
@@ -2654,9 +2658,52 @@ async fn converge_from_resolution(
             ConvergeMode::Retrieve { .. } => Ok(SyncOutcome::NoChanges),
             ConvergeMode::Publish => {
                 let token = token.ok_or(CliError::AuthRequired)?;
-                publish_reviewed(client, token, copy, opts, staging, None, Some(folder), root).await
+                publish_reviewed(
+                    client,
+                    token,
+                    copy,
+                    opts,
+                    staging,
+                    None,
+                    Some(folder),
+                    None,
+                    root,
+                )
+                .await
             }
         };
+    }
+
+    // SPEC u292 `converge` 1 and 2 — a folder copy whose base trails the
+    // head only by versions that changed no path under the folder
+    // publishes at the head with no resolution written.
+    if mode == ConvergeMode::Publish
+        && let Some(scope) = &copy.folder
+        && let (Some(base_commit), Some(head_commit)) = (&base.commit, &head.commit)
+        && head_files == without(&base.files, &excluded)
+    {
+        let token = token.ok_or(CliError::AuthRequired)?;
+        let mut check = FolderCheck {
+            repo_id: repo_id(copy),
+            folder: scope.path.clone(),
+            since: base_commit.clone(),
+            since_version: None,
+        };
+        if !check.folder_moved(client, Some(token)).await? {
+            let at_head = (check, head_commit.clone(), head.files.clone());
+            return publish_reviewed(
+                client,
+                token,
+                copy,
+                opts,
+                staging,
+                None,
+                Some(folder),
+                Some(at_head),
+                root,
+            )
+            .await;
+        }
     }
 
     // 10 to 12
@@ -3026,10 +3073,22 @@ fn marked_text(
     Ok(text && scan.markers.finish())
 }
 
+/// What a folder copy's publication at a head past its base stands on
+/// (SPEC u292 `publish_reviewed`, `at_head`): the folder check the run
+/// asked, the head's commit, and the head's file hashes.
+type AtHead = (FolderCheck, String, BTreeMap<String, String>);
+
 /// `publish_reviewed`, under a lock the caller holds. `resumed` is the
 /// head `converge` 3 resumed at; `reviewed` is the collection the run
 /// took — the folder `continue_resolution` 3 just recorded, or the one
 /// `converge` 1 took — standing in for step 1's walk.
+///
+/// SPEC u292: `at_head`, set by `converge` 2 alone, names the parent and
+/// the reference the first send takes with no tree read; and on a folder
+/// copy a moved-head refusal is answered by a send at the named head,
+/// with no wait and no round raised, wherever no version after the
+/// work's standing version changed the folder — at most
+/// `FOLDER_SEND_BOUND` sends in the run.
 #[allow(clippy::too_many_arguments)]
 async fn publish_reviewed(
     client: &SynsClient,
@@ -3039,11 +3098,21 @@ async fn publish_reviewed(
     staging: &Staging,
     resumed: Option<Option<String>>,
     reviewed: Option<Folder>,
+    at_head: Option<AtHead>,
     root: &FolderRoot,
 ) -> Result<SyncOutcome, CliError> {
     let mut reviewed = reviewed;
     let mut forget: Vec<String> = Vec::new();
     let held = opts.held_bytes();
+    // SPEC u292: the run's one folder check, the head a pass sends at
+    // with the reference it sends over, the tree the outbox at that head
+    // recorded, and the sends made.
+    let (mut check, mut named) = match at_head {
+        Some((check, commit, files)) => (Some(check), Some((commit, files))),
+        None => (None, None),
+    };
+    let mut outbox_tree: Option<BTreeMap<String, String>> = None;
+    let mut sends: u32 = 0;
     'passes: for _ in 0..MAX_PASSES {
         // 1 — the run's collection, or a fresh one after a publication
         // pass refused on a file changed since its collection, each such
@@ -3103,10 +3172,11 @@ async fn publish_reviewed(
 
         // 4
         let base = load_base(copy);
-        let parent = match (&resumed, &resolution) {
-            (Some(head), _) => head.clone(),
-            (None, Some(standing)) => Some(standing.head_commit.clone()),
-            (None, None) => base.commit.clone(),
+        let parent = match (&named, &resumed, &resolution) {
+            (Some((head, _)), _, _) => Some(head.clone()),
+            (None, Some(head), _) => head.clone(),
+            (None, None, Some(standing)) => Some(standing.head_commit.clone()),
+            (None, None, None) => base.commit.clone(),
         };
         copy.write_outbox(&Outbox {
             parent_commit: parent.clone(),
@@ -3114,13 +3184,18 @@ async fn publish_reviewed(
         })?;
 
         // 5
-        let reference = match &parent {
-            Some(commit) if base.commit.as_ref() == Some(commit) => base.files.clone(),
-            Some(commit) => match read_tree(client, Some(token), copy, Some(commit)).await {
-                Ok(tree) => tree.files,
-                Err(err) => return Err(settle_refused_outbox(copy, err)),
-            },
-            None => BTreeMap::new(),
+        // SPEC u292: a send at a named head takes the reference it was
+        // handed, reading no tree.
+        let reference = match (&named, &parent) {
+            (Some((_, files)), _) => files.clone(),
+            (None, Some(commit)) if base.commit.as_ref() == Some(commit) => base.files.clone(),
+            (None, Some(commit)) => {
+                match read_tree(client, Some(token), copy, Some(commit)).await {
+                    Ok(tree) => tree.files,
+                    Err(err) => return Err(settle_refused_outbox(copy, err)),
+                }
+            }
+            (None, None) => BTreeMap::new(),
         };
         let reference = without(
             &reference,
@@ -3133,7 +3208,12 @@ async fn publish_reviewed(
         push_opts.prefix = None;
         push_opts.parent_sha = parent.clone();
         push_opts.reference = Some(to_hash_map(&reference));
-        push_opts.expected = resolution.as_ref().map(|_| to_hash_map(&hashes));
+        // SPEC u292 `publish_reviewed` 3: a send at a named head is held
+        // to the tree the outbox at that head recorded.
+        push_opts.expected = match outbox_tree.take() {
+            Some(tree) => Some(to_hash_map(&tree)),
+            None => resolution.as_ref().map(|_| to_hash_map(&hashes)),
+        };
         // SPEC u291 `converge` 5: a folder copy publishes under its
         // recorded path, with no local record and no identity file.
         push_opts.folder = copy.folder.as_ref().map(|scope| scope.path.clone());
@@ -3141,7 +3221,11 @@ async fn publish_reviewed(
         // collection (SPEC u280 `converge` 1).
         push_opts.collected = Some(folder.into_collected());
 
-        match smart_push(client, token, &repo_id(copy), &copy.root, push_opts).await {
+        let sent = smart_push(client, token, &repo_id(copy), &copy.root, push_opts).await;
+        if !matches!(sent, Err(CliError::CollectedSetChanged { .. })) {
+            sends += 1;
+        }
+        match sent {
             Ok((response, raw, meta)) => {
                 // 6
                 if !response.commit_sha.is_empty() {
@@ -3167,10 +3251,33 @@ async fn publish_reviewed(
             Err(CliError::Api {
                 status: Some(409),
                 ref error,
-                context: Some(ApiErrorContext::HeadMoved { .. }),
+                context: Some(ApiErrorContext::HeadMoved { ref current_sha }),
             }) if error == "conflict" => {
                 // 7
                 copy.remove_outbox()?;
+                // SPEC u292 `publish_reviewed` 1 to 3 — on a folder copy
+                // below the bound, the run's one folder check decides
+                // between a send at the named head and the round.
+                if let Some(scope) = &copy.folder
+                    && sends < FOLDER_SEND_BOUND
+                    && let Some(since) = &parent
+                {
+                    let check = check.get_or_insert_with(|| FolderCheck {
+                        repo_id: repo_id(copy),
+                        folder: scope.path.clone(),
+                        since: since.clone(),
+                        since_version: None,
+                    });
+                    if !check.folder_moved(client, Some(token)).await? {
+                        copy.write_outbox(&Outbox {
+                            parent_commit: Some(current_sha.clone()),
+                            tree: hashes.clone(),
+                        })?;
+                        outbox_tree = Some(hashes);
+                        named = Some((current_sha.clone(), reference));
+                        continue 'passes;
+                    }
+                }
                 return guard_refused(
                     client, token, copy, &opts, staging, resolution, parent, reference, root,
                 )
@@ -3300,6 +3407,7 @@ async fn continue_locked(
                 &staging,
                 Some(parent),
                 None,
+                None,
                 &root,
             )
             .await;
@@ -3350,6 +3458,7 @@ async fn continue_locked(
         &staging,
         None,
         Some(folder),
+        None,
         &root,
     )
     .await

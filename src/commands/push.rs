@@ -19,6 +19,7 @@ use crate::push::converge::{
     ConvergeMode, FolderRoot, SyncOutcome, collect_in_place, converge, lay_over_enclosing,
     read_folder_tree, read_holder_synsignore, resolution_elsewhere,
 };
+use crate::push::folder_check::{FOLDER_SEND_BOUND, FolderCheck, named_head};
 use crate::push::smart::{PushPipelineMeta, SmartPushOptions, smart_push};
 use crate::push::working_copy::{WorkingCopy, folder_base};
 use crate::repo::folder::{FolderScope, lies_under, place_under, resolve_folder_scope};
@@ -432,32 +433,59 @@ async fn push_folder(
         None => read_holder_synsignore(&client, Some(&token), &holder, parent.as_deref()).await?,
     };
     let root = FolderRoot::of_scope(&copy.root, &scope, holder_bytes);
-    opts.collected = Some(collect_in_place(
-        &root,
-        &args.exclude,
-        CollectOptions {
-            no_default_excludes: args.no_default_excludes,
-            debug: args.debug,
-            prefix: prefix.clone(),
-            holder_synsignore: None,
-        },
-        None,
-        &held,
-    )?);
+    let collect_options = CollectOptions {
+        no_default_excludes: args.no_default_excludes,
+        debug: args.debug,
+        prefix: prefix.clone(),
+        holder_synsignore: None,
+    };
+    let collect = || collect_in_place(&root, &args.exclude, collect_options.clone(), None, &held);
+    opts.collected = Some(collect()?);
     opts.prefix = prefix;
     if args.force {
-        opts.declined_parent = parent;
+        opts.declined_parent = parent.clone();
     } else {
         opts.reference = Some(reference);
-        opts.parent_sha = parent;
+        opts.parent_sha = parent.clone();
     }
-    let (response, raw, meta) = smart_push(&client, &token, &holder, &copy.root, opts).await?;
-    // The publication laid over the base it stood on — the one
+    // SPEC u292 `cmd_push` 1 to 3 — a scoped publication refused under a
+    // moved head is sent again at the named head, with the folder
+    // collected again, wherever no version after the parent it first
+    // claimed changed the folder; at most `FOLDER_SEND_BOUND` sends.
+    let resend = (!args.force).then(|| opts.clone());
+    let mut answer = smart_push(&client, &token, &holder, &copy.root, opts).await;
+    let mut sends: u32 = 1;
+    let mut check: Option<FolderCheck> = None;
+    while let (Err(refused), Some(template), Some(since)) = (&answer, &resend, &parent) {
+        let Some(named) = named_head(refused) else {
+            break;
+        };
+        if sends >= FOLDER_SEND_BOUND {
+            break;
+        }
+        let check = check.get_or_insert_with(|| FolderCheck {
+            repo_id: holder.clone(),
+            folder: scope.path.clone(),
+            since: since.clone(),
+            since_version: None,
+        });
+        if check.folder_moved(&client, Some(&token)).await? {
+            break;
+        }
+        let mut again = template.clone();
+        again.parent_sha = Some(named.to_string());
+        again.collected = Some(collect()?);
+        sends += 1;
+        answer = smart_push(&client, &token, &holder, &copy.root, again).await;
+    }
+    let (response, raw, meta) = answer?;
+    // 4 — the publication laid over the base it stood on — the one
     // `folder_base` answered, the folder copy's own or an enclosing
-    // copy's narrowed to the folder — recorded as the folder copy's base,
-    // and that base laid over every copy enclosing the folder.
+    // copy's narrowed to the folder — where that base names the parent
+    // the run first claimed, recorded as the folder copy's base, and that
+    // base laid over every copy enclosing the folder.
     if let Some(base) = based
-        && lay_folder_publication(&copy, base, &response, &meta)
+        && lay_folder_publication(&copy, base, parent.as_deref(), &response, &meta)
         && let Some(recorded) = copy.base()
     {
         lay_over_enclosing(
@@ -471,20 +499,27 @@ async fn push_folder(
 }
 
 /// Where `base` — the base a folder's forced or scoped publication stood
-/// on — names the parent the publication sent, record the acknowledged
+/// on — names the parent the run first claimed, record the acknowledged
 /// commit as the folder copy's base with the collected set laid over it
 /// and the named deletions taken out, as `lay_publication_over_base` does
 /// for a copy's own base. Answers whether it recorded one; a failed write
 /// leaves the base as it stood.
+///
+/// SPEC u292 `cmd_push` 4: `claimed` is the parent the run first
+/// claimed, which a send again at a named head no folder change stood
+/// between leaves the base the publication landed over; a forced run
+/// claims none and lays nothing.
 fn lay_folder_publication(
     copy: &WorkingCopy,
     base: crate::push::manifest::Manifest,
+    claimed: Option<&str>,
     response: &PushResponse,
     meta: &PushPipelineMeta,
 ) -> bool {
     if response.commit_sha.is_empty()
         || base.commit_sha().is_none()
-        || base.commit_sha() != meta.sent_parent.as_deref()
+        || meta.sent_parent.is_none()
+        || base.commit_sha() != claimed
     {
         return false;
     }
@@ -1084,7 +1119,7 @@ mod tests {
             .push_body(
                 "alice/my-project",
                 "test-token",
-                serde_json::to_vec(&request).unwrap(),
+                bytes::Bytes::from(serde_json::to_vec(&request).unwrap()),
             )
             .await
             .unwrap();

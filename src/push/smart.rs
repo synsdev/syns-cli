@@ -707,7 +707,7 @@ async fn publish_pass(
         .map_err(PassRefusal::standing)?;
         match target
             .client
-            .push_body(target.repo_id, target.token, body)
+            .push_body(target.repo_id, target.token, bytes::Bytes::from(body))
             .await
         {
             Ok(answered) => return Ok(answered),
@@ -785,7 +785,7 @@ async fn chunked_push(
         let bytes_sent = body.len() as u64;
         return match target
             .client
-            .push_body(target.repo_id, target.token, body)
+            .push_body(target.repo_id, target.token, bytes::Bytes::from(body))
             .await
         {
             Ok(ok) => Ok(ok),
@@ -879,7 +879,7 @@ async fn chunked_push(
         // now reflects server HEAD at batch k-1 (HIGH-2 fix).
         match target
             .client
-            .push_body(target.repo_id, target.token, body)
+            .push_body(target.repo_id, target.token, bytes::Bytes::from(body))
             .await
         {
             Ok((response, raw)) => {

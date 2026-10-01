@@ -1,5 +1,6 @@
 pub mod collector;
 pub mod converge;
+pub mod folder_check;
 pub mod hash;
 pub mod manifest;
 pub mod reconcile;

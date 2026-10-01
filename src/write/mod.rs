@@ -31,6 +31,7 @@ use crate::push::collector::{CollectOptions, HeldBytes, MAX_FILE_BYTES, collect_
 use crate::push::converge::{
     FolderRoot, collect_in_place, excluded_local_files, is_partial_write, read_holder_synsignore,
 };
+use crate::push::folder_check::{FOLDER_SEND_BOUND, FolderCheck, named_head};
 use crate::push::hash::blob_sha1;
 use crate::push::manifest::Manifest;
 use crate::push::working_copy::{WorkingCopy, folder_base};
@@ -133,6 +134,9 @@ pub struct WriteTarget {
     pub parent: ParentRef,
     pub checkout: Option<PathBuf>,
     pub folder: Option<FolderScope>,
+    /// SPEC u292: the head's commit the repository read answered at
+    /// `resolve_write_target` 4, none where that answer named none.
+    pub head: Option<String>,
 }
 
 impl WriteTarget {
@@ -593,8 +597,13 @@ pub async fn resolve_write_target(
     let checkout = checkout_of(config, cwd, &repo_id, opts.repo.is_some(), &client, &token).await?;
 
     // 4 — read the repository, so no push of this run can be the request
-    // that creates one (`issues/069`).
-    client.get_repo(&repo_id, Some(&token)).await?;
+    // that creates one (`issues/069`), keeping the head it names (SPEC
+    // u292 `WriteTarget.head`).
+    let head = client
+        .get_repo(&repo_id, Some(&token))
+        .await?
+        .commit_sha
+        .filter(|sha| !sha.is_empty());
 
     // 5 and 6 — pin the parent.
     let parent = resolve_parent(&client, &repo_id, &token, &opts.parent).await?;
@@ -605,6 +614,7 @@ pub async fn resolve_write_target(
         parent,
         checkout,
         folder,
+        head,
     })
 }
 
@@ -748,14 +758,154 @@ fn report(output: &Output, target: &WriteTarget, response: &PushResponse, raw: s
     }
 }
 
-/// Publishes the changeset as exactly one commit at the pinned parent,
-/// and writes the run's one answer (SPEC u271 Behaviour,
-/// `commit_changeset`).
+/// The key whose one value `with_parent_sha` rewrites, as `serde_json`
+/// writes it.
+const PARENT_SHA_KEY: &[u8] = b"\"parentSha\":\"";
+
+/// `body` with its one `parentSha` value set to `head` and every other
+/// byte as it stood (SPEC u292 Contract Surface, `with_parent_sha`):
+/// rewritten in place where `body` is the buffer's only handle and the
+/// value keeps its length, and otherwise one fresh copy carrying the
+/// rewrite, the shared buffer left reading as it did.
 ///
-/// One call of `EP-push` per run and no second request of any kind: the
-/// claimed parent is `target.parent.commit_sha` under every combination
-/// of options, nothing is retried and nothing is resent, and no file of
-/// any folder is read, written or removed.
+/// The key is sought from the end: `parentSha` is serialised after
+/// `files`, and inside any JSON string a quote stands escaped, so the
+/// last unescaped `"parentSha":"` is the key itself.
+fn with_parent_sha(body: bytes::Bytes, head: &str) -> bytes::Bytes {
+    let Some(start) = body
+        .windows(PARENT_SHA_KEY.len())
+        .rposition(|window| window == PARENT_SHA_KEY)
+        .map(|at| at + PARENT_SHA_KEY.len())
+    else {
+        return body;
+    };
+    let Some(end) = body[start..]
+        .iter()
+        .position(|&b| b == b'"')
+        .map(|len| start + len)
+    else {
+        return body;
+    };
+    if end - start == head.len() {
+        match body.try_into_mut() {
+            Ok(mut unique) => {
+                unique[start..end].copy_from_slice(head.as_bytes());
+                return unique.freeze();
+            }
+            Err(shared) => {
+                let mut fresh = shared.to_vec();
+                fresh[start..end].copy_from_slice(head.as_bytes());
+                return bytes::Bytes::from(fresh);
+            }
+        }
+    }
+    let mut fresh = Vec::with_capacity(body.len() - (end - start) + head.len());
+    fresh.extend_from_slice(&body[..start]);
+    fresh.extend_from_slice(head.as_bytes());
+    fresh.extend_from_slice(&body[end..]);
+    bytes::Bytes::from(fresh)
+}
+
+/// One `EP-push` of `body`, a handle to it kept across the send and
+/// answered beside the send's own answer, so the next send takes the
+/// buffer back where the server read it whole.
+async fn send_keeping(
+    client: &SynsClient,
+    target: &WriteTarget,
+    body: bytes::Bytes,
+) -> (
+    Result<(PushResponse, serde_json::Value), CliError>,
+    bytes::Bytes,
+) {
+    let kept = body.clone();
+    let answer = client.push_body(&target.repo_id, &target.token, body).await;
+    (answer, kept)
+}
+
+/// SPEC u292 Behaviour, `commit_changeset` 1 to 5 inside a folder: the
+/// one serialised body sent at the pinned parent — or, where the
+/// repository read named another head, at none until the folder check
+/// answers — and then at each head a refusal names while no version
+/// after the pinned parent changed the folder, at most
+/// `FOLDER_SEND_BOUND` sends in all.
+async fn send_inside_folder(
+    client: &SynsClient,
+    target: &WriteTarget,
+    folder: &FolderScope,
+    body: bytes::Bytes,
+) -> Result<(PushResponse, serde_json::Value), CliError> {
+    let pinned = &target.parent.commit_sha;
+    let conflict = |head: &str| CliError::WriteConflict {
+        parent: pinned.clone(),
+        current_sha: head.to_string(),
+    };
+    let mut sends: u32 = 0;
+    let mut body = body;
+
+    // 1 — the first send at the pinned parent, unless the repository
+    // read already named another head.
+    let mut named = match target.head.as_deref() {
+        Some(head) if head != pinned => head.to_string(),
+        _ => {
+            sends += 1;
+            let (answer, kept) = send_keeping(client, target, body).await;
+            body = kept;
+            match answer {
+                Ok(landed) => return Ok(landed),
+                Err(err) => match named_head(&err) {
+                    Some(head) => head.to_string(),
+                    None => return Err(fold_conflict(err, pinned)),
+                },
+            }
+        }
+    };
+
+    // 2 — the run's one check, on the folder's recorded path and the
+    // pinned parent.
+    let mut check = FolderCheck {
+        repo_id: target.repo_id.clone(),
+        folder: folder.path.clone(),
+        since: pinned.clone(),
+        since_version: target.parent.version,
+    };
+    loop {
+        // A head named in any other spelling than a full hash is sent
+        // nothing: the body's parent is rewritten in its own bytes.
+        if !is_full_commit_hash(&named) {
+            return Err(conflict(&named));
+        }
+        // 3
+        if sends >= FOLDER_SEND_BOUND {
+            return Err(conflict(&named));
+        }
+        // 4
+        if check.folder_moved(client, Some(&target.token)).await? {
+            return Err(conflict(&named));
+        }
+        // 5
+        body = with_parent_sha(body, &named);
+        sends += 1;
+        let (answer, kept) = send_keeping(client, target, body).await;
+        body = kept;
+        match answer {
+            Ok(landed) => return Ok(landed),
+            Err(err) => match named_head(&err) {
+                Some(head) => named = head.to_string(),
+                None => return Err(fold_conflict(err, pinned)),
+            },
+        }
+    }
+}
+
+/// Publishes the changeset as one commit, and writes the run's one
+/// answer (SPEC u271 Behaviour, `commit_changeset`).
+///
+/// Outside a folder, one call of `EP-push` per run and no second request
+/// of any kind: the claimed parent is `target.parent.commit_sha` under
+/// every combination of options, nothing is retried and nothing is
+/// resent, and no file of any folder is read, written or removed. Inside
+/// one (SPEC u292), the same body is sent again at a head that moved only
+/// by versions that changed no path under the folder.
 pub async fn commit_changeset(
     config: &Config,
     output: &Output,
@@ -787,18 +937,22 @@ pub async fn commit_changeset(
     let message = caption(opts, default_message)?;
     let request = push_body(target, changeset, opts, message);
 
-    // 3 — the one call of `EP-push`, its body serialised once and sent
-    // through the one sender of every publication's body (SPEC u280
-    // `push_body`).
+    // 3 — the body serialised once and sent through the one sender of
+    // every publication's body (SPEC u280 `push_body`), as the buffer it
+    // goes out in.
     let body = serde_json::to_vec(&request).map_err(|e| CliError::Io {
         message: format!("could not serialise a request body: {e}"),
     })?;
     drop(request);
+    let body = bytes::Bytes::from(body);
     let client = SynsClient::new(config.server_url())?;
-    let (response, raw) = client
-        .push_body(&target.repo_id, &target.token, body)
-        .await
-        .map_err(|err| fold_conflict(err, &target.parent.commit_sha))?;
+    let (response, raw) = match &target.folder {
+        None => client
+            .push_body(&target.repo_id, &target.token, body)
+            .await
+            .map_err(|err| fold_conflict(err, &target.parent.commit_sha))?,
+        Some(folder) => send_inside_folder(&client, target, folder, body).await?,
+    };
 
     // 4 and 5 — compose the run's one answer and render it.
     report(output, target, &response, raw);
@@ -886,6 +1040,7 @@ mod tests {
             },
             checkout,
             folder: None,
+            head: None,
         }
     }
 
@@ -1294,6 +1449,34 @@ mod tests {
         assert_eq!(paths, vec!["/api/v1/repos/alice/notes".to_string()]);
     }
 
+    // SPEC u292 `WriteTarget.head`: the head the repository read
+    // answered is kept on the target, none where that answer named none.
+    #[tokio::test]
+    #[serial]
+    async fn the_target_keeps_the_head_the_repository_read_named() {
+        for (named, kept) in [
+            (serde_json::json!(MOVED_SHA), Some(MOVED_SHA.to_string())),
+            (serde_json::Value::Null, None),
+        ] {
+            let server = MockServer::start().await;
+            let mut repo = repo_body();
+            repo["commitSha"] = named;
+            Mock::given(method("GET"))
+                .and(path_matcher("/api/v1/repos/alice/notes"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(repo))
+                .mount(&server)
+                .await;
+            let env = env_for(&server.uri());
+            let work = tempfile::tempdir().unwrap();
+
+            let target = resolve_write_target(&env.config, work.path(), &write_options(HEAD_SHA))
+                .await
+                .unwrap();
+            assert_eq!(target.head, kept);
+            assert_eq!(target.parent.commit_sha, HEAD_SHA);
+        }
+    }
+
     // `resolve_write_target` 5: every other spelling is resolved into a
     // version and that version's full hash.
     #[tokio::test]
@@ -1619,6 +1802,136 @@ mod tests {
         );
         assert_eq!(body["deletions"][0]["path"], serde_json::json!("gone.md"));
         assert!(body.get("provenance").is_none());
+    }
+
+    // SPEC u292 Behaviour, `commit_changeset` 1 to 5: inside a folder,
+    // a repository read naming a head past the pinned parent sends
+    // nothing at the parent, asks the folder check once, and sends at
+    // that head.
+    #[tokio::test]
+    #[serial]
+    async fn a_folder_write_whose_read_head_moved_sends_once_at_that_head() {
+        use wiremock::matchers::{body_partial_json, query_param};
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path_matcher("/api/v1/repos/alice/notes/push"))
+            .and(body_partial_json(
+                serde_json::json!({"parentSha": MOVED_SHA}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(push_body(
+                1,
+                3,
+                "e".repeat(40).as_str(),
+            )))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path_matcher("/api/v1/repos/alice/notes/push"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "error": "conflict", "currentSha": MOVED_SHA,
+            })))
+            .mount(&server)
+            .await;
+        let mut at_parent = version_body(1, HEAD_SHA);
+        at_parent["filesChanged"] = serde_json::json!(["q3/board.json"]);
+        Mock::given(method("GET"))
+            .and(path_matcher("/api/v1/repos/alice/notes/versions"))
+            .and(query_param("path", "q3"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [at_parent], "total": 1, "limit": 1, "offset": 0,
+            })))
+            .mount(&server)
+            .await;
+        let env = env_for(&server.uri());
+        let work = tempfile::tempdir().unwrap();
+        let mut target = target_at(None);
+        target.parent.version = Some(1);
+        target.head = Some(MOVED_SHA.to_string());
+        target.folder = Some(FolderScope {
+            dir: work.path().to_path_buf(),
+            owner: "alice".to_string(),
+            name: "notes".to_string(),
+            path: "q3".to_string(),
+            checkout: None,
+            enclosing: Vec::new(),
+        });
+
+        commit_changeset(
+            &env.config,
+            &Output::new(true),
+            &target,
+            Changeset {
+                files: vec![(
+                    "board.json".to_string(),
+                    FileContent::Text("{}".to_string()),
+                )],
+                deletions: Vec::new(),
+            },
+            &write_options(HEAD_SHA),
+            "write board.json",
+        )
+        .await
+        .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let pushes: Vec<serde_json::Value> = requests
+            .iter()
+            .filter(|r| r.method.as_str() == "PUT")
+            .map(|r| r.body_json().unwrap())
+            .collect();
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0]["parentSha"], serde_json::json!(MOVED_SHA));
+        assert_eq!(
+            pushes[0]["files"][0]["path"],
+            serde_json::json!("q3/board.json")
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.url.path().ends_with("/versions"))
+                .count(),
+            1
+        );
+    }
+
+    // SPEC u292 Tests, `a_shared_body_is_copied_once_for_the_next_send`.
+    #[test]
+    fn a_shared_body_is_copied_once_for_the_next_send() {
+        let mut request = PushRequest {
+            files: vec![PushFileEntry {
+                path: "q3/board.json".to_string(),
+                sha: blob_sha1(b"{}"),
+                content: Some("{}".to_string()),
+                content_base64: None,
+            }],
+            deletions: None,
+            message: Some("m".to_string()),
+            author: None,
+            parent_sha: Some("1".repeat(40)),
+            description: None,
+            tags: None,
+            status: None,
+            visibility: None,
+            provenance: None,
+        };
+        let input = bytes::Bytes::from(serde_json::to_vec(&request).unwrap());
+        request.parent_sha = Some("2".repeat(40));
+        let expected = serde_json::to_vec(&request).unwrap();
+
+        // A second handle kept: one fresh copy, the shared one untouched.
+        let kept = input.clone();
+        let original = kept.to_vec();
+        let rewritten = with_parent_sha(input, &"2".repeat(40));
+        assert_eq!(rewritten.as_ref(), expected.as_slice());
+        assert_eq!(kept.as_ref(), original.as_slice());
+        assert_ne!(rewritten.as_ptr(), kept.as_ptr());
+
+        // The second handle dropped: rewritten in place.
+        let address = kept.as_ptr();
+        let rewritten = with_parent_sha(kept, &"2".repeat(40));
+        assert_eq!(rewritten.as_ref(), expected.as_slice());
+        assert_eq!(rewritten.as_ptr(), address);
     }
 
     // `commit_changeset` 1: a `--message` empty once trimmed is refused

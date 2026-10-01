@@ -81,6 +81,24 @@ struct State {
     /// The delay the first tree answer is held for.
     hold_first_tree: Option<Duration>,
     trees_answered: usize,
+    /// SPEC u292: whether a push claiming a parent other than the head is
+    /// refused naming it while a landing push leaves the head standing —
+    /// the Tests preamble's mock, whose push lands at the head alone.
+    pin_head: bool,
+    /// SPEC u292: the commit the repository read answers in place of the
+    /// head.
+    repo_head: Option<usize>,
+    /// SPEC u292: the commit a tree, raw or file read addressing no
+    /// reference answers in place of the head.
+    tip: Option<usize>,
+    /// SPEC u292: whether each push is refused naming a new head one
+    /// version past the head, changing `README.md` alone.
+    race_each_push: bool,
+    /// SPEC u292: whether the version list answers its newest version
+    /// whatever `path` it is asked with.
+    versions_unnarrowed: bool,
+    /// SPEC u292: the refusal the version list asked with `path` answers.
+    path_versions_refusal: Option<(u16, &'static str)>,
 }
 
 impl State {
@@ -95,12 +113,18 @@ impl State {
             file_answers: HashMap::new(),
             hold_first_tree: None,
             trees_answered: 0,
+            pin_head: false,
+            repo_head: None,
+            tip: None,
+            race_each_push: false,
+            versions_unnarrowed: false,
+            path_versions_refusal: None,
         }
     }
 
     fn commit_at(&self, reference: Option<&str>) -> Option<usize> {
         match reference {
-            None => Some(self.head),
+            None => Some(self.tip.unwrap_or(self.head)),
             Some(reference) => self
                 .commits
                 .iter()
@@ -109,6 +133,34 @@ impl State {
                     sha == reference || (index + 1).to_string() == reference
                 }),
         }
+    }
+
+    /// The paths the commit at `index` changed against the one before it,
+    /// every path of the first commit.
+    fn changed_at(&self, index: usize) -> Vec<String> {
+        let tree = &self.commits[index].1;
+        let empty = BTreeMap::new();
+        let before = if index == 0 {
+            &empty
+        } else {
+            &self.commits[index - 1].1
+        };
+        tree.keys()
+            .chain(before.keys())
+            .filter(|p| tree.get(*p) != before.get(*p))
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// The version-list entry of the commit at `index`.
+    fn version_entry(&self, index: usize) -> Value {
+        json!({
+            "version": index + 1, "sha": self.commits[index].0, "parentSha": null,
+            "message": "m", "messageBody": null, "author": "alice",
+            "createdAt": "2026-01-01T00:00:00Z", "filesChanged": self.changed_at(index),
+        })
     }
 
     /// Add a commit holding `tree` as the new head, answering its hash.
@@ -150,7 +202,7 @@ impl Respond for Server {
         };
         let method = request.method.as_str();
         if rest.is_empty() && method == "GET" {
-            let (sha, tree) = &state.commits[state.head];
+            let (sha, tree) = &state.commits[state.repo_head.unwrap_or(state.head)];
             return ResponseTemplate::new(200).set_body_json(json!({
                 "owner": "alice", "name": "work", "description": null,
                 "commitSha": sha, "status": "active", "author": null, "tags": [],
@@ -205,6 +257,9 @@ impl Respond for Server {
             return ResponseTemplate::new(200).set_body_json(json!({
                 "content": content, "sha": blob_sha1(content.as_bytes()), "size": content.len(),
             }));
+        }
+        if method == "GET" && rest == "/versions" {
+            return versions_answer(&state, request);
         }
         if method == "GET"
             && let Some(reference) = rest.strip_prefix("/versions/")
@@ -284,11 +339,56 @@ fn tree_answer(state: &mut State, rest: &str, request: &Request) -> ResponseTemp
     }
 }
 
+/// `EP-versions`: the newest versions first, up to the head, narrowed to
+/// the versions changing a path at or under `path` where one is asked.
+fn versions_answer(state: &State, request: &Request) -> ResponseTemplate {
+    let path = query(request, "path");
+    if path.is_some()
+        && let Some((status, error)) = state.path_versions_refusal
+    {
+        return refusal(status, error);
+    }
+    let limit: usize = query(request, "limit")
+        .and_then(|l| l.parse().ok())
+        .unwrap_or(20);
+    let offset: usize = query(request, "offset")
+        .and_then(|o| o.parse().ok())
+        .unwrap_or(0);
+    let listed: Vec<usize> = (0..=state.head)
+        .rev()
+        .filter(|index| match &path {
+            Some(folder) if !state.versions_unnarrowed => state
+                .changed_at(*index)
+                .iter()
+                .any(|p| p == folder || p.starts_with(&format!("{folder}/"))),
+            _ => true,
+        })
+        .collect();
+    let data: Vec<Value> = listed
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(|index| state.version_entry(*index))
+        .collect();
+    ResponseTemplate::new(200).set_body_json(json!({
+        "data": data, "total": listed.len(), "limit": limit, "offset": offset,
+    }))
+}
+
 fn push_answer(state: &mut State, request: &Request) -> ResponseTemplate {
     let body: Value = serde_json::from_slice(&request.body).expect("a push body");
+    if state.race_each_push {
+        let mut tree = state.commits[state.head].1.clone();
+        let raced = format!("# raced {}\n", state.next);
+        tree.insert("README.md".to_string(), raced.into_bytes());
+        let sha = state.set_head(tree);
+        return ResponseTemplate::new(409).set_body_json(json!({
+            "error": "conflict", "currentSha": sha,
+        }));
+    }
     let (head_sha, head_tree) = state.commits[state.head].clone();
     if let Some(parent) = body["parentSha"].as_str()
-        && state.advance
+        && (state.advance || state.pin_head)
         && parent != head_sha
     {
         return ResponseTemplate::new(409).set_body_json(json!({
@@ -343,7 +443,7 @@ fn push_answer(state: &mut State, request: &Request) -> ResponseTemplate {
     let sha = h(state.next);
     state.next += 1;
     state.commits.push((sha.clone(), tree));
-    if state.advance {
+    if state.advance && !state.pin_head {
         state.head = state.commits.len() - 1;
     }
     ResponseTemplate::new(200).set_body_json(json!({
@@ -364,6 +464,9 @@ struct Deployment {
     cache: TempDir,
     _work: TempDir,
     w: PathBuf,
+    /// SPEC u292: the address the binary is pointed at in place of the
+    /// mock's own.
+    via: Option<String>,
 }
 
 impl Deployment {
@@ -400,6 +503,7 @@ impl Deployment {
             cache: tempfile::tempdir().expect("cache dir"),
             _work: work,
             w,
+            via: None,
         }
     }
 
@@ -493,7 +597,8 @@ impl Deployment {
         for (key, value) in envs {
             command.env(key, value);
         }
-        command.arg("--server").arg(self.server.uri()).args(args);
+        let server = self.via.clone().unwrap_or_else(|| self.server.uri());
+        command.arg("--server").arg(server).args(args);
         command
     }
 
@@ -1229,11 +1334,12 @@ fn a_scoped_or_forced_push_inside_a_folder_stands_on_the_folder_base() {
 }
 
 /// The preamble's deployment with the folder's identity file declaring
-/// `check`, a head `h2` changing `.page/x.json` alone, and the folder's
-/// `board.json` edited.
+/// `check`, a head `h2` adding `notes.md` under the folder — a change of
+/// the folder, so the sync behind it prepares a review (SPEC u292 Files)
+/// — and the folder's `board.json` edited.
 fn behind_with_check(check: &str) -> Deployment {
     let d = Deployment::converged();
-    d.advance_head(&[(".page/x.json", Some("{\"x\":2}\n"))]);
+    d.advance_head(&[(in_folder("notes.md").as_str(), Some("noted\n"))]);
     write(&d.folder().join(".page/board.json"), "{\"cards\":[4]}\n");
     write(
         &d.folder().join(".syns.yaml"),
@@ -1707,4 +1813,629 @@ fn a_pull_inside_a_folder_its_holder_converged_names_the_head() {
     assert_eq!(document["commitSha"], json!(h(1)));
     assert_eq!(document["downloaded"], json!(0));
     assert_eq!(document["unchanged"], json!(2));
+}
+
+// ---- SPEC u292: a write, push or sync inside a folder meeting a moved head
+
+const README_H1: &str = "# work\n";
+
+/// The head `h1` the u292 Tests preamble fixes: the checkout's identity
+/// file, `README.md`, and the folder holding its identity file and
+/// `board.json`.
+fn u292_h1() -> BTreeMap<String, Vec<u8>> {
+    BTreeMap::from([
+        (".syns.yaml".to_string(), W_YAML.as_bytes().to_vec()),
+        ("README.md".to_string(), README_H1.as_bytes().to_vec()),
+        (in_folder(".syns.yaml"), FOLDER_YAML.as_bytes().to_vec()),
+        (in_folder("board.json"), BOARD_H1.as_bytes().to_vec()),
+    ])
+}
+
+/// The u292 Tests preamble: `W` and the folder each converged at `h1`,
+/// the head `h2` changing `README.md` alone, and a push landing at `h2`
+/// alone with the head left standing, any other parent refused naming
+/// `h2`. The version list asked with the folder's path answers version
+/// `1` at `h1`, the newest version changing a path under it.
+fn behind_outside() -> Deployment {
+    let d = Deployment::converged_over(u292_h1());
+    d.advance_head(&[("README.md", Some("# work, moved outside\n"))]);
+    d.state().pin_head = true;
+    d
+}
+
+/// The `h1` deployment, converged, with `changes` laid over it as `h2`
+/// and the head pinned as `behind_outside` pins it.
+fn behind_with(changes: &[(&str, Option<&str>)]) -> Deployment {
+    let d = Deployment::converged_over(u292_h1());
+    d.advance_head(changes);
+    d.state().pin_head = true;
+    d
+}
+
+/// The unread-check line's opening, for the folder.
+fn unread_line_opening() -> String {
+    format!(
+        "warning: the history of the folder {FOLDER} could not be read, so the run answers as though the folder moved: "
+    )
+}
+
+impl Deployment {
+    /// Every version-list request since `mark`.
+    fn version_lists_since(&self, mark: usize) -> Vec<Request> {
+        self.requests_since(mark)
+            .into_iter()
+            .filter(|r| {
+                r.method.as_str() == "GET" && decoded(r.url.path()) == format!("{PREFIX}/versions")
+            })
+            .collect()
+    }
+
+    /// Every single-version request since `mark`, by the reference it
+    /// addresses.
+    fn single_versions_since(&self, mark: usize) -> Vec<String> {
+        self.requests_since(mark)
+            .into_iter()
+            .filter_map(|r| {
+                decoded(r.url.path())
+                    .strip_prefix(&format!("{PREFIX}/versions/"))
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// Whether a resolution stands in the folder copy.
+    fn folder_resolution_stands(&self) -> bool {
+        exit_of(&self.run_in(&self.folder(), b"", &["resolution", "show"])) == 4
+    }
+}
+
+/// Read one HTTP/1.1 request off `stream`: its head, and a body of the
+/// length it declares.
+fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, Vec<u8>)> {
+    use std::io::Read;
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if stream.read(&mut byte).ok()? == 0 {
+            return None;
+        }
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8_lossy(&head).to_string();
+    let length = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+    let mut body = vec![0u8; length];
+    stream.read_exact(&mut body).ok()?;
+    Some((head, body))
+}
+
+/// A listener in front of the mock at `upstream` forwarding each request
+/// on a connection of its own, and closing with no status every request
+/// whose request line asks the version list with a `path`.
+fn path_versions_dropping_proxy(upstream: &str) -> String {
+    use std::io::{Read, Write};
+    let upstream = upstream.trim_start_matches("http://").to_string();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("proxy");
+    let port = listener.local_addr().expect("proxy address").port();
+    std::thread::spawn(move || {
+        for incoming in listener.incoming() {
+            let Ok(mut client) = incoming else {
+                return;
+            };
+            let upstream = upstream.clone();
+            std::thread::spawn(move || {
+                let Some((head, body)) = read_request(&mut client) else {
+                    return;
+                };
+                let line = head.lines().next().unwrap_or_default().to_string();
+                if line.contains("/versions?") && line.contains("path=") {
+                    let _ = client.shutdown(std::net::Shutdown::Both);
+                    return;
+                }
+                let Ok(mut up) = std::net::TcpStream::connect(&upstream) else {
+                    return;
+                };
+                let mut forwarded: String = head
+                    .trim_end_matches("\r\n")
+                    .lines()
+                    .filter(|l| !l.to_ascii_lowercase().starts_with("connection:"))
+                    .map(|l| format!("{l}\r\n"))
+                    .collect();
+                forwarded.push_str("connection: close\r\n\r\n");
+                if up.write_all(forwarded.as_bytes()).is_err() || up.write_all(&body).is_err() {
+                    return;
+                }
+                let mut answer = Vec::new();
+                let _ = up.read_to_end(&mut answer);
+                let _ = client.write_all(&answer);
+                let _ = client.shutdown(std::net::Shutdown::Both);
+            });
+        }
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
+/// A PNG's eight-byte signature and a few bytes past it no text holds.
+fn png_bytes() -> Vec<u8> {
+    let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    bytes.extend_from_slice(&[0, 0, 0, 13, b'I', b'H', b'D', b'R', 0xff, 0x00, 0xfe]);
+    bytes
+}
+
+#[test]
+#[serial]
+fn every_write_verb_inside_a_folder_lands_over_a_push_outside_it() {
+    let d = behind_outside();
+    d.state()
+        .file_answers
+        .insert(in_folder("board.json"), "a".to_string());
+    let png = png_bytes();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+    let changeset = json!({
+        "files": [
+            {"path": "board.json", "content": "{}"},
+            {"path": "images/pic.png", "contentBase64": encoded},
+        ],
+    })
+    .to_string();
+
+    let runs: Vec<(Vec<&str>, Vec<u8>)> = vec![
+        (vec!["write", "board.json", "--parent", "1"], b"{}".to_vec()),
+        (
+            vec!["write", "images/pic.png", "--bytes", "--parent", "1"],
+            png.clone(),
+        ),
+        (
+            vec![
+                "edit",
+                "board.json",
+                "--old",
+                "a",
+                "--new",
+                "b",
+                "--parent",
+                "1",
+            ],
+            Vec::new(),
+        ),
+        (vec!["rm", "notes.md", "--parent", "1"], Vec::new()),
+        (vec!["commit", "--parent", "1"], changeset.into_bytes()),
+    ];
+    for (args, stdin) in runs {
+        let mark = d.mark();
+        let out = d.run_in(&d.folder(), &stdin, &args);
+        assert_eq!(exit_of(&out), 0, "{args:?}: {}", stderr_of(&out));
+        let pushes = d.pushes_since(mark);
+        assert_eq!(pushes.len(), 1, "{args:?}: {pushes:?}");
+        let push = &pushes[0];
+        assert_eq!(push["parentSha"], json!(h(2)), "{args:?}");
+        let paths = carried(push);
+        assert!(!paths.is_empty(), "{args:?}");
+        for path in &paths {
+            assert!(path.starts_with(&format!("{FOLDER}/")), "{args:?}: {path}");
+        }
+        assert!(!paths.contains(&"README.md".to_string()), "{args:?}");
+        for file in push["files"].as_array().into_iter().flatten() {
+            if let Some(sent) = file["contentBase64"].as_str() {
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(sent)
+                    .expect("base64");
+                assert_eq!(sha256(&decoded), sha256(&png), "{args:?}");
+            }
+        }
+        let lists = d.version_lists_since(mark);
+        assert_eq!(lists.len(), 1, "{args:?}");
+        assert_eq!(query(&lists[0], "path").as_deref(), Some(FOLDER));
+        assert_eq!(query(&lists[0], "limit").as_deref(), Some("1"));
+        assert_eq!(query(&lists[0], "offset").as_deref(), Some("0"));
+    }
+}
+
+#[test]
+#[serial]
+fn a_folder_write_refused_at_its_read_head_checks_then_sends_at_the_named_head() {
+    let d = behind_outside();
+    d.state().repo_head = Some(0);
+    let mark = d.mark();
+    let out = d.run_in(
+        &d.folder(),
+        b"{}",
+        &["write", "board.json", "--parent", "1"],
+    );
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    let parents: Vec<Value> = d
+        .pushes_since(mark)
+        .iter()
+        .map(|p| p["parentSha"].clone())
+        .collect();
+    assert_eq!(parents, vec![json!(h(1)), json!(h(2))]);
+    assert_eq!(d.version_lists_since(mark).len(), 1);
+
+    {
+        let mut state = d.state();
+        state.head = 0;
+    }
+    let mark = d.mark();
+    let out = d.run_in(
+        &d.folder(),
+        b"{}",
+        &["write", "board.json", "--parent", "1"],
+    );
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    let parents: Vec<Value> = d
+        .pushes_since(mark)
+        .iter()
+        .map(|p| p["parentSha"].clone())
+        .collect();
+    assert_eq!(parents, vec![json!(h(1))]);
+    assert!(d.version_lists_since(mark).is_empty());
+}
+
+#[test]
+#[serial]
+fn a_write_inside_a_folder_is_refused_by_a_version_that_changed_it() {
+    let d = behind_with(&[(in_folder("notes.md").as_str(), Some("noted\n"))]);
+    let mark = d.mark();
+    let out = d.run_in(
+        &d.folder(),
+        b"{}",
+        &["write", "board.json", "--parent", "1"],
+    );
+    assert_eq!(exit_of(&out), 7, "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains(&format!(
+            "error: conflict: the repository moved past {}; its head is now {}",
+            h(1),
+            h(2)
+        )),
+        "{}",
+        stderr_of(&out)
+    );
+
+    let json_out = d.run_in(
+        &d.folder(),
+        b"{}",
+        &["--json", "write", "board.json", "--parent", "1"],
+    );
+    assert_eq!(exit_of(&json_out), 7, "{}", stderr_of(&json_out));
+    assert_eq!(one_document(&json_out)["currentSha"], json!(h(2)));
+    assert!(d.pushes_since(mark).is_empty());
+}
+
+#[test]
+#[serial]
+fn a_version_restoring_the_folder_still_refuses_the_write() {
+    let d = behind_with(&[(in_folder("board.json").as_str(), Some("{\"cards\":[2]}\n"))]);
+    d.advance_head(&[(in_folder("board.json").as_str(), Some(BOARD_H1))]);
+    let mark = d.mark();
+    let out = d.run_in(
+        &d.folder(),
+        b"{}",
+        &["write", "board.json", "--parent", "1"],
+    );
+    assert_eq!(exit_of(&out), 7, "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains(&h(3)), "{}", stderr_of(&out));
+    assert!(d.pushes_since(mark).is_empty());
+}
+
+#[test]
+#[serial]
+fn a_hash_parent_is_numbered_once() {
+    let d = behind_outside();
+    d.advance_head(&[("README.md", Some("# work, v3\n"))]);
+    d.advance_head(&[("README.md", Some("# work, v4\n"))]);
+    let parent = format!("--parent={}", h(2));
+    let mark = d.mark();
+    let out = d.run_in(
+        &d.folder(),
+        b"{}",
+        &[
+            "write",
+            &parent,
+            "--message=m",
+            "--integration=syns-bb-plugin",
+            "--trigger=thread-page",
+            "--run=s1",
+            "--json",
+            "--",
+            "board.json",
+        ],
+    );
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    let pushes = d.pushes_since(mark);
+    assert_eq!(pushes.len(), 1, "{pushes:?}");
+    assert_eq!(pushes[0]["parentSha"], json!(h(4)));
+    assert_eq!(d.single_versions_since(mark), vec![h(2)]);
+}
+
+#[test]
+#[serial]
+fn the_holder_root_and_repo_option_keep_the_whole_repository_check() {
+    let d = behind_outside();
+    let runs: [(PathBuf, Vec<&str>); 2] = [
+        (
+            d.w.clone(),
+            vec!["write", "clients/vela/q3-board/board.json", "--parent", "1"],
+        ),
+        (
+            d.folder(),
+            vec![
+                "write",
+                "clients/vela/q3-board/board.json",
+                "--repo",
+                REPO,
+                "--parent",
+                "1",
+            ],
+        ),
+    ];
+    for (cwd, args) in runs {
+        let mark = d.mark();
+        let out = d.run_in(&cwd, b"{}", &args);
+        assert_eq!(exit_of(&out), 7, "{args:?}: {}", stderr_of(&out));
+        assert!(stderr_of(&out).contains(&h(2)), "{}", stderr_of(&out));
+        assert_eq!(d.pushes_since(mark).len(), 1, "{args:?}");
+        assert!(d.version_lists_since(mark).is_empty(), "{args:?}");
+    }
+}
+
+#[test]
+#[serial]
+fn a_folder_checked_out_alone_meets_the_other_copy_change() {
+    let d = Deployment::with_head(u292_h1());
+    let (_u_dir, u) = empty_u();
+    let q3 = u.join("q3");
+    let pull = d.run_in(&u, b"", &["pull", REPO, "--path", FOLDER, "q3"]);
+    assert_eq!(exit_of(&pull), 0, "{}", stderr_of(&pull));
+    d.advance_head(&[(in_folder("notes.md").as_str(), Some("noted\n"))]);
+    d.state().pin_head = true;
+
+    let mark = d.mark();
+    let out = d.run_in(&q3, b"{}", &["write", "board.json", "--parent", "1"]);
+    assert_eq!(exit_of(&out), 7, "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains(&h(2)), "{}", stderr_of(&out));
+    assert!(d.pushes_since(mark).is_empty());
+}
+
+#[test]
+#[serial]
+fn a_folder_page_the_path_did_not_narrow_ends_on_the_unsupported_server_refusal() {
+    let d = behind_outside();
+    d.state().versions_unnarrowed = true;
+    let refusal = format!(
+        "folder_write_unsupported: the server does not support writes inside a folder yet, so {FOLDER} cannot be written from inside it"
+    );
+    let mark = d.mark();
+    let out = d.run_in(
+        &d.folder(),
+        b"{}",
+        &["write", "board.json", "--parent", "1"],
+    );
+    assert_eq!(exit_of(&out), 1, "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains(&format!("error: {refusal}")),
+        "{}",
+        stderr_of(&out)
+    );
+    assert!(!stderr_of(&out).contains(&unread_line_opening()));
+
+    write(&d.folder().join("board.json"), "{\"cards\":[9]}\n");
+    let sync = d.run_in(&d.folder(), b"", &["--json", "sync"]);
+    assert_eq!(exit_of(&sync), 1, "{}", stderr_of(&sync));
+    let document = one_document(&sync);
+    assert_eq!(document["outcome"], "validation_failure", "{document}");
+    assert_eq!(document["error"], json!(refusal), "{document}");
+    assert!(!stderr_of(&sync).contains(&unread_line_opening()));
+    assert!(d.pushes_since(mark).is_empty());
+    assert!(!d.folder_resolution_stands());
+}
+
+#[test]
+#[serial]
+fn a_folder_check_failing_transiently_answers_as_moved() {
+    let mut d = behind_outside();
+    d.via = Some(path_versions_dropping_proxy(&d.server.uri()));
+    let mark = d.mark();
+    let out = d.run_in(
+        &d.folder(),
+        b"{}",
+        &["write", "board.json", "--parent", "1"],
+    );
+    assert_eq!(exit_of(&out), 7, "{}", stderr_of(&out));
+    let err = stderr_of(&out);
+    let warned = err
+        .find(&format!(
+            "{}could not reach server at",
+            unread_line_opening()
+        ))
+        .unwrap_or_else(|| panic!("no unread-check line: {err}"));
+    let refused = err
+        .find("error: conflict: ")
+        .unwrap_or_else(|| panic!("no conflict line: {err}"));
+    assert!(warned < refused, "{err}");
+    assert!(err.contains(&h(2)), "{err}");
+
+    write(&d.folder().join("board.json"), "{\"cards\":[9]}\n");
+    let sync = d.run_in(&d.folder(), b"", &["--json", "sync"]);
+    assert_eq!(exit_of(&sync), 4, "{}", stderr_of(&sync));
+    assert_eq!(one_document(&sync)["outcome"], "resolution_required");
+    assert!(
+        stderr_of(&sync).contains(&unread_line_opening()),
+        "{}",
+        stderr_of(&sync)
+    );
+    assert!(d.pushes_since(mark).is_empty());
+}
+
+#[test]
+#[serial]
+fn a_folder_check_refused_otherwise_ends_on_its_refusal() {
+    let d = behind_outside();
+    d.state().path_versions_refusal = Some((500, "internal_error"));
+    let mark = d.mark();
+    let out = d.run_in(
+        &d.folder(),
+        b"{}",
+        &["write", "board.json", "--parent", "1"],
+    );
+    assert_eq!(exit_of(&out), 1, "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("error: server error (500): internal_error"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert!(!stderr_of(&out).contains(&unread_line_opening()));
+    assert!(d.pushes_since(mark).is_empty());
+}
+
+#[test]
+#[serial]
+fn sends_stop_at_the_bound() {
+    let d = behind_outside();
+    d.state().race_each_push = true;
+    let mark = d.mark();
+    let out = d.run_in(
+        &d.folder(),
+        b"{}",
+        &["write", "board.json", "--parent", "1"],
+    );
+    assert_eq!(exit_of(&out), 7, "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains(&h(5)), "{}", stderr_of(&out));
+    let parents: Vec<Value> = d
+        .pushes_since(mark)
+        .iter()
+        .map(|p| p["parentSha"].clone())
+        .collect();
+    assert_eq!(parents, vec![json!(h(2)), json!(h(3)), json!(h(4))]);
+    assert_eq!(d.version_lists_since(mark).len(), 3);
+}
+
+#[test]
+#[serial]
+fn a_folder_sync_behind_only_outside_publishes_without_review() {
+    let d = behind_outside();
+    write(&d.folder().join("board.json"), "{\"cards\":[9]}\n");
+    let mark = d.mark();
+    let out = d.run_in(&d.folder(), b"", &["--json", "sync"]);
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(one_document(&out)["outcome"], "synced");
+    let pushes = d.pushes_since(mark);
+    assert_eq!(pushes.len(), 1, "{pushes:?}");
+    let push = &pushes[0];
+    assert_eq!(push["parentSha"], json!(h(2)));
+    assert_eq!(named(push), vec![in_folder("board.json")]);
+    for path in carried(push) {
+        assert!(path.starts_with(&format!("{FOLDER}/")), "{path}");
+    }
+    assert!(push.get("deletions").is_none(), "{push}");
+    assert_eq!(d.version_lists_since(mark).len(), 1);
+    assert!(!d.folder_resolution_stands());
+}
+
+#[test]
+#[serial]
+fn a_folder_sync_behind_a_folder_change_prepares_a_review() {
+    let d = behind_with(&[(in_folder("board.json").as_str(), Some("{\"cards\":[2]}\n"))]);
+    write(&d.folder().join("notes.md"), "noted here\n");
+    let mark = d.mark();
+    let out = d.run_in(&d.folder(), b"", &["--json", "sync"]);
+    assert_eq!(exit_of(&out), 4, "{}", stderr_of(&out));
+    assert_eq!(one_document(&out)["outcome"], "resolution_required");
+    assert!(d.pushes_since(mark).is_empty());
+    assert!(d.version_lists_since(mark).is_empty());
+}
+
+#[test]
+#[serial]
+fn a_folder_publication_refused_by_a_push_outside_sends_again_without_waiting() {
+    for scoped in [false, true] {
+        let d = Deployment::converged_over(u292_h1());
+        d.advance_head(&[("README.md", Some("# work, moved outside\n"))]);
+        d.state().tip = Some(0);
+        write(&d.folder().join("board.json"), "{\"cards\":[9]}\n");
+        let args: &[&str] = if scoped {
+            &["push", "board.json"]
+        } else {
+            &["sync"]
+        };
+        let mark = d.mark();
+        let started = std::time::Instant::now();
+        let out = d.run_in(&d.folder(), b"", args);
+        let took = started.elapsed();
+        assert_eq!(exit_of(&out), 0, "{args:?}: {}", stderr_of(&out));
+        assert!(took < Duration::from_secs(2), "{args:?} took {took:?}");
+        let mut pushes = d.pushes_since(mark);
+        assert_eq!(pushes.len(), 2, "{args:?}: {pushes:?}");
+        let parents: Vec<Value> = pushes
+            .iter_mut()
+            .map(|p| {
+                p.as_object_mut()
+                    .expect("body")
+                    .remove("parentSha")
+                    .unwrap_or(Value::Null)
+            })
+            .collect();
+        assert_eq!(parents, vec![json!(h(1)), json!(h(2))], "{args:?}");
+        assert_eq!(pushes[0], pushes[1], "{args:?}");
+        assert!(!d.folder_resolution_stands(), "{args:?}");
+
+        if scoped {
+            d.state().tip = None;
+            let status = d.run_in(&d.folder(), b"", &["--json", "status"]);
+            assert_eq!(exit_of(&status), 0, "{}", stderr_of(&status));
+            assert_eq!(
+                one_document(&status)["workingCopyState"],
+                "converged",
+                "{}",
+                stdout_of(&status)
+            );
+        }
+    }
+}
+
+#[test]
+#[serial]
+fn ten_page_saves_land_between_ten_pushes_outside_the_folder() {
+    let d = Deployment::converged_over(u292_h1());
+    let mut parent = h(1);
+    for save in 0..10 {
+        d.advance_head(&[("README.md", Some(format!("# outside {save}\n").as_str()))]);
+        let mark = d.mark();
+        let parent_arg = format!("--parent={parent}");
+        let drawing = format!("{{\"strokes\":[{save}]}}");
+        let out = d.run_in(
+            &d.folder(),
+            drawing.as_bytes(),
+            &[
+                "write",
+                &parent_arg,
+                "--integration=syns-bb-plugin",
+                "--trigger=thread-page",
+                "--run=s1",
+                "--json",
+                "--",
+                ".page/board.json",
+            ],
+        );
+        assert_eq!(exit_of(&out), 0, "save {save}: {}", stderr_of(&out));
+        let pushes = d.pushes_since(mark);
+        assert_eq!(pushes.len(), 1, "save {save}: {pushes:?}");
+        assert_eq!(named(&pushes[0]), vec![in_folder(".page/board.json")]);
+        parent = one_document(&out)["commitSha"]
+            .as_str()
+            .expect("commitSha")
+            .to_string();
+    }
 }
