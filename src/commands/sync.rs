@@ -138,7 +138,10 @@ pub(crate) fn error_class(err: &CliError) -> Option<ErrorClass> {
         // SPEC u291 `cmd_sync` 1: a misplaced folder is a local failure,
         // ending as the validation failure outcome.
         | CliError::FolderMoved { .. }
-        | CliError::FolderInAnotherCheckout { .. } => Some(ErrorClass::Local),
+        | CliError::FolderInAnotherCheckout { .. }
+        // SPEC u298: a TLS-layer refusal is a local failure no retry
+        // clears (`D-114`).
+        | CliError::TlsRefused { .. } => Some(ErrorClass::Local),
         CliError::PayloadTooLarge { .. } => Some(ErrorClass::Validation),
         // SPEC u292 `error_class`: a server that cannot narrow the
         // version list to a folder refuses a write inside it as a
@@ -709,6 +712,21 @@ pub async fn cmd_resolution(
 
 #[cfg(test)]
 mod tests {
+    // SPEC u298 Contract Surface, `CliError::TlsRefused`: a sync ends it
+    // as the validation-failure outcome, class `local`.
+    #[test]
+    fn a_tls_refusal_ends_a_sync_as_a_validation_failure() {
+        let err = super::CliError::TlsRefused {
+            url: "https://localhost:9/".into(),
+            reason: "invalid peer certificate: UnknownIssuer".into(),
+        };
+        assert_eq!(super::error_class(&err), Some(super::ErrorClass::Local));
+        assert!(matches!(
+            super::outcome_for_error(err),
+            super::SyncOutcome::ValidationFailure(super::CliError::TlsRefused { .. })
+        ));
+    }
+
     use super::*;
     use std::collections::HashMap;
 

@@ -769,8 +769,12 @@ pub fn request_deadline(body_len: usize) -> std::time::Duration {
 /// The one client builder every client of `BND-public-api` is built by:
 /// the build's `User-Agent`, no redirect followed, and `REQUEST_CEILING`
 /// as its only client-wide bound.
+///
+/// SPEC u298: built over `tls_config`, the one TLS configuration every
+/// client of `BND-public-api` shares.
 pub(crate) fn api_client() -> Result<reqwest::Client, CliError> {
     reqwest::Client::builder()
+        .tls_backend_preconfigured(crate::tls::tls_config()?)
         .user_agent(USER_AGENT)
         .timeout(REQUEST_CEILING)
         .redirect(Policy::none())
@@ -798,9 +802,36 @@ pub(crate) async fn send_bounded(
     match tokio::time::timeout(request_deadline(body_len), client.execute(request)).await {
         Err(_elapsed) => Err(unreachable_at(&url)),
         Ok(Err(err)) if err.is_builder() => Err(CliError::from(err)),
-        Ok(Err(_transport)) => Err(unreachable_at(&url)),
+        // SPEC u298 `send_bounded` 1: a failure the TLS layer itself
+        // raised ends as the TLS refusal; a connection closed, reset or
+        // stalled during the handshake carries none and stays unreachable.
+        Ok(Err(transport)) => match tls_refusal(&transport) {
+            Some(reason) => Err(CliError::TlsRefused { url, reason }),
+            None => Err(unreachable_at(&url)),
+        },
         Ok(Ok(response)) => Ok(response),
     }
+}
+
+/// The TLS layer's own reason where `err`'s source chain holds a
+/// `rustls::Error`, carried directly or inside I/O errors at any depth.
+pub(crate) fn tls_refusal(err: &(dyn std::error::Error + 'static)) -> Option<String> {
+    let mut current = Some(err);
+    while let Some(err) = current {
+        if let Some(tls) = err.downcast_ref::<rustls::Error>() {
+            return Some(tls.to_string());
+        }
+        // An I/O error answers its inner error's source, never the inner
+        // error itself, so the inner error is walked into here.
+        current = match err
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+        {
+            Some(inner) => Some(inner as &(dyn std::error::Error + 'static)),
+            None => err.source(),
+        };
+    }
+    None
 }
 
 /// Read an answer's body chunk by chunk, each chunk arriving within
@@ -2160,6 +2191,41 @@ impl SynsClient {
 
 #[cfg(test)]
 mod tests {
+    // SPEC u298 `send_bounded` 1: a `rustls::Error` anywhere in a
+    // transport failure's source chain, inside an I/O error included, is
+    // the TLS layer's reason; a connection closed during the handshake
+    // carries none.
+    #[test]
+    fn only_a_failure_the_tls_layer_raised_carries_its_reason() {
+        #[derive(Debug)]
+        struct Wrapping(std::io::Error);
+        impl std::fmt::Display for Wrapping {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("client error (Connect)")
+            }
+        }
+        impl std::error::Error for Wrapping {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let refused = Wrapping(std::io::Error::other(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer),
+        )));
+        assert_eq!(
+            super::tls_refusal(&refused).as_deref(),
+            Some("invalid peer certificate: UnknownIssuer")
+        );
+        let direct = rustls::Error::InvalidCertificate(rustls::CertificateError::Expired);
+        assert!(super::tls_refusal(&direct).is_some());
+        let closed = Wrapping(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "tls handshake eof",
+        ));
+        assert_eq!(super::tls_refusal(&closed), None);
+    }
+
     use super::*;
     use wiremock::matchers::{header, method, path, query_param, query_param_is_missing};
     use wiremock::{Mock, MockServer, ResponseTemplate};

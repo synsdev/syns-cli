@@ -73,7 +73,11 @@ async fn post_json<T: serde::Serialize>(
         len,
     )
     .await
-    .map_err(|_| unreachable())
+    .map_err(|err| match err {
+        // SPEC u298: a TLS-layer refusal is carried out as it stands.
+        CliError::TlsRefused { .. } => err,
+        _ => unreachable(),
+    })
 }
 
 /// Decode an answer read through `read_body`, or `refusal` where it does

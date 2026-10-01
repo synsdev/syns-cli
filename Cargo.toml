@@ -46,6 +46,12 @@ diffy = "=0.5.2"
 globset = "0.4"
 grep-regex = "0.1"
 grep-searcher = "0.1"
+# SPEC u298: the one TLS configuration every deployment client shares —
+# the platform verifier, and the carried roots standing in for it only
+# where the run cannot reach the platform's trust service.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+rustls-platform-verifier = "0.6"
+webpki-root-certs = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.184"

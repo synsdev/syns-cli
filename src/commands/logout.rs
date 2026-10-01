@@ -13,7 +13,9 @@ pub async fn cmd_logout(config: &Config, output: &Output) -> Result<(), CliError
     let token = store.read().ok().flatten();
 
     if let Some(token) = &token
+        && let Ok(tls) = crate::tls::tls_config()
         && let Ok(client) = reqwest::Client::builder()
+            .tls_backend_preconfigured(tls)
             .user_agent(crate::client::USER_AGENT)
             .timeout(Duration::from_secs(SIGN_OUT_TIMEOUT_SECS))
             .redirect(reqwest::redirect::Policy::none())

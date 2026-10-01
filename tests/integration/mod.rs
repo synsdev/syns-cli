@@ -23,6 +23,7 @@ mod reads_test;
 mod repo_root_test;
 mod state_home_test;
 mod teams_remove_json_test;
+mod tls_refusal_test;
 mod upgrade_test;
 mod version_test;
 mod writes_test;

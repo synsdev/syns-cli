@@ -2255,6 +2255,8 @@ dependencies = [
  "libc",
  "open",
  "reqwest",
+ "rustls",
+ "rustls-platform-verifier",
  "self-replace",
  "semver",
  "serde",
@@ -2269,6 +2271,7 @@ dependencies = [
  "tokio",
  "url",
  "urlencoding",
+ "webpki-root-certs",
  "wiremock",
  "zip",
 ]

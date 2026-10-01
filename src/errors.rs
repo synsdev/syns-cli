@@ -61,6 +61,15 @@ pub enum CliError {
     ServerUnreachable {
         url: String,
     },
+    /// SPEC u298, `CliError::TlsRefused`: a failure the TLS layer itself
+    /// raised during the handshake, a refused certificate included —
+    /// `TLS_REFUSED` (`unregistered`, `D-114`), class `local`, at exit `1`
+    /// with no retry, its line led by its wire form. `url` is the address
+    /// the request named and `reason` the TLS layer's.
+    TlsRefused {
+        url: String,
+        reason: String,
+    },
     Io {
         message: String,
     },
@@ -467,6 +476,9 @@ impl std::fmt::Display for CliError {
                 dir.display()
             ),
             CliError::ServerUnreachable { url } => write!(f, "could not reach server at {url}"),
+            CliError::TlsRefused { url, reason } => {
+                write!(f, "tls_refused: the TLS layer refused {url}: {reason}")
+            }
             CliError::Io { message } => write!(f, "{message}"),
             CliError::Config { message } => write!(f, "configuration error: {message}"),
             CliError::Upgrade(e) => write!(f, "{e}"),
@@ -725,6 +737,23 @@ mod tests {
             Some(2),
             "the document carries `error` and `currentSha` and nothing else"
         );
+    }
+
+    // SPEC u298 Contract Surface, `CliError::TlsRefused`: its one line is
+    // led by its wire form and names the address and the TLS layer's
+    // reason, at exit `1`, its document `error` alone.
+    #[test]
+    fn the_tls_refusal_names_the_address_and_the_reason_at_exit_one() {
+        let err = CliError::TlsRefused {
+            url: "https://localhost:9/api/auth/get-session".to_string(),
+            reason: "invalid peer certificate: UnknownIssuer".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "tls_refused: the TLS layer refused https://localhost:9/api/auth/get-session: invalid peer certificate: UnknownIssuer"
+        );
+        assert_eq!(err.exit_code(), 1);
+        assert!(err.json_value().is_none());
     }
 
     // SPEC u292 Contract Surface, `CliError::FolderWriteUnsupported`: its
