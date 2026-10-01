@@ -824,7 +824,10 @@ pub(crate) async fn folder_root(
 /// pattern anchored by a `/` before its last character is anchored under
 /// the place, every other one matching at any depth as it stands.
 fn exclude_under(place: &str, pattern: &str) -> String {
-    let body = &pattern[..pattern.len().saturating_sub(1)];
+    let body = match pattern.char_indices().next_back() {
+        Some((last, _)) => &pattern[..last],
+        None => pattern,
+    };
     if !body.contains('/') {
         return pattern.to_string();
     }
@@ -3814,6 +3817,12 @@ mod tests {
         );
         assert_eq!(exclude_under("clients/q3", "/a.md"), "/clients/q3/a.md");
         assert_eq!(exclude_under("clients/q3", "dist/"), "dist/");
+        // CR1-1: a pattern ending in a character of more than one byte.
+        assert_eq!(exclude_under("clients/q3", "résumé"), "résumé");
+        assert_eq!(
+            exclude_under("clients/q3", "docs/résumé"),
+            "clients/q3/docs/résumé"
+        );
     }
 
     // SPEC u291 Behaviour, `converge` 6.
@@ -3972,6 +3981,101 @@ mod tests {
         assert!(holder.resolution().unwrap().is_none());
         assert!(!holder.local_snapshot_path().exists());
         assert!(!holder.remote_snapshot_path().exists());
+        assert_eq!(std::fs::read(w.join("f/a.md")).unwrap(), b"a\nlocal\n");
+    }
+
+    // CR1-3, SPEC u291 Behaviour `converge` 4: a preparation going on to
+    // write a resolution waits on the holder's review lock, and once it
+    // takes it answers the review written under it by another copy over
+    // the same path, writing nothing of its own. The collision — a local
+    // edit the head deleted — reads no content, so the preparation reaches
+    // the lock at once.
+    #[test]
+    fn a_preparation_waits_on_the_review_lock_and_then_answers_the_review_written_under_it() {
+        let cache = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        let w = std::fs::canonicalize(tree.path()).unwrap();
+        std::fs::create_dir_all(w.join("f")).unwrap();
+        std::fs::write(w.join(".syns.yaml"), "owner: alice\nname: r\n").unwrap();
+        std::fs::write(w.join("f/.syns.yaml"), "holder: alice/r\npath: f\n").unwrap();
+        std::fs::write(w.join("f/a.md"), b"a\nlocal\n").unwrap();
+        let holder = WorkingCopy::open(cache.path(), "alice", "r", &w).unwrap();
+        let scope = scope_at(&w.join("f"), "f", Some(w.clone()));
+        let folder = WorkingCopy::open_folder(cache.path(), &scope).unwrap();
+        let standing = Resolution {
+            recovery_id: "rec-w".into(),
+            base_commit: Some("h0".into()),
+            head_commit: "h1".into(),
+            round: 1,
+            local_paths: vec![],
+            remote_paths: vec![],
+            collisions: vec![("f/a.md".into(), CollisionKind::ModifyDelete)],
+            combined_paths: vec!["f/a.md".into()],
+            reviewed_tree: None,
+            pending_writes: None,
+        };
+
+        // Everything slow to build is built before the lock is taken, so
+        // the preparation alone stands between the spawn and the lock.
+        let client = SynsClient::new("http://127.0.0.1:9").unwrap();
+        let staging = Staging::open(cache.path()).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let held = review_lock(&holder).unwrap();
+        std::thread::scope(|threads| {
+            let preparing = threads.spawn(|| {
+                runtime.block_on(async {
+                    let identity = blob_sha1(b"holder: alice/r\npath: f\n");
+                    let head = Head {
+                        commit: Some("h1".into()),
+                        files: BTreeMap::from([(".syns.yaml".to_string(), identity.clone())]),
+                        sizes: BTreeMap::new(),
+                        truncated: false,
+                    };
+                    prepare_candidate(
+                        &client,
+                        None,
+                        &folder,
+                        &bare_opts(cache.path()),
+                        &staging,
+                        Candidate {
+                            base_commit: Some("h0".into()),
+                            base_files: BTreeMap::from([
+                                (".syns.yaml".to_string(), identity),
+                                ("a.md".to_string(), blob_sha1(b"a\nb\n")),
+                            ]),
+                            head: &head,
+                            publishing: false,
+                            existing: None,
+                            force_resolution: false,
+                            hold_root_identity: Some(false),
+                            root: &FolderRoot::of_scope(&folder.root, &scope, None),
+                        },
+                        None,
+                    )
+                    .await
+                })
+            });
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(
+                !preparing.is_finished(),
+                "the preparation did not wait on the review lock"
+            );
+            holder.write_resolution(&standing).unwrap();
+            drop(held);
+            match preparing.join().unwrap().unwrap() {
+                Prepared::Elsewhere(resolution, dir) => {
+                    assert_eq!(resolution, standing);
+                    assert_eq!(dir, holder.root);
+                }
+                _ => panic!("expected the review standing in the holder's checkout"),
+            }
+        });
+        assert!(!folder.local_snapshot_path().exists());
+        assert!(!folder.remote_snapshot_path().exists());
+        assert!(folder.resolution().unwrap().is_none());
         assert_eq!(std::fs::read(w.join("f/a.md")).unwrap(), b"a\nlocal\n");
     }
 

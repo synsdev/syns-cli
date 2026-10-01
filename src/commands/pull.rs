@@ -459,7 +459,10 @@ async fn pull_into_folder(
     if !output.is_json() {
         render_transfer_lines(&written, &removed);
     }
-    render_pulled(output, &repo_id, copy.base().as_ref(), &written, &removed);
+    // The base the folder stands at — its own record, or an enclosing
+    // copy's narrowed to it where the folder copy records none (CR1-2).
+    let base = crate::push::working_copy::folder_base(config.cache_dir(), &scope);
+    render_pulled(output, &repo_id, base.as_ref(), &written, &removed);
     Ok(())
 }
 

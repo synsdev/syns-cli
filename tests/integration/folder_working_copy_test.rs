@@ -1691,3 +1691,20 @@ fn a_pull_at_a_version_inside_a_folder_writes_the_folder_alone() {
     }
     assert!(!d.local_record().exists(), "a local record was written");
 }
+
+// CR1-2: a pull inside a folder its holder's checkout converged names the
+// head the folder stands at, the folder copy recording no base of its own.
+#[test]
+#[serial]
+fn a_pull_inside_a_folder_its_holder_converged_names_the_head() {
+    let d = Deployment::with_head(h1_tree());
+    d.pull_in(&d.w.clone());
+
+    let out = d.run_in(&d.folder(), b"", &["--json", "pull"]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    let document = one_document(&out);
+    assert_eq!(document["commitSha"], json!(h(1)));
+    assert_eq!(document["downloaded"], json!(0));
+    assert_eq!(document["unchanged"], json!(2));
+}
