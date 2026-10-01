@@ -128,6 +128,8 @@ struct Repo {
     raw_bytes: HashMap<String, Vec<u8>>,
     /// Paths a recursive tree lists beside the stored ones.
     extra_tree_paths: Vec<String>,
+    /// Whether the recursive tree at the root is served truncated.
+    truncated: bool,
 }
 
 impl Repo {
@@ -140,6 +142,7 @@ impl Repo {
             record_refusal: None,
             raw_bytes: HashMap::new(),
             extra_tree_paths: Vec::new(),
+            truncated: false,
         }
     }
 
@@ -385,7 +388,7 @@ fn tree_answer(repo: &Repo, rest: &str, request: &Request) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_json(json!({
         "entries": entries.into_values().collect::<Vec<_>>(),
         "commitSha": commit.sha,
-        "truncated": false,
+        "truncated": repo.truncated && recursive && under.is_empty(),
     }))
 }
 
@@ -1179,6 +1182,54 @@ fn a_folder_landed_at_the_moved_head_is_refused() {
     assert!(!d.folder().exists());
 }
 
+/// CR1-1: a placement re-sent at a head another push moved leaves the
+/// checkout's base standing at the commit it recorded, so the next sync
+/// retrieves what that push changed.
+#[test]
+#[serial]
+fn a_placement_over_a_moved_head_leaves_the_checkout_base_standing() {
+    let d = Deployment::converged();
+    d.state()
+        .races
+        .push_back(vec![("README.md".into(), Some(b"# raced\n".to_vec()))]);
+
+    let placed = d.run_in(&d.w, &["place", TEMPLATE, FOLDER]);
+    assert_eq!(exit_of(&placed), 0, "{}", stderr_of(&placed));
+    let sync = d.run_in(&d.w, &["--json", "sync"]);
+
+    assert_eq!(exit_of(&sync), 0, "{}", stderr_of(&sync));
+    assert_eq!(read(&d.w.join("README.md")), "# raced\n");
+}
+
+/// CR1-3: a template whose tree arrives truncated is refused before any
+/// of its files is read.
+#[test]
+#[serial]
+fn a_template_past_one_tree_answer_is_refused() {
+    let d = Deployment::fixture();
+    d.state().template().truncated = true;
+    let before = snapshot(&d.w);
+    let mark = d.mark();
+
+    let out = d.run_in(&d.w, &["place", TEMPLATE, FOLDER]);
+
+    assert_eq!(exit_of(&out), 1, "{}", stderr_of(&out));
+    assert_eq!(
+        stderr_of(&out).trim_end(),
+        format!(
+            "error: configuration error: {TEMPLATE} at version 14 holds more entries than one tree answer carries; nothing placed"
+        )
+    );
+    let raw_reads = d
+        .requests_since(mark)
+        .into_iter()
+        .filter(|r| decoded(r.url.path()).starts_with(&format!("/api/v1/repos/{TEMPLATE}/raw/")))
+        .count();
+    assert_eq!(raw_reads, 0);
+    assert!(d.pushes_since(mark).is_empty());
+    assert_eq!(snapshot(&d.w), before);
+}
+
 #[test]
 #[serial]
 fn place_inside_a_scoped_folder_places_relative_to_it() {
@@ -1451,6 +1502,29 @@ fn enable_checks_publishes_the_recorded_checks_for_everyone() {
     assert_eq!(exit_of(&sync), 0, "{}", stderr_of(&sync));
     assert!(d.pushes_since(mark).is_empty());
     assert!(!d.resolution_stands(&d.w));
+}
+
+/// CR1-2: turning checks on at a head another push moved leaves the
+/// checkout's base standing at the commit it recorded, so the next sync
+/// retrieves what that push changed.
+#[test]
+#[serial]
+fn enable_checks_over_a_moved_head_leaves_the_checkout_base_standing() {
+    let d = Deployment::converged();
+    let placed = d.run_in(&d.w, &["place", TEMPLATE, FOLDER]);
+    assert_eq!(exit_of(&placed), 0, "{}", stderr_of(&placed));
+    d.state()
+        .races
+        .push_back(vec![("README.md".into(), Some(b"# raced\n".to_vec()))]);
+    let mark = d.mark();
+
+    let out = d.run_in(&d.w, &["enable-checks", FOLDER]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(d.pushes_since(mark).len(), 2);
+    let sync = d.run_in(&d.w, &["--json", "sync"]);
+    assert_eq!(exit_of(&sync), 0, "{}", stderr_of(&sync));
+    assert_eq!(read(&d.w.join("README.md")), "# raced\n");
 }
 
 #[test]

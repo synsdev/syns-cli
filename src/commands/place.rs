@@ -781,6 +781,77 @@ mod tests {
         );
     }
 
+    /// A working copy of `alice/work` at a directory of its own, its base
+    /// recording `h1` over `README.md`.
+    fn copy_at_h1() -> (tempfile::TempDir, tempfile::TempDir, WorkingCopy) {
+        let cache = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let copy = WorkingCopy::open(cache.path(), "alice", "work", root.path()).unwrap();
+        copy.record_laid_base(
+            "h1",
+            HashMap::from([("README.md".to_string(), "r1".to_string())]),
+            Some(7),
+        )
+        .unwrap();
+        (cache, root, copy)
+    }
+
+    fn recorded(copy: &WorkingCopy) -> (Option<String>, Vec<(String, String)>, Option<u64>) {
+        let base = copy.base().expect("a base");
+        let mut files: Vec<(String, String)> = base
+            .file_paths()
+            .map(|p| (p.to_string(), base.file_sha(p).unwrap().to_string()))
+            .collect();
+        files.sort();
+        (
+            base.commit_sha().map(str::to_string),
+            files,
+            base.recorded_at(),
+        )
+    }
+
+    // CR1-1: `lay_placed` lays over a base standing at the claimed parent
+    // alone, and over none holding an outbox.
+    #[test]
+    fn a_placement_lays_only_over_a_clean_base_at_the_claimed_parent() {
+        let placed = HashMap::from([(".syns.yaml".to_string(), "y".to_string())]);
+        let counted = |p: &str| Some(format!("q3/{p}"));
+        let standing = (
+            Some("h1".to_string()),
+            vec![("README.md".to_string(), "r1".to_string())],
+            Some(7),
+        );
+
+        let (_c, _r, copy) = copy_at_h1();
+        copy.write_outbox(&crate::push::working_copy::Outbox {
+            parent_commit: Some("h1".to_string()),
+            tree: Default::default(),
+        })
+        .unwrap();
+        lay_placed(&copy, &placed, counted, Some("h1"), "h2").unwrap();
+        assert_eq!(recorded(&copy), standing);
+
+        for claimed in [Some("h0"), None] {
+            let (_c, _r, copy) = copy_at_h1();
+            lay_placed(&copy, &placed, counted, claimed, "h2").unwrap();
+            assert_eq!(recorded(&copy), standing, "{claimed:?}");
+        }
+
+        let (_c, _r, copy) = copy_at_h1();
+        lay_placed(&copy, &placed, counted, Some("h1"), "h2").unwrap();
+        assert_eq!(
+            recorded(&copy),
+            (
+                Some("h2".to_string()),
+                vec![
+                    ("README.md".to_string(), "r1".to_string()),
+                    ("q3/.syns.yaml".to_string(), "y".to_string())
+                ],
+                Some(7)
+            )
+        );
+    }
+
     fn landed() -> Landed {
         Landed {
             template: "bartsoj/syns-whiteboard-template".into(),

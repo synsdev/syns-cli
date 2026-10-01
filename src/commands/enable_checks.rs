@@ -314,6 +314,86 @@ fn lay_turned_on(
 mod tests {
     use super::*;
 
+    fn recorded(copy: &WorkingCopy) -> (Option<String>, Vec<(String, String)>) {
+        let base = copy.base().expect("a base");
+        let mut files: Vec<(String, String)> = base
+            .file_paths()
+            .map(|p| (p.to_string(), base.file_sha(p).unwrap().to_string()))
+            .collect();
+        files.sort();
+        (base.commit_sha().map(str::to_string), files)
+    }
+
+    // CR1-2: `lay_turned_on` lays over no holder copy holding an outbox,
+    // none standing at another commit than the claimed parent, and no
+    // folder copy standing at neither the parent nor the claimed one.
+    #[test]
+    fn turning_checks_on_lays_only_over_clean_bases_at_the_parent() {
+        let cache = tempfile::tempdir().unwrap();
+        let w = tempfile::tempdir().unwrap();
+        let w = std::fs::canonicalize(w.path()).unwrap();
+        let folder = w.join("q3");
+        std::fs::create_dir_all(&folder).unwrap();
+        let scope = FolderScope {
+            dir: folder.clone(),
+            owner: "alice".into(),
+            name: "work".into(),
+            path: "q3".into(),
+            checkout: Some(w.clone()),
+            enclosing: Vec::new(),
+        };
+        let holder = WorkingCopy::open(cache.path(), "alice", "work", &w).unwrap();
+        let held = HashMap::from([("q3/.syns.yaml".to_string(), "old".to_string())]);
+        holder.record_base("h3", held.clone()).unwrap();
+        holder
+            .write_outbox(&crate::push::working_copy::Outbox {
+                parent_commit: Some("h3".to_string()),
+                tree: Default::default(),
+            })
+            .unwrap();
+        let own = WorkingCopy::open_folder(cache.path(), &scope).unwrap();
+        let mine = HashMap::from([(".syns.yaml".to_string(), "old".to_string())]);
+        own.record_base("h1", mine).unwrap();
+
+        lay_turned_on(cache.path(), &scope, "new", "h2", "h3", "h4").unwrap();
+
+        assert_eq!(
+            recorded(&holder),
+            (
+                Some("h3".to_string()),
+                vec![("q3/.syns.yaml".to_string(), "old".to_string())]
+            )
+        );
+        assert_eq!(
+            recorded(&own),
+            (
+                Some("h1".to_string()),
+                vec![(".syns.yaml".to_string(), "old".to_string())]
+            )
+        );
+
+        holder.remove_outbox().unwrap();
+        holder.record_base("h2", held).unwrap();
+        lay_turned_on(cache.path(), &scope, "new", "h2", "h3", "h4").unwrap();
+        assert_eq!(recorded(&holder).0.as_deref(), Some("h2"));
+
+        lay_turned_on(cache.path(), &scope, "new", "h1", "h2", "h4").unwrap();
+        assert_eq!(
+            recorded(&holder),
+            (
+                Some("h4".to_string()),
+                vec![("q3/.syns.yaml".to_string(), "new".to_string())]
+            )
+        );
+        assert_eq!(
+            recorded(&own),
+            (
+                Some("h4".to_string()),
+                vec![(".syns.yaml".to_string(), "new".to_string())]
+            )
+        );
+    }
+
     #[test]
     fn every_enable_line_is_written_whole() {
         assert_eq!(
