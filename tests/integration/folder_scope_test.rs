@@ -944,6 +944,30 @@ fn repo_at_a_root_answers_the_head_version_number() {
 
 #[test]
 #[serial]
+fn repo_at_a_root_answers_a_null_version_where_no_head_stands() {
+    let d = Deployment::new();
+    std::fs::remove_dir_all(d.w.join("clients")).expect("no folder");
+    let mut record = repo_body();
+    record["commitSha"] = Value::Null;
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path_matcher(format!("/api/v1/repos/{REPO}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(record)),
+    );
+
+    let out = d.run_in(&d.w, b"", &["--json", "repo"]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    let document = one_document(&out);
+    let keys = document.as_object().expect("an object");
+    assert_eq!(keys.get("version"), Some(&Value::Null), "{document}");
+    let requests = d.requests();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert_eq!(requests[0].url.path(), format!("/api/v1/repos/{REPO}"));
+}
+
+#[test]
+#[serial]
 fn repo_option_and_the_holder_root_read_the_whole_holder() {
     let d = Deployment::new();
     d.mount_reference();
