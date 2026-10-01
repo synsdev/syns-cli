@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -9,6 +9,7 @@ use crate::client::{
     EntryType, PushDeleteEntry, PushFileEntry, PushProvenance, PushRequest, PushResponse,
     RepoStatus, SynsClient, TreeResponse, Visibility,
 };
+use crate::config::StoreRoots;
 use crate::errors::{ApiErrorContext, CliError};
 use crate::push::collector::{
     CollectOptions, CollectResult, CollectedFile, HELD_BYTES_BUDGET, HeldBytes, SkipReason,
@@ -31,7 +32,9 @@ pub struct SmartPushOptions {
     pub author: Option<String>,
     pub parent_sha: Option<String>,
     pub excludes: Vec<String>,
-    pub cache_dir: PathBuf,
+    /// The run's store roots (SPEC u298): the staging directory under
+    /// `write`, and the local record where `Manifest::save` puts it.
+    pub stores: StoreRoots,
     pub description: Option<String>,
     pub tags: Option<Vec<String>>,
     pub status: Option<RepoStatus>,
@@ -112,7 +115,7 @@ impl Clone for SmartPushOptions {
             author: self.author.clone(),
             parent_sha: self.parent_sha.clone(),
             excludes: self.excludes.clone(),
-            cache_dir: self.cache_dir.clone(),
+            stores: self.stores.clone(),
             description: self.description.clone(),
             tags: self.tags.clone(),
             status: self.status.clone(),
@@ -672,7 +675,7 @@ struct Target<'a> {
     repo_id: &'a str,
     root: &'a Path,
     local_files: &'a HashMap<String, CollectedFile>,
-    cache_dir: &'a Path,
+    stores: &'a StoreRoots,
     owner: &'a str,
     name: &'a str,
     record_base: &'a HashMap<String, String>,
@@ -900,7 +903,9 @@ async fn chunked_push(
                     let cumulative = merged_record(target.record_base, &[], &uploaded);
                     let mut manifest = Manifest::default();
                     manifest.update(response.commit_sha.clone(), cumulative);
-                    if let Err(e) = manifest.save(target.cache_dir, target.owner, target.name) {
+                    if let Err(e) =
+                        manifest.save(target.stores, target.owner, target.name, target.root)
+                    {
                         eprintln!(
                             "warning: could not save per-batch manifest after chunk {}/{}: {}",
                             k1, n, e,
@@ -1131,7 +1136,7 @@ pub async fn smart_push(
             // Phase 3b — Load manifest unconditionally (so
             // `manifest_existed` is set even when --force bypasses the
             // reference state from it).
-            let loaded_manifest = Manifest::load(&opts.cache_dir, owner, name);
+            let loaded_manifest = Manifest::load(&opts.stores, owner, name, path);
             let manifest_existed = loaded_manifest.is_some();
             let record_from_manifest: Option<(HashMap<String, String>, Option<String>)> =
                 loaded_manifest.map(|manifest| {
@@ -1287,7 +1292,7 @@ pub async fn smart_push(
         repo_id,
         root: path,
         local_files: &local_files,
-        cache_dir: &opts.cache_dir,
+        stores: &opts.stores,
         owner,
         name,
         record_base: &record_base,
@@ -1338,7 +1343,7 @@ pub async fn smart_push(
         };
         let mut manifest = Manifest::default();
         manifest.update(response.commit_sha.clone(), record);
-        if let Err(e) = manifest.save(&opts.cache_dir, owner, name) {
+        if let Err(e) = manifest.save(&opts.stores, owner, name, path) {
             eprintln!("warning: could not save manifest (next push will re-upload all files): {e}");
         }
     }
@@ -1365,6 +1370,7 @@ mod tests {
     use super::*;
     use crate::errors::EdgeRejecter;
     use crate::push::hash::blob_sha1;
+    use std::path::PathBuf;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1410,7 +1416,11 @@ mod tests {
                 author: Some("alice".into()),
                 parent_sha: None,
                 excludes: vec![],
-                cache_dir: cache_dir.path().to_path_buf(),
+                stores: crate::config::StoreRoots::resolve(
+                    Some(cache_dir.path()),
+                    cache_dir.path(),
+                    cache_dir.path(),
+                ),
                 description: None,
                 tags: None,
                 status: None,
@@ -1504,7 +1514,18 @@ mod tests {
                 ("b.txt".into(), blob_sha1(b"original")),
             ]),
         );
-        manifest.save(cache_dir.path(), "bob", "my-repo").unwrap();
+        manifest
+            .save(
+                &crate::config::StoreRoots::resolve(
+                    Some(cache_dir.path()),
+                    cache_dir.path(),
+                    cache_dir.path(),
+                ),
+                "bob",
+                "my-repo",
+                cache_dir.path(),
+            )
+            .unwrap();
 
         let client = SynsClient::new(&mock_server.uri()).unwrap();
 
@@ -1519,7 +1540,11 @@ mod tests {
                 author: Some("bob".into()),
                 parent_sha: None,
                 excludes: vec![],
-                cache_dir: cache_dir.path().to_path_buf(),
+                stores: crate::config::StoreRoots::resolve(
+                    Some(cache_dir.path()),
+                    cache_dir.path(),
+                    cache_dir.path(),
+                ),
                 description: None,
                 tags: None,
                 status: None,
@@ -1595,7 +1620,18 @@ mod tests {
                 ("removed.txt".into(), blob_sha1(b"gone")),
             ]),
         );
-        manifest.save(cache_dir.path(), "owner", "repo").unwrap();
+        manifest
+            .save(
+                &crate::config::StoreRoots::resolve(
+                    Some(cache_dir.path()),
+                    cache_dir.path(),
+                    cache_dir.path(),
+                ),
+                "owner",
+                "repo",
+                cache_dir.path(),
+            )
+            .unwrap();
 
         let client = SynsClient::new(&mock_server.uri()).unwrap();
 
@@ -1610,7 +1646,11 @@ mod tests {
                 author: Some("owner".into()),
                 parent_sha: None,
                 excludes: vec![],
-                cache_dir: cache_dir.path().to_path_buf(),
+                stores: crate::config::StoreRoots::resolve(
+                    Some(cache_dir.path()),
+                    cache_dir.path(),
+                    cache_dir.path(),
+                ),
                 description: None,
                 tags: None,
                 status: None,
@@ -1705,7 +1745,18 @@ mod tests {
                 ("b.txt".into(), blob_sha1(b"old-b")),
             ]),
         );
-        manifest.save(cache_dir.path(), "owner", "repo").unwrap();
+        manifest
+            .save(
+                &crate::config::StoreRoots::resolve(
+                    Some(cache_dir.path()),
+                    cache_dir.path(),
+                    cache_dir.path(),
+                ),
+                "owner",
+                "repo",
+                cache_dir.path(),
+            )
+            .unwrap();
 
         let client = SynsClient::new(&mock_server.uri()).unwrap();
 
@@ -1720,7 +1771,11 @@ mod tests {
                 author: Some("owner".into()),
                 parent_sha: None,
                 excludes: vec![],
-                cache_dir: cache_dir.path().to_path_buf(),
+                stores: crate::config::StoreRoots::resolve(
+                    Some(cache_dir.path()),
+                    cache_dir.path(),
+                    cache_dir.path(),
+                ),
                 description: None,
                 tags: None,
                 status: None,
@@ -1808,7 +1863,18 @@ mod tests {
                 ("b.txt".into(), blob_sha1(b"bbb")),
             ]),
         );
-        manifest.save(cache_dir.path(), "owner", "repo").unwrap();
+        manifest
+            .save(
+                &crate::config::StoreRoots::resolve(
+                    Some(cache_dir.path()),
+                    cache_dir.path(),
+                    cache_dir.path(),
+                ),
+                "owner",
+                "repo",
+                cache_dir.path(),
+            )
+            .unwrap();
 
         let client = SynsClient::new(&mock_server.uri()).unwrap();
 
@@ -1823,7 +1889,11 @@ mod tests {
                 author: Some("owner".into()),
                 parent_sha: None,
                 excludes: vec![],
-                cache_dir: cache_dir.path().to_path_buf(),
+                stores: crate::config::StoreRoots::resolve(
+                    Some(cache_dir.path()),
+                    cache_dir.path(),
+                    cache_dir.path(),
+                ),
                 description: None,
                 tags: None,
                 status: None,
@@ -1882,7 +1952,7 @@ mod tests {
             author: Some("alice".into()),
             parent_sha: None,
             excludes: vec![],
-            cache_dir: cache,
+            stores: StoreRoots::resolve(Some(&cache), &cache, &cache),
             description: None,
             tags: None,
             status: None,
@@ -2264,7 +2334,11 @@ mod tests {
                 author: Some("alice".into()),
                 parent_sha: None,
                 excludes: vec![],
-                cache_dir: cache_dir.path().to_path_buf(),
+                stores: crate::config::StoreRoots::resolve(
+                    Some(cache_dir.path()),
+                    cache_dir.path(),
+                    cache_dir.path(),
+                ),
                 description: None,
                 tags: None,
                 status: None,
@@ -2325,8 +2399,17 @@ mod tests {
                 .is_some_and(|m| m.contains("(part 2/2)")),
         );
 
-        let manifest = Manifest::load(cache_dir.path(), "alice", "repo")
-            .expect("manifest should be saved after successful chunked push");
+        let manifest = Manifest::load(
+            &crate::config::StoreRoots::resolve(
+                Some(cache_dir.path()),
+                cache_dir.path(),
+                cache_dir.path(),
+            ),
+            "alice",
+            "repo",
+            cache_dir.path(),
+        )
+        .expect("manifest should be saved after successful chunked push");
         assert_eq!(
             manifest.commit_sha(),
             Some("bbbbbbbb00000000000000000000000000000002"),
@@ -2396,7 +2479,11 @@ mod tests {
                 author: Some("alice".into()),
                 parent_sha: None,
                 excludes: vec![".syns.yaml".into()],
-                cache_dir: cache_dir.path().to_path_buf(),
+                stores: crate::config::StoreRoots::resolve(
+                    Some(cache_dir.path()),
+                    cache_dir.path(),
+                    cache_dir.path(),
+                ),
                 description: None,
                 tags: None,
                 status: None,
@@ -2526,7 +2613,18 @@ mod tests {
                 ("big2.txt".to_string(), big2_sha.clone()),
             ]),
         );
-        manifest.save(cache_dir.path(), "charlie", "repo").unwrap();
+        manifest
+            .save(
+                &crate::config::StoreRoots::resolve(
+                    Some(cache_dir.path()),
+                    cache_dir.path(),
+                    cache_dir.path(),
+                ),
+                "charlie",
+                "repo",
+                cache_dir.path(),
+            )
+            .unwrap();
 
         let client = SynsClient::new(&mock_server.uri()).unwrap();
         let result = smart_push(
@@ -2540,7 +2638,11 @@ mod tests {
                 author: Some("charlie".into()),
                 parent_sha: None,
                 excludes: vec![".syns.yaml".into()],
-                cache_dir: cache_dir.path().to_path_buf(),
+                stores: crate::config::StoreRoots::resolve(
+                    Some(cache_dir.path()),
+                    cache_dir.path(),
+                    cache_dir.path(),
+                ),
                 description: None,
                 tags: None,
                 status: None,
@@ -2683,7 +2785,11 @@ mod tests {
                 author: Some("dave".into()),
                 parent_sha: None,
                 excludes: vec![".syns.yaml".into()],
-                cache_dir: cache_dir.path().to_path_buf(),
+                stores: crate::config::StoreRoots::resolve(
+                    Some(cache_dir.path()),
+                    cache_dir.path(),
+                    cache_dir.path(),
+                ),
                 description: None,
                 tags: None,
                 status: None,
@@ -2716,8 +2822,17 @@ mod tests {
         // saved against batch 1's commit_sha — not absent, not at the
         // pre-push parent (None for a first push). The next push will
         // diff from aaaa...001 and only re-upload the missing files.
-        let loaded = Manifest::load(cache_dir.path(), "dave", "repo")
-            .expect("per-batch manifest should be saved after batch 1 success");
+        let loaded = Manifest::load(
+            &crate::config::StoreRoots::resolve(
+                Some(cache_dir.path()),
+                cache_dir.path(),
+                cache_dir.path(),
+            ),
+            "dave",
+            "repo",
+            cache_dir.path(),
+        )
+        .expect("per-batch manifest should be saved after batch 1 success");
         assert_eq!(
             loaded.commit_sha(),
             Some("aaaaaaaa00000000000000000000000000000001"),
@@ -2834,7 +2949,18 @@ mod tests {
             "record-sha".into(),
             HashMap::from([("record-only.txt".into(), "x".into())]),
         );
-        manifest.save(cache_dir.path(), "alice", "repo").unwrap();
+        manifest
+            .save(
+                &crate::config::StoreRoots::resolve(
+                    Some(cache_dir.path()),
+                    cache_dir.path(),
+                    cache_dir.path(),
+                ),
+                "alice",
+                "repo",
+                cache_dir.path(),
+            )
+            .unwrap();
 
         let client = SynsClient::new(&mock_server.uri()).unwrap();
         let mut opts = opts_with(cache_dir.path().to_path_buf(), false, false);
@@ -2866,7 +2992,17 @@ mod tests {
         assert_eq!(meta.deleted, vec!["gone.txt".to_string()]);
         assert_eq!(meta.collected.get("a.txt"), Some(&blob_sha1(b"a")));
 
-        let record = Manifest::load(cache_dir.path(), "alice", "repo").unwrap();
+        let record = Manifest::load(
+            &crate::config::StoreRoots::resolve(
+                Some(cache_dir.path()),
+                cache_dir.path(),
+                cache_dir.path(),
+            ),
+            "alice",
+            "repo",
+            cache_dir.path(),
+        )
+        .unwrap();
         assert_eq!(record.commit_sha(), Some("new-sha"));
         assert!(record.file_sha("record-only.txt").is_none());
         assert!(record.file_sha("gone.txt").is_none());
@@ -3017,7 +3153,7 @@ mod unclaimed_parent_tests {
             author: None,
             parent_sha: None,
             excludes: vec![],
-            cache_dir: cache_dir.to_path_buf(),
+            stores: crate::config::StoreRoots::resolve(Some(cache_dir), cache_dir, cache_dir),
             description: None,
             tags: None,
             status: None,
@@ -3066,7 +3202,14 @@ mod unclaimed_parent_tests {
             RECORDED.to_string(),
             HashMap::from([("a.md".to_string(), blob_sha1(b"was one"))]),
         );
-        manifest.save(cache.path(), "alice", "notes").unwrap();
+        manifest
+            .save(
+                &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+                "alice",
+                "notes",
+                cache.path(),
+            )
+            .unwrap();
 
         let client = SynsClient::new(&server.uri()).unwrap();
         let (_response, _raw, meta) = smart_push(
@@ -3219,7 +3362,14 @@ mod unclaimed_parent_tests {
             RECORDED.to_string(),
             HashMap::from([("a.md".to_string(), blob_sha1(b"was one"))]),
         );
-        manifest.save(cache.path(), "alice", "notes").unwrap();
+        manifest
+            .save(
+                &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+                "alice",
+                "notes",
+                cache.path(),
+            )
+            .unwrap();
 
         let client = SynsClient::new(&server.uri()).unwrap();
         let (_response, _raw, meta) = smart_push(
@@ -3283,7 +3433,7 @@ mod u280_publication_tests {
             author: None,
             parent_sha: None,
             excludes: vec![],
-            cache_dir: cache_dir.to_path_buf(),
+            stores: crate::config::StoreRoots::resolve(Some(cache_dir), cache_dir, cache_dir),
             description: None,
             tags: None,
             status: None,
@@ -3633,7 +3783,14 @@ mod u280_publication_tests {
                 ),
             ]),
         );
-        manifest.save(cache.path(), "alice", "repo").unwrap();
+        manifest
+            .save(
+                &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+                "alice",
+                "repo",
+                cache.path(),
+            )
+            .unwrap();
         let client = SynsClient::new(&server.uri()).unwrap();
 
         let err = smart_push(
@@ -3712,7 +3869,14 @@ mod u280_publication_tests {
                 ("c.txt".into(), blob_sha1(b"c")),
             ]),
         );
-        manifest.save(cache.path(), "alice", "repo").unwrap();
+        manifest
+            .save(
+                &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+                "alice",
+                "repo",
+                cache.path(),
+            )
+            .unwrap();
         let client = SynsClient::new(&server.uri()).unwrap();
 
         let err = smart_push(
@@ -3802,7 +3966,14 @@ mod u280_publication_tests {
                 ("big2.txt".into(), blob_sha1(b"old")),
             ]),
         );
-        manifest.save(cache.path(), "alice", "repo").unwrap();
+        manifest
+            .save(
+                &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+                "alice",
+                "repo",
+                cache.path(),
+            )
+            .unwrap();
         let client = SynsClient::new(&server.uri()).unwrap();
 
         let err = smart_push(

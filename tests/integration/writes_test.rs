@@ -230,7 +230,17 @@ fn seed_checkout(d: &Deployment, root: &Path, repo: &str, record: bool) {
     if !record {
         return;
     }
-    let copy = WorkingCopy::open(d.cache.path(), owner, name, root).expect("working copy");
+    let copy = WorkingCopy::open(
+        &syns_cli::config::StoreRoots::resolve(
+            Some(d.cache.path()),
+            d.cache.path(),
+            d.cache.path(),
+        ),
+        owner,
+        name,
+        root,
+    )
+    .expect("working copy");
     copy.record_base(HEAD_SHA, folder_hashes(root))
         .expect("recorded base");
 }
@@ -912,7 +922,16 @@ fn a_forced_publication_names_the_parent_it_did_not_claim() {
         let mut manifest = Manifest::default();
         manifest.update(HEAD_SHA.to_string(), folder_hashes(d.work.path()));
         manifest
-            .save(d.cache.path(), "alice", "notes")
+            .save(
+                &syns_cli::config::StoreRoots::resolve(
+                    Some(d.cache.path()),
+                    d.cache.path(),
+                    d.cache.path(),
+                ),
+                "alice",
+                "notes",
+                d.cache.path(),
+            )
             .expect("local record");
     };
 

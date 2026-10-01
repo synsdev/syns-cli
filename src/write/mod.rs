@@ -316,7 +316,7 @@ fn guard_root(config: &Config, root: &Path, repo_id: &str) -> Result<PathBuf, Cl
     // answer, which this function does not do (CR1-2). A state
     // directory that does not stand carries no recorded base, which
     // step 3 reads as unpublished local work.
-    let base = match WorkingCopy::open_existing(config.cache_dir(), owner, name, root) {
+    let base = match WorkingCopy::open_existing(config.stores(), owner, name, root) {
         Ok(Some(copy)) => {
             if copy.outbox()?.is_some() || copy.resolution()?.is_some() {
                 return Err(refuse());
@@ -362,13 +362,13 @@ async fn guard_folder(
         message: checkout_guard_refusal(&scope.dir, repo_id),
     };
     // 2
-    if let Ok(Some(copy)) = WorkingCopy::open_existing_folder(config.cache_dir(), scope)
+    if let Ok(Some(copy)) = WorkingCopy::open_existing_folder(config.stores(), scope)
         && (copy.outbox()?.is_some() || copy.resolution()?.is_some())
     {
         return Err(refuse());
     }
     // 3
-    let base = folder_base(config.cache_dir(), scope);
+    let base = folder_base(config.stores(), scope);
     let holder = match &scope.checkout {
         Some(_) => None,
         None => {
@@ -1099,7 +1099,7 @@ mod tests {
         if !record {
             return;
         }
-        let copy = WorkingCopy::open(config.cache_dir(), owner, name, root).unwrap();
+        let copy = WorkingCopy::open(config.stores(), owner, name, root).unwrap();
         copy.record_base(HEAD_SHA, folder_hashes(root)).unwrap();
     }
 
@@ -1206,8 +1206,7 @@ mod tests {
         // and so in the base a retrieval recorded.
         std::fs::create_dir_all(work.path().join("dist")).unwrap();
         std::fs::write(work.path().join("dist/index.js"), "built").unwrap();
-        let copy =
-            WorkingCopy::open(env.config.cache_dir(), "alice", "notes", work.path()).unwrap();
+        let copy = WorkingCopy::open(env.config.stores(), "alice", "notes", work.path()).unwrap();
         let mut recorded = folder_hashes(work.path());
         recorded.insert("dist/index.js".to_string(), blob_sha1(b"built"));
         copy.record_base(HEAD_SHA, recorded).unwrap();

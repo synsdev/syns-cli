@@ -53,10 +53,10 @@ pub async fn cmd_status(config: &Config, output: &Output, if_repo: bool) -> Resu
     // read in this same run — the folder copy's inside a folder (SPEC
     // u291 `cmd_status` 2).
     let copy = match &folder {
-        Some(scope) => WorkingCopy::open_folder(config.cache_dir(), scope)?,
+        Some(scope) => WorkingCopy::open_folder(config.stores(), scope)?,
         None => {
             let scope = push_scope(None, &current_dir, &owner, &name)?;
-            WorkingCopy::open(config.cache_dir(), &owner, &name, &scope.root)?
+            WorkingCopy::open(config.stores(), &owner, &name, &scope.root)?
         }
     };
     let state = working_copy_state(&client, token.as_deref(), &copy).await?;

@@ -73,7 +73,7 @@ pub fn convergence_options(config: &Config) -> SmartPushOptions {
         author: None,
         parent_sha: None,
         excludes: Vec::new(),
-        cache_dir: config.cache_dir().to_path_buf(),
+        stores: config.stores().clone(),
         description: None,
         tags: None,
         status: None,
@@ -500,10 +500,10 @@ fn open_copy(
     folder: Option<&FolderScope>,
 ) -> Result<WorkingCopy, CliError> {
     if let Some(scope) = folder {
-        return WorkingCopy::open_folder(config.cache_dir(), scope);
+        return WorkingCopy::open_folder(config.stores(), scope);
     }
     let scope = push_scope(None, cwd, owner, name)?;
-    WorkingCopy::open(config.cache_dir(), owner, name, &scope.root)
+    WorkingCopy::open(config.stores(), owner, name, &scope.root)
 }
 
 /// Write the identity file where a publication from `copy` would: never

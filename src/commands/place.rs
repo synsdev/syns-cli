@@ -16,7 +16,7 @@ use crate::output::Output;
 use crate::push::converge::check_server_path;
 use crate::push::folder_check::named_head;
 use crate::push::hash::blob_sha1;
-use crate::push::working_copy::WorkingCopy;
+use crate::push::working_copy::{WorkingCopy, holds_in_root_home};
 use crate::read::{refuse_reference_spelling, version_not_found_refusal};
 use crate::repo::folder::{FolderScope, current_dir, folder_checkout, resolve_folder_scope};
 use crate::repo::syns_yaml::{
@@ -442,6 +442,9 @@ pub async fn cmd_place(
     for (served, _) in &files {
         check_server_path(served)?;
     }
+    // SPEC u298 `IN_ROOT_HOME`: a template path in the in-root home is
+    // neither written into the folder nor carried into the publication.
+    files.retain(|(served, _)| !holds_in_root_home(served));
     if let Some((nested, _)) = files
         .iter()
         .find(|(served, _)| served.ends_with("/.syns.yaml"))
@@ -716,7 +719,7 @@ fn record_bases(
     claimed: Option<&str>,
     landed: &str,
 ) -> Result<(), CliError> {
-    let cache = config.cache_dir();
+    let cache = config.stores();
     let (owner, name) = counted
         .holder
         .split_once('/')
@@ -786,7 +789,13 @@ mod tests {
     fn copy_at_h1() -> (tempfile::TempDir, tempfile::TempDir, WorkingCopy) {
         let cache = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
-        let copy = WorkingCopy::open(cache.path(), "alice", "work", root.path()).unwrap();
+        let copy = WorkingCopy::open(
+            &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+            "alice",
+            "work",
+            root.path(),
+        )
+        .unwrap();
         copy.record_laid_base(
             "h1",
             HashMap::from([("README.md".to_string(), "r1".to_string())]),

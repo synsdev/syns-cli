@@ -4,6 +4,10 @@
 //! One state directory per repository and canonical root, under the
 //! cache root, holding the state lock, the recorded base, a pending
 //! resolution, the publication outbox and the two private snapshots.
+//! SPEC u298: where the default root refuses a run's writes, the copy's
+//! state is written to its in-root home, `{canonical root}/.syns-state`,
+//! instead; every run reads and locks both homes, the state stamped last
+//! answering its reads and adopted by the next lock.
 //! Every file under it is written through `write_atomic`: beside its
 //! target, flushed, renamed over the target and its directory flushed,
 //! so a killed process or a lost machine leaves the version before a
@@ -18,6 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::config::{StoreRoots, is_foreign_or_link};
 use crate::errors::CliError;
 use crate::push::hash::blob_sha1;
 use crate::push::manifest::Manifest;
@@ -31,6 +36,91 @@ const OUTBOX_FILE: &str = "outbox.json";
 const LOCAL_SNAPSHOT_FILE: &str = "local-snapshot.json";
 const REMOTE_SNAPSHOT_FILE: &str = "remote-snapshot.json";
 const STAT_RECORD_FILE: &str = "stat-record.json";
+
+/// SPEC u298, `IN_ROOT_HOME`: the directory at a working copy's root its
+/// state is kept in where the default root refuses a run's writes. A path
+/// holding this segment, letter case aside, is collected, retrieved and
+/// placed by nothing.
+pub const IN_ROOT_HOME: &str = ".syns-state";
+
+/// SPEC u298, `STATE_STAMP`: the nanoseconds since the Unix epoch a
+/// home's state last changed, rewritten under the lock at every write or
+/// removal of a state file.
+pub const STATE_STAMP: &str = "state.stamp";
+
+/// The local record's file name inside an in-root home (SPEC u298,
+/// `Manifest::save`).
+pub(crate) const LOCAL_RECORD_FILE: &str = "local-record.json";
+
+const GITIGNORE_FILE: &str = ".gitignore";
+
+/// The state files the `WorkingCopy` reads answer from, beside every
+/// content under `snapshot-content`.
+const READ_FILES: [&str; 6] = [
+    BASE_FILE,
+    RESOLUTION_FILE,
+    OUTBOX_FILE,
+    LOCAL_SNAPSHOT_FILE,
+    REMOTE_SNAPSHOT_FILE,
+    STAT_RECORD_FILE,
+];
+
+#[cfg(unix)]
+const IN_ROOT_HOME_MODE: u32 = 0o700;
+
+/// Whether a served or collected path holds the in-root home as one of
+/// its segments, under either separator and letter case aside.
+pub(crate) fn holds_in_root_home(path: &str) -> bool {
+    path.split(['/', '\\'])
+        .any(|seg| seg.eq_ignore_ascii_case(IN_ROOT_HOME))
+}
+
+/// Create the in-root home `dir` where it does not stand, at mode `0700`
+/// holding a `.gitignore` whose one line is `*`, and set its mode to
+/// `0700`; one standing as a link or owned by another account is refused
+/// (SPEC u298 Behaviour, `WorkingCopy::open` 1).
+pub(crate) fn ensure_in_root_home(dir: &Path) -> Result<(), CliError> {
+    let refuse = |reason: &dyn std::fmt::Display| CliError::Io {
+        message: format!(
+            "could not create working copy state {}: {reason}",
+            dir.display()
+        ),
+    };
+    let foreign = "it stands as a link or is owned by another account";
+    if is_foreign_or_link(dir) {
+        return Err(refuse(&foreign));
+    }
+    if !dir.is_dir() {
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(IN_ROOT_HOME_MODE);
+        }
+        match builder.create(dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(refuse(&err)),
+        }
+        if is_foreign_or_link(dir) {
+            return Err(refuse(&foreign));
+        }
+        if !dir.is_dir() {
+            return Err(refuse(&"it stands as a file"));
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(IN_ROOT_HOME_MODE))
+            .map_err(|err| refuse(&err))?;
+    }
+    let ignore = dir.join(GITIGNORE_FILE);
+    if !ignore.exists() {
+        write_atomic(&ignore, b"*\n", flush_directory)?;
+    }
+    Ok(())
+}
 
 /// What a collection saw of each file it read, so the next collection
 /// spares a file its read where nothing about it moved (SPEC u280
@@ -188,6 +278,10 @@ impl StatRecord {
 /// SPEC u291: `folder` is the scoped folder a folder copy works, its
 /// holder's `owner` and `name` standing beside it; none on every copy
 /// `WorkingCopy::open` answers.
+///
+/// SPEC u298: `state_dir` names the copy's write home — its in-root home
+/// where the default root refuses the run's writes, its default home
+/// otherwise — and `other_home` the home the run does not write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkingCopy {
     pub owner: String,
@@ -195,6 +289,8 @@ pub struct WorkingCopy {
     pub root: PathBuf,
     pub state_dir: PathBuf,
     pub folder: Option<FolderScope>,
+    stores: StoreRoots,
+    other_home: PathBuf,
 }
 
 /// A reconciliation handed to a reviewer: what both sides changed, and
@@ -254,19 +350,57 @@ const CONTENT_FILE_MODE: u32 = 0o600;
 pub type Snapshot = BTreeMap<String, Option<SnapshotContent>>;
 
 /// The working copy's exclusive state lock, released when dropped or
-/// when its process dies.
+/// when its process dies: the write home's, and the other home's where
+/// one could be taken (SPEC u298, `StateLock`).
 #[derive(Debug)]
 pub struct StateLock {
-    _file: File,
+    _write: File,
+    _other: Option<File>,
+}
+
+impl StateLock {
+    /// Whether the other home's lock was taken beside the write home's.
+    pub fn holds_other(&self) -> bool {
+        self._other.is_some()
+    }
+}
+
+/// Where a home stands in the order the `WorkingCopy` reads follow: a
+/// stamped home after every unstamped one, stamps compared by value, and
+/// unstamped homes by the newest modification time among the files the
+/// reads answer from, a home holding none of them first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Standing {
+    Empty,
+    Unstamped(std::time::SystemTime),
+    Stamped(u128),
+}
+
+/// Open the standing lock file at `path` for writing, else for reading,
+/// and take its lock, waiting; none where it is absent, opens neither way
+/// or refuses the lock call. Creates nothing.
+fn take_standing_lock(path: &Path) -> Option<File> {
+    if !path.is_file() {
+        return None;
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .or_else(|_| OpenOptions::new().read(true).open(path))
+        .ok()?;
+    file.lock().ok()?;
+    Some(file)
 }
 
 impl WorkingCopy {
-    /// Open the state directory for `owner/name` worked on at `root`.
+    /// Open the state of `owner/name` worked on at `root` over `stores`.
     ///
     /// The key is the canonical root, so two spellings of one directory
-    /// — a link to it included — open one state directory.
+    /// — a link to it included — open one state directory. The write home
+    /// is created where it does not stand (SPEC u298, `WorkingCopy::open`).
     pub fn open(
-        cache_dir: &Path,
+        stores: &StoreRoots,
         owner: &str,
         name: &str,
         root: &Path,
@@ -274,79 +408,144 @@ impl WorkingCopy {
         let canonical = std::fs::canonicalize(root).map_err(|err| CliError::Io {
             message: format!("could not resolve working copy {}: {err}", root.display()),
         })?;
-        let state_dir = Self::state_dir_for(cache_dir, owner, name, &canonical);
-        std::fs::create_dir_all(&state_dir).map_err(|err| CliError::Io {
-            message: format!(
-                "could not create working copy state {}: {err}",
-                state_dir.display()
-            ),
-        })?;
-        let canonical_state = std::fs::canonicalize(&state_dir).map_err(|err| CliError::Io {
-            message: format!(
-                "could not resolve working copy state {}: {err}",
-                state_dir.display()
-            ),
-        })?;
-        if canonical_state.starts_with(&canonical) {
-            return Err(CliError::Io {
+        if !stores.default_refused {
+            let state_dir = Self::state_dir_for(&stores.default, owner, name, &canonical);
+            std::fs::create_dir_all(&state_dir).map_err(|err| CliError::Io {
                 message: format!(
-                    "the working copy state {} lies inside the working copy {}; point SYNS_CACHE_DIR elsewhere",
-                    canonical_state.display(),
-                    canonical.display()
+                    "could not create working copy state {}: {err}",
+                    state_dir.display()
                 ),
-            });
+            })?;
         }
+        let copy = Self::at(stores, owner, name, canonical)?;
+        copy.ensure_write_home()?;
+        Ok(copy)
+    }
+
+    /// The copy of `owner/name` at the canonical root, both homes named
+    /// and neither created; a default home lying inside the root refused.
+    fn at(
+        stores: &StoreRoots,
+        owner: &str,
+        name: &str,
+        canonical: PathBuf,
+    ) -> Result<WorkingCopy, CliError> {
+        let default_home = Self::default_home_for(stores, owner, name, &canonical)?;
+        let in_root = canonical.join(IN_ROOT_HOME);
+        let (state_dir, other_home) = if stores.default_refused {
+            (in_root, default_home)
+        } else {
+            (default_home, in_root)
+        };
         Ok(WorkingCopy {
             owner: owner.to_string(),
             name: name.to_string(),
             root: canonical,
-            state_dir: canonical_state,
+            state_dir,
             folder: None,
+            stores: stores.clone(),
+            other_home,
         })
+    }
+
+    /// The default home of `owner/name` at a canonical root, canonical
+    /// where it stands; the refusal of one lying inside the copy's root.
+    fn default_home_for(
+        stores: &StoreRoots,
+        owner: &str,
+        name: &str,
+        canonical: &Path,
+    ) -> Result<PathBuf, CliError> {
+        let raw = Self::state_dir_for(&stores.default, owner, name, canonical);
+        let home = match std::fs::canonicalize(&raw) {
+            Ok(home) => home,
+            Err(_) => match std::fs::canonicalize(&stores.default) {
+                Ok(default) => Self::state_dir_for(&default, owner, name, canonical),
+                Err(_) => raw,
+            },
+        };
+        if home.starts_with(canonical) {
+            return Err(CliError::Io {
+                message: format!(
+                    "the working copy state {} lies inside the working copy {}; point SYNS_CACHE_DIR elsewhere",
+                    home.display(),
+                    canonical.display()
+                ),
+            });
+        }
+        Ok(home)
+    }
+
+    /// Whether the run writes this copy's state to its in-root home.
+    fn writes_in_root(&self) -> bool {
+        self.stores.default_refused
+    }
+
+    /// The copy's in-root home, whichever role it plays.
+    fn in_root_home(&self) -> &Path {
+        if self.writes_in_root() {
+            &self.state_dir
+        } else {
+            &self.other_home
+        }
+    }
+
+    /// Whether `home` may be read: an in-root home standing as a link or
+    /// owned by another account is read as holding no state.
+    fn readable(&self, home: &Path) -> bool {
+        home != self.in_root_home() || !is_foreign_or_link(home)
+    }
+
+    /// Create the write home where it does not stand — the in-root home
+    /// through `ensure_in_root_home` — before a write reaches it.
+    fn ensure_write_home(&self) -> Result<(), CliError> {
+        if self.writes_in_root() {
+            return ensure_in_root_home(&self.state_dir);
+        }
+        std::fs::create_dir_all(&self.state_dir).map_err(|err| CliError::Io {
+            message: format!(
+                "could not create working copy state {}: {err}",
+                self.state_dir.display()
+            ),
+        })
+    }
+
+    /// The roots the copy was opened over (SPEC u298, `WorkingCopy::stores`).
+    pub fn stores(&self) -> &StoreRoots {
+        &self.stores
     }
 
     /// Open the state of the holder worked on at the folder's canonical
     /// directory (SPEC u291, `WorkingCopy::open_folder`): a folder and its
     /// holder's checkout never share a state directory.
-    pub fn open_folder(cache_dir: &Path, scope: &FolderScope) -> Result<WorkingCopy, CliError> {
-        let mut copy = Self::open(cache_dir, &scope.owner, &scope.name, &scope.dir)?;
+    pub fn open_folder(stores: &StoreRoots, scope: &FolderScope) -> Result<WorkingCopy, CliError> {
+        let mut copy = Self::open(stores, &scope.owner, &scope.name, &scope.dir)?;
         copy.folder = Some(scope.clone());
         Ok(copy)
     }
 
-    /// The folder copy where its state directory already stands, none
-    /// where it does not, creating nothing (SPEC u291,
+    /// The folder copy where either home already holds its state, none
+    /// where neither does, creating nothing (SPEC u291,
     /// `WorkingCopy::open_existing_folder`).
     pub fn open_existing_folder(
-        cache_dir: &Path,
+        stores: &StoreRoots,
         scope: &FolderScope,
     ) -> Result<Option<WorkingCopy>, CliError> {
         Ok(
-            Self::open_existing(cache_dir, &scope.owner, &scope.name, &scope.dir)?.map(
-                |mut copy| {
-                    copy.folder = Some(scope.clone());
-                    copy
-                },
-            ),
+            Self::open_existing(stores, &scope.owner, &scope.name, &scope.dir)?.map(|mut copy| {
+                copy.folder = Some(scope.clone());
+                copy
+            }),
         )
     }
 
-    /// The cache directory this copy's state stands under: the fourth
-    /// ancestor of its state directory, `{cache}/working-copies/{owner}/{name}/{key}`.
-    pub fn cache_dir(&self) -> PathBuf {
-        self.state_dir
-            .ancestors()
-            .nth(4)
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| self.state_dir.clone())
-    }
-
-    /// Where the state directory for `owner/name` at `root` already
-    /// stands, the working copy holding it, and `None` where it does not
-    /// — the read a guard makes when it must not create one (SPEC u271,
-    /// `checkout_of`, which answers none of its three by writing state).
+    /// The copy of `owner/name` at `root` where either of its homes
+    /// already stands, and `None` where neither does — the read a guard
+    /// makes when it must not create one (SPEC u271, `checkout_of`, which
+    /// answers none of its three by writing state). It creates no
+    /// directory; a write through the copy creates its write home first.
     pub fn open_existing(
-        cache_dir: &Path,
+        stores: &StoreRoots,
         owner: &str,
         name: &str,
         root: &Path,
@@ -354,10 +553,13 @@ impl WorkingCopy {
         let Ok(canonical) = std::fs::canonicalize(root) else {
             return Ok(None);
         };
-        if !Self::state_dir_for(cache_dir, owner, name, &canonical).is_dir() {
+        let in_root = canonical.join(IN_ROOT_HOME);
+        let standing = Self::state_dir_for(&stores.default, owner, name, &canonical).is_dir()
+            || (in_root.is_dir() && !is_foreign_or_link(&in_root));
+        if !standing {
             return Ok(None);
         }
-        Self::open(cache_dir, owner, name, root).map(Some)
+        Self::at(stores, owner, name, canonical).map(Some)
     }
 
     /// Where the state for `owner/name` at a canonical root stands. The
@@ -371,30 +573,169 @@ impl WorkingCopy {
             .join(blob_sha1(canonical.as_os_str().as_encoded_bytes()))
     }
 
-    /// Take the exclusive state lock, waiting while another process
-    /// holds it.
+    /// Take the copy's lock in every home where one could be taken, the
+    /// default home's first, waiting while another process holds either;
+    /// then adopt the other home's state where it was stamped later
+    /// (SPEC u298 Behaviour, `WorkingCopy::lock` 1–3).
     pub fn lock(&self) -> Result<StateLock, CliError> {
-        let path = self.state_dir.join(LOCK_FILE);
         let io = |err: std::io::Error| CliError::Io {
             message: format!(
                 "could not lock working copy state {}: {err}",
                 self.state_dir.display()
             ),
         };
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .map_err(io)?;
-        file.lock().map_err(io)?;
-        Ok(StateLock { _file: file })
+        let take_write = || -> Result<File, CliError> {
+            self.ensure_write_home()?;
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(self.state_dir.join(LOCK_FILE))
+                .map_err(io)?;
+            file.lock().map_err(io)?;
+            Ok(file)
+        };
+        let take_other = || -> Option<File> {
+            if !self.readable(&self.other_home) {
+                return None;
+            }
+            take_standing_lock(&self.other_home.join(LOCK_FILE))
+        };
+        // 1 — the default home's lock before the in-root home's.
+        let lock = if self.writes_in_root() {
+            let other = take_other();
+            StateLock {
+                _write: take_write()?,
+                _other: other,
+            }
+        } else {
+            let write = take_write()?;
+            StateLock {
+                _write: write,
+                _other: take_other(),
+            }
+        };
+        // 3 — the state stamped last adopted into the write home.
+        if self.other_stamped_later() {
+            self.adopt().map_err(|err| CliError::Io {
+                message: format!(
+                    "could not adopt working copy state into {}: {err}",
+                    self.state_dir.display()
+                ),
+            })?;
+        }
+        Ok(lock)
+    }
+
+    /// Where `home` stands in the order the reads follow.
+    fn standing(&self, home: &Path) -> Standing {
+        if !self.readable(home) {
+            return Standing::Empty;
+        }
+        if let Some(stamp) = std::fs::read_to_string(home.join(STATE_STAMP))
+            .ok()
+            .and_then(|text| text.trim().parse::<u128>().ok())
+        {
+            return Standing::Stamped(stamp);
+        }
+        read_files(home)
+            .into_iter()
+            .map(|(_, modified)| modified)
+            .max()
+            .map_or(Standing::Empty, Standing::Unstamped)
+    }
+
+    /// Whether the other home is ordered after the write home, a tie
+    /// going to the write home (SPEC u298, `WorkingCopy` reads).
+    fn other_stamped_later(&self) -> bool {
+        self.standing(&self.other_home) > self.standing(&self.state_dir)
+    }
+
+    /// The home the reads answer from: the one ordered later, none where
+    /// it may not be read.
+    fn read_home(&self) -> Option<&Path> {
+        let home: &Path = if self.other_stamped_later() {
+            &self.other_home
+        } else {
+            &self.state_dir
+        };
+        self.readable(home).then_some(home)
+    }
+
+    /// The file `name` in the home the reads answer from.
+    fn read_path(&self, name: &str) -> Option<PathBuf> {
+        self.read_home().map(|home| home.join(name))
+    }
+
+    /// `WorkingCopy::lock` 3: copy every state file the other home's
+    /// reads answer from into the write home, the newest-modified last and
+    /// each keeping its modification time, after removing each the write
+    /// home holds that the other lacks; then the other's stamp, last.
+    fn adopt(&self) -> std::io::Result<()> {
+        let source = &self.other_home;
+        let target = &self.state_dir;
+        let mut adopted = read_files(source);
+        let keep: std::collections::HashSet<&str> =
+            adopted.iter().map(|(rel, _)| rel.as_str()).collect();
+        for (rel, _) in read_files(target) {
+            if !keep.contains(rel.as_str()) {
+                match std::fs::remove_file(target.join(&rel)) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+        adopted.sort_by_key(|(_, modified)| *modified);
+        if adopted
+            .iter()
+            .any(|(rel, _)| rel.starts_with(SNAPSHOT_CONTENT_DIR))
+        {
+            self.content_dir()
+                .map_err(|err| std::io::Error::other(err.to_string()))?;
+        }
+        for (rel, modified) in &adopted {
+            copy_keeping_time(&source.join(rel), &target.join(rel), *modified)?;
+        }
+        let stamp = source.join(STATE_STAMP);
+        if stamp.is_file() {
+            let bytes = std::fs::read(&stamp)?;
+            write_atomic(&target.join(STATE_STAMP), &bytes, flush_directory)
+                .map_err(|err| std::io::Error::other(err.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Rewrite the write home's stamp, dating its last change.
+    fn restamp(&self) -> Result<(), CliError> {
+        write_atomic(
+            &self.state_dir.join(STATE_STAMP),
+            now_nanos_wide().to_string().as_bytes(),
+            flush_directory,
+        )
+    }
+
+    /// Write `value` as the state file `name` in the write home, then
+    /// restamp it.
+    fn write_state<T: Serialize>(&self, name: &str, value: &T) -> Result<(), CliError> {
+        self.ensure_write_home()?;
+        write_json(&self.state_dir.join(name), value)?;
+        self.restamp()
+    }
+
+    /// Remove the state file `name` from the write home, restamping it
+    /// where a file was removed.
+    fn remove_state(&self, name: &str) -> Result<(), CliError> {
+        if remove_state_file(&self.state_dir.join(name))? {
+            self.restamp()?;
+        }
+        Ok(())
     }
 
     /// The recorded base, none where its file is absent or unreadable.
     pub fn base(&self) -> Option<Manifest> {
-        let text = std::fs::read_to_string(self.state_dir.join(BASE_FILE)).ok()?;
+        let text = std::fs::read_to_string(self.read_path(BASE_FILE)?).ok()?;
         serde_json::from_str(&text).ok()
     }
 
@@ -420,53 +761,63 @@ impl WorkingCopy {
         let mut manifest = Manifest::default();
         manifest.update(commit.to_string(), files);
         manifest.set_recorded_at(recorded_at);
-        write_json(&self.state_dir.join(BASE_FILE), &manifest)
+        self.write_state(BASE_FILE, &manifest)
     }
 
     pub fn resolution(&self) -> Result<Option<Resolution>, CliError> {
-        read_json(&self.state_dir.join(RESOLUTION_FILE))
+        match self.read_path(RESOLUTION_FILE) {
+            Some(path) => read_json(&path),
+            None => Ok(None),
+        }
     }
 
     pub fn write_resolution(&self, resolution: &Resolution) -> Result<(), CliError> {
-        write_json(&self.state_dir.join(RESOLUTION_FILE), resolution)
+        self.write_state(RESOLUTION_FILE, resolution)
     }
 
     pub fn remove_resolution(&self) -> Result<(), CliError> {
-        remove_state_file(&self.state_dir.join(RESOLUTION_FILE))
+        self.remove_state(RESOLUTION_FILE)
     }
 
     pub fn outbox(&self) -> Result<Option<Outbox>, CliError> {
-        read_json(&self.state_dir.join(OUTBOX_FILE))
+        match self.read_path(OUTBOX_FILE) {
+            Some(path) => read_json(&path),
+            None => Ok(None),
+        }
     }
 
     pub fn write_outbox(&self, outbox: &Outbox) -> Result<(), CliError> {
-        write_json(&self.state_dir.join(OUTBOX_FILE), outbox)
+        self.write_state(OUTBOX_FILE, outbox)
     }
 
     pub fn remove_outbox(&self) -> Result<(), CliError> {
-        remove_state_file(&self.state_dir.join(OUTBOX_FILE))
+        self.remove_state(OUTBOX_FILE)
+    }
+
+    /// A snapshot document as the home the reads answer from holds it.
+    fn read_snapshot(&self, name: &str) -> Result<Snapshot, CliError> {
+        match self.read_path(name) {
+            Some(path) => Ok(read_json(&path)?.unwrap_or_default()),
+            None => Ok(Snapshot::new()),
+        }
     }
 
     /// The folder's content before a reconciliation rewrote it.
     pub fn local_snapshot(&self) -> Result<Snapshot, CliError> {
-        Ok(read_json(&self.local_snapshot_path())?.unwrap_or_default())
+        self.read_snapshot(LOCAL_SNAPSHOT_FILE)
     }
 
     pub fn write_local_snapshot(&self, snapshot: &Snapshot) -> Result<(), CliError> {
-        self.flush_snapshot_content()?;
-        write_json(&self.local_snapshot_path(), snapshot)?;
-        self.prune_snapshot_content()
+        self.write_snapshots(Some(snapshot), None)
     }
 
     /// Each collision's content at the head it was prepared against.
     pub fn remote_snapshot(&self) -> Result<Snapshot, CliError> {
-        Ok(read_json(&self.remote_snapshot_path())?.unwrap_or_default())
+        self.read_snapshot(REMOTE_SNAPSHOT_FILE)
     }
 
     pub fn write_remote_snapshot(&self, snapshot: &Snapshot) -> Result<(), CliError> {
-        self.flush_snapshot_content()?;
-        write_json(&self.remote_snapshot_path(), snapshot)?;
-        self.prune_snapshot_content()
+        self.write_snapshots(None, Some(snapshot))
     }
 
     /// Make every content stored since the last flush durable in its
@@ -488,6 +839,7 @@ impl WorkingCopy {
         local: Option<&Snapshot>,
         remote: Option<&Snapshot>,
     ) -> Result<(), CliError> {
+        self.ensure_write_home()?;
         self.flush_snapshot_content()?;
         if let Some(local) = local {
             write_json(&self.local_snapshot_path(), local)?;
@@ -495,14 +847,19 @@ impl WorkingCopy {
         if let Some(remote) = remote {
             write_json(&self.remote_snapshot_path(), remote)?;
         }
-        self.prune_snapshot_content()
+        self.prune_snapshot_content()?;
+        self.restamp()
     }
 
     /// Remove both snapshots, then every content file neither names.
     pub fn remove_snapshots(&self) -> Result<(), CliError> {
-        remove_state_file(&self.local_snapshot_path())?;
-        remove_state_file(&self.remote_snapshot_path())?;
-        self.prune_snapshot_content()
+        let local = remove_state_file(&self.local_snapshot_path())?;
+        let remote = remove_state_file(&self.remote_snapshot_path())?;
+        self.prune_snapshot_content()?;
+        if local || remote {
+            self.restamp()?;
+        }
+        Ok(())
     }
 
     /// The directory holding each stored snapshot content.
@@ -513,6 +870,7 @@ impl WorkingCopy {
     /// Create the content directory, reachable by the person's own
     /// account alone, where it does not stand.
     fn content_dir(&self) -> Result<PathBuf, CliError> {
+        self.ensure_write_home()?;
         let dir = self.snapshot_content_dir();
         let io = |err: std::io::Error| CliError::Io {
             message: format!("could not write {}: {err}", dir.display()),
@@ -638,7 +996,11 @@ impl WorkingCopy {
     /// The file holding a stored content, answered only where its bytes,
     /// read in pieces, hash to its name.
     pub fn stored_content(&self, sha: &str) -> Result<PathBuf, CliError> {
-        let path = self.snapshot_content_dir().join(sha);
+        let path = self
+            .read_home()
+            .unwrap_or(&self.state_dir)
+            .join(SNAPSHOT_CONTENT_DIR)
+            .join(sha);
         let refused = || CliError::Io {
             message: format!(
                 "could not read {}: content does not match its hash",
@@ -667,14 +1029,21 @@ impl WorkingCopy {
         }
     }
 
-    /// Remove every content file neither standing snapshot names.
+    /// Remove every content file neither snapshot standing in the write
+    /// home names.
     pub fn prune_snapshot_content(&self) -> Result<(), CliError> {
         let dir = self.snapshot_content_dir();
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return Ok(());
         };
         let mut named = std::collections::HashSet::new();
-        for snapshot in [self.local_snapshot()?, self.remote_snapshot()?] {
+        let standing = |path: PathBuf| -> Result<Snapshot, CliError> {
+            Ok(read_json(&path)?.unwrap_or_default())
+        };
+        for snapshot in [
+            standing(self.local_snapshot_path())?,
+            standing(self.remote_snapshot_path())?,
+        ] {
             for content in snapshot.into_values().flatten() {
                 if let SnapshotContent::Stored { stored } = content {
                     named.insert(stored);
@@ -707,12 +1076,98 @@ impl WorkingCopy {
 
     /// The stat record this working copy keeps, empty where none loads.
     pub fn stat_record(&self) -> StatRecord {
-        StatRecord::load(&self.state_dir)
+        match self.read_home() {
+            Some(home) => StatRecord::load(home),
+            None => StatRecord::default(),
+        }
     }
 
     pub fn write_stat_record(&self, record: &StatRecord) -> Result<(), CliError> {
-        record.save(&self.state_dir)
+        self.ensure_write_home()?;
+        record.save(&self.state_dir)?;
+        self.restamp()
     }
+}
+
+/// Each state file the reads answer from standing in `home` — the
+/// documents, and every content under `snapshot-content` — counted from
+/// `home`, beside its modification time.
+fn read_files(home: &Path) -> Vec<(String, std::time::SystemTime)> {
+    let modified = |path: &Path| {
+        std::fs::symlink_metadata(path)
+            .ok()
+            .filter(|meta| meta.is_file())
+            .and_then(|meta| meta.modified().ok())
+    };
+    let mut files: Vec<(String, std::time::SystemTime)> = READ_FILES
+        .iter()
+        .filter_map(|name| modified(&home.join(name)).map(|time| (name.to_string(), time)))
+        .collect();
+    for entry in std::fs::read_dir(home.join(SNAPSHOT_CONTENT_DIR))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        if let Some(time) = modified(&entry.path()) {
+            files.push((format!("{SNAPSHOT_CONTENT_DIR}/{name}"), time));
+        }
+    }
+    files
+}
+
+/// Copy `source` over `target` through a sibling renamed over it, the
+/// sibling carrying `modified` as its modification time before the rename.
+fn copy_keeping_time(
+    source: &Path,
+    target: &Path,
+    modified: std::time::SystemTime,
+) -> std::io::Result<()> {
+    let dir = target
+        .parent()
+        .ok_or_else(|| std::io::Error::other("no parent directory"))?;
+    let sibling = dir.join(format!(
+        ".adopt.{}.{}.tmp",
+        std::process::id(),
+        SIBLING_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let copied = (|| -> std::io::Result<()> {
+        let bytes = std::fs::read(source)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(CONTENT_FILE_MODE);
+        }
+        let mut file = options.open(&sibling)?;
+        file.write_all(&bytes)?;
+        file.set_modified(modified)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&sibling, target)
+    })();
+    if copied.is_err() {
+        let _ = std::fs::remove_file(&sibling);
+    }
+    copied?;
+    match flush_directory(dir) {
+        Ok(()) => Ok(()),
+        Err(err) if is_unsupported_flush(&err) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+/// The nanoseconds since the Unix epoch the system clock reads now, in
+/// full.
+fn now_nanos_wide() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default()
 }
 
 /// The nanoseconds since the Unix epoch the system clock reads now.
@@ -730,7 +1185,7 @@ fn now_nanos() -> u64 {
 /// it, the one recorded last, a record carrying no time ranking below
 /// every one that does and a tie going to the copy whose root lies
 /// outermost. It creates no state.
-pub fn folder_base(cache_dir: &Path, scope: &FolderScope) -> Option<Manifest> {
+pub fn folder_base(stores: &StoreRoots, scope: &FolderScope) -> Option<Manifest> {
     // 1 — every record standing, outermost first, each narrowed to the
     // folder: the holder checkout's, each enclosing folder's outermost
     // first, then the folder's own.
@@ -758,19 +1213,19 @@ pub fn folder_base(cache_dir: &Path, scope: &FolderScope) -> Option<Manifest> {
     };
     if let Some(checkout) = &scope.checkout
         && let Ok(Some(copy)) =
-            WorkingCopy::open_existing(cache_dir, &scope.owner, &scope.name, checkout)
+            WorkingCopy::open_existing(stores, &scope.owner, &scope.name, checkout)
         && let Some(base) = copy.base()
     {
         standing.push(narrowed(base, None));
     }
     for enclosing in scope.enclosing.iter().rev() {
-        if let Ok(Some(copy)) = WorkingCopy::open_existing_folder(cache_dir, enclosing)
+        if let Ok(Some(copy)) = WorkingCopy::open_existing_folder(stores, enclosing)
             && let Some(base) = copy.base()
         {
             standing.push(narrowed(base, Some(&enclosing.path)));
         }
     }
-    if let Ok(Some(copy)) = WorkingCopy::open_existing_folder(cache_dir, scope)
+    if let Ok(Some(copy)) = WorkingCopy::open_existing_folder(stores, scope)
         && let Some(base) = copy.base()
     {
         standing.push(base);
@@ -823,10 +1278,11 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), CliError> {
     write_atomic(path, &bytes, flush_directory)
 }
 
-fn remove_state_file(path: &Path) -> Result<(), CliError> {
+/// Remove a state file, answering whether one was removed.
+fn remove_state_file(path: &Path) -> Result<bool, CliError> {
     match std::fs::remove_file(path) {
         Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(err) => {
             return Err(CliError::Io {
                 message: format!("could not remove {}: {err}", path.display()),
@@ -834,8 +1290,8 @@ fn remove_state_file(path: &Path) -> Result<(), CliError> {
         }
     }
     match path.parent() {
-        Some(dir) => finish_directory_flush(dir, flush_directory(dir)),
-        None => Ok(()),
+        Some(dir) => finish_directory_flush(dir, flush_directory(dir)).map(|()| true),
+        None => Ok(true),
     }
 }
 
@@ -1031,9 +1487,15 @@ mod tests {
         let target = tree.path().join("copy");
         std::fs::create_dir_all(target.join("sub")).unwrap();
 
-        let direct = WorkingCopy::open(cache.path(), "alice", "proj", &target).unwrap();
+        let direct = WorkingCopy::open(
+            &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+            "alice",
+            "proj",
+            &target,
+        )
+        .unwrap();
         let dotted = WorkingCopy::open(
-            cache.path(),
+            &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
             "alice",
             "proj",
             &target.join("sub").join(".."),
@@ -1045,14 +1507,26 @@ mod tests {
         {
             let link = tree.path().join("link");
             std::os::unix::fs::symlink(&target, &link).unwrap();
-            let linked = WorkingCopy::open(cache.path(), "alice", "proj", &link).unwrap();
+            let linked = WorkingCopy::open(
+                &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+                "alice",
+                "proj",
+                &link,
+            )
+            .unwrap();
             assert_eq!(direct.state_dir, linked.state_dir);
             assert_eq!(direct.root, linked.root);
         }
 
         let other = tree.path().join("other");
         std::fs::create_dir_all(&other).unwrap();
-        let elsewhere = WorkingCopy::open(cache.path(), "alice", "proj", &other).unwrap();
+        let elsewhere = WorkingCopy::open(
+            &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+            "alice",
+            "proj",
+            &other,
+        )
+        .unwrap();
         assert_ne!(direct.state_dir, elsewhere.state_dir);
     }
 
@@ -1060,7 +1534,13 @@ mod tests {
     fn state_files_round_trip_and_an_unreadable_base_reads_as_none() {
         let cache = tempfile::tempdir().unwrap();
         let tree = tempfile::tempdir().unwrap();
-        let copy = WorkingCopy::open(cache.path(), "alice", "proj", tree.path()).unwrap();
+        let copy = WorkingCopy::open(
+            &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+            "alice",
+            "proj",
+            tree.path(),
+        )
+        .unwrap();
 
         assert!(copy.base().is_none());
         copy.record_base("h0", HashMap::from([("a.md".into(), "1".into())]))
@@ -1136,7 +1616,13 @@ mod tests {
         let tree = tempfile::tempdir().unwrap();
         let w = std::fs::canonicalize(tree.path()).unwrap();
         std::fs::create_dir_all(w.join("clients/vela/q3-board")).unwrap();
-        let holder = WorkingCopy::open(cache.path(), "alice", "work", &w).unwrap();
+        let holder = WorkingCopy::open(
+            &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+            "alice",
+            "work",
+            &w,
+        )
+        .unwrap();
         let holder_files = HashMap::from([
             (".page/x.json".to_string(), "x1".to_string()),
             ("clients/vela/q3-board/a.md".to_string(), "a1".to_string()),
@@ -1145,7 +1631,10 @@ mod tests {
         let scope = q3_scope(&w, Some(w.clone()));
         let answer = |scope: &FolderScope| {
             let before = entries_under(cache.path());
-            let base = folder_base(cache.path(), scope);
+            let base = folder_base(
+                &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+                scope,
+            );
             assert_eq!(
                 entries_under(cache.path()),
                 before,
@@ -1172,7 +1661,11 @@ mod tests {
         assert_eq!(answer(&scope), h1);
         assert_eq!(answer(&q3_scope(&w, None)), None);
 
-        let folder = WorkingCopy::open_folder(cache.path(), &scope).unwrap();
+        let folder = WorkingCopy::open_folder(
+            &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+            &scope,
+        )
+        .unwrap();
         folder
             .record_base(
                 "h0",
@@ -1200,22 +1693,36 @@ mod tests {
         std::fs::create_dir_all(w.join("clients/vela/q3-board")).unwrap();
         let scope = q3_scope(&w, Some(w.clone()));
         assert_eq!(
-            WorkingCopy::open_existing_folder(cache.path(), &scope).unwrap(),
+            WorkingCopy::open_existing_folder(
+                &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+                &scope
+            )
+            .unwrap(),
             None
         );
-        let folder = WorkingCopy::open_folder(cache.path(), &scope).unwrap();
-        let holder = WorkingCopy::open(cache.path(), "alice", "work", &w).unwrap();
+        let folder = WorkingCopy::open_folder(
+            &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+            &scope,
+        )
+        .unwrap();
+        let holder = WorkingCopy::open(
+            &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+            "alice",
+            "work",
+            &w,
+        )
+        .unwrap();
         assert_ne!(folder.state_dir, holder.state_dir);
         assert_eq!(folder.folder.as_ref(), Some(&scope));
         assert_eq!(holder.folder, None);
+        assert_eq!(folder.stores().write, cache.path());
         assert_eq!(
-            folder.cache_dir(),
-            std::fs::canonicalize(cache.path()).unwrap()
-        );
-        assert_eq!(
-            WorkingCopy::open_existing_folder(cache.path(), &scope)
-                .unwrap()
-                .map(|c| c.state_dir),
+            WorkingCopy::open_existing_folder(
+                &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+                &scope
+            )
+            .unwrap()
+            .map(|c| c.state_dir),
             Some(folder.state_dir)
         );
     }
@@ -1224,7 +1731,12 @@ mod tests {
     fn open_refuses_a_state_directory_inside_the_working_copy() {
         let tree = tempfile::tempdir().unwrap();
         let cache = tree.path().join(".cache");
-        let result = WorkingCopy::open(&cache, "alice", "proj", tree.path());
+        let result = WorkingCopy::open(
+            &crate::config::StoreRoots::resolve(Some(&cache), &cache, &cache),
+            "alice",
+            "proj",
+            tree.path(),
+        );
         assert!(matches!(result, Err(CliError::Io { .. })), "{result:?}");
     }
 
@@ -1233,7 +1745,13 @@ mod tests {
     fn open_copy() -> (tempfile::TempDir, tempfile::TempDir, WorkingCopy) {
         let cache = tempfile::tempdir().unwrap();
         let tree = tempfile::tempdir().unwrap();
-        let copy = WorkingCopy::open(cache.path(), "alice", "proj", tree.path()).unwrap();
+        let copy = WorkingCopy::open(
+            &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+            "alice",
+            "proj",
+            tree.path(),
+        )
+        .unwrap();
         (cache, tree, copy)
     }
 
@@ -1394,5 +1912,431 @@ mod tests {
         );
         assert_eq!(snapshot["a.md"], Some(SnapshotContent::Text("a\n".into())));
         assert_eq!(snapshot["gone.md"], None);
+    }
+
+    // ---- u298: the two homes ------------------------------------------
+
+    /// A scratch default root, fallback root and folder, with the roots a
+    /// run answers where the default root takes writes and where it
+    /// refuses them.
+    struct Homes {
+        _scratch: tempfile::TempDir,
+        default: PathBuf,
+        root: PathBuf,
+        writable: StoreRoots,
+        refused: StoreRoots,
+    }
+
+    fn homes() -> Homes {
+        let scratch = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(scratch.path()).unwrap();
+        let default = base.join("default");
+        let fallback = base.join("fallback");
+        let root = base.join("folder");
+        std::fs::create_dir_all(&default).unwrap();
+        std::fs::create_dir_all(&fallback).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        Homes {
+            writable: StoreRoots {
+                default: default.clone(),
+                write: default.clone(),
+                default_refused: false,
+            },
+            refused: StoreRoots {
+                default: default.clone(),
+                write: fallback,
+                default_refused: true,
+            },
+            _scratch: scratch,
+            default,
+            root,
+        }
+    }
+
+    fn files(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(p, s)| (p.to_string(), s.to_string()))
+            .collect()
+    }
+
+    fn commit_of(copy: &WorkingCopy) -> Option<String> {
+        copy.base().and_then(|b| b.commit_sha().map(String::from))
+    }
+
+    fn set_stamp(home: &Path, value: u128) {
+        std::fs::write(home.join(STATE_STAMP), value.to_string()).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// Whether another open file can take the lock at `path` now.
+    fn lock_is_free(path: &Path) -> bool {
+        let file = File::open(path).unwrap();
+        let free = file.try_lock().is_ok();
+        if free {
+            file.unlock().unwrap();
+        }
+        free
+    }
+
+    // SPEC u298 Tests, `in_root_home_is_confined_and_ignored_by_git`.
+    #[test]
+    fn in_root_home_is_confined_and_ignored_by_git() {
+        let h = homes();
+        let copy = WorkingCopy::open(&h.refused, "alice", "proj", &h.root).unwrap();
+        let home = h.root.join(IN_ROOT_HOME);
+        assert_eq!(copy.state_dir, home);
+        assert!(home.is_dir());
+        #[cfg(unix)]
+        assert_eq!(mode_of(&home), 0o700);
+        assert_eq!(
+            std::fs::read_to_string(home.join(".gitignore"))
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            vec!["*"]
+        );
+        assert!(
+            !h.default.join("working-copies").exists(),
+            "a refused run created the default home"
+        );
+    }
+
+    // SPEC u298 Tests, `in_root_home_standing_as_a_link_is_refused`.
+    #[cfg(unix)]
+    #[test]
+    fn in_root_home_standing_as_a_link_is_refused() {
+        let h = homes();
+        let elsewhere = h.default.parent().unwrap().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        set_stamp(&elsewhere, 9);
+        let mut base = Manifest::default();
+        base.update("h9".into(), files(&[("a.md", "9")]));
+        std::fs::write(
+            elsewhere.join(BASE_FILE),
+            serde_json::to_vec(&base).unwrap(),
+        )
+        .unwrap();
+        let before = entries_under(&elsewhere);
+        let link = h.root.join(IN_ROOT_HOME);
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+
+        match WorkingCopy::open(&h.refused, "alice", "proj", &h.root) {
+            Err(CliError::Io { message }) => {
+                assert!(
+                    message.contains("could not create working copy state"),
+                    "{message}"
+                )
+            }
+            other => panic!("expected the refusal, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_link(&link).unwrap(), elsewhere);
+        assert_eq!(entries_under(&elsewhere), before);
+
+        // As the other home, it is read as holding no state.
+        let copy = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        assert_eq!(commit_of(&copy), None);
+        let lock = copy.lock().unwrap();
+        assert!(!lock.holds_other());
+        assert_eq!(commit_of(&copy), None);
+    }
+
+    // SPEC u298 Tests, `reads_answer_the_state_stamped_last`.
+    #[test]
+    fn reads_answer_the_state_stamped_last() {
+        let h = homes();
+        let write = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        let other = WorkingCopy::open(&h.refused, "alice", "proj", &h.root).unwrap();
+        write.record_base("h1", files(&[("a.md", "1")])).unwrap();
+        other.record_base("h2", files(&[("a.md", "2")])).unwrap();
+        set_stamp(&write.state_dir, 100);
+        set_stamp(&other.state_dir, 200);
+        assert_eq!(commit_of(&write).as_deref(), Some("h2"));
+        set_stamp(&other.state_dir, 100);
+        assert_eq!(commit_of(&write).as_deref(), Some("h1"));
+        // Seen from the other side, the tie goes to its own write home.
+        assert_eq!(commit_of(&other).as_deref(), Some("h2"));
+    }
+
+    // SPEC u298 Contract Surface, `WorkingCopy` reads: a home holding no
+    // stamp is ordered before every home holding one, and two holding
+    // none by the newest modification time among their state files.
+    #[test]
+    fn unstamped_homes_are_ordered_by_their_newest_state_file() {
+        let h = homes();
+        let write = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        let other = WorkingCopy::open(&h.refused, "alice", "proj", &h.root).unwrap();
+        write.record_base("h1", files(&[("a.md", "1")])).unwrap();
+        other.record_base("h2", files(&[("a.md", "2")])).unwrap();
+        std::fs::remove_file(write.state_dir.join(STATE_STAMP)).unwrap();
+        // A stamped home is ordered after an unstamped one.
+        assert_eq!(commit_of(&write).as_deref(), Some("h2"));
+        std::fs::remove_file(other.state_dir.join(STATE_STAMP)).unwrap();
+        let at = |secs: u64| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        let touch = |path: PathBuf, secs: u64| {
+            File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(at(secs))
+                .unwrap();
+        };
+        touch(write.state_dir.join(BASE_FILE), 2_000);
+        touch(other.state_dir.join(BASE_FILE), 1_000);
+        assert_eq!(commit_of(&write).as_deref(), Some("h1"));
+        touch(other.state_dir.join(BASE_FILE), 3_000);
+        assert_eq!(commit_of(&write).as_deref(), Some("h2"));
+    }
+
+    // SPEC u298 Tests, `open_existing_finds_state_in_either_home`.
+    #[test]
+    fn open_existing_finds_state_in_either_home() {
+        let h = homes();
+        assert_eq!(
+            WorkingCopy::open_existing(&h.writable, "alice", "proj", &h.root).unwrap(),
+            None
+        );
+        let other = WorkingCopy::open(&h.refused, "alice", "proj", &h.root).unwrap();
+        other.record_base("h2", files(&[("a.md", "2")])).unwrap();
+        let found = WorkingCopy::open_existing(&h.writable, "alice", "proj", &h.root)
+            .unwrap()
+            .expect("the copy whose state stands in its in-root home");
+        assert_eq!(commit_of(&found).as_deref(), Some("h2"));
+        assert!(
+            !found.state_dir.exists(),
+            "open_existing created the write home"
+        );
+        assert!(!h.default.join("working-copies").exists());
+    }
+
+    // SPEC u298 Tests, `folder_base_reads_a_holder_base_in_its_default_home`.
+    #[test]
+    fn folder_base_reads_a_holder_base_in_its_default_home() {
+        let h = homes();
+        let w = h.root.clone();
+        std::fs::create_dir_all(w.join("clients/vela/q3-board")).unwrap();
+        let holder = WorkingCopy::open(&h.writable, "alice", "work", &w).unwrap();
+        holder
+            .record_base("h1", files(&[("clients/vela/q3-board/a.md", "a1")]))
+            .unwrap();
+        let scope = q3_scope(&w, Some(w.clone()));
+        let base = folder_base(&h.refused, &scope).expect("the holder's base");
+        assert_eq!(base.commit_sha(), Some("h1"));
+        assert_eq!(base.file_paths().collect::<Vec<_>>(), vec!["a.md"]);
+        assert_eq!(base.file_sha("a.md"), Some("a1"));
+        assert!(!w.join(IN_ROOT_HOME).exists(), "folder_base wrote state");
+    }
+
+    /// Hold the lock at `path` through another open file from a thread
+    /// for a while, answering when it was released.
+    fn hold_from_a_thread(
+        path: PathBuf,
+        writable: bool,
+    ) -> std::thread::JoinHandle<std::time::Instant> {
+        let (taken, wait) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(writable)
+                .open(&path)
+                .unwrap();
+            file.lock().unwrap();
+            taken.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            let released = std::time::Instant::now();
+            file.unlock().unwrap();
+            released
+        });
+        wait.recv().unwrap();
+        holder
+    }
+
+    // SPEC u298 Tests, `lock_queues_behind_the_other_homes_lock`.
+    #[test]
+    fn lock_queues_behind_the_other_homes_lock() {
+        let h = homes();
+        let sandboxed = WorkingCopy::open(&h.refused, "alice", "proj", &h.root).unwrap();
+        drop(sandboxed.lock().unwrap());
+        let copy = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        let in_root_lock = h.root.join(IN_ROOT_HOME).join(LOCK_FILE);
+        let holder = hold_from_a_thread(in_root_lock.clone(), true);
+        let lock = copy.lock().unwrap();
+        let returned = std::time::Instant::now();
+        let released = holder.join().unwrap();
+        assert!(returned >= released, "the lock did not wait");
+        assert!(lock.holds_other());
+        assert!(!lock_is_free(&copy.state_dir.join(LOCK_FILE)));
+        assert!(!lock_is_free(&in_root_lock));
+        drop(lock);
+        assert!(lock_is_free(&in_root_lock));
+    }
+
+    // SPEC u298 Tests, `lock_queues_behind_a_read_only_default_lock`.
+    #[cfg(unix)]
+    #[test]
+    fn lock_queues_behind_a_read_only_default_lock() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let h = homes();
+        let unsandboxed = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        drop(unsandboxed.lock().unwrap());
+        let default_lock = unsandboxed.state_dir.join(LOCK_FILE);
+        std::fs::set_permissions(&default_lock, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let copy = WorkingCopy::open(&h.refused, "alice", "proj", &h.root).unwrap();
+        let holder = hold_from_a_thread(default_lock.clone(), false);
+        let lock = copy.lock().unwrap();
+        let returned = std::time::Instant::now();
+        let released = holder.join().unwrap();
+        assert!(returned >= released, "the lock did not wait");
+        assert!(lock.holds_other());
+        assert!(!lock_is_free(&default_lock));
+        assert!(!lock_is_free(&copy.state_dir.join(LOCK_FILE)));
+        drop(lock);
+        std::fs::set_permissions(&default_lock, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    // SPEC u298 Tests, `lock_adopts_an_unstamped_default_home`.
+    #[test]
+    fn lock_adopts_an_unstamped_default_home() {
+        let h = homes();
+        let released = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        released.record_base("h1", files(&[("a.md", "1")])).unwrap();
+        std::fs::remove_file(released.state_dir.join(STATE_STAMP)).unwrap();
+        assert!(!h.root.join(IN_ROOT_HOME).exists());
+
+        let copy = WorkingCopy::open(&h.refused, "alice", "proj", &h.root).unwrap();
+        let lock = copy.lock().unwrap();
+        assert_eq!(commit_of(&copy).as_deref(), Some("h1"));
+        let adopted: Manifest = serde_json::from_slice(
+            &std::fs::read(h.root.join(IN_ROOT_HOME).join(BASE_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(adopted.commit_sha(), Some("h1"));
+        drop(lock);
+        // Adopted once: the homes now tie, and the next lock copies nothing.
+        assert!(!copy.other_stamped_later());
+    }
+
+    // SPEC u298 Tests, `writable_default_run_creates_no_in_root_home`.
+    #[test]
+    fn writable_default_run_creates_no_in_root_home() {
+        let h = homes();
+        let copy = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        let lock = copy.lock().unwrap();
+        assert!(!lock.holds_other());
+        assert!(!lock_is_free(&copy.state_dir.join(LOCK_FILE)));
+        copy.record_base("h1", files(&[("a.md", "1")])).unwrap();
+        drop(lock);
+        assert!(!h.root.join(IN_ROOT_HOME).exists());
+    }
+
+    // SPEC u298 Tests, `lock_adopts_state_stamped_later`.
+    #[test]
+    fn lock_adopts_state_stamped_later() {
+        let h = homes();
+        let write = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        let other = WorkingCopy::open(&h.refused, "alice", "proj", &h.root).unwrap();
+        write.record_base("h1", files(&[("a.md", "1")])).unwrap();
+        write
+            .write_resolution(&Resolution {
+                recovery_id: "r".into(),
+                base_commit: Some("h1".into()),
+                head_commit: "h0".into(),
+                round: 1,
+                local_paths: Vec::new(),
+                remote_paths: Vec::new(),
+                collisions: Vec::new(),
+                combined_paths: Vec::new(),
+                reviewed_tree: None,
+                pending_writes: None,
+            })
+            .unwrap();
+        other.record_base("h2", files(&[("a.md", "2")])).unwrap();
+        let outbox = Outbox {
+            parent_commit: Some("h2".into()),
+            tree: BTreeMap::from([("a.md".into(), "3".into())]),
+        };
+        other.write_outbox(&outbox).unwrap();
+        let (stored, _) = other.store_bytes(b"theirs\n").unwrap();
+        let mut snapshot = Snapshot::new();
+        snapshot.insert(
+            "a.md".into(),
+            Some(SnapshotContent::Stored {
+                stored: stored.clone(),
+            }),
+        );
+        other.write_local_snapshot(&snapshot).unwrap();
+        set_stamp(&write.state_dir, 100);
+        set_stamp(&other.state_dir, 200);
+
+        let lock = write.lock().unwrap();
+        assert_eq!(commit_of(&write).as_deref(), Some("h2"));
+        assert_eq!(write.outbox().unwrap(), Some(outbox));
+        assert_eq!(write.resolution().unwrap(), None);
+        assert!(!write.state_dir.join(RESOLUTION_FILE).exists());
+        assert_eq!(
+            std::fs::read_to_string(write.state_dir.join(STATE_STAMP)).unwrap(),
+            "200"
+        );
+        assert_eq!(
+            write
+                .content_bytes(&SnapshotContent::Stored { stored })
+                .unwrap(),
+            b"theirs\n"
+        );
+        for name in [BASE_FILE, OUTBOX_FILE, LOCAL_SNAPSHOT_FILE] {
+            let copied = std::fs::metadata(write.state_dir.join(name)).unwrap();
+            let source = std::fs::metadata(other.state_dir.join(name)).unwrap();
+            assert_eq!(
+                copied.modified().unwrap(),
+                source.modified().unwrap(),
+                "{name}"
+            );
+        }
+        drop(lock);
+    }
+
+    // SPEC u298 Tests, `discard_under_one_home_is_not_undone`.
+    #[test]
+    fn discard_under_one_home_is_not_undone() {
+        let h = homes();
+        let write = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        let other = WorkingCopy::open(&h.refused, "alice", "proj", &h.root).unwrap();
+        let resolution = Resolution {
+            recovery_id: "r".into(),
+            base_commit: Some("h1".into()),
+            head_commit: "h0".into(),
+            round: 1,
+            local_paths: Vec::new(),
+            remote_paths: Vec::new(),
+            collisions: Vec::new(),
+            combined_paths: Vec::new(),
+            reviewed_tree: None,
+            pending_writes: None,
+        };
+        other.write_resolution(&resolution).unwrap();
+        write.write_resolution(&resolution).unwrap();
+        set_stamp(&write.state_dir, 100);
+        set_stamp(&other.state_dir, 200);
+        {
+            let _lock = write.lock().unwrap();
+            assert_eq!(write.resolution().unwrap(), Some(resolution));
+            write.remove_resolution().unwrap();
+        }
+        {
+            let _lock = write.lock().unwrap();
+            assert_eq!(write.resolution().unwrap(), None);
+        }
+        // Nor by a run on the other side of the refused default root.
+        let _lock = other.lock().unwrap();
+        assert_eq!(other.resolution().unwrap(), None);
+        assert!(!other.state_dir.join(RESOLUTION_FILE).exists());
     }
 }

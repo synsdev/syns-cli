@@ -1634,3 +1634,63 @@ fn enable_checks_is_refused_outside_a_placed_folder_or_over_unpublished_work() {
     assert!(d.pushes_since(mark).is_empty());
     assert_eq!(read(&d.folder().join(".syns.yaml")), identity);
 }
+
+// SPEC u298 Tests, `snapshot_and_placement_never_write_the_in_root_home`.
+#[test]
+#[serial]
+fn snapshot_and_placement_never_write_the_in_root_home() {
+    let state_files: [(&str, &[u8]); 3] = [
+        ("a.md", b"a\n"),
+        (".syns-state/state.stamp", b"9"),
+        (
+            ".syns-state/base.json",
+            b"{\"commit_sha\":\"h9\",\"files\":{}}",
+        ),
+    ];
+    let mut holder_tree = h1_tree();
+    let mut template = template_tree(&[CHECK]);
+    for (path, bytes) in state_files {
+        holder_tree.insert(path.to_string(), bytes.to_vec());
+        template.insert(path.to_string(), bytes.to_vec());
+    }
+    let d = Deployment::over(holder_tree, template);
+    let scratch = tempfile::Builder::new()
+        .prefix("u298-snapshot-")
+        .tempdir()
+        .expect("scratch");
+    let dir = std::fs::canonicalize(scratch.path())
+        .expect("canonical")
+        .join("dir");
+    let target = dir.display().to_string();
+
+    let pulled = d.run_in(
+        scratch.path(),
+        &["pull", "--version", "42", HOLDER, target.as_str()],
+    );
+    assert_eq!(exit_of(&pulled), 0, "{}", stderr_of(&pulled));
+    let mark = d.mark();
+    let placed = d.run_in(&dir, &["place", TEMPLATE, "t"]);
+
+    assert_eq!(exit_of(&placed), 0, "{}", stderr_of(&placed));
+    assert_eq!(read(&dir.join("a.md")), "a\n");
+    assert_eq!(read(&dir.join("t/a.md")), "a\n");
+    for held in [snapshot(&dir), snapshot(&dir.join("t"))] {
+        assert!(
+            held.keys().all(|p| !p
+                .split('/')
+                .any(|seg| seg.eq_ignore_ascii_case(".syns-state"))),
+            "{:?}",
+            held.keys().collect::<Vec<_>>()
+        );
+    }
+    assert!(!dir.join(".syns-state").exists());
+    assert!(!dir.join("t/.syns-state").exists());
+    let pushes = d.pushes_since(mark);
+    assert_eq!(pushes.len(), 1, "{pushes:?}");
+    let carried = carried(&pushes[0]);
+    assert!(carried.contains(&"t/a.md".to_string()), "{carried:?}");
+    assert!(
+        carried.iter().all(|p| !p.contains(".syns-state")),
+        "{carried:?}"
+    );
+}

@@ -74,7 +74,7 @@ fn seed_record(ctx: &TestContext) {
         ]),
     );
     manifest
-        .save(ctx.config.cache_dir(), "alice", "proj")
+        .save(ctx.config.stores(), "alice", "proj", ctx.config.cache_dir())
         .unwrap();
 }
 
@@ -91,7 +91,7 @@ async fn seed_converged_base(ctx: &TestContext, root: &Path) {
         ("root-b.md".to_string(), blob_sha1(b"b")),
         ("sub/nested.md".to_string(), blob_sha1(b"n")),
     ]);
-    WorkingCopy::open(ctx.config.cache_dir(), "alice", "proj", root)
+    WorkingCopy::open(ctx.config.stores(), "alice", "proj", root)
         .unwrap()
         .record_base("1111111111111111111111111111111111111111", files.clone())
         .unwrap();
@@ -346,7 +346,8 @@ async fn scoped_push_leaves_the_local_record_naming_the_whole_tree() {
             .unwrap();
     }
 
-    let record = Manifest::load(ctx.config.cache_dir(), "alice", "proj").expect("record");
+    let record = Manifest::load(ctx.config.stores(), "alice", "proj", ctx.config.cache_dir())
+        .expect("record");
     assert!(record.file_sha("root-a.md").is_some());
     assert!(record.file_sha("root-b.md").is_some());
     assert!(record.file_sha("sub/nested.md").is_some());
@@ -368,7 +369,8 @@ async fn forced_scoped_push_leaves_the_local_record_naming_the_whole_tree() {
         cmd_push(&ctx.config, &ctx.output, &args).await.unwrap();
     }
 
-    let record = Manifest::load(ctx.config.cache_dir(), "alice", "proj").expect("record");
+    let record = Manifest::load(ctx.config.stores(), "alice", "proj", ctx.config.cache_dir())
+        .expect("record");
     assert!(record.file_sha("root-a.md").is_some());
     assert!(record.file_sha("root-b.md").is_some());
 }
@@ -417,7 +419,8 @@ async fn forced_scoped_push_with_no_local_record_rebuilds_it_from_the_remote_tre
         cmd_push(&ctx.config, &ctx.output, &args).await.unwrap();
     }
 
-    let record = Manifest::load(ctx.config.cache_dir(), "alice", "proj").expect("record");
+    let record = Manifest::load(ctx.config.stores(), "alice", "proj", ctx.config.cache_dir())
+        .expect("record");
     assert!(
         record.file_sha("root-a.md").is_some(),
         "a forced scoped publication with no record dropped root-a.md"
@@ -625,7 +628,7 @@ async fn bare_pull_from_subdirectory_reconciles_at_the_repository_root() {
 
     // A retrieval converges from the working copy's base, not the local
     // record: the base names `root-b.md`, which the head no longer holds.
-    WorkingCopy::open(ctx.config.cache_dir(), "alice", "proj", &root)
+    WorkingCopy::open(ctx.config.stores(), "alice", "proj", &root)
         .unwrap()
         .record_base(
             "1111111111111111111111111111111111111111",

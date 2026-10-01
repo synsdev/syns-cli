@@ -84,7 +84,17 @@ impl Machine {
     }
 
     fn copy(&self) -> WorkingCopy {
-        WorkingCopy::open(self.cache.path(), "alice", "proj", self.folder.path()).unwrap()
+        WorkingCopy::open(
+            &syns_cli::config::StoreRoots::resolve(
+                Some(self.cache.path()),
+                self.cache.path(),
+                self.cache.path(),
+            ),
+            "alice",
+            "proj",
+            self.folder.path(),
+        )
+        .unwrap()
     }
 }
 
@@ -522,7 +532,18 @@ async fn missing_blobs_resend_keeps_the_byte_field() {
         .into_iter()
         .collect(),
     );
-    record.save(m.cache.path(), "alice", "proj").unwrap();
+    record
+        .save(
+            &syns_cli::config::StoreRoots::resolve(
+                Some(m.cache.path()),
+                m.cache.path(),
+                m.cache.path(),
+            ),
+            "alice",
+            "proj",
+            m.cache.path(),
+        )
+        .unwrap();
 
     let out = m.run(&["push", dir.to_str().unwrap()]).await;
 
@@ -591,7 +612,18 @@ fn recorded_eight(m: &Machine, len: usize, rewritten: &[usize]) -> Vec<String> {
     }
     let mut record = Manifest::default();
     record.update("b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0".into(), recorded);
-    record.save(m.cache.path(), "alice", "proj").unwrap();
+    record
+        .save(
+            &syns_cli::config::StoreRoots::resolve(
+                Some(m.cache.path()),
+                m.cache.path(),
+                m.cache.path(),
+            ),
+            "alice",
+            "proj",
+            m.cache.path(),
+        )
+        .unwrap();
     names
 }
 

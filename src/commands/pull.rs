@@ -9,7 +9,7 @@ use crate::push::converge::{
     ConvergeMode, FolderRoot, Staging, SyncOutcome, collect_in_place, converge, folder_root,
     read_blobs, replace_file_whole,
 };
-use crate::push::working_copy::WorkingCopy;
+use crate::push::working_copy::{WorkingCopy, holds_in_root_home};
 use crate::repo::folder::{
     FolderScope, enclosing_folders, folder_checkout, lies_under, resolve_folder_scope,
 };
@@ -337,7 +337,7 @@ pub async fn cmd_pull(
     std::fs::create_dir_all(&target_dir).map_err(|e| CliError::Io {
         message: format!("could not create target directory: {e}"),
     })?;
-    let copy = WorkingCopy::open(config.cache_dir(), &owner, &name, &target_dir)?;
+    let copy = WorkingCopy::open(config.stores(), &owner, &name, &target_dir)?;
     let outcome = converge(
         &client,
         token.as_deref(),
@@ -368,7 +368,7 @@ pub async fn cmd_pull(
     // follows the base the convergence recorded.
     let base = copy.base();
     if let Some(base) = &base {
-        base.save(config.cache_dir(), &owner, &name)?;
+        base.save(config.stores(), &owner, &name, &target_dir)?;
     }
     render_pulled(output, &repo_id, base.as_ref(), &written, &removed);
     Ok(())
@@ -420,7 +420,7 @@ async fn pull_into_folder(
         .ok()
         .flatten();
     let client = SynsClient::new(config.server_url())?;
-    let copy = WorkingCopy::open_folder(config.cache_dir(), &scope)?;
+    let copy = WorkingCopy::open_folder(config.stores(), &scope)?;
 
     if let Some(version) = version {
         return pull_snapshot(
@@ -461,7 +461,7 @@ async fn pull_into_folder(
     }
     // The base the folder stands at — its own record, or an enclosing
     // copy's narrowed to it where the folder copy records none (CR1-2).
-    let base = crate::push::working_copy::folder_base(config.cache_dir(), &scope);
+    let base = crate::push::working_copy::folder_base(config.stores(), &scope);
     render_pulled(output, &repo_id, base.as_ref(), &written, &removed);
     Ok(())
 }
@@ -627,6 +627,13 @@ async fn pull_snapshot(
             )
         }
     };
+    // SPEC u298 `IN_ROOT_HOME`: a served path in the in-root home is
+    // written into the folder by no retrieval of a named version.
+    let server_files: Vec<ServedFile> = server_files
+        .into_iter()
+        .filter(|(path, _, _)| !holds_in_root_home(path))
+        .collect();
+
     // 1 — every path the version's tree carries checked before anything
     // is read or written.
     for (path, _, _) in &server_files {

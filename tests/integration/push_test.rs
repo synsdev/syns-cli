@@ -89,7 +89,12 @@ async fn push_sends_only_changed_files() {
         ]),
     );
     manifest
-        .save(ctx.config.cache_dir(), "bob", "my-repo")
+        .save(
+            ctx.config.stores(),
+            "bob",
+            "my-repo",
+            ctx.config.cache_dir(),
+        )
         .unwrap();
 
     Mock::given(method("PUT"))

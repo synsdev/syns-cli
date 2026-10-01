@@ -565,6 +565,13 @@ fn build_positive_only_matcher_at(
     })
 }
 
+/// Whether a walked entry's name is the in-root home, letter case aside
+/// (SPEC u298, `IN_ROOT_HOME`).
+fn is_in_root_home(name: &OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| name.eq_ignore_ascii_case(crate::push::working_copy::IN_ROOT_HOME))
+}
+
 /// Collect every file under `path` that should be pushed, plus an
 /// attributed list of every file the walker rejected (SPEC u280
 /// `collect_files` 1–5).
@@ -654,7 +661,10 @@ pub fn collect_files(
         .overrides(user_overrides.clone())
         .filter_entry(move |entry| {
             let name = entry.file_name();
-            if name == OsStr::new(".git") {
+            // SPEC u298 `IN_ROOT_HOME`: the in-root home, letter case
+            // aside, is carried by no collection, the flag lifting the
+            // default excludes included.
+            if name == OsStr::new(".git") || is_in_root_home(name) {
                 return false;
             }
             if !no_default_excludes
@@ -806,7 +816,7 @@ pub fn collect_files(
         .parents(false)
         .standard_filters(false)
         .filter_entry(move |entry| {
-            if entry.file_name() == OsStr::new(".git") {
+            if entry.file_name() == OsStr::new(".git") || is_in_root_home(entry.file_name()) {
                 return false;
             }
             if let Some(prefix) = full_prefix.as_deref() {

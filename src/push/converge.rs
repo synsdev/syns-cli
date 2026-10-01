@@ -40,6 +40,7 @@ use crate::push::smart::{
 };
 use crate::push::working_copy::{
     Outbox, Resolution, Snapshot, SnapshotContent, StatRecord, WorkingCopy, folder_base,
+    holds_in_root_home,
 };
 use crate::repo::folder::{FolderScope, lies_under};
 use crate::repo::syns_yaml::{IdentityForm, read_identity_form, read_required_checks};
@@ -346,7 +347,12 @@ fn repo_id(copy: &WorkingCopy) -> String {
 /// A served tree as a head, every path counted from `folder` where one
 /// stands and a path lying outside it left out.
 fn head_of(tree: &crate::client::TreeResponse, folder: Option<&str>) -> Head {
+    // SPEC u298 `IN_ROOT_HOME`: a served path in the in-root home reads
+    // as absent, so a convergence writes and removes none.
     let counted = |path: &str| -> Option<String> {
+        if holds_in_root_home(path) {
+            return None;
+        }
         match folder {
             Some(folder) => lies_under(path, folder).then(|| path[folder.len() + 1..].to_string()),
             None => Some(path.to_string()),
@@ -806,8 +812,7 @@ pub(crate) async fn folder_root(
     if scope.checkout.is_some() {
         return Ok(FolderRoot::of_scope(&copy.root, scope, None));
     }
-    let based =
-        folder_base(&copy.cache_dir(), scope).and_then(|b| b.commit_sha().map(String::from));
+    let based = folder_base(copy.stores(), scope).and_then(|b| b.commit_sha().map(String::from));
     let at = match based {
         Some(commit) => Some(commit),
         None => match read_folder_tree(client, token, &repo_id(copy), &scope.path, None).await {
@@ -1000,7 +1005,7 @@ struct Base {
 /// `folder_base` (SPEC u291 `converge` 3), every other copy's own.
 fn base_of(copy: &WorkingCopy) -> Option<Manifest> {
     match &copy.folder {
-        Some(scope) => folder_base(&copy.cache_dir(), scope),
+        Some(scope) => folder_base(copy.stores(), scope),
         None => copy.base(),
     }
 }
@@ -1482,7 +1487,7 @@ enum Prepared {
 
 // ---- one review per path across every copy (SPEC u291 `converge` 4) ---
 
-/// The holder's review lock, one per cache directory and holder, released
+/// The holder's review lock, one per store root and holder, released
 /// when dropped or when its process dies.
 pub(crate) struct ReviewLock {
     _file: std::fs::File,
@@ -1490,12 +1495,35 @@ pub(crate) struct ReviewLock {
 
 /// Take the holder's review lock, waiting while another run holds it. A
 /// run holding it takes no other working copy's state lock.
+///
+/// SPEC u298 Behaviour, `review_lock` 1–2: the lock under the default
+/// root wherever it could be taken — created where that root takes
+/// writes, and otherwise the standing one opened for writing, else for
+/// reading — and, where the default root refuses writes and none could be
+/// taken there, the lock under the fallback root, or in the copy's write
+/// home where no fallback root stands apart from the default.
 pub(crate) fn review_lock(copy: &WorkingCopy) -> Result<ReviewLock, CliError> {
-    let dir = copy
-        .cache_dir()
-        .join("working-copies")
-        .join(copy.owner.to_ascii_lowercase())
-        .join(copy.name.to_ascii_lowercase());
+    let stores = copy.stores();
+    let holder = |root: &Path| {
+        root.join("working-copies")
+            .join(copy.owner.to_ascii_lowercase())
+            .join(copy.name.to_ascii_lowercase())
+    };
+    let dir = if !stores.default_refused {
+        holder(&stores.default)
+    } else {
+        // 1 — the default root's standing lock, taken where it can be.
+        if let Some(file) = take_standing_review_lock(&holder(&stores.default).join("review.lock"))
+        {
+            return Ok(ReviewLock { _file: file });
+        }
+        // 2 — the fallback root's, or the write home's.
+        if stores.write != stores.default {
+            holder(&stores.write)
+        } else {
+            copy.state_dir.clone()
+        }
+    };
     let io = |err: std::io::Error| CliError::Io {
         message: format!(
             "could not lock {}: {err}",
@@ -1512,6 +1540,23 @@ pub(crate) fn review_lock(copy: &WorkingCopy) -> Result<ReviewLock, CliError> {
         .map_err(io)?;
     file.lock().map_err(io)?;
     Ok(ReviewLock { _file: file })
+}
+
+/// The standing review lock at `path` opened for writing, else for
+/// reading, and taken, waiting; none where it is absent, opens neither
+/// way or refuses the lock call. Creates nothing.
+fn take_standing_review_lock(path: &Path) -> Option<std::fs::File> {
+    if !path.is_file() {
+        return None;
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .or_else(|_| OpenOptions::new().read(true).open(path))
+        .ok()?;
+    file.lock().ok()?;
+    Some(file)
 }
 
 /// Every folder form naming `owner/name`, letter case aside, standing on
@@ -1566,23 +1611,23 @@ fn folders_below(root: &Path, owner: &str, name: &str) -> Vec<FolderScope> {
 fn copies_over_the_same_files(
     copy: &WorkingCopy,
 ) -> Result<Vec<(WorkingCopy, Option<String>)>, CliError> {
-    let cache = copy.cache_dir();
+    let cache = copy.stores();
     let mut copies = Vec::new();
     if let Some(scope) = &copy.folder {
         if let Some(checkout) = &scope.checkout
             && let Some(holder) =
-                WorkingCopy::open_existing(&cache, &copy.owner, &copy.name, checkout)?
+                WorkingCopy::open_existing(cache, &copy.owner, &copy.name, checkout)?
         {
             copies.push((holder, None));
         }
         for enclosing in &scope.enclosing {
-            if let Some(other) = WorkingCopy::open_existing_folder(&cache, enclosing)? {
+            if let Some(other) = WorkingCopy::open_existing_folder(cache, enclosing)? {
                 copies.push((other, Some(enclosing.path.clone())));
             }
         }
     }
     for below in folders_below(&copy.root, &copy.owner, &copy.name) {
-        if let Some(other) = WorkingCopy::open_existing_folder(&cache, &below)? {
+        if let Some(other) = WorkingCopy::open_existing_folder(cache, &below)? {
             copies.push((other, Some(below.path.clone())));
         }
     }
@@ -2405,16 +2450,16 @@ pub(crate) fn lay_over_enclosing(
     let Some(scope) = &copy.folder else {
         return;
     };
-    let cache = copy.cache_dir();
+    let cache = copy.stores();
     let mut targets: Vec<(WorkingCopy, Option<String>)> = Vec::new();
     if let Some(checkout) = &scope.checkout
         && let Ok(Some(holder)) =
-            WorkingCopy::open_existing(&cache, &copy.owner, &copy.name, checkout)
+            WorkingCopy::open_existing(cache, &copy.owner, &copy.name, checkout)
     {
         targets.push((holder, None));
     }
     for enclosing in &scope.enclosing {
-        if let Ok(Some(other)) = WorkingCopy::open_existing_folder(&cache, enclosing) {
+        if let Ok(Some(other)) = WorkingCopy::open_existing_folder(cache, enclosing) {
             targets.push((other, Some(enclosing.path.clone())));
         }
     }
@@ -2470,7 +2515,7 @@ async fn converge_locked(
 
     // 1 — the run's staging, then the one collection the run hands on,
     // taken from where the copy stands (SPEC u291 `converge` 2).
-    let staging = Staging::open(&opts.cache_dir)?;
+    let staging = Staging::open(&opts.stores.write)?;
     let root = folder_root(client, token, copy).await?;
     let folder = collect_folder(copy, &opts, &[], true, &root)?;
 
@@ -3392,7 +3437,7 @@ async fn continue_locked(
     // 1
     let _lock = copy.lock()?;
     let opts = with_run_budget(opts);
-    let staging = Staging::open(&opts.cache_dir)?;
+    let staging = Staging::open(&opts.stores.write)?;
     let root = folder_root(client, Some(token), copy).await?;
 
     // 2
@@ -3614,7 +3659,13 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let folder = tempfile::tempdir().unwrap();
         std::fs::write(folder.path().join("a.md"), base).unwrap();
-        let copy = WorkingCopy::open(cache.path(), "alice", "r", folder.path()).unwrap();
+        let copy = WorkingCopy::open(
+            &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+            "alice",
+            "r",
+            folder.path(),
+        )
+        .unwrap();
         let staging = Staging::open(cache.path()).unwrap();
         let opts = SmartPushOptions {
             force: false,
@@ -3622,7 +3673,11 @@ mod tests {
             author: None,
             parent_sha: None,
             excludes: vec![],
-            cache_dir: cache.path().to_path_buf(),
+            stores: crate::config::StoreRoots::resolve(
+                Some(cache.path()),
+                cache.path(),
+                cache.path(),
+            ),
             description: None,
             tags: None,
             status: None,
@@ -3700,7 +3755,7 @@ mod tests {
             author: None,
             parent_sha: None,
             excludes: vec![],
-            cache_dir: cache.to_path_buf(),
+            stores: crate::config::StoreRoots::resolve(Some(cache), cache, cache),
             description: None,
             tags: None,
             status: None,
@@ -3895,7 +3950,11 @@ mod tests {
         std::fs::write(folder.join("k.env"), "k").unwrap();
         std::fs::write(folder.join("sub/b.md"), "b").unwrap();
         let scope = scope_at(&folder, "clients/q3", Some(w.clone()));
-        let copy = WorkingCopy::open_folder(cache.path(), &scope).unwrap();
+        let copy = WorkingCopy::open_folder(
+            &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+            &scope,
+        )
+        .unwrap();
         let root = FolderRoot::of_scope(&copy.root, &scope, None);
 
         let collected = collect_folder(&copy, &bare_opts(cache.path()), &[], true, &root).unwrap();
@@ -3941,7 +4000,13 @@ mod tests {
         let tree = tempfile::tempdir().unwrap();
         let w = std::fs::canonicalize(tree.path()).unwrap();
         std::fs::create_dir_all(w.join("clients/q3")).unwrap();
-        let holder = WorkingCopy::open(cache.path(), "alice", "r", &w).unwrap();
+        let holder = WorkingCopy::open(
+            &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+            "alice",
+            "r",
+            &w,
+        )
+        .unwrap();
         holder
             .record_laid_base(
                 "h1",
@@ -3954,7 +4019,11 @@ mod tests {
             )
             .unwrap();
         let scope = scope_at(&w.join("clients/q3"), "clients/q3", Some(w.clone()));
-        let folder = WorkingCopy::open_folder(cache.path(), &scope).unwrap();
+        let folder = WorkingCopy::open_folder(
+            &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+            &scope,
+        )
+        .unwrap();
         folder
             .record_base(
                 "h3",
@@ -3986,9 +4055,19 @@ mod tests {
         let bare = tempfile::tempdir().unwrap();
         let v = std::fs::canonicalize(bare.path()).unwrap();
         std::fs::create_dir_all(v.join("clients/q3")).unwrap();
-        let other_holder = WorkingCopy::open(cache.path(), "alice", "r", &v).unwrap();
+        let other_holder = WorkingCopy::open(
+            &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+            "alice",
+            "r",
+            &v,
+        )
+        .unwrap();
         let other_scope = scope_at(&v.join("clients/q3"), "clients/q3", Some(v.clone()));
-        let other_folder = WorkingCopy::open_folder(cache.path(), &other_scope).unwrap();
+        let other_folder = WorkingCopy::open_folder(
+            &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+            &other_scope,
+        )
+        .unwrap();
         other_folder
             .record_base(
                 "h3",
@@ -4027,7 +4106,11 @@ mod tests {
         std::fs::write(w.join("f/a.md"), b"a\nlocal\n").unwrap();
 
         let scope = scope_at(&w.join("f"), "f", Some(w.clone()));
-        let folder = WorkingCopy::open_folder(cache.path(), &scope).unwrap();
+        let folder = WorkingCopy::open_folder(
+            &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+            &scope,
+        )
+        .unwrap();
         let standing = Resolution {
             recovery_id: "rec-f".into(),
             base_commit: Some("h0".into()),
@@ -4042,7 +4125,13 @@ mod tests {
         };
         folder.write_resolution(&standing).unwrap();
 
-        let holder = WorkingCopy::open(cache.path(), "alice", "r", &w).unwrap();
+        let holder = WorkingCopy::open(
+            &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+            "alice",
+            "r",
+            &w,
+        )
+        .unwrap();
         let staging = Staging::open(cache.path()).unwrap();
         let identity = blob_sha1(b"owner: alice\nname: r\n");
         let folder_identity = blob_sha1(b"holder: alice/r\npath: f\n");
@@ -4108,9 +4197,19 @@ mod tests {
         std::fs::write(w.join(".syns.yaml"), "owner: alice\nname: r\n").unwrap();
         std::fs::write(w.join("f/.syns.yaml"), "holder: alice/r\npath: f\n").unwrap();
         std::fs::write(w.join("f/a.md"), b"a\nlocal\n").unwrap();
-        let holder = WorkingCopy::open(cache.path(), "alice", "r", &w).unwrap();
+        let holder = WorkingCopy::open(
+            &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+            "alice",
+            "r",
+            &w,
+        )
+        .unwrap();
         let scope = scope_at(&w.join("f"), "f", Some(w.clone()));
-        let folder = WorkingCopy::open_folder(cache.path(), &scope).unwrap();
+        let folder = WorkingCopy::open_folder(
+            &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+            &scope,
+        )
+        .unwrap();
         let standing = Resolution {
             recovery_id: "rec-w".into(),
             base_commit: Some("h0".into()),
@@ -4452,5 +4551,82 @@ mod tests {
             }
             assert_eq!(scan.finish(), holds_conflict_marker(text), "{text:?}");
         }
+    }
+
+    // SPEC u298 `IN_ROOT_HOME`: a served path in the in-root home, letter
+    // case aside, reads from a head as absent.
+    #[test]
+    fn a_head_reads_the_in_root_home_as_absent() {
+        let entry = |path: &str| crate::client::TreeEntry {
+            name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            path: path.to_string(),
+            entry_type: EntryType::File,
+            size: Some(1),
+            sha: Some("1".repeat(40)),
+        };
+        let tree = crate::client::TreeResponse {
+            entries: vec![
+                entry("a.md"),
+                entry(".SYNS-STATE/z"),
+                entry("f/.syns-state/base.json"),
+            ],
+            commit_sha: "h1".into(),
+            truncated: false,
+        };
+        let head = head_of(&tree, None);
+        assert_eq!(head.files.keys().collect::<Vec<_>>(), vec!["a.md"]);
+        assert_eq!(head.sizes.len(), 1);
+        assert!(head_of(&tree, Some("f")).files.is_empty());
+    }
+
+    // SPEC u298 Tests, `review_lock_falls_to_the_fallback_root`.
+    #[cfg(unix)]
+    #[test]
+    fn review_lock_falls_to_the_fallback_root() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(scratch.path()).unwrap();
+        let default = base.join("default");
+        let temp = base.join("temp");
+        let one = base.join("one");
+        let two = base.join("two");
+        for dir in [&default, &temp, &one, &two] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::set_permissions(&default, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let stores = crate::config::StoreRoots::resolve(None, &default, &temp);
+        assert!(stores.default_refused);
+        let first = WorkingCopy::open(&stores, "Alice", "R", &one).unwrap();
+        let second = WorkingCopy::open(&stores, "alice", "r", &two).unwrap();
+
+        let held = review_lock(&first).unwrap();
+        let standing = crate::config::fallback_root(&temp)
+            .join("working-copies")
+            .join("alice")
+            .join("r")
+            .join("review.lock");
+        assert!(standing.is_file(), "{}", standing.display());
+        assert!(!default.join("working-copies").exists());
+
+        let (taken, waited) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let lock = review_lock(&second).unwrap();
+            taken.send(std::time::Instant::now()).unwrap();
+            drop(lock);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            waited.try_recv().is_err(),
+            "the second copy did not wait on the review lock"
+        );
+        let released = std::time::Instant::now();
+        drop(held);
+        let returned = waited.recv().unwrap();
+        waiter.join().unwrap();
+        assert!(returned >= released);
+        std::fs::set_permissions(&default, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 }

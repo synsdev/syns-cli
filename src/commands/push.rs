@@ -181,7 +181,7 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
         author: None,
         parent_sha: None,
         excludes: args.exclude.clone(),
-        cache_dir: config.cache_dir().to_path_buf(),
+        stores: config.stores().clone(),
         description: args.description.clone(),
         tags: if args.tag.is_empty() {
             None
@@ -213,7 +213,7 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
         None => SynsClient::new(config.server_url())?,
     };
 
-    let copy = WorkingCopy::open(config.cache_dir(), &owner, &name, &scope.root)?;
+    let copy = WorkingCopy::open(config.stores(), &owner, &name, &scope.root)?;
 
     if args.force || args.path.is_some() {
         // SPEC u256 `cmd_push` 2: a forced or path-scoped publication
@@ -343,7 +343,7 @@ async fn push_folder(
         .read()?
         .ok_or(CliError::AuthRequired)?;
     let client = SynsClient::new(config.server_url())?;
-    let copy = WorkingCopy::open_folder(config.cache_dir(), &scope)?;
+    let copy = WorkingCopy::open_folder(config.stores(), &scope)?;
     let held = HeldBytes::new(HELD_BYTES_BUDGET);
     let mut opts = SmartPushOptions {
         force: args.force,
@@ -351,7 +351,7 @@ async fn push_folder(
         author: None,
         parent_sha: None,
         excludes: args.exclude.clone(),
-        cache_dir: config.cache_dir().to_path_buf(),
+        stores: config.stores().clone(),
         description: None,
         tags: None,
         status: None,
@@ -412,7 +412,7 @@ async fn push_folder(
             Some(place_under(start_path, &scope.dir)).filter(|place| !place.is_empty())
         }
     };
-    let based = folder_base(&copy.cache_dir(), &scope);
+    let based = folder_base(copy.stores(), &scope);
     let (reference, parent) = match &based {
         Some(base) => (
             base.file_paths()
@@ -1389,7 +1389,7 @@ mod tests {
             )]),
         );
         record
-            .save(config.cache_dir(), "alice", "test-repo")
+            .save(config.stores(), "alice", "test-repo", config.cache_dir())
             .unwrap();
 
         let args = PushArgs {

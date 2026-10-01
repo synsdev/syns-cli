@@ -1,7 +1,9 @@
+use crate::config::{StoreRoots, is_foreign_or_link};
 use crate::errors::CliError;
+use crate::push::working_copy::{IN_ROOT_HOME, LOCAL_RECORD_FILE, ensure_in_root_home};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct Manifest {
@@ -16,10 +18,46 @@ pub struct Manifest {
     recorded_at: Option<u64>,
 }
 
+/// Where the local record of `owner/name` stands under the default root
+/// (`D-025`), and where it stands in the in-root home of the content root
+/// `root` (SPEC u298, `Manifest::save`).
+fn record_places(stores: &StoreRoots, owner: &str, name: &str, root: &Path) -> (PathBuf, PathBuf) {
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    (
+        stores.default.join(owner).join(format!("{name}.json")),
+        canonical.join(IN_ROOT_HOME).join(LOCAL_RECORD_FILE),
+    )
+}
+
 impl Manifest {
-    pub fn load(cache_dir: &Path, owner: &str, name: &str) -> Option<Manifest> {
-        let path = cache_dir.join(owner).join(format!("{name}.json"));
-        let content = std::fs::read_to_string(&path).ok()?;
+    /// The local record of `owner/name` for the content root `root`: of
+    /// the record under the default root and the one in the root's in-root
+    /// home, the one whose file was modified last, a tie going to the one
+    /// `save` would write (SPEC u298, `Manifest::load`).
+    pub fn load(stores: &StoreRoots, owner: &str, name: &str, root: &Path) -> Option<Manifest> {
+        let (default, in_root) = record_places(stores, owner, name, root);
+        let modified = |path: &Path| {
+            std::fs::metadata(path)
+                .ok()
+                .filter(|meta| meta.is_file())
+                .and_then(|meta| meta.modified().ok())
+        };
+        let in_root_time = in_root
+            .parent()
+            .filter(|home| !is_foreign_or_link(home))
+            .and_then(|_| modified(&in_root));
+        let (saved, other, saved_time, other_time) = if stores.default_refused {
+            (&in_root, &default, in_root_time, modified(&default))
+        } else {
+            (&default, &in_root, modified(&default), in_root_time)
+        };
+        let path = match (saved_time, other_time) {
+            (_, None) => saved,
+            (None, Some(_)) => other,
+            (Some(saved_time), Some(other_time)) if other_time > saved_time => other,
+            _ => saved,
+        };
+        let content = std::fs::read_to_string(path).ok()?;
         let manifest: Manifest = serde_json::from_str(&content).ok()?;
         // Defensive stub guard (SPEC u213 § 4): reject manifests that
         // carry an empty/missing commit_sha OR an empty files map.
@@ -36,8 +74,26 @@ impl Manifest {
         Some(manifest)
     }
 
-    pub fn save(&self, cache_dir: &Path, owner: &str, name: &str) -> Result<(), CliError> {
-        let path = cache_dir.join(owner).join(format!("{name}.json"));
+    /// Write the local record of `owner/name`: at the `D-025` path under
+    /// the default root, or as `local-record.json` in the content root's
+    /// in-root home where the default root refuses writes (SPEC u298,
+    /// `Manifest::save`).
+    pub fn save(
+        &self,
+        stores: &StoreRoots,
+        owner: &str,
+        name: &str,
+        root: &Path,
+    ) -> Result<(), CliError> {
+        let (default, in_root) = record_places(stores, owner, name, root);
+        let path = if stores.default_refused {
+            if let Some(home) = in_root.parent() {
+                ensure_in_root_home(home)?;
+            }
+            in_root
+        } else {
+            default
+        };
         // A local record carries no recorded time (SPEC u291).
         let record = Manifest {
             commit_sha: self.commit_sha.clone(),
@@ -100,8 +156,21 @@ mod tests {
                 ("README.md".to_string(), "cafebabe".to_string()),
             ]),
         );
-        manifest.save(dir.path(), "bart", "my-project").unwrap();
-        let loaded = Manifest::load(dir.path(), "bart", "my-project").unwrap();
+        manifest
+            .save(
+                &crate::config::StoreRoots::resolve(Some(dir.path()), dir.path(), dir.path()),
+                "bart",
+                "my-project",
+                dir.path(),
+            )
+            .unwrap();
+        let loaded = Manifest::load(
+            &crate::config::StoreRoots::resolve(Some(dir.path()), dir.path(), dir.path()),
+            "bart",
+            "my-project",
+            dir.path(),
+        )
+        .unwrap();
         assert_eq!(loaded.commit_sha(), Some("abc123"));
         assert_eq!(loaded.file_sha("src/main.rs"), Some("deadbeef"));
         assert_eq!(loaded.file_sha("README.md"), Some("cafebabe"));
@@ -127,13 +196,25 @@ mod tests {
         assert_eq!(older.recorded_at(), None);
 
         let dir = tempfile::tempdir().unwrap();
-        manifest.save(dir.path(), "alice", "work").unwrap();
+        manifest
+            .save(
+                &crate::config::StoreRoots::resolve(Some(dir.path()), dir.path(), dir.path()),
+                "alice",
+                "work",
+                dir.path(),
+            )
+            .unwrap();
         let saved = std::fs::read_to_string(dir.path().join("alice/work.json")).unwrap();
         assert!(!saved.contains("recorded_at"), "{saved}");
         assert_eq!(
-            Manifest::load(dir.path(), "alice", "work")
-                .unwrap()
-                .recorded_at(),
+            Manifest::load(
+                &crate::config::StoreRoots::resolve(Some(dir.path()), dir.path(), dir.path()),
+                "alice",
+                "work",
+                dir.path()
+            )
+            .unwrap()
+            .recorded_at(),
             None
         );
     }
@@ -141,7 +222,15 @@ mod tests {
     #[test]
     fn load_returns_none_for_nonexistent_file() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(Manifest::load(dir.path(), "bart", "no-such-repo").is_none());
+        assert!(
+            Manifest::load(
+                &crate::config::StoreRoots::resolve(Some(dir.path()), dir.path(), dir.path()),
+                "bart",
+                "no-such-repo",
+                dir.path()
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -152,9 +241,22 @@ mod tests {
             "sha1".to_string(),
             HashMap::from([("a.txt".to_string(), "aaa".to_string())]),
         );
-        manifest.save(dir.path(), "alice", "new-repo").unwrap();
+        manifest
+            .save(
+                &crate::config::StoreRoots::resolve(Some(dir.path()), dir.path(), dir.path()),
+                "alice",
+                "new-repo",
+                dir.path(),
+            )
+            .unwrap();
         assert!(dir.path().join("alice").join("new-repo.json").exists());
-        let loaded = Manifest::load(dir.path(), "alice", "new-repo").unwrap();
+        let loaded = Manifest::load(
+            &crate::config::StoreRoots::resolve(Some(dir.path()), dir.path(), dir.path()),
+            "alice",
+            "new-repo",
+            dir.path(),
+        )
+        .unwrap();
         assert_eq!(loaded.commit_sha(), Some("sha1"));
     }
 
@@ -205,7 +307,15 @@ mod tests {
         let manifest_path = dir.path().join("alice").join("repo.json");
         std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
         std::fs::write(&manifest_path, r#"{"commit_sha":"","files":{}}"#).unwrap();
-        assert!(Manifest::load(dir.path(), "alice", "repo").is_none());
+        assert!(
+            Manifest::load(
+                &crate::config::StoreRoots::resolve(Some(dir.path()), dir.path(), dir.path()),
+                "alice",
+                "repo",
+                dir.path()
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -214,7 +324,15 @@ mod tests {
         let manifest_path = dir.path().join("alice").join("repo.json");
         std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
         std::fs::write(&manifest_path, r#"{"files":{"a.txt":"abc"}}"#).unwrap();
-        assert!(Manifest::load(dir.path(), "alice", "repo").is_none());
+        assert!(
+            Manifest::load(
+                &crate::config::StoreRoots::resolve(Some(dir.path()), dir.path(), dir.path()),
+                "alice",
+                "repo",
+                dir.path()
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -223,6 +341,73 @@ mod tests {
         let manifest_path = dir.path().join("alice").join("repo.json");
         std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
         std::fs::write(&manifest_path, r#"{"commit_sha":"deadbeef","files":{}}"#).unwrap();
-        assert!(Manifest::load(dir.path(), "alice", "repo").is_none());
+        assert!(
+            Manifest::load(
+                &crate::config::StoreRoots::resolve(Some(dir.path()), dir.path(), dir.path()),
+                "alice",
+                "repo",
+                dir.path()
+            )
+            .is_none()
+        );
+    }
+
+    // SPEC u298 Tests, `local_record_answers_the_later_record`: of the
+    // record under the default root and the one in the in-root home, the
+    // one modified last answers, a tie going to the one `save` writes.
+    #[test]
+    fn local_record_answers_the_later_record() {
+        let scratch = tempfile::tempdir().unwrap();
+        let default = scratch.path().join("default");
+        let root = scratch.path().join("folder");
+        std::fs::create_dir_all(&root).unwrap();
+        let writable = StoreRoots {
+            default: default.clone(),
+            write: default.clone(),
+            default_refused: false,
+        };
+        let refused = StoreRoots {
+            default: default.clone(),
+            write: scratch.path().join("fallback"),
+            default_refused: true,
+        };
+        let record = |commit: &str| {
+            let mut manifest = Manifest::default();
+            manifest.update(
+                commit.to_string(),
+                HashMap::from([("a.md".to_string(), commit.to_string())]),
+            );
+            manifest
+        };
+        record("h1")
+            .save(&writable, "alice", "work", &root)
+            .unwrap();
+        record("h2").save(&refused, "alice", "work", &root).unwrap();
+        let in_root = root.join(IN_ROOT_HOME).join(LOCAL_RECORD_FILE);
+        assert!(in_root.is_file());
+        assert!(default.join("alice/work.json").is_file());
+
+        let at = |path: &Path, secs: u64| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+                .unwrap();
+        };
+        let commit = |stores: &StoreRoots| {
+            Manifest::load(stores, "alice", "work", &root)
+                .and_then(|m| m.commit_sha().map(String::from))
+        };
+        at(&default.join("alice/work.json"), 1_000);
+        at(&in_root, 2_000);
+        assert_eq!(commit(&writable).as_deref(), Some("h2"));
+        assert_eq!(commit(&refused).as_deref(), Some("h2"));
+        at(&default.join("alice/work.json"), 3_000);
+        assert_eq!(commit(&writable).as_deref(), Some("h1"));
+        assert_eq!(commit(&refused).as_deref(), Some("h1"));
+        at(&in_root, 3_000);
+        assert_eq!(commit(&writable).as_deref(), Some("h1"));
+        assert_eq!(commit(&refused).as_deref(), Some("h2"));
     }
 }

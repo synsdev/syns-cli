@@ -643,7 +643,7 @@ impl Env {
     }
 
     fn copy(&self, dir: &Path) -> WorkingCopy {
-        WorkingCopy::open(self.config.cache_dir(), "alice", "proj", dir).unwrap()
+        WorkingCopy::open(self.config.stores(), "alice", "proj", dir).unwrap()
     }
 
     fn opts(&self) -> SmartPushOptions {
@@ -658,7 +658,7 @@ fn opts_at(cache_dir: &Path) -> SmartPushOptions {
         author: None,
         parent_sha: None,
         excludes: vec![],
-        cache_dir: cache_dir.to_path_buf(),
+        stores: syns_cli::config::StoreRoots::resolve(Some(cache_dir), cache_dir, cache_dir),
         description: None,
         tags: None,
         status: None,
@@ -3057,7 +3057,13 @@ async fn a_preparation_killed_after_recording_its_resolution_is_finished_before_
         let cache = PathBuf::from(spec["cache"].as_str().unwrap());
         let dir = PathBuf::from(spec["dir"].as_str().unwrap());
         let client = SynsClient::new(spec["uri"].as_str().unwrap()).unwrap();
-        let copy = WorkingCopy::open(&cache, "alice", "proj", &dir).unwrap();
+        let copy = WorkingCopy::open(
+            &syns_cli::config::StoreRoots::resolve(Some(&cache), &cache, &cache),
+            "alice",
+            "proj",
+            &dir,
+        )
+        .unwrap();
         let _ = converge(
             &client,
             Some(TOKEN),
@@ -3212,7 +3218,13 @@ async fn run_as_torn_writer() -> bool {
         return true;
     }
     let client = SynsClient::new(spec["uri"].as_str().unwrap()).unwrap();
-    let copy = WorkingCopy::open(&cache, "alice", "proj", &dir).unwrap();
+    let copy = WorkingCopy::open(
+        &syns_cli::config::StoreRoots::resolve(Some(&cache), &cache, &cache),
+        "alice",
+        "proj",
+        &dir,
+    )
+    .unwrap();
     let mode = if spec["publish"].as_bool().unwrap() {
         ConvergeMode::Publish
     } else {
@@ -3558,7 +3570,13 @@ fn state_write_replaces_a_base_another_process_holds_open() {
 
     let cache = tempfile::tempdir().unwrap();
     let folder = tempfile::tempdir().unwrap();
-    let copy = WorkingCopy::open(cache.path(), "alice", "proj", folder.path()).unwrap();
+    let copy = WorkingCopy::open(
+        &syns_cli::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+        "alice",
+        "proj",
+        folder.path(),
+    )
+    .unwrap();
     copy.record_base("h0-commit", HashMap::from([("a.md".into(), "1".into())]))
         .unwrap();
 

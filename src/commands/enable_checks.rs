@@ -160,7 +160,7 @@ pub async fn cmd_enable_checks(
     }
 
     // 5 — the parent: the base the folder's files are read against.
-    let cache = config.cache_dir();
+    let cache = config.stores();
     let parent = folder_base(cache, &scope)
         .and_then(|base| base.commit_sha().map(str::to_string))
         .filter(|sha| !sha.is_empty())
@@ -248,7 +248,7 @@ fn base_refusal(copy: &WorkingCopy, err: CliError) -> CliError {
 /// parent, each keeping its recorded time. One copy's lock is held at a
 /// time, every other base is left standing, and no state is created.
 fn lay_turned_on(
-    cache: &Path,
+    cache: &crate::config::StoreRoots,
     scope: &FolderScope,
     sha: &str,
     parent: &str,
@@ -358,7 +358,13 @@ mod tests {
             checkout: Some(w.clone()),
             enclosing: Vec::new(),
         };
-        let holder = WorkingCopy::open(cache.path(), "alice", "work", &w).unwrap();
+        let holder = WorkingCopy::open(
+            &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+            "alice",
+            "work",
+            &w,
+        )
+        .unwrap();
         let held = HashMap::from([("q3/.syns.yaml".to_string(), "old".to_string())]);
         holder
             .record_laid_base("h3", held.clone(), Some(7))
@@ -369,11 +375,23 @@ mod tests {
                 tree: Default::default(),
             })
             .unwrap();
-        let own = WorkingCopy::open_folder(cache.path(), &scope).unwrap();
+        let own = WorkingCopy::open_folder(
+            &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+            &scope,
+        )
+        .unwrap();
         let mine = HashMap::from([(".syns.yaml".to_string(), "old".to_string())]);
         own.record_laid_base("h1", mine, Some(5)).unwrap();
 
-        lay_turned_on(cache.path(), &scope, "new", "h2", "h3", "h4").unwrap();
+        lay_turned_on(
+            &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+            &scope,
+            "new",
+            "h2",
+            "h3",
+            "h4",
+        )
+        .unwrap();
 
         assert_eq!(
             recorded(&holder),
@@ -397,7 +415,15 @@ mod tests {
                 pending_writes: None,
             })
             .unwrap();
-        lay_turned_on(cache.path(), &scope, "new", "h2", "h3", "h4").unwrap();
+        lay_turned_on(
+            &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+            &scope,
+            "new",
+            "h2",
+            "h3",
+            "h4",
+        )
+        .unwrap();
         assert_eq!(
             recorded(&holder),
             standing("h3", "q3/.syns.yaml", "old", Some(7)),
@@ -406,10 +432,26 @@ mod tests {
 
         holder.remove_resolution().unwrap();
         holder.record_laid_base("h2", held, Some(7)).unwrap();
-        lay_turned_on(cache.path(), &scope, "new", "h2", "h3", "h4").unwrap();
+        lay_turned_on(
+            &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+            &scope,
+            "new",
+            "h2",
+            "h3",
+            "h4",
+        )
+        .unwrap();
         assert_eq!(recorded(&holder).0.as_deref(), Some("h2"));
 
-        lay_turned_on(cache.path(), &scope, "new", "h1", "h2", "h4").unwrap();
+        lay_turned_on(
+            &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+            &scope,
+            "new",
+            "h1",
+            "h2",
+            "h4",
+        )
+        .unwrap();
         assert_eq!(
             recorded(&holder),
             standing("h4", "q3/.syns.yaml", "new", Some(7))
