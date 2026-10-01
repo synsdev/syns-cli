@@ -3,7 +3,8 @@ use crate::client::{RevertFileRequest, SynsClient};
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
-use crate::repo::if_repo::resolve_full_or_skip;
+use crate::read::repository_argument;
+use crate::repo::folder::resolve_scoped_or_skip;
 
 pub async fn cmd_revert(
     config: &Config,
@@ -16,10 +17,14 @@ pub async fn cmd_revert(
     let current_dir = std::env::current_dir().map_err(|e| CliError::Io {
         message: format!("could not determine current directory: {e}"),
     })?;
-    let (owner, name) = match resolve_full_or_skip(None, &current_dir, if_repo, output)? {
-        Some(pair) => pair,
+    // SPEC u291 `cmd_revert` 1: the holder and the folder the run stands
+    // in, and the positional mapped under the folder, a path leaving it
+    // refused before any request.
+    let (owner, name, folder) = match resolve_scoped_or_skip(&current_dir, if_repo, output)? {
+        Some(bound) => bound,
         None => return Ok(()),
     };
+    let mapped = repository_argument(folder.as_ref(), Some(&path))?.unwrap_or_else(|| path.clone());
     let repo_id = format!("{owner}/{name}");
     let token = TokenStore::new(config.credentials_path())
         .read()?
@@ -31,7 +36,7 @@ pub async fn cmd_revert(
         message: message.clone(),
     };
     let (response, raw) = client
-        .revert_file(&repo_id, &token, &path, &request)
+        .revert_file(&repo_id, &token, &mapped, &request)
         .await?;
 
     if output.is_json() {

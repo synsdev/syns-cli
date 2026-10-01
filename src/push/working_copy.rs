@@ -22,6 +22,7 @@ use crate::errors::CliError;
 use crate::push::hash::blob_sha1;
 use crate::push::manifest::Manifest;
 use crate::push::reconcile::CollisionKind;
+use crate::repo::folder::{FolderScope, lies_under};
 
 const LOCK_FILE: &str = "state.lock";
 const BASE_FILE: &str = "base.json";
@@ -183,12 +184,17 @@ impl StatRecord {
 }
 
 /// One folder a repository is worked on in, and where its state lives.
+///
+/// SPEC u291: `folder` is the scoped folder a folder copy works, its
+/// holder's `owner` and `name` standing beside it; none on every copy
+/// `WorkingCopy::open` answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkingCopy {
     pub owner: String,
     pub name: String,
     pub root: PathBuf,
     pub state_dir: PathBuf,
+    pub folder: Option<FolderScope>,
 }
 
 /// A reconciliation handed to a reviewer: what both sides changed, and
@@ -295,7 +301,44 @@ impl WorkingCopy {
             name: name.to_string(),
             root: canonical,
             state_dir: canonical_state,
+            folder: None,
         })
+    }
+
+    /// Open the state of the holder worked on at the folder's canonical
+    /// directory (SPEC u291, `WorkingCopy::open_folder`): a folder and its
+    /// holder's checkout never share a state directory.
+    pub fn open_folder(cache_dir: &Path, scope: &FolderScope) -> Result<WorkingCopy, CliError> {
+        let mut copy = Self::open(cache_dir, &scope.owner, &scope.name, &scope.dir)?;
+        copy.folder = Some(scope.clone());
+        Ok(copy)
+    }
+
+    /// The folder copy where its state directory already stands, none
+    /// where it does not, creating nothing (SPEC u291,
+    /// `WorkingCopy::open_existing_folder`).
+    pub fn open_existing_folder(
+        cache_dir: &Path,
+        scope: &FolderScope,
+    ) -> Result<Option<WorkingCopy>, CliError> {
+        Ok(
+            Self::open_existing(cache_dir, &scope.owner, &scope.name, &scope.dir)?.map(
+                |mut copy| {
+                    copy.folder = Some(scope.clone());
+                    copy
+                },
+            ),
+        )
+    }
+
+    /// The cache directory this copy's state stands under: the fourth
+    /// ancestor of its state directory, `{cache}/working-copies/{owner}/{name}/{key}`.
+    pub fn cache_dir(&self) -> PathBuf {
+        self.state_dir
+            .ancestors()
+            .nth(4)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.state_dir.clone())
     }
 
     /// Where the state directory for `owner/name` at `root` already
@@ -355,14 +398,28 @@ impl WorkingCopy {
         serde_json::from_str(&text).ok()
     }
 
-    /// Record `commit` and exactly `files` as the base.
+    /// Record `commit` and exactly `files` as the base, stamped with the
+    /// time the system clock reads as it is recorded (SPEC u291).
     pub fn record_base(
         &self,
         commit: &str,
         files: HashMap<String, String>,
     ) -> Result<(), CliError> {
+        self.record_laid_base(commit, files, Some(now_nanos()))
+    }
+
+    /// Record `commit` and exactly `files` as the base carrying
+    /// `recorded_at` as given: a base laid over this copy's keeps the time
+    /// this copy's record carried before it (SPEC u291, `converge` 6).
+    pub fn record_laid_base(
+        &self,
+        commit: &str,
+        files: HashMap<String, String>,
+        recorded_at: Option<u64>,
+    ) -> Result<(), CliError> {
         let mut manifest = Manifest::default();
         manifest.update(commit.to_string(), files);
+        manifest.set_recorded_at(recorded_at);
         write_json(&self.state_dir.join(BASE_FILE), &manifest)
     }
 
@@ -656,6 +713,81 @@ impl WorkingCopy {
     pub fn write_stat_record(&self, record: &StatRecord) -> Result<(), CliError> {
         record.save(&self.state_dir)
     }
+}
+
+/// The nanoseconds since the Unix epoch the system clock reads now.
+fn now_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or_default()
+}
+
+/// The base a run inside the folder `scope` reads the folder's files
+/// against (SPEC u291 Behaviour, `folder_base`): of the folder copy's own
+/// base and the base of each copy enclosing it — the holder checkout's
+/// and each enclosing folder's — narrowed to the folder and counted from
+/// it, the one recorded last, a record carrying no time ranking below
+/// every one that does and a tie going to the copy whose root lies
+/// outermost. It creates no state.
+pub fn folder_base(cache_dir: &Path, scope: &FolderScope) -> Option<Manifest> {
+    // 1 — every record standing, outermost first, each narrowed to the
+    // folder: the holder checkout's, each enclosing folder's outermost
+    // first, then the folder's own.
+    let mut standing: Vec<Manifest> = Vec::new();
+    let narrowed = |base: Manifest, under: Option<&str>| -> Manifest {
+        let files = base
+            .file_paths()
+            .filter_map(|path| {
+                let from_holder = match under {
+                    Some(under) if !under.is_empty() => format!("{under}/{path}"),
+                    _ => path.to_string(),
+                };
+                lies_under(&from_holder, &scope.path).then(|| {
+                    (
+                        from_holder[scope.path.len() + 1..].to_string(),
+                        base.file_sha(path).unwrap_or_default().to_string(),
+                    )
+                })
+            })
+            .collect();
+        let mut manifest = Manifest::default();
+        manifest.update(base.commit_sha().unwrap_or_default().to_string(), files);
+        manifest.set_recorded_at(base.recorded_at());
+        manifest
+    };
+    if let Some(checkout) = &scope.checkout
+        && let Ok(Some(copy)) =
+            WorkingCopy::open_existing(cache_dir, &scope.owner, &scope.name, checkout)
+        && let Some(base) = copy.base()
+    {
+        standing.push(narrowed(base, None));
+    }
+    for enclosing in scope.enclosing.iter().rev() {
+        if let Ok(Some(copy)) = WorkingCopy::open_existing_folder(cache_dir, enclosing)
+            && let Some(base) = copy.base()
+        {
+            standing.push(narrowed(base, Some(&enclosing.path)));
+        }
+    }
+    if let Ok(Some(copy)) = WorkingCopy::open_existing_folder(cache_dir, scope)
+        && let Some(base) = copy.base()
+    {
+        standing.push(base);
+    }
+
+    // 2 — the greatest recorded time, the outermost root on a tie.
+    let mut chosen: Option<Manifest> = None;
+    for record in standing {
+        let later = match &chosen {
+            None => true,
+            Some(best) => record.recorded_at() > best.recorded_at(),
+        };
+        if later {
+            chosen = Some(record);
+        }
+    }
+    chosen
 }
 
 /// Copy `source` into `dest` in pieces, answering the blob hash of what
@@ -959,6 +1091,133 @@ mod tests {
         copy.remove_outbox().unwrap();
         copy.remove_outbox().unwrap();
         assert_eq!(copy.outbox().unwrap(), None);
+    }
+
+    /// Every path standing under `root`, sorted.
+    fn entries_under(root: &Path) -> Vec<PathBuf> {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                out.push(entry.path());
+                walk(&entry.path(), out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, &mut out);
+        out.sort();
+        out
+    }
+
+    fn q3_scope(w: &Path, checkout: Option<PathBuf>) -> FolderScope {
+        FolderScope {
+            dir: w.join("clients/vela/q3-board"),
+            owner: "alice".into(),
+            name: "work".into(),
+            path: "clients/vela/q3-board".into(),
+            checkout,
+            enclosing: Vec::new(),
+        }
+    }
+
+    /// Rewrite the base recorded in `copy` with `recorded_at` in its bytes.
+    fn stamp(copy: &WorkingCopy, recorded_at: Option<u64>) {
+        let base = copy.base().unwrap();
+        let files = base
+            .file_paths()
+            .map(|p| (p.to_string(), base.file_sha(p).unwrap().to_string()))
+            .collect();
+        copy.record_laid_base(base.commit_sha().unwrap(), files, recorded_at)
+            .unwrap();
+    }
+
+    // SPEC u291 Tests, `folder_base_narrows_the_holder_base`.
+    #[test]
+    fn folder_base_narrows_the_holder_base() {
+        let cache = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        let w = std::fs::canonicalize(tree.path()).unwrap();
+        std::fs::create_dir_all(w.join("clients/vela/q3-board")).unwrap();
+        let holder = WorkingCopy::open(cache.path(), "alice", "work", &w).unwrap();
+        let holder_files = HashMap::from([
+            (".page/x.json".to_string(), "x1".to_string()),
+            ("clients/vela/q3-board/a.md".to_string(), "a1".to_string()),
+        ]);
+        holder.record_base("h1", holder_files.clone()).unwrap();
+        let scope = q3_scope(&w, Some(w.clone()));
+        let answer = |scope: &FolderScope| {
+            let before = entries_under(cache.path());
+            let base = folder_base(cache.path(), scope);
+            assert_eq!(
+                entries_under(cache.path()),
+                before,
+                "folder_base wrote state"
+            );
+            base.map(|b| {
+                let mut files: Vec<(String, String)> = b
+                    .file_paths()
+                    .map(|p| (p.to_string(), b.file_sha(p).unwrap().to_string()))
+                    .collect();
+                files.sort();
+                (b.commit_sha().unwrap().to_string(), files)
+            })
+        };
+        let h1 = Some((
+            "h1".to_string(),
+            vec![("a.md".to_string(), "a1".to_string())],
+        ));
+        let h0 = Some((
+            "h0".to_string(),
+            vec![("b.md".to_string(), "b0".to_string())],
+        ));
+
+        assert_eq!(answer(&scope), h1);
+        assert_eq!(answer(&q3_scope(&w, None)), None);
+
+        let folder = WorkingCopy::open_folder(cache.path(), &scope).unwrap();
+        folder
+            .record_base(
+                "h0",
+                HashMap::from([("b.md".to_string(), "b0".to_string())]),
+            )
+            .unwrap();
+        holder.record_base("h1", holder_files).unwrap();
+        assert_eq!(answer(&scope), h1);
+
+        stamp(&holder, Some(7));
+        stamp(&folder, Some(7));
+        assert_eq!(answer(&scope), h1);
+
+        stamp(&holder, None);
+        assert_eq!(answer(&scope), h0);
+    }
+
+    // SPEC u291 Contract Surface, `WorkingCopy::open_folder`: a folder and
+    // its holder's checkout never share a state directory.
+    #[test]
+    fn a_folder_copy_and_its_checkout_hold_two_state_directories() {
+        let cache = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        let w = std::fs::canonicalize(tree.path()).unwrap();
+        std::fs::create_dir_all(w.join("clients/vela/q3-board")).unwrap();
+        let scope = q3_scope(&w, Some(w.clone()));
+        assert_eq!(
+            WorkingCopy::open_existing_folder(cache.path(), &scope).unwrap(),
+            None
+        );
+        let folder = WorkingCopy::open_folder(cache.path(), &scope).unwrap();
+        let holder = WorkingCopy::open(cache.path(), "alice", "work", &w).unwrap();
+        assert_ne!(folder.state_dir, holder.state_dir);
+        assert_eq!(folder.folder.as_ref(), Some(&scope));
+        assert_eq!(holder.folder, None);
+        assert_eq!(
+            folder.cache_dir(),
+            std::fs::canonicalize(cache.path()).unwrap()
+        );
+        assert_eq!(
+            WorkingCopy::open_existing_folder(cache.path(), &scope)
+                .unwrap()
+                .map(|c| c.state_dir),
+            Some(folder.state_dir)
+        );
     }
 
     #[test]

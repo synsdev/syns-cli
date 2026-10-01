@@ -19,12 +19,21 @@ use crate::repo::syns_yaml::{IdentityForm, find_syns_yaml, read_identity_form};
 /// One scoped folder: `dir` is the absolute folder holding the identity
 /// file, `owner` and `name` the holder lower-cased, and `path` the
 /// recorded path with no leading or trailing `/`.
+///
+/// SPEC u291: `checkout` is the absolute directory of the root-form
+/// identity file naming the holder above the folder, none for a folder
+/// with no checkout of its holder above it; `enclosing` is every folder
+/// of the holder standing above it that `enclosing_folders` answers,
+/// nearest first, each carrying no checkout and no enclosing folder of
+/// its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FolderScope {
     pub dir: PathBuf,
     pub owner: String,
     pub name: String,
     pub path: String,
+    pub checkout: Option<PathBuf>,
+    pub enclosing: Vec<FolderScope>,
 }
 
 /// Whether `path` lies under the folder `folder`: it begins with the
@@ -164,7 +173,7 @@ fn check_folder_form(holder: &str, path: &str) -> Result<(), CliError> {
 }
 
 /// The folder's place under `checkout`, its components joined by `/`.
-fn place_under(dir: &Path, checkout: &Path) -> String {
+pub(crate) fn place_under(dir: &Path, checkout: &Path) -> String {
     match dir.strip_prefix(checkout) {
         Ok(relative) => relative
             .components()
@@ -178,11 +187,150 @@ fn place_under(dir: &Path, checkout: &Path) -> String {
     }
 }
 
+/// `place` joined under `under`, either of them empty standing for the
+/// root it is counted from.
+fn joined_under(under: &str, place: &str) -> String {
+    match (under.is_empty(), place.is_empty()) {
+        (true, _) => place.to_string(),
+        (false, true) => under.to_string(),
+        (false, false) => format!("{under}/{place}"),
+    }
+}
+
+/// Each identity file standing above `dir`, nearest first, up to and
+/// including the nearest one in the root form, each read as the form it
+/// is written in, a marked one by its local side.
+fn identity_files_above(dir: &Path) -> Result<Vec<(PathBuf, IdentityForm)>, CliError> {
+    let mut found = Vec::new();
+    let mut above = dir.parent().and_then(find_syns_yaml);
+    while let Some(candidate) = above {
+        let candidate_dir = candidate
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let form = read_identity_form(&candidate)?;
+        let root = matches!(form, IdentityForm::Root { .. });
+        found.push((candidate_dir.clone(), form));
+        if root {
+            break;
+        }
+        above = candidate_dir.parent().and_then(find_syns_yaml);
+    }
+    Ok(found)
+}
+
+/// The place check for a folder of `holder` recording `path` and
+/// standing, or about to stand, at `dir` (SPEC u291 Behaviour,
+/// `folder_checkout`): against the holder's checkout above it, answering
+/// that checkout's directory, and where no checkout stands above it
+/// against the outermost folder form above it, answering none. It sends
+/// nothing and writes nothing.
+pub fn folder_checkout(dir: &Path, holder: &str, path: &str) -> Result<Option<PathBuf>, CliError> {
+    // 1 — the nearest root form above, past every folder form.
+    let above = identity_files_above(dir)?;
+    let refuse_moved = |actual: String, checkout: PathBuf, back: PathBuf| CliError::FolderMoved {
+        dir: dir.to_path_buf(),
+        holder: holder.to_string(),
+        recorded: path.to_string(),
+        actual,
+        checkout,
+        back,
+    };
+    if let Some((checkout, IdentityForm::Root { owner, name })) = above.last() {
+        // 2 — a checkout of another repository.
+        let standing = format!("{owner}/{name}");
+        if !standing.eq_ignore_ascii_case(holder) {
+            return Err(CliError::FolderInAnotherCheckout {
+                dir: dir.to_path_buf(),
+                holder: holder.to_string(),
+                checkout: checkout.clone(),
+                standing,
+            });
+        }
+        // 3 — the holder's checkout: the place must be the record.
+        let actual = place_under(dir, checkout);
+        if actual != path {
+            return Err(refuse_moved(actual, checkout.clone(), checkout.join(path)));
+        }
+        return Ok(Some(checkout.clone()));
+    }
+
+    // 4 — no checkout above: the outermost folder form above fixes the
+    // place, whatever it names and records.
+    let Some((
+        outer,
+        IdentityForm::Folder {
+            holder: outer_holder,
+            path: outer_path,
+        },
+    )) = above.last()
+    else {
+        return Ok(None);
+    };
+    if !outer_holder.eq_ignore_ascii_case(holder) || !lies_under(path, outer_path) {
+        return Err(CliError::FolderInAnotherCheckout {
+            dir: dir.to_path_buf(),
+            holder: holder.to_string(),
+            checkout: outer.clone(),
+            standing: format!("{outer_holder}'s {outer_path}"),
+        });
+    }
+    let actual = joined_under(outer_path, &place_under(dir, outer));
+    if actual != path {
+        let counted = &path[outer_path.len() + 1..];
+        return Err(refuse_moved(actual, outer.clone(), outer.join(counted)));
+    }
+    Ok(None)
+}
+
+/// Every folder of `holder` standing above `dir` below the nearest
+/// root-form identity file, nearest first, whose recorded path `path`
+/// lies under and whose place agrees with it (SPEC u291 Behaviour,
+/// `enclosing_folders`). Each is answered at its directory and recorded
+/// path, carrying no checkout and no enclosing folder of its own. It
+/// sends nothing and writes nothing.
+pub fn enclosing_folders(
+    dir: &Path,
+    holder: &str,
+    path: &str,
+) -> Result<Vec<FolderScope>, CliError> {
+    let mut kept = Vec::new();
+    for (form_dir, form) in identity_files_above(dir)? {
+        let IdentityForm::Folder {
+            holder: form_holder,
+            path: form_path,
+        } = form
+        else {
+            break;
+        };
+        if !form_holder.eq_ignore_ascii_case(holder) || !lies_under(path, &form_path) {
+            continue;
+        }
+        if joined_under(&form_path, &place_under(dir, &form_dir)) != path {
+            continue;
+        }
+        let Some((owner, name)) = holder.split_once('/') else {
+            continue;
+        };
+        kept.push(FolderScope {
+            dir: form_dir,
+            owner: owner.to_ascii_lowercase(),
+            name: name.to_ascii_lowercase(),
+            path: form_path,
+            checkout: None,
+            enclosing: Vec::new(),
+        });
+    }
+    Ok(kept)
+}
+
 /// The scope a run standing at `start` reads (SPEC u290 Behaviour,
 /// `resolve_folder_scope`): a scope only where the nearest identity file
 /// at or above `start` is the folder form and its place agrees with its
 /// record, none where that file is the root form or no file stands. It
-/// sends nothing and writes nothing.
+/// sends nothing and writes nothing. SPEC u291: its steps 3 to 5 are
+/// `folder_checkout`'s, whose answer the scope carries as `checkout`
+/// beside the folders `enclosing_folders` answers.
 pub fn resolve_folder_scope(start: &Path) -> Result<Option<FolderScope>, CliError> {
     // 1 — the nearest identity file, a marked one by its local side.
     let Some(file) = find_syns_yaml(start) else {
@@ -204,47 +352,10 @@ pub fn resolve_folder_scope(start: &Path) -> Result<Option<FolderScope>, CliErro
         .map(Path::to_path_buf)
         .unwrap_or_else(|| start.to_path_buf());
 
-    // 3 — the nearest root form above the folder, past every folder form.
-    let mut above = dir.parent().and_then(find_syns_yaml);
-    while let Some(candidate) = above {
-        let candidate_dir = candidate
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_default();
-        match read_identity_form(&candidate)? {
-            IdentityForm::Folder { .. } => {
-                above = candidate_dir.parent().and_then(find_syns_yaml);
-            }
-            IdentityForm::Root {
-                owner: standing_owner,
-                name: standing_name,
-            } => {
-                // 4 — a checkout of another repository.
-                if !standing_owner.eq_ignore_ascii_case(&owner)
-                    || !standing_name.eq_ignore_ascii_case(&name)
-                {
-                    return Err(CliError::FolderInAnotherCheckout {
-                        dir,
-                        holder: format!("{owner}/{name}"),
-                        checkout: candidate_dir,
-                        standing: format!("{standing_owner}/{standing_name}"),
-                    });
-                }
-                // 5 — the holder's checkout: the place must be the record.
-                let actual = place_under(&dir, &candidate_dir);
-                if actual != path {
-                    return Err(CliError::FolderMoved {
-                        dir,
-                        holder: format!("{owner}/{name}"),
-                        recorded: path,
-                        actual,
-                        checkout: candidate_dir,
-                    });
-                }
-                break;
-            }
-        }
-    }
+    // 3 to 5 — the place check, and the folders enclosing this one.
+    let holder = format!("{owner}/{name}");
+    let checkout = folder_checkout(&dir, &holder, &path)?;
+    let enclosing = enclosing_folders(&dir, &holder, &path)?;
 
     // 6 — the scope at its recorded path.
     Ok(Some(FolderScope {
@@ -252,6 +363,8 @@ pub fn resolve_folder_scope(start: &Path) -> Result<Option<FolderScope>, CliErro
         owner,
         name,
         path,
+        checkout,
+        enclosing,
     }))
 }
 
@@ -305,6 +418,8 @@ mod tests {
             owner: "alice".into(),
             name: "work".into(),
             path: path.into(),
+            checkout: None,
+            enclosing: Vec::new(),
         }
     }
 
@@ -372,6 +487,146 @@ mod tests {
             .expect("a scope");
         assert_eq!(scope.holder(), "alice/work");
         assert_eq!(resolve_folder_scope(&root).unwrap(), None);
+    }
+
+    /// A directory `U` holding no identity file above it, each
+    /// `(place, yaml)` written as `U/{place}/.syns.yaml`.
+    fn forms(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
+        let u = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(u.path()).unwrap();
+        for (place, yaml) in files {
+            let dir = root.join(place);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(".syns.yaml"), yaml).unwrap();
+        }
+        (u, root)
+    }
+
+    // SPEC u291 Behaviour, `folder_checkout` 3: a folder in its holder's
+    // checkout answers that checkout, and no folder encloses it.
+    #[test]
+    fn a_folder_in_its_holder_checkout_answers_the_checkout() {
+        let (_w, root) = checkout("holder: alice/work\npath: clients/vela/q3-board\n");
+        let scope = resolve_folder_scope(&root.join("clients/vela/q3-board/sub"))
+            .unwrap()
+            .expect("a scope");
+        assert_eq!(scope.checkout, Some(root.clone()));
+        assert!(scope.enclosing.is_empty());
+    }
+
+    // `folder_checkout` 4: with no checkout above, the outermost folder
+    // form fixes the place, and a folder moved under it is told to move
+    // back to its place under that folder.
+    #[test]
+    fn a_folder_moved_under_a_folder_checked_out_alone_is_told_its_place() {
+        let (_u, u) = forms(&[
+            ("q3", "holder: alice/work\npath: clients/vela/q3-board\n"),
+            (
+                "q3/old/inner",
+                "holder: alice/work\npath: clients/vela/q3-board/inner\n",
+            ),
+        ]);
+        match resolve_folder_scope(&u.join("q3/old/inner")) {
+            Err(err @ CliError::FolderMoved { .. }) => {
+                let CliError::FolderMoved {
+                    back,
+                    checkout,
+                    actual,
+                    ..
+                } = &err
+                else {
+                    unreachable!()
+                };
+                assert_eq!(back, &u.join("q3/inner"));
+                assert_eq!(checkout, &u.join("q3"));
+                assert_eq!(actual, "clients/vela/q3-board/old/inner");
+                assert!(
+                    err.to_string().contains(&format!(
+                        "move the folder back to {}",
+                        u.join("q3/inner").display()
+                    )),
+                    "{err}"
+                );
+            }
+            other => panic!("expected the moved refusal, got {other:?}"),
+        }
+        let scope = resolve_folder_scope(&u.join("q3")).unwrap().expect("q3");
+        assert_eq!(scope.checkout, None);
+        assert!(scope.enclosing.is_empty());
+    }
+
+    // `folder_checkout` 4: an outermost folder form naming another
+    // repository is refused by its holder and its recorded path.
+    #[test]
+    fn a_folder_under_another_repositorys_folder_is_refused() {
+        let (_u, u) = forms(&[
+            ("x", "holder: bob/other\npath: x\n"),
+            ("x/q3", "holder: alice/work\npath: clients/vela/q3-board\n"),
+        ]);
+        match resolve_folder_scope(&u.join("x/q3")) {
+            Err(CliError::FolderInAnotherCheckout {
+                standing, checkout, ..
+            }) => {
+                assert_eq!(standing, "bob/other's x");
+                assert_eq!(checkout, u.join("x"));
+            }
+            other => panic!("expected the other-checkout refusal, got {other:?}"),
+        }
+    }
+
+    // SPEC u291 Behaviour, `enclosing_folders` 1–2: nearest first, every
+    // form naming another holder, recording a path the folder's does not
+    // lie under, or standing where its record disagrees passed over.
+    #[test]
+    fn enclosing_folders_keeps_the_folders_whose_place_agrees_nearest_first() {
+        let (_u, u) = forms(&[
+            ("q3", "holder: alice/work\npath: clients/vela/q3-board\n"),
+            ("q3/a", "holder: bob/other\npath: y\n"),
+            (
+                "q3/a/b",
+                "holder: Alice/Work\npath: clients/vela/q3-board/a/b\n",
+            ),
+            ("q3/a/b/c", "holder: alice/work\npath: other/z\n"),
+            (
+                "q3/a/b/c/mid",
+                "holder: alice/work\npath: clients/vela/q3-board/a/b/c/x\n",
+            ),
+            (
+                "q3/a/b/c/mid/inner",
+                "holder: alice/work\npath: clients/vela/q3-board/a/b/c/mid/inner\n",
+            ),
+        ]);
+        let kept = enclosing_folders(
+            &u.join("q3/a/b/c/mid/inner"),
+            "alice/work",
+            "clients/vela/q3-board/a/b/c/mid/inner",
+        )
+        .unwrap();
+        let dirs: Vec<PathBuf> = kept.iter().map(|f| f.dir.clone()).collect();
+        assert_eq!(dirs, vec![u.join("q3/a/b"), u.join("q3")]);
+        assert_eq!(kept[0].path, "clients/vela/q3-board/a/b");
+        assert_eq!(kept[0].holder(), "alice/work");
+        assert!(
+            kept.iter()
+                .all(|f| f.checkout.is_none() && f.enclosing.is_empty())
+        );
+
+        let (_v, v) = forms(&[
+            ("q3", "holder: alice/work\npath: clients/vela/q3-board\n"),
+            (
+                "q3/x/mid",
+                "holder: alice/work\npath: clients/vela/q3-board/x\n",
+            ),
+            (
+                "q3/x/mid/inner",
+                "holder: alice/work\npath: clients/vela/q3-board/x/mid/inner\n",
+            ),
+        ]);
+        let scope = resolve_folder_scope(&v.join("q3/x/mid/inner"))
+            .unwrap()
+            .expect("inner");
+        let dirs: Vec<PathBuf> = scope.enclosing.iter().map(|f| f.dir.clone()).collect();
+        assert_eq!(dirs, vec![v.join("q3")]);
     }
 
     #[test]

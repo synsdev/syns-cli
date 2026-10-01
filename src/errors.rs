@@ -37,13 +37,17 @@ pub enum CliError {
     },
     /// SPEC u290, the misplaced-folder refusal (`D-101`): a folder whose
     /// place under its holder's checkout at `checkout` differs from the
-    /// path it records.
+    /// path it records. SPEC u291: `back` is the absolute directory the
+    /// folder stands right at — `checkout` joined with `recorded` under a
+    /// holder checkout, and under a folder checked out alone that folder's
+    /// directory joined with `recorded` counted from its recorded path.
     FolderMoved {
         dir: std::path::PathBuf,
         holder: String,
         recorded: String,
         actual: String,
         checkout: std::path::PathBuf,
+        back: std::path::PathBuf,
     },
     /// SPEC u290, the misplaced-folder refusal (`D-101`): a folder
     /// standing inside `checkout`, a checkout of `standing`, spelt as its
@@ -434,12 +438,13 @@ impl std::fmt::Display for CliError {
                 recorded,
                 actual,
                 checkout,
+                back,
             } => write!(
                 f,
-                "folder out of place: {} records {recorded} in {holder} but stands at {actual} in its checkout at {} \u{2014} move the folder back to {}/{recorded}, or correct the path its .syns.yaml records to {actual}",
+                "folder out of place: {} records {recorded} in {holder} but stands at {actual} in its checkout at {} \u{2014} move the folder back to {}, or correct the path its .syns.yaml records to {actual}",
                 dir.display(),
                 checkout.display(),
-                checkout.display()
+                back.display()
             ),
             CliError::FolderInAnotherCheckout {
                 dir,
@@ -938,6 +943,7 @@ mod tests {
             recorded: "clients/q3".into(),
             actual: "archive/q3".into(),
             checkout: std::path::PathBuf::from("/w"),
+            back: std::path::PathBuf::from("/w/clients/q3"),
         };
         assert_eq!(
             moved.to_string(),

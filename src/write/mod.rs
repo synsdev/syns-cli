@@ -28,9 +28,14 @@ use crate::config::Config;
 use crate::errors::{ApiErrorContext, CliError, IdentityRemedy, NotTextSurface};
 use crate::output::Output;
 use crate::push::collector::{CollectOptions, HeldBytes, MAX_FILE_BYTES, collect_files, is_text};
-use crate::push::converge::{excluded_local_files, is_partial_write};
+use crate::push::converge::{
+    FolderRoot, collect_in_place, excluded_local_files, is_partial_write, read_holder_synsignore,
+};
 use crate::push::hash::blob_sha1;
-use crate::push::working_copy::WorkingCopy;
+use crate::push::manifest::Manifest;
+use crate::push::working_copy::{WorkingCopy, folder_base};
+use crate::read::repository_argument;
+use crate::repo::folder::{FolderScope, resolve_folder_scope};
 use crate::repo::if_repo::resolve_full_or_skip;
 use crate::repo::syns_yaml::nearest_identity;
 
@@ -118,13 +123,29 @@ impl ParentRef {
 /// The run's one write target: every request addresses `repo_id` under
 /// `token` at `parent`, and `checkout` is the canonical root of a
 /// working copy in the run's directory tracking this repository, `None`
-/// where none does.
+/// where none does. SPEC u291: `folder` is the scoped folder the run
+/// stands in where no `--repo` stood, every path the run takes counted
+/// from it; none wherever `--repo` stood.
 #[derive(Debug, Clone)]
 pub struct WriteTarget {
     pub repo_id: String,
     pub token: String,
     pub parent: ParentRef,
     pub checkout: Option<PathBuf>,
+    pub folder: Option<FolderScope>,
+}
+
+impl WriteTarget {
+    /// A typed path as a path in the repository (SPEC u291 Contract
+    /// Surface, `WriteTarget::repository_path`): unchanged with no folder,
+    /// and inside one joined under it, a path leaving it refused.
+    pub fn repository_path(&self, typed: &str) -> Result<String, CliError> {
+        match &self.folder {
+            None => Ok(typed.to_string()),
+            Some(folder) => Ok(repository_argument(Some(folder), Some(typed))?
+                .unwrap_or_else(|| folder.path.clone())),
+        }
+    }
 }
 
 /// One content a commit carries (SPEC u283 Contract Surface,
@@ -190,27 +211,95 @@ pub fn default_message(verb: &str, path: Option<&str>) -> String {
 
 /// Answers the canonical root of a working copy in the run's directory
 /// tracking `repo_id`, and only where that copy holds no unpublished
-/// local work. It sends no request and writes no state to reach any of
-/// its three answers.
-pub fn checkout_of(
+/// local work. It writes no state to reach any of its answers, and sends
+/// one request — `read_holder_synsignore`'s — only inside a folder whose
+/// scope carries no checkout (SPEC u291 Behaviour, `checkout_of`).
+///
+/// Inside the folder of the repository bound with no `--repo`, a clean
+/// folder answers the folder's directory and a folder holding unpublished
+/// work is refused naming that directory, whatever the rest of its
+/// holder's checkout holds; with `--repo` naming that repository there,
+/// the holder checkout above the folder is guarded whole.
+pub async fn checkout_of(
     config: &Config,
     cwd: &Path,
     repo_id: &str,
+    repo_named: bool,
+    client: &SynsClient,
+    token: &str,
 ) -> Result<Option<PathBuf>, CliError> {
-    // 1 — the identity file nearest `cwd`, that directory included.
-    let Some(identity) = nearest_identity(cwd)? else {
-        return Ok(None);
-    };
-    let Some((owner, name)) = repo_id.split_once('/') else {
-        return Ok(None);
-    };
-    if !identity.names(owner, name) {
-        return Ok(None);
+    // 1 — the folder the run stands in, where one stands.
+    match resolve_folder_scope(cwd)? {
+        Some(scope) if !scope.holder().eq_ignore_ascii_case(repo_id) => Ok(None),
+        Some(scope) if repo_named => match &scope.checkout {
+            Some(checkout) => guard_root(config, checkout, repo_id).map(Some),
+            None => Ok(None),
+        },
+        Some(scope) => guard_folder(config, &scope, repo_id, client, token)
+            .await
+            .map(Some),
+        None => {
+            // u271 1 — the identity file nearest `cwd`, that directory
+            // included.
+            let Some(identity) = nearest_identity(cwd)? else {
+                return Ok(None);
+            };
+            let Some((owner, name)) = repo_id.split_once('/') else {
+                return Ok(None);
+            };
+            if !identity.names(owner, name) {
+                return Ok(None);
+            }
+            guard_root(config, &identity.dir, repo_id).map(Some)
+        }
     }
-    let root = identity.dir.clone();
-    let refuse = || CliError::Io {
-        message: checkout_guard_refusal(&root, repo_id),
+}
+
+/// The file hashes a guard compares: every kept path but a sibling a
+/// killed convergence left, which is no local work.
+fn guarded_hashes(collected: &crate::push::collector::CollectResult) -> BTreeMap<String, String> {
+    collected
+        .files
+        .iter()
+        .filter(|(path, _)| !is_partial_write(path))
+        .map(|(path, file)| (path.clone(), file.sha.clone()))
+        .collect()
+}
+
+/// u271's comparison: the folder's hashes against the recorded base, a
+/// path the base names that a file stands at and the collection left out
+/// dropped from both sides (CR1-1), and a copy recording no base holding
+/// unpublished work wherever its folder holds a file.
+fn agrees_with_base(
+    root: &Path,
+    folder: &BTreeMap<String, String>,
+    base: Option<Manifest>,
+) -> bool {
+    let Some(base) = base else {
+        return folder.is_empty();
     };
+    let recorded: BTreeMap<String, String> = base
+        .file_paths()
+        .filter_map(|path| {
+            base.file_sha(path)
+                .map(|sha| (path.to_string(), sha.to_string()))
+        })
+        .collect();
+    let excluded = excluded_local_files(root, |path| folder.contains_key(path), recorded.keys());
+    let recorded: BTreeMap<String, String> = recorded
+        .into_iter()
+        .filter(|(path, _)| !excluded.contains(path))
+        .collect();
+    *folder == recorded
+}
+
+/// u271 `checkout_of` 2 and 3 over the checkout at `root`: answers `root`,
+/// or refuses naming it where the copy holds unpublished work.
+fn guard_root(config: &Config, root: &Path, repo_id: &str) -> Result<PathBuf, CliError> {
+    let refuse = || CliError::Io {
+        message: checkout_guard_refusal(root, repo_id),
+    };
+    let (owner, name) = repo_id.split_once('/').unwrap_or((repo_id, ""));
 
     // 2 — the working copy at the directory that identity file stands
     // in, where its state already stands. It is opened rather than
@@ -218,7 +307,7 @@ pub fn checkout_of(
     // answer, which this function does not do (CR1-2). A state
     // directory that does not stand carries no recorded base, which
     // step 3 reads as unpublished local work.
-    let base = match WorkingCopy::open_existing(config.cache_dir(), owner, name, &identity.dir) {
+    let base = match WorkingCopy::open_existing(config.cache_dir(), owner, name, root) {
         Ok(Some(copy)) => {
             if copy.outbox()?.is_some() || copy.resolution()?.is_some() {
                 return Err(refuse());
@@ -237,56 +326,59 @@ pub fn checkout_of(
     // record and holds no byte: a budget of zero keeps each kept file's
     // hash and nothing more (SPEC u280, the `src/write/mod.rs` row).
     let collected = collect_files(
-        &identity.dir,
+        root,
         &[],
         CollectOptions::default(),
         None,
         &HeldBytes::new(0),
     )?;
-    let folder: BTreeMap<String, String> = collected
-        .files
-        .iter()
-        // A sibling a killed convergence left is no local work: the
-        // next collection sweeps it.
-        .filter(|(path, _)| !is_partial_write(path))
-        .map(|(path, file)| (path.clone(), file.sha.clone()))
-        .collect();
-
-    let Some(base) = base else {
-        // A copy recording no base has published nothing from here, so
-        // every file it holds is unpublished work.
-        return if folder.is_empty() {
-            Ok(Some(identity.dir))
-        } else {
-            Err(refuse())
-        };
-    };
-    let recorded: BTreeMap<String, String> = base
-        .file_paths()
-        .filter_map(|path| {
-            base.file_sha(path)
-                .map(|sha| (path.to_string(), sha.to_string()))
-        })
-        .collect();
-    // A path the base names that a file stands at and the collection
-    // left out is an exclusion, not an edit — a convergence drops it
-    // from both sides before comparing, and so does this guard. Without
-    // it, a checkout of a repository holding any path the local
-    // collector skips is refused every write for good, with no override
-    // (CR1-1).
-    let excluded = excluded_local_files(
-        &identity.dir,
-        |path| folder.contains_key(path),
-        recorded.keys(),
-    );
-    let recorded: BTreeMap<String, String> = recorded
-        .into_iter()
-        .filter(|(path, _)| !excluded.contains(path))
-        .collect();
-    if folder != recorded {
+    if !agrees_with_base(root, &guarded_hashes(&collected), base) {
         return Err(refuse());
     }
-    Ok(Some(identity.dir))
+    Ok(root.to_path_buf())
+}
+
+/// SPEC u291 `checkout_of` 2 and 3 inside the folder of the repository
+/// bound: the folder copy's outbox and resolution, then the folder
+/// collected as a convergence collects it against the base `folder_base`
+/// answers. Answers the folder's directory, or refuses naming it.
+async fn guard_folder(
+    config: &Config,
+    scope: &FolderScope,
+    repo_id: &str,
+    client: &SynsClient,
+    token: &str,
+) -> Result<PathBuf, CliError> {
+    let refuse = || CliError::Io {
+        message: checkout_guard_refusal(&scope.dir, repo_id),
+    };
+    // 2
+    if let Ok(Some(copy)) = WorkingCopy::open_existing_folder(config.cache_dir(), scope)
+        && (copy.outbox()?.is_some() || copy.resolution()?.is_some())
+    {
+        return Err(refuse());
+    }
+    // 3
+    let base = folder_base(config.cache_dir(), scope);
+    let holder = match &scope.checkout {
+        Some(_) => None,
+        None => {
+            let at = base.as_ref().and_then(|b| b.commit_sha().map(String::from));
+            read_holder_synsignore(client, Some(token), repo_id, at.as_deref()).await?
+        }
+    };
+    let root = FolderRoot::of_scope(&scope.dir, scope, holder);
+    let collected = collect_in_place(
+        &root,
+        &[],
+        CollectOptions::default(),
+        None,
+        &HeldBytes::new(0),
+    )?;
+    if !agrees_with_base(&scope.dir, &guarded_hashes(&collected), base) {
+        return Err(refuse());
+    }
+    Ok(scope.dir.clone())
 }
 
 // ---- the data channel -------------------------------------------------
@@ -459,12 +551,17 @@ pub async fn resolve_write_target(
     // a spelling the caller alone got wrong.
     refuse_parent_spelling(&opts.parent)?;
 
-    // 1 — bind the repository. A `--repo` value takes it outright, in
-    // exactly the spelling the five read verbs admit; no ladder, no
-    // mismatch check and no skip runs beside it.
-    let repo_id = match opts.repo.as_deref() {
-        Some(named) => named.to_ascii_lowercase(),
-        None => {
+    // 1 — the folder the run stands in, whether or not `--repo` stands,
+    // so a misplaced folder is refused before the credential (SPEC u291
+    // `resolve_write_target` 1); then bind the repository. A `--repo`
+    // value takes it outright, in exactly the spelling the five read
+    // verbs admit, with no folder; no ladder, no mismatch check and no
+    // skip runs beside it. Inside a folder the holder is bound.
+    let scope = resolve_folder_scope(cwd)?;
+    let (repo_id, folder) = match (opts.repo.as_deref(), scope) {
+        (Some(named), _) => (named.to_ascii_lowercase(), None),
+        (None, Some(scope)) => (scope.holder(), Some(scope)),
+        (None, None) => {
             // `if_repo: false` refuses rather than skipping — these
             // verbs register no skip, a skipped write being a change its
             // caller believes landed.
@@ -474,7 +571,7 @@ pub async fn resolve_write_target(
             match resolve_full_or_skip(None, cwd, false, &quiet)
                 .map_err(|e| e.with_identity_remedy(IdentityRemedy::RepoOption))?
             {
-                Some((owner, name)) => format!("{owner}/{name}"),
+                Some((owner, name)) => (format!("{owner}/{name}"), None),
                 None => {
                     return Err(CliError::RepoIdentityUnknown {
                         remedy: IdentityRemedy::RepoOption,
@@ -490,10 +587,10 @@ pub async fn resolve_write_target(
         .ok_or(CliError::AuthRequired)?;
 
     // 3 — the checkout guard against the bound repository, before any
-    // request.
-    let checkout = checkout_of(config, cwd, &repo_id)?;
-
+    // request but the holder's root `.synsignore` a folder standing in no
+    // checkout of its holder reads.
     let client = SynsClient::new(config.server_url())?;
+    let checkout = checkout_of(config, cwd, &repo_id, opts.repo.is_some(), &client, &token).await?;
 
     // 4 — read the repository, so no push of this run can be the request
     // that creates one (`issues/069`).
@@ -507,6 +604,7 @@ pub async fn resolve_write_target(
         token,
         parent,
         checkout,
+        folder,
     })
 }
 
@@ -666,6 +764,25 @@ pub async fn commit_changeset(
     opts: &WriteOptions,
     default_message: &str,
 ) -> Result<(), CliError> {
+    // SPEC u291 `commit_changeset` 1 — inside a folder, every file and
+    // deletion the changeset names taken as a path in the holder, a path
+    // leaving the folder refused before the push.
+    let changeset = match &target.folder {
+        None => changeset,
+        Some(_) => Changeset {
+            files: changeset
+                .files
+                .into_iter()
+                .map(|(path, content)| Ok((target.repository_path(&path)?, content)))
+                .collect::<Result<_, CliError>>()?,
+            deletions: changeset
+                .deletions
+                .iter()
+                .map(|path| target.repository_path(path))
+                .collect::<Result<_, CliError>>()?,
+        },
+    };
+
     // 1 and 2 — the caption, and each content's blob hash beside its path.
     let message = caption(opts, default_message)?;
     let request = push_body(target, changeset, opts, message);
@@ -768,6 +885,7 @@ mod tests {
                 version: None,
             },
             checkout,
+            folder: None,
         }
     }
 
@@ -791,6 +909,18 @@ mod tests {
         copy.record_base(HEAD_SHA, folder_hashes(root)).unwrap();
     }
 
+    /// `checkout_of` driven to its answer for a run binding the
+    /// repository with no `--repo`, against a deployment it never reaches
+    /// outside a folder standing in no checkout.
+    fn guard(config: &Config, cwd: &Path, repo_id: &str) -> Result<Option<PathBuf>, CliError> {
+        let client = SynsClient::new("https://syns.dev").unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(checkout_of(config, cwd, repo_id, false, &client, "t"))
+    }
+
     // ---- step 3 -------------------------------------------------------
 
     // SPEC u271 Behaviour, `checkout_of` 3: a folder equal to its
@@ -802,7 +932,7 @@ mod tests {
         let work = tempfile::tempdir().unwrap();
         seed_checkout(&env.config, work.path(), "alice", "notes", true);
 
-        let root = checkout_of(&env.config, work.path(), "alice/notes").unwrap();
+        let root = guard(&env.config, work.path(), "alice/notes").unwrap();
         assert_eq!(
             root.map(|r| std::fs::canonicalize(r).unwrap()),
             Some(std::fs::canonicalize(work.path()).unwrap())
@@ -818,7 +948,7 @@ mod tests {
         let work = tempfile::tempdir().unwrap();
         seed_checkout(&env.config, work.path(), "alice", "notes", false);
 
-        let err = checkout_of(&env.config, work.path(), "alice/notes").unwrap_err();
+        let err = guard(&env.config, work.path(), "alice/notes").unwrap_err();
         assert!(err.to_string().contains(&work.path().display().to_string()));
         assert!(err.to_string().contains("syns sync"));
         assert_eq!(err.exit_code(), 1);
@@ -833,7 +963,7 @@ mod tests {
         seed_checkout(&env.config, work.path(), "alice", "notes", true);
         std::fs::write(work.path().join("a.md"), "edited since").unwrap();
 
-        let err = checkout_of(&env.config, work.path(), "alice/notes").unwrap_err();
+        let err = guard(&env.config, work.path(), "alice/notes").unwrap_err();
         let line = err.to_string();
         assert!(line.contains("holds unpublished local changes for alice/notes"));
         assert!(!line.contains("--"), "the refusal names no option: {line}");
@@ -849,11 +979,11 @@ mod tests {
         seed_checkout(&env.config, work.path(), "alice", "notes", false);
 
         assert!(
-            checkout_of(&env.config, work.path(), "bob/other")
+            guard(&env.config, work.path(), "bob/other")
                 .unwrap()
                 .is_none()
         );
-        assert!(checkout_of(&env.config, work.path(), "ALICE/NOTES").is_err());
+        assert!(guard(&env.config, work.path(), "ALICE/NOTES").is_err());
     }
 
     // `checkout_of` 1: no identity file at or above the directory.
@@ -865,11 +995,7 @@ mod tests {
         let deep = work.path().join("a").join("b");
         std::fs::create_dir_all(&deep).unwrap();
 
-        assert!(
-            checkout_of(&env.config, &deep, "alice/notes")
-                .unwrap()
-                .is_none()
-        );
+        assert!(guard(&env.config, &deep, "alice/notes").unwrap().is_none());
     }
 
     // CR1-1: a path the recorded base names that a file stands at and
@@ -893,7 +1019,7 @@ mod tests {
         copy.record_base(HEAD_SHA, recorded).unwrap();
 
         assert!(
-            checkout_of(&env.config, work.path(), "alice/notes")
+            guard(&env.config, work.path(), "alice/notes")
                 .unwrap()
                 .is_some(),
             "the excluded path is dropped from both sides"
@@ -901,7 +1027,7 @@ mod tests {
 
         // An edit to a path the collection does take still refuses.
         std::fs::write(work.path().join("a.md"), "edited since").unwrap();
-        assert!(checkout_of(&env.config, work.path(), "alice/notes").is_err());
+        assert!(guard(&env.config, work.path(), "alice/notes").is_err());
     }
 
     // CR1-2: the guard answers none of its three by writing state, so a
@@ -915,7 +1041,7 @@ mod tests {
         seed_checkout(&env.config, work.path(), "alice", "notes", false);
         let before = cache_entries(env.config.cache_dir());
 
-        assert!(checkout_of(&env.config, work.path(), "alice/notes").is_err());
+        assert!(guard(&env.config, work.path(), "alice/notes").is_err());
         assert_eq!(
             cache_entries(env.config.cache_dir()),
             before,

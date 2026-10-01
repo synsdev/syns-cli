@@ -675,6 +675,8 @@ fn opts_at(cache_dir: &Path) -> SmartPushOptions {
         held: None,
         json_output: false,
         renders_publication_summary: false,
+        folder: None,
+        declined_parent: None,
     }
 }
 
@@ -740,7 +742,7 @@ fn body_content<'a>(body: &'a Value, path: &str) -> Option<&'a str> {
 
 fn expect_resolution(outcome: SyncOutcome) -> Resolution {
     match outcome {
-        SyncOutcome::ResolutionRequired(resolution) => resolution,
+        SyncOutcome::ResolutionRequired(resolution, _) => resolution,
         other => panic!("expected ResolutionRequired, got {other:?}"),
     }
 }
@@ -1195,7 +1197,7 @@ async fn discard_restores_a_file_and_a_folder_a_candidate_swapped() {
         )
         .await;
         assert!(
-            matches!(prepared, Ok(SyncOutcome::ResolutionRequired(_))),
+            matches!(prepared, Ok(SyncOutcome::ResolutionRequired(_, _))),
             "{label}: {prepared:?}"
         );
 
@@ -1230,7 +1232,7 @@ async fn discard_restores_a_folder_a_head_replaced_with_a_file_over_local_work()
     )
     .await;
     assert!(
-        matches!(prepared, Ok(SyncOutcome::ResolutionRequired(_))),
+        matches!(prepared, Ok(SyncOutcome::ResolutionRequired(_, _))),
         "{prepared:?}"
     );
     std::fs::remove_dir_all(dir.join("d")).unwrap();
@@ -1311,7 +1313,7 @@ async fn a_head_replacing_a_folder_holding_local_work_with_a_file_prepares_a_res
             let prepared = converge(&client, Some(TOKEN), &copy, mode, e.opts()).await;
 
             let resolution = match prepared {
-                Ok(SyncOutcome::ResolutionRequired(resolution)) => resolution,
+                Ok(SyncOutcome::ResolutionRequired(resolution, _)) => resolution,
                 other => panic!("{label}: expected ResolutionRequired, got {other:?}"),
             };
             assert!(
@@ -1346,7 +1348,7 @@ async fn a_head_replacing_a_folder_holding_local_work_with_a_file_prepares_a_res
 
             let again = converge(&client, Some(TOKEN), &copy, mode, e.opts()).await;
             match again {
-                Ok(SyncOutcome::ResolutionRequired(rerun)) => {
+                Ok(SyncOutcome::ResolutionRequired(rerun, _)) => {
                     assert_eq!(rerun.recovery_id, resolution.recovery_id, "{label}")
                 }
                 other => panic!("{label}: expected ResolutionRequired again, got {other:?}"),
@@ -1462,6 +1464,7 @@ async fn sync_and_pull_answer_resolution_required_over_local_work_a_head_swapped
                         None,
                         false,
                         false,
+                        None,
                     )
                     .await
                 }
@@ -1536,7 +1539,7 @@ async fn a_head_replacing_a_file_holding_local_work_with_a_folder_prepares_a_res
         let prepared = converge(&client, Some(TOKEN), &copy, ConvergeMode::Publish, e.opts()).await;
 
         let resolution = match prepared {
-            Ok(SyncOutcome::ResolutionRequired(resolution)) => resolution,
+            Ok(SyncOutcome::ResolutionRequired(resolution, _)) => resolution,
             other => panic!("{label}: expected ResolutionRequired, got {other:?}"),
         };
         assert!(
@@ -1592,7 +1595,7 @@ async fn discard_restores_a_file_a_head_replaced_with_a_folder_over_local_work()
     )
     .await;
     assert!(
-        matches!(prepared, Ok(SyncOutcome::ResolutionRequired(_))),
+        matches!(prepared, Ok(SyncOutcome::ResolutionRequired(_, _))),
         "{prepared:?}"
     );
     std::fs::remove_file(dir.join("d")).unwrap();
@@ -1820,7 +1823,7 @@ async fn publication_past_a_moved_head_requires_resolution_for_every_change_shap
         .unwrap();
 
         let resolution = match outcome {
-            SyncOutcome::ResolutionRequired(r) => r,
+            SyncOutcome::ResolutionRequired(r, _) => r,
             other => panic!("{label}: expected ResolutionRequired, got {other:?}"),
         };
         assert_eq!(
@@ -2221,7 +2224,7 @@ async fn a_retrieval_without_a_credential_settles_a_landed_publication_first() {
     .unwrap();
 
     assert!(
-        !matches!(retrieved, SyncOutcome::ResolutionRequired(_)),
+        !matches!(retrieved, SyncOutcome::ResolutionRequired(_, _)),
         "{retrieved:?}"
     );
     assert_eq!(read(&dir, "a.md"), "a\nQ\nc\n");
@@ -2268,7 +2271,7 @@ async fn a_landed_publication_keeps_a_resolution_prepared_after_it() {
             .await
             .unwrap();
         match outcome {
-            SyncOutcome::ResolutionRequired(r) => {
+            SyncOutcome::ResolutionRequired(r, _) => {
                 assert_eq!(r.recovery_id, prepared.recovery_id)
             }
             other => panic!("expected the prepared resolution, got {other:?}"),
@@ -2714,6 +2717,7 @@ async fn pull_version(e: &Env, dir: &Path, version: &str) -> Result<(), CliError
         Some(version.into()),
         false,
         false,
+        None,
     )
     .await
 }
@@ -3202,6 +3206,7 @@ async fn run_as_torn_writer() -> bool {
             Some(version.into()),
             false,
             false,
+            None,
         )
         .await;
         return true;
@@ -3472,7 +3477,7 @@ async fn a_retrieval_without_a_resolution_killed_mid_write_takes_the_head_on_its
         matches!(outcome, SyncOutcome::Synced { .. }),
         "{:?}",
         match &outcome {
-            SyncOutcome::ResolutionRequired(r) => format!("resolution over {:?}", r.collisions),
+            SyncOutcome::ResolutionRequired(r, _) => format!("resolution over {:?}", r.collisions),
             other => format!("{other:?}"),
         }
     );

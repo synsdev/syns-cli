@@ -1,0 +1,5 @@
+# The error every command returns carries the misplaced-folder refusal,
+# whose six fields (SPEC u290, and u291's `back`) sit just past clippy's
+# default bound of 128 bytes; the bound rises to hold it rather than
+# boxing a variant whose fields both units fix.
+large-error-threshold = 160

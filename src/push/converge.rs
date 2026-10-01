@@ -30,6 +30,7 @@ use crate::push::collector::{
     too_large_line,
 };
 use crate::push::hash::blob_sha1;
+use crate::push::manifest::Manifest;
 use crate::push::reconcile::{
     CONFLICT_MARKERS, CollisionKind, holds_conflict_marker, merge_text, reconcile,
 };
@@ -37,9 +38,10 @@ use crate::push::smart::{
     PushPipelineMeta, SmartPushOptions, smart_push, strict_refuses, tree_to_sha_map,
 };
 use crate::push::working_copy::{
-    Outbox, Resolution, Snapshot, SnapshotContent, StatRecord, WorkingCopy,
+    Outbox, Resolution, Snapshot, SnapshotContent, StatRecord, WorkingCopy, folder_base,
 };
-use crate::repo::syns_yaml::read_required_checks;
+use crate::repo::folder::{FolderScope, lies_under};
+use crate::repo::syns_yaml::{IdentityForm, read_identity_form, read_required_checks};
 
 /// The last round a resolution stands at before attention is required:
 /// the first candidate and three continuations (Q-03).
@@ -120,7 +122,9 @@ pub enum SyncOutcome {
         published: Option<(PushResponse, serde_json::Value, PushPipelineMeta)>,
     },
     NoChanges,
-    ResolutionRequired(Resolution),
+    /// SPEC u291: the directory is that of the working copy whose
+    /// resolution the run answered with, none where it is the run's own.
+    ResolutionRequired(Resolution, Option<PathBuf>),
     RetryableFailure(CliError),
     CredentialFailure(CliError),
     ValidationFailure(CliError),
@@ -309,12 +313,12 @@ fn read_failed(path: &Path, err: std::io::Error) -> CliError {
 // ---- reading the head ------------------------------------------------
 
 #[derive(Debug, Clone, Default)]
-struct Head {
-    commit: Option<String>,
-    files: BTreeMap<String, String>,
+pub(crate) struct Head {
+    pub(crate) commit: Option<String>,
+    pub(crate) files: BTreeMap<String, String>,
     /// Each file's size as the tree answers it, none where it answers
     /// none.
-    sizes: BTreeMap<String, Option<u64>>,
+    pub(crate) sizes: BTreeMap<String, Option<u64>>,
     truncated: bool,
 }
 
@@ -338,27 +342,113 @@ fn repo_id(copy: &WorkingCopy) -> String {
     format!("{}/{}", copy.owner, copy.name)
 }
 
+/// A served tree as a head, every path counted from `folder` where one
+/// stands and a path lying outside it left out.
+fn head_of(tree: &crate::client::TreeResponse, folder: Option<&str>) -> Head {
+    let counted = |path: &str| -> Option<String> {
+        match folder {
+            Some(folder) => lies_under(path, folder).then(|| path[folder.len() + 1..].to_string()),
+            None => Some(path.to_string()),
+        }
+    };
+    let sizes = tree
+        .entries
+        .iter()
+        .filter(|e| e.entry_type == EntryType::File && e.sha.is_some())
+        .filter_map(|e| counted(&e.path).map(|path| (path, e.size)))
+        .collect();
+    Head {
+        commit: Some(tree.commit_sha.clone()).filter(|c| !c.is_empty()),
+        files: tree_to_sha_map(tree)
+            .into_iter()
+            .filter_map(|(path, sha)| counted(&path).map(|path| (path, sha)))
+            .collect(),
+        sizes,
+        truncated: tree.truncated,
+    }
+}
+
 async fn read_tree(
     client: &SynsClient,
     token: Option<&str>,
     copy: &WorkingCopy,
     at: Option<&str>,
 ) -> Result<Head, CliError> {
+    // SPEC u291 `converge` 1: a folder copy reads the holder's tree
+    // under its recorded path.
+    if let Some(scope) = &copy.folder {
+        return read_folder_tree(client, token, &repo_id(copy), &scope.path, at).await;
+    }
     let (tree, _raw) = client
         .get_tree(&repo_id(copy), token, None, true, at)
         .await?;
-    let sizes = tree
-        .entries
-        .iter()
-        .filter(|e| e.entry_type == EntryType::File && e.sha.is_some())
-        .map(|e| (e.path.clone(), e.size))
-        .collect();
-    Ok(Head {
-        commit: Some(tree.commit_sha.clone()).filter(|c| !c.is_empty()),
-        files: tree_to_sha_map(&tree).into_iter().collect(),
-        sizes,
-        truncated: tree.truncated,
-    })
+    Ok(head_of(&tree, None))
+}
+
+/// Whether a refusal is `NOT_FOUND`, the address answering no entry.
+fn is_not_found(err: &CliError) -> bool {
+    matches!(err, CliError::Api { status: Some(404), error, .. } if error == "not_found")
+}
+
+/// The holder's tree under `folder` at `at` or the tip, every path
+/// counted from the folder and its commit the holder's, and an empty
+/// folder at that commit where the holder holds no folder there (SPEC
+/// u291 Behaviour, `read_folder_tree`).
+pub(crate) async fn read_folder_tree(
+    client: &SynsClient,
+    token: Option<&str>,
+    repo_id: &str,
+    folder: &str,
+    at: Option<&str>,
+) -> Result<Head, CliError> {
+    // 1 — the folder's tree, recursively.
+    match client
+        .get_tree(repo_id, token, Some(folder), true, at)
+        .await
+    {
+        Ok((tree, _raw)) => Ok(head_of(&tree, Some(folder))),
+        Err(err) if is_not_found(&err) => {
+            // 2 — the root, not recursively, then the folder again at the
+            // commit that answer names.
+            let (root, _raw) = client.get_tree(repo_id, token, None, false, at).await?;
+            let commit = root.commit_sha.clone();
+            match client
+                .get_tree(repo_id, token, Some(folder), true, Some(&commit))
+                .await
+            {
+                Ok((tree, _raw)) => Ok(head_of(&tree, Some(folder))),
+                Err(err) if is_not_found(&err) => Ok(Head {
+                    commit: Some(commit).filter(|c| !c.is_empty()),
+                    ..Head::default()
+                }),
+                Err(err) => Err(err),
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// The bytes of the `.synsignore` at the holder's root at `at` or the
+/// tip, none where the holder holds none there or the server answers it
+/// to the caller as absent (SPEC u291 Behaviour, `read_holder_synsignore`).
+pub async fn read_holder_synsignore(
+    client: &SynsClient,
+    token: Option<&str>,
+    repo_id: &str,
+    at: Option<&str>,
+) -> Result<Option<Vec<u8>>, CliError> {
+    match client
+        .get_raw(repo_id, token, ".synsignore", at, None)
+        .await
+    {
+        Ok(raw) => Ok(Some(raw.bytes)),
+        Err(CliError::Api {
+            status: Some(404),
+            ref error,
+            ..
+        }) if error == "not_found" || error == "repo_not_found" => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 fn is_empty_repository(err: &CliError) -> bool {
@@ -419,10 +509,12 @@ fn reading_for(mode: ConvergeMode) -> HeadReading {
 /// `MAX_FILE_BYTES`; a read with none outstanding always goes out. On
 /// the first refusal the rest are abandoned and every file staged here
 /// removed, nothing written.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn read_blobs(
     client: &SynsClient,
     token: Option<&str>,
     repo_id: &str,
+    folder: Option<&str>,
     at: &str,
     wanted: &BTreeMap<String, (String, Option<u64>)>,
     held: &Arc<HeldBytes>,
@@ -468,6 +560,12 @@ pub(crate) async fn read_blobs(
             let repo_id = repo_id.to_string();
             let at = at.to_string();
             let path = path.clone();
+            // SPEC u291 `converge` 1: each wanted path is read at the
+            // folder joined with it.
+            let remote = match folder {
+                Some(folder) => format!("{folder}/{path}"),
+                None => path.clone(),
+            };
             let hash = hash.clone();
             let held = held.clone();
             set.spawn(async move {
@@ -476,7 +574,7 @@ pub(crate) async fn read_blobs(
                     token.as_deref(),
                     &repo_id,
                     &at,
-                    &path,
+                    &remote,
                     &hash,
                     hold,
                     counted,
@@ -636,17 +734,186 @@ impl Folder {
     }
 }
 
+// ---- where a folder copy is collected from (SPEC u291 `converge` 2) ----
+
+/// Where one run collects a working copy's files from: the walk root, the
+/// copy's place under it, and the holder's root `.synsignore` handed to a
+/// collection standing in no checkout of its holder. A copy that is no
+/// folder walks its own root with neither.
+#[derive(Debug, Clone)]
+pub(crate) struct FolderRoot {
+    root: PathBuf,
+    place: Option<String>,
+    holder_synsignore: Option<(String, Vec<u8>)>,
+}
+
+impl FolderRoot {
+    /// The root of a copy collected where it stands.
+    pub(crate) fn whole(root: &Path) -> FolderRoot {
+        FolderRoot {
+            root: root.to_path_buf(),
+            place: None,
+            holder_synsignore: None,
+        }
+    }
+
+    /// The root a folder at `folder_dir` is collected from, `holder` the
+    /// holder's root `.synsignore` where the scope carries no checkout:
+    /// the checkout and the folder's place under it; otherwise the
+    /// outermost enclosing folder, or the folder's own directory where
+    /// none encloses it, beside that root's recorded path.
+    pub(crate) fn of_scope(
+        folder_dir: &Path,
+        scope: &FolderScope,
+        holder: Option<Vec<u8>>,
+    ) -> FolderRoot {
+        if let Some(checkout) = &scope.checkout {
+            return FolderRoot {
+                root: checkout.clone(),
+                place: Some(scope.path.clone()),
+                holder_synsignore: None,
+            };
+        }
+        match scope.enclosing.last() {
+            Some(outer) => FolderRoot {
+                root: outer.dir.clone(),
+                place: Some(scope.path[outer.path.len() + 1..].to_string()),
+                holder_synsignore: holder.map(|bytes| (outer.path.clone(), bytes)),
+            },
+            None => FolderRoot {
+                root: folder_dir.to_path_buf(),
+                place: None,
+                holder_synsignore: holder.map(|bytes| (scope.path.clone(), bytes)),
+            },
+        }
+    }
+}
+
+/// The root one run collects `copy` from (SPEC u291 `converge` 2): a
+/// folder standing in no checkout of its holder reads the holder's root
+/// `.synsignore` at the commit of the base `folder_base` answers, or at
+/// the head's commit where it answers none; every other copy sends
+/// nothing.
+pub(crate) async fn folder_root(
+    client: &SynsClient,
+    token: Option<&str>,
+    copy: &WorkingCopy,
+) -> Result<FolderRoot, CliError> {
+    let Some(scope) = &copy.folder else {
+        return Ok(FolderRoot::whole(&copy.root));
+    };
+    if scope.checkout.is_some() {
+        return Ok(FolderRoot::of_scope(&copy.root, scope, None));
+    }
+    let based =
+        folder_base(&copy.cache_dir(), scope).and_then(|b| b.commit_sha().map(String::from));
+    let at = match based {
+        Some(commit) => Some(commit),
+        None => match read_folder_tree(client, token, &repo_id(copy), &scope.path, None).await {
+            Ok(head) => head.commit,
+            Err(err) if is_empty_repository(&err) => None,
+            Err(err) => return Err(err),
+        },
+    };
+    let holder = read_holder_synsignore(client, token, &repo_id(copy), at.as_deref()).await?;
+    Ok(FolderRoot::of_scope(&copy.root, scope, holder))
+}
+
+/// An `--exclude` pattern matched against a path counted from the folder,
+/// as at a walk rooted there, for a walk rooted `place` above it: a
+/// pattern anchored by a `/` before its last character is anchored under
+/// the place, every other one matching at any depth as it stands.
+fn exclude_under(place: &str, pattern: &str) -> String {
+    let body = &pattern[..pattern.len().saturating_sub(1)];
+    if !body.contains('/') {
+        return pattern.to_string();
+    }
+    match pattern.strip_prefix('/') {
+        Some(rest) => format!("/{place}/{rest}"),
+        None => format!("{place}/{pattern}"),
+    }
+}
+
+/// Collect a copy's files from where `root` places it (SPEC u291
+/// `converge` 2): every kept and skipped path counted from the copy,
+/// `opts.prefix` counted from the copy too, each `--exclude` pattern
+/// matched as at a walk rooted at the copy, and the stat record's keys
+/// counted from the copy before and after the walk.
+pub(crate) fn collect_in_place(
+    root: &FolderRoot,
+    excludes: &[String],
+    opts: CollectOptions,
+    record: Option<&mut StatRecord>,
+    held: &Arc<HeldBytes>,
+) -> Result<CollectResult, CliError> {
+    let mut opts = opts;
+    opts.holder_synsignore = root.holder_synsignore.clone();
+    let Some(place) = root.place.as_deref().filter(|p| !p.is_empty()) else {
+        return collect_files(&root.root, excludes, opts, record, held);
+    };
+    let under = |path: &str| format!("{place}/{path}");
+    let counted = |path: &str| -> Option<String> {
+        path.strip_prefix(place)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .map(str::to_string)
+    };
+    opts.prefix = Some(match opts.prefix.as_deref() {
+        Some(prefix) if !prefix.is_empty() => under(prefix),
+        _ => place.to_string(),
+    });
+    let excludes: Vec<String> = excludes.iter().map(|p| exclude_under(place, p)).collect();
+    let mut joined = record.as_deref().map(|r| StatRecord {
+        entries: r
+            .entries
+            .iter()
+            .map(|(path, entry)| (under(path), entry.clone()))
+            .collect(),
+        stamp: r.stamp,
+    });
+    let collected = collect_files(&root.root, &excludes, opts, joined.as_mut(), held)?;
+    if let (Some(record), Some(joined)) = (record, joined) {
+        record.entries = joined
+            .entries
+            .into_iter()
+            .filter_map(|(path, entry)| counted(&path).map(|path| (path, entry)))
+            .collect();
+    }
+    let CollectResult {
+        files,
+        skipped,
+        total_walked,
+    } = collected;
+    Ok(CollectResult {
+        files: files
+            .into_iter()
+            .filter_map(|(path, file)| counted(&path).map(|path| (path, file)))
+            .collect(),
+        skipped: skipped
+            .into_iter()
+            .filter_map(|skip| {
+                counted(&skip.path).map(|path| SkippedFile {
+                    path,
+                    reason: skip.reason,
+                })
+            })
+            .collect(),
+        total_walked,
+    })
+}
+
 /// Collect the folder (SPEC u280 `converge` 1): on macOS and Linux through
 /// the working copy's stat record, each path in `forget` read again
 /// whatever its entry says. A collection taken under the state lock
 /// writes the record back with a fresh stamp where it changed an entry or
 /// read a file whose entry stood too recent to trust; a refused record
-/// write leaves the record as it stood.
+/// write leaves the record as it stood. SPEC u291: from where `root`
+/// places the copy.
 fn collect_folder(
     copy: &WorkingCopy,
     opts: &SmartPushOptions,
     forget: &[String],
     under_lock: bool,
+    root: &FolderRoot,
 ) -> Result<Folder, CliError> {
     let held = opts.held_bytes();
     #[cfg(unix)]
@@ -659,13 +926,14 @@ fn collect_folder(
         }
     }
     let loaded = record.clone();
-    let collected = collect_files(
-        &copy.root,
+    let collected = collect_in_place(
+        root,
         &opts.excludes,
         CollectOptions {
             no_default_excludes: opts.no_default_excludes,
             debug: opts.debug,
             prefix: None,
+            holder_synsignore: None,
         },
         record.as_mut(),
         &held,
@@ -724,8 +992,17 @@ struct Base {
     files: BTreeMap<String, String>,
 }
 
+/// The base a run reads `copy` against: a folder copy's through
+/// `folder_base` (SPEC u291 `converge` 3), every other copy's own.
+fn base_of(copy: &WorkingCopy) -> Option<Manifest> {
+    match &copy.folder {
+        Some(scope) => folder_base(&copy.cache_dir(), scope),
+        None => copy.base(),
+    }
+}
+
 fn load_base(copy: &WorkingCopy) -> Base {
-    match copy.base() {
+    match base_of(copy) {
         Some(manifest) => Base {
             commit: manifest.commit_sha().map(String::from),
             files: manifest
@@ -1192,6 +1469,155 @@ enum Prepared {
     },
     Resolution(Resolution),
     Attention(Option<Resolution>),
+    /// SPEC u291 `converge` 4: another working copy of the holder standing
+    /// over the same files holds a resolution over a path this one would
+    /// review, so nothing was prepared; that resolution and that copy's
+    /// directory.
+    Elsewhere(Resolution, PathBuf),
+}
+
+// ---- one review per path across every copy (SPEC u291 `converge` 4) ---
+
+/// The holder's review lock, one per cache directory and holder, released
+/// when dropped or when its process dies.
+pub(crate) struct ReviewLock {
+    _file: std::fs::File,
+}
+
+/// Take the holder's review lock, waiting while another run holds it. A
+/// run holding it takes no other working copy's state lock.
+pub(crate) fn review_lock(copy: &WorkingCopy) -> Result<ReviewLock, CliError> {
+    let dir = copy
+        .cache_dir()
+        .join("working-copies")
+        .join(copy.owner.to_ascii_lowercase())
+        .join(copy.name.to_ascii_lowercase());
+    let io = |err: std::io::Error| CliError::Io {
+        message: format!(
+            "could not lock {}: {err}",
+            dir.join("review.lock").display()
+        ),
+    };
+    std::fs::create_dir_all(&dir).map_err(io)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.join("review.lock"))
+        .map_err(io)?;
+    file.lock().map_err(io)?;
+    Ok(ReviewLock { _file: file })
+}
+
+/// Every folder form naming `owner/name`, letter case aside, standing on
+/// disk below `root` — its directory and recorded path — `.git` passed
+/// over and a file parsing as neither form left out.
+fn folders_below(root: &Path, owner: &str, name: &str) -> Vec<FolderScope> {
+    let holder = format!("{owner}/{name}");
+    let mut found = Vec::new();
+    for entry in ignore::WalkBuilder::new(root)
+        .standard_filters(false)
+        .hidden(false)
+        .parents(false)
+        .filter_entry(|entry| entry.file_name() != std::ffi::OsStr::new(".git"))
+        .build()
+        .flatten()
+    {
+        if entry.file_name() != std::ffi::OsStr::new(".syns.yaml")
+            || !entry.file_type().is_some_and(|t| t.is_file())
+        {
+            continue;
+        }
+        let Some(dir) = entry.path().parent() else {
+            continue;
+        };
+        if dir == root {
+            continue;
+        }
+        if let Ok(IdentityForm::Folder {
+            holder: standing,
+            path,
+        }) = read_identity_form(entry.path())
+            && standing.eq_ignore_ascii_case(&holder)
+        {
+            found.push(FolderScope {
+                dir: dir.to_path_buf(),
+                owner: owner.to_ascii_lowercase(),
+                name: name.to_ascii_lowercase(),
+                path,
+                checkout: None,
+                enclosing: Vec::new(),
+            });
+        }
+    }
+    found
+}
+
+/// Every other working copy of `copy`'s holder standing over the same
+/// files and recording state, each beside the recorded path its paths are
+/// counted from — none for the holder's checkout: the holder's at the
+/// scope's checkout, each enclosing folder's, and each folder's whose
+/// folder form stands on disk below `copy`'s root.
+fn copies_over_the_same_files(
+    copy: &WorkingCopy,
+) -> Result<Vec<(WorkingCopy, Option<String>)>, CliError> {
+    let cache = copy.cache_dir();
+    let mut copies = Vec::new();
+    if let Some(scope) = &copy.folder {
+        if let Some(checkout) = &scope.checkout
+            && let Some(holder) =
+                WorkingCopy::open_existing(&cache, &copy.owner, &copy.name, checkout)?
+        {
+            copies.push((holder, None));
+        }
+        for enclosing in &scope.enclosing {
+            if let Some(other) = WorkingCopy::open_existing_folder(&cache, enclosing)? {
+                copies.push((other, Some(enclosing.path.clone())));
+            }
+        }
+    }
+    for below in folders_below(&copy.root, &copy.owner, &copy.name) {
+        if let Some(other) = WorkingCopy::open_existing_folder(&cache, &below)? {
+            copies.push((other, Some(below.path.clone())));
+        }
+    }
+    copies.retain(|(other, _)| other.state_dir != copy.state_dir);
+    Ok(copies)
+}
+
+/// A path counted from a copy's root, counted from the holder's root.
+fn from_holder_root(recorded: Option<&str>, path: &str) -> String {
+    match recorded {
+        Some(recorded) => format!("{recorded}/{path}"),
+        None => path.to_string(),
+    }
+}
+
+/// The resolution of another working copy of the holder standing over the
+/// same files whose local, remote, collision or combined paths, counted
+/// from the holder's root, name one `names` admits, beside that copy's
+/// directory (SPEC u291 `converge` 4); none where no copy holds one.
+pub(crate) fn resolution_elsewhere(
+    copy: &WorkingCopy,
+    names: impl Fn(&str) -> bool,
+) -> Result<Option<(Resolution, PathBuf)>, CliError> {
+    for (other, recorded) in copies_over_the_same_files(copy)? {
+        let Some(standing) = other.resolution()? else {
+            continue;
+        };
+        let named = standing
+            .local_paths
+            .iter()
+            .chain(standing.remote_paths.iter())
+            .chain(standing.collisions.iter().map(|(path, _)| path))
+            .chain(standing.combined_paths.iter())
+            .any(|path| names(&from_holder_root(recorded.as_deref(), path)));
+        if named {
+            return Ok(Some((standing, other.root.clone())));
+        }
+    }
+    Ok(None)
 }
 
 struct Candidate<'a> {
@@ -1208,6 +1634,8 @@ struct Candidate<'a> {
     /// once and applied to every collection; `None` leaves the first pass
     /// to decide it from its own collection.
     hold_root_identity: Option<bool>,
+    /// Where every collection of the run is taken from (SPEC u291).
+    root: &'a FolderRoot,
 }
 
 /// Where a pass's write takes its bytes from.
@@ -1299,6 +1727,10 @@ async fn prepare_candidate(
     // untouched, which the next pass takes afresh (`D-093`).
     let mut snapshots_written = false;
     let mut untouched: BTreeSet<String> = BTreeSet::new();
+    // SPEC u291 `converge` 4: the holder's review lock, taken once a pass
+    // goes on to write a resolution and released once it is written.
+    let mut review: Option<ReviewLock> = None;
+    let recorded = copy.folder.as_ref().map(|scope| scope.path.as_str());
 
     // A preparation resumed over a resolution a killed or failed run left
     // half-written keeps that run's summaries, and counts a path already
@@ -1326,7 +1758,7 @@ async fn prepare_candidate(
         // a pass refused on a file changed since its collection.
         let mut folder = match first_folder.take() {
             Some(folder) => folder,
-            None => collect_folder(copy, opts, &forget, true)?,
+            None => collect_folder(copy, opts, &forget, true, candidate.root)?,
         };
         forget.clear();
         if *hold.get_or_insert_with(|| {
@@ -1385,6 +1817,7 @@ async fn prepare_candidate(
                 client,
                 token,
                 &repo,
+                recorded,
                 &head_commit,
                 &head_wanted,
                 &held,
@@ -1398,6 +1831,7 @@ async fn prepare_candidate(
                     client,
                     token,
                     &repo,
+                    recorded,
                     base_commit,
                     &base_wanted,
                     &held,
@@ -1523,6 +1957,37 @@ async fn prepare_candidate(
             );
         }
         let writes = kept_writes;
+
+        // SPEC u291 `converge` 4 — where this pass goes on to write a
+        // resolution, take the holder's review lock, then prepare nothing
+        // over a path another copy standing over the same files holds a
+        // resolution for.
+        let resolving = candidate.force_resolution
+            || resolution.is_some()
+            || !collisions.is_empty()
+            || !rec.collisions.is_empty()
+            || !held_collisions.is_empty()
+            || candidate.publishing && (!local_paths.is_empty() || !rec.local_only.is_empty());
+        if resolving {
+            if review.is_none() {
+                review = Some(review_lock(copy)?);
+            }
+            let ours: BTreeSet<String> = local_paths
+                .iter()
+                .chain(rec.local_only.iter())
+                .chain(remote_paths.iter())
+                .chain(rec.remote_only.iter())
+                .chain(collisions.keys())
+                .chain(rec.collisions.iter().map(|(path, _)| path))
+                .chain(held_collisions.iter().map(|(path, _)| path))
+                .chain(resumed_combined.iter())
+                .chain(candidate_hashes.keys())
+                .map(|path| from_holder_root(recorded, path))
+                .collect();
+            if let Some((standing, dir)) = resolution_elsewhere(copy, |path| ours.contains(path))? {
+                return Ok(Prepared::Elsewhere(standing, dir));
+            }
+        }
 
         // `converge` 5 — the snapshots, each content in a file of its
         // own. Replaced whole where no resolution stood when the run began
@@ -1673,6 +2138,8 @@ async fn prepare_candidate(
             copy.write_resolution(&next)?;
             resolution = Some(next);
         }
+        // The resolution stands: the review lock goes with it.
+        review = None;
 
         // `converge` 6 — every write before any removal, but for a removal
         // clearing the way for a write, each path hashed again immediately
@@ -1769,8 +2236,11 @@ fn prepared_outcome(prepared: Prepared) -> SyncOutcome {
             removed,
             published: None,
         },
-        Prepared::Resolution(resolution) => SyncOutcome::ResolutionRequired(resolution),
+        Prepared::Resolution(resolution) => SyncOutcome::ResolutionRequired(resolution, None),
         Prepared::Attention(resolution) => SyncOutcome::AttentionRequired(resolution),
+        Prepared::Elsewhere(resolution, dir) => {
+            SyncOutcome::ResolutionRequired(resolution, Some(dir))
+        }
     }
 }
 
@@ -1799,7 +2269,7 @@ async fn settle_outbox(
     // 2 sends nothing, so a retrieval holding no credential settles a
     // landed publication too, before it compares anything against a base
     // that publication left behind.
-    let has_base = copy.base().is_some();
+    let has_base = base_of(copy).is_some();
     let head = read_head(client, token, copy, reading_for(mode), has_base).await?;
 
     let excluded = excluded_on_disk(copy, &outbox.tree, head.files.keys());
@@ -1870,12 +2340,135 @@ pub async fn converge(
     mode: ConvergeMode,
     opts: SmartPushOptions,
 ) -> Result<SyncOutcome, CliError> {
+    let before = recorded_at_of(copy);
+    let outcome = converge_locked(client, token, copy, mode, opts).await;
+    // SPEC u291 `converge` 6: with the folder copy's lock released, the
+    // base the run recorded is laid over every copy enclosing it.
+    lay_recorded_base(copy, before, &outcome);
+    outcome
+}
+
+/// The time the base a folder copy records carries, read before a run so
+/// the run can tell whether it recorded one; none for every other copy.
+fn recorded_at_of(copy: &WorkingCopy) -> Option<Option<Option<u64>>> {
+    copy.folder
+        .as_ref()
+        .map(|_| copy.base().map(|base| base.recorded_at()))
+}
+
+/// Where a run on a folder copy recorded a base, lay it over every copy
+/// enclosing the folder, the commit a publication landed standing in for
+/// the parent it claimed (SPEC u291 `converge` 6).
+fn lay_recorded_base(
+    copy: &WorkingCopy,
+    before: Option<Option<Option<u64>>>,
+    outcome: &Result<SyncOutcome, CliError>,
+) {
+    let Some(before) = before else {
+        return;
+    };
+    let Some(base) = copy.base() else {
+        return;
+    };
+    if Some(base.recorded_at()) == before {
+        return;
+    }
+    let published = match outcome {
+        Ok(SyncOutcome::Synced {
+            published: Some((response, _, meta)),
+            ..
+        }) if !response.commit_sha.is_empty() => {
+            Some((meta.sent_parent.clone(), response.commit_sha.clone()))
+        }
+        _ => None,
+    };
+    lay_over_enclosing(copy, &base, published);
+}
+
+/// Lay `base`, recorded on the folder copy `copy`, over the base of the
+/// holder's working copy at the scope's checkout and of each enclosing
+/// folder's copy, one at a time under that copy's lock (SPEC u291
+/// Behaviour, `converge` 6): each folder path laid at its place, each path
+/// under the folder the folder's base lacks taken out, the copy's commit
+/// standing — or becoming the landed commit where `published` claimed it
+/// as its parent — and the copy's own recorded time kept. A copy recording
+/// no base is left with none, and a failed write leaves a base as it stood.
+pub(crate) fn lay_over_enclosing(
+    copy: &WorkingCopy,
+    base: &Manifest,
+    published: Option<(Option<String>, String)>,
+) {
+    let Some(scope) = &copy.folder else {
+        return;
+    };
+    let cache = copy.cache_dir();
+    let mut targets: Vec<(WorkingCopy, Option<String>)> = Vec::new();
+    if let Some(checkout) = &scope.checkout
+        && let Ok(Some(holder)) =
+            WorkingCopy::open_existing(&cache, &copy.owner, &copy.name, checkout)
+    {
+        targets.push((holder, None));
+    }
+    for enclosing in &scope.enclosing {
+        if let Ok(Some(other)) = WorkingCopy::open_existing_folder(&cache, enclosing) {
+            targets.push((other, Some(enclosing.path.clone())));
+        }
+    }
+    for (target, recorded) in targets {
+        let Ok(_lock) = target.lock() else {
+            continue;
+        };
+        let Some(standing) = target.base() else {
+            continue;
+        };
+        // A path of the folder counted from the target's root.
+        let counted = |path: &str| -> String {
+            let from_holder = format!("{}/{path}", scope.path);
+            match &recorded {
+                Some(recorded) => from_holder[recorded.len() + 1..].to_string(),
+                None => from_holder,
+            }
+        };
+        let mut files: HashMap<String, String> = standing
+            .file_paths()
+            .filter(|path| !lies_under(&from_holder_root(recorded.as_deref(), path), &scope.path))
+            .filter_map(|path| {
+                standing
+                    .file_sha(path)
+                    .map(|sha| (path.to_string(), sha.to_string()))
+            })
+            .collect();
+        for path in base.file_paths() {
+            if let Some(sha) = base.file_sha(path) {
+                files.insert(counted(path), sha.to_string());
+            }
+        }
+        let commit = match (&published, standing.commit_sha()) {
+            (Some((Some(parent), landed)), Some(commit)) if commit == parent => landed.clone(),
+            (_, commit) => commit.unwrap_or_default().to_string(),
+        };
+        if let Err(err) = target.record_laid_base(&commit, files, standing.recorded_at()) {
+            eprintln!("warning: could not record the working copy base: {err}");
+        }
+    }
+}
+
+/// `converge` under the copy's state lock, held for the whole run.
+async fn converge_locked(
+    client: &SynsClient,
+    token: Option<&str>,
+    copy: &WorkingCopy,
+    mode: ConvergeMode,
+    opts: SmartPushOptions,
+) -> Result<SyncOutcome, CliError> {
     let _lock = copy.lock()?;
     let opts = with_run_budget(opts);
 
-    // 1 — the run's staging, then the one collection the run hands on.
+    // 1 — the run's staging, then the one collection the run hands on,
+    // taken from where the copy stands (SPEC u291 `converge` 2).
     let staging = Staging::open(&opts.cache_dir)?;
-    let folder = collect_folder(copy, &opts, &[], true)?;
+    let root = folder_root(client, token, copy).await?;
+    let folder = collect_folder(copy, &opts, &[], true, &root)?;
 
     // 3 — the too-large line, once per run, outside machine-readable
     // mode; a bare publication whose own summary carries it writes it
@@ -1902,12 +2495,23 @@ pub async fn converge(
                     &staging,
                     Some(parent),
                     Some(folder),
+                    &root,
                 )
                 .await
             }
         },
         Ok(OutboxStep::CarryOn) => {
-            converge_from_resolution(client, token, copy, mode, opts, &staging, Some(folder)).await
+            converge_from_resolution(
+                client,
+                token,
+                copy,
+                mode,
+                opts,
+                &staging,
+                Some(folder),
+                &root,
+            )
+            .await
         }
     };
 
@@ -1928,6 +2532,7 @@ pub async fn converge(
 
 /// `converge` 4 to 12, under a lock the caller holds. `folder` is the
 /// run's own collection, taken where the caller took none.
+#[allow(clippy::too_many_arguments)]
 async fn converge_from_resolution(
     client: &SynsClient,
     token: Option<&str>,
@@ -1936,6 +2541,7 @@ async fn converge_from_resolution(
     opts: SmartPushOptions,
     staging: &Staging,
     folder: Option<Folder>,
+    root: &FolderRoot,
 ) -> Result<SyncOutcome, CliError> {
     // 4
     let resolution = copy.resolution()?;
@@ -1951,6 +2557,7 @@ async fn converge_from_resolution(
                 mode,
                 standing.clone(),
                 folder,
+                root,
             )
             .await;
         }
@@ -1960,10 +2567,11 @@ async fn converge_from_resolution(
         match mode {
             ConvergeMode::Publish if standing.reviewed_tree.is_some() => {
                 let token = token.ok_or(CliError::AuthRequired)?;
-                return publish_reviewed(client, token, copy, opts, staging, None, folder).await;
+                return publish_reviewed(client, token, copy, opts, staging, None, folder, root)
+                    .await;
             }
             ConvergeMode::Retrieve { overwrite: true } => {}
-            _ => return Ok(SyncOutcome::ResolutionRequired(standing.clone())),
+            _ => return Ok(SyncOutcome::ResolutionRequired(standing.clone(), None)),
         }
     }
 
@@ -1986,7 +2594,7 @@ async fn converge_from_resolution(
     // and the head that steps 7 to 12 compare, write and remove from.
     let mut folder = match folder {
         Some(folder) => folder,
-        None => collect_folder(copy, &opts, &[], true)?,
+        None => collect_folder(copy, &opts, &[], true, root)?,
     };
     let hold = holds_root_identity(
         matches!(mode, ConvergeMode::Retrieve { .. }),
@@ -2043,7 +2651,7 @@ async fn converge_from_resolution(
             ConvergeMode::Retrieve { .. } => Ok(SyncOutcome::NoChanges),
             ConvergeMode::Publish => {
                 let token = token.ok_or(CliError::AuthRequired)?;
-                publish_reviewed(client, token, copy, opts, staging, None, Some(folder)).await
+                publish_reviewed(client, token, copy, opts, staging, None, Some(folder), root).await
             }
         };
     }
@@ -2063,6 +2671,7 @@ async fn converge_from_resolution(
             existing: None,
             force_resolution: false,
             hold_root_identity: Some(hold),
+            root,
         },
         Some(folder),
     )
@@ -2084,6 +2693,7 @@ async fn finish_preparation(
     mode: ConvergeMode,
     standing: Resolution,
     folder: Option<Folder>,
+    root: &FolderRoot,
 ) -> Result<SyncOutcome, CliError> {
     let base = load_base(copy);
     let base_files = match &standing.base_commit {
@@ -2115,6 +2725,7 @@ async fn finish_preparation(
             existing: Some(standing),
             force_resolution: true,
             hold_root_identity: None,
+            root,
         },
         folder,
     )
@@ -2160,6 +2771,7 @@ async fn overwrite_with_head(
             client,
             token,
             &repo_id(copy),
+            copy.folder.as_ref().map(|scope| scope.path.as_str()),
             &head_commit,
             &wanted,
             &opts.held_bytes(),
@@ -2424,6 +3036,7 @@ async fn publish_reviewed(
     staging: &Staging,
     resumed: Option<Option<String>>,
     reviewed: Option<Folder>,
+    root: &FolderRoot,
 ) -> Result<SyncOutcome, CliError> {
     let mut reviewed = reviewed;
     let mut forget: Vec<String> = Vec::new();
@@ -2434,7 +3047,7 @@ async fn publish_reviewed(
         // path's record entry dropped first.
         let folder = match reviewed.take() {
             Some(folder) => folder,
-            None => collect_folder(copy, &opts, &forget, true)?,
+            None => collect_folder(copy, &opts, &forget, true, root)?,
         };
         forget.clear();
         let mut resolution = copy.resolution()?;
@@ -2451,12 +3064,12 @@ async fn publish_reviewed(
                     union_sorted(&mut standing.combined_paths, changed);
                     copy.write_resolution(standing)?;
                     copy.remove_outbox()?;
-                    return Ok(SyncOutcome::ResolutionRequired(standing.clone()));
+                    return Ok(SyncOutcome::ResolutionRequired(standing.clone(), None));
                 }
                 Some(_) => {}
                 None => {
                     copy.remove_outbox()?;
-                    return Ok(SyncOutcome::ResolutionRequired(standing.clone()));
+                    return Ok(SyncOutcome::ResolutionRequired(standing.clone(), None));
                 }
             }
 
@@ -2467,7 +3080,7 @@ async fn publish_reviewed(
                     continue;
                 };
                 match marked_text(&copy.root, path, file, &held) {
-                    Ok(true) => return Ok(SyncOutcome::ResolutionRequired(standing.clone())),
+                    Ok(true) => return Ok(SyncOutcome::ResolutionRequired(standing.clone(), None)),
                     Ok(false) => {}
                     Err(CliError::CollectedSetChanged { paths }) => {
                         forget = paths;
@@ -2480,7 +3093,7 @@ async fn publish_reviewed(
             // 3
             for check in read_required_checks(&copy.root)? {
                 if !run_check(&copy.root, &check) {
-                    return Ok(SyncOutcome::ResolutionRequired(standing.clone()));
+                    return Ok(SyncOutcome::ResolutionRequired(standing.clone(), None));
                 }
             }
         }
@@ -2518,6 +3131,9 @@ async fn publish_reviewed(
         push_opts.parent_sha = parent.clone();
         push_opts.reference = Some(to_hash_map(&reference));
         push_opts.expected = resolution.as_ref().map(|_| to_hash_map(&hashes));
+        // SPEC u291 `converge` 5: a folder copy publishes under its
+        // recorded path, with no local record and no identity file.
+        push_opts.folder = copy.folder.as_ref().map(|scope| scope.path.clone());
         // The publication walks nothing: it publishes from this pass's
         // collection (SPEC u280 `converge` 1).
         push_opts.collected = Some(folder.into_collected());
@@ -2553,7 +3169,7 @@ async fn publish_reviewed(
                 // 7
                 copy.remove_outbox()?;
                 return guard_refused(
-                    client, token, copy, &opts, staging, resolution, parent, reference,
+                    client, token, copy, &opts, staging, resolution, parent, reference, root,
                 )
                 .await;
             }
@@ -2577,6 +3193,7 @@ async fn guard_refused(
     resolution: Option<Resolution>,
     parent: Option<String>,
     reference: BTreeMap<String, String>,
+    root: &FolderRoot,
 ) -> Result<SyncOutcome, CliError> {
     let refused_round = resolution.as_ref().map(|r| r.round).unwrap_or(1).max(1);
     let raised = resolution.map(|mut standing| {
@@ -2593,7 +3210,7 @@ async fn guard_refused(
         tokio::time::sleep(Duration::from_secs(BACKOFF_SECONDS[index])).await;
     }
 
-    let has_base = copy.base().is_some();
+    let has_base = base_of(copy).is_some();
     let head = read_head(
         client,
         Some(token),
@@ -2624,6 +3241,7 @@ async fn guard_refused(
             existing,
             force_resolution: true,
             hold_root_identity: Some(false),
+            root,
         },
         None,
     )
@@ -2647,16 +3265,41 @@ pub async fn continue_resolution(
     copy: &WorkingCopy,
     opts: SmartPushOptions,
 ) -> Result<SyncOutcome, CliError> {
+    let before = recorded_at_of(copy);
+    let outcome = continue_locked(client, token, copy, opts).await;
+    // SPEC u291 `converge` 6.
+    lay_recorded_base(copy, before, &outcome);
+    outcome
+}
+
+/// `continue_resolution` under the copy's state lock.
+async fn continue_locked(
+    client: &SynsClient,
+    token: &str,
+    copy: &WorkingCopy,
+    opts: SmartPushOptions,
+) -> Result<SyncOutcome, CliError> {
     // 1
     let _lock = copy.lock()?;
     let opts = with_run_budget(opts);
     let staging = Staging::open(&opts.cache_dir)?;
+    let root = folder_root(client, Some(token), copy).await?;
 
     // 2
     match settle_outbox(client, Some(token), copy, ConvergeMode::Publish).await? {
         OutboxStep::Completed(outcome) => return Ok(outcome),
         OutboxStep::Resume(parent) => {
-            return publish_reviewed(client, token, copy, opts, &staging, Some(parent), None).await;
+            return publish_reviewed(
+                client,
+                token,
+                copy,
+                opts,
+                &staging,
+                Some(parent),
+                None,
+                &root,
+            )
+            .await;
         }
         OutboxStep::CarryOn => {}
     }
@@ -2669,6 +3312,7 @@ pub async fn continue_resolution(
             opts,
             &staging,
             None,
+            &root,
         )
         .await;
     };
@@ -2684,17 +3328,28 @@ pub async fn continue_resolution(
             opts,
             &staging,
             None,
+            &root,
         )
         .await;
     }
 
     // 3 — the one collection, recorded as reviewed and handed on.
-    let folder = collect_folder(copy, &opts, &[], true)?;
+    let folder = collect_folder(copy, &opts, &[], true, &root)?;
     resolution.reviewed_tree = Some(folder.hashes.clone());
     copy.write_resolution(&resolution)?;
 
     // 4
-    publish_reviewed(client, token, copy, opts, &staging, None, Some(folder)).await
+    publish_reviewed(
+        client,
+        token,
+        copy,
+        opts,
+        &staging,
+        None,
+        Some(folder),
+        &root,
+    )
+    .await
 }
 
 /// Put the folder back as it stood before the resolution rewrote it,
@@ -2772,13 +3427,14 @@ pub async fn working_copy_state(
     )
     .await?;
 
-    // 3
+    // 3 — collected from where the copy stands (SPEC u291 `converge` 2).
+    let root = folder_root(client, token, copy).await?;
     #[cfg(unix)]
     let mut record = Some(copy.stat_record());
     #[cfg(not(unix))]
     let mut record: Option<StatRecord> = None;
-    let collected = collect_files(
-        &copy.root,
+    let collected = collect_in_place(
+        &root,
         &[],
         CollectOptions::default(),
         record.as_mut(),
@@ -2808,6 +3464,7 @@ pub async fn working_copy_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::push::collector::SkipReason;
     use std::cell::RefCell;
 
     thread_local! {
@@ -2870,6 +3527,8 @@ mod tests {
             held: None,
             json_output: false,
             renders_publication_summary: false,
+            folder: None,
+            declined_parent: None,
         };
         let head = Head {
             commit: Some("h1".into()),
@@ -2898,6 +3557,7 @@ mod tests {
                 existing: None,
                 force_resolution: false,
                 hold_root_identity: Some(false),
+                root: &FolderRoot::whole(&copy.root),
             },
             None,
         )
@@ -2919,6 +3579,400 @@ mod tests {
             std::fs::read(folder.path().join("a.md")).unwrap(),
             b"a\nagent\nc\n"
         );
+    }
+
+    fn bare_opts(cache: &Path) -> SmartPushOptions {
+        SmartPushOptions {
+            force: false,
+            message: "push".into(),
+            author: None,
+            parent_sha: None,
+            excludes: vec![],
+            cache_dir: cache.to_path_buf(),
+            description: None,
+            tags: None,
+            status: None,
+            visibility: None,
+            strict: false,
+            allow_empty: false,
+            debug: false,
+            no_default_excludes: false,
+            prefix: None,
+            reference: None,
+            expected: None,
+            provenance: None,
+            collected: None,
+            held: None,
+            json_output: false,
+            renders_publication_summary: false,
+            folder: None,
+            declined_parent: None,
+        }
+    }
+
+    fn scope_at(dir: &Path, path: &str, checkout: Option<PathBuf>) -> FolderScope {
+        FolderScope {
+            dir: dir.to_path_buf(),
+            owner: "alice".into(),
+            name: "r".into(),
+            path: path.into(),
+            checkout,
+            enclosing: Vec::new(),
+        }
+    }
+
+    // ---- u291: the folder's reads ----------------------------------------
+
+    // SPEC u291 Behaviour, `read_folder_tree` 1–3: a folder tree counted
+    // from the folder, and where the head lacks the folder the root read
+    // without recursion and the folder again at the commit it names.
+    #[tokio::test]
+    async fn a_folder_tree_is_counted_from_the_folder_and_an_absent_one_reads_empty() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/r/tree/clients/q3"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "entries": [
+                    {"name": "a.md", "path": "clients/q3/a.md", "type": "file", "size": 1, "sha": "1".repeat(40)},
+                    {"name": "d", "path": "clients/q3/d", "type": "dir", "size": null, "sha": null},
+                ],
+                "commitSha": "h1", "truncated": false,
+            })))
+            .mount(&server)
+            .await;
+        let not_found =
+            || ResponseTemplate::new(404).set_body_json(serde_json::json!({"error": "not_found"}));
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/r/tree/clients/gone"))
+            .respond_with(not_found())
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/r/tree"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "entries": [], "commitSha": "h3", "truncated": false,
+            })))
+            .mount(&server)
+            .await;
+        let client = SynsClient::new(&server.uri()).unwrap();
+
+        let head = read_folder_tree(&client, None, "alice/r", "clients/q3", None)
+            .await
+            .unwrap();
+        assert_eq!(head.commit.as_deref(), Some("h1"));
+        assert_eq!(
+            head.files,
+            BTreeMap::from([("a.md".to_string(), "1".repeat(40))])
+        );
+
+        let empty = read_folder_tree(&client, None, "alice/r", "clients/gone", None)
+            .await
+            .unwrap();
+        assert_eq!(empty.commit.as_deref(), Some("h3"));
+        assert!(empty.files.is_empty());
+        let requests = server.received_requests().await.unwrap();
+        let reads: Vec<(String, Option<String>, Option<String>)> = requests[1..]
+            .iter()
+            .map(|r| {
+                let query = |key: &str| {
+                    r.url
+                        .query_pairs()
+                        .find(|(k, _)| k == key)
+                        .map(|(_, v)| v.to_string())
+                };
+                (r.url.path().to_string(), query("recursive"), query("ref"))
+            })
+            .collect();
+        assert_eq!(
+            reads,
+            vec![
+                (
+                    "/api/v1/repos/alice/r/tree/clients/gone".to_string(),
+                    Some("true".to_string()),
+                    None
+                ),
+                ("/api/v1/repos/alice/r/tree".to_string(), None, None),
+                (
+                    "/api/v1/repos/alice/r/tree/clients/gone".to_string(),
+                    Some("true".to_string()),
+                    Some("h3".to_string())
+                ),
+            ]
+        );
+        let _ = query_param("ref", "h3");
+    }
+
+    // SPEC u291 Behaviour, `read_holder_synsignore` 1, and `read_blobs`
+    // with a folder.
+    #[tokio::test]
+    async fn the_holder_synsignore_and_folder_contents_are_read_at_their_places() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/r/raw/.synsignore"))
+            .and(query_param("ref", "h1"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"*.env\n".to_vec()))
+            .mount(&server)
+            .await;
+        for (at, error) in [("h2", "not_found"), ("h3", "repo_not_found")] {
+            Mock::given(method("GET"))
+                .and(path("/api/v1/repos/alice/r/raw/.synsignore"))
+                .and(query_param("ref", at))
+                .respond_with(
+                    ResponseTemplate::new(404).set_body_json(serde_json::json!({"error": error})),
+                )
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/r/raw/clients/q3/a.md"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"a".to_vec()))
+            .mount(&server)
+            .await;
+        let client = SynsClient::new(&server.uri()).unwrap();
+        assert_eq!(
+            read_holder_synsignore(&client, None, "alice/r", Some("h1"))
+                .await
+                .unwrap(),
+            Some(b"*.env\n".to_vec())
+        );
+        for at in ["h2", "h3"] {
+            assert_eq!(
+                read_holder_synsignore(&client, None, "alice/r", Some(at))
+                    .await
+                    .unwrap(),
+                None,
+                "{at}"
+            );
+        }
+        let cache = tempfile::tempdir().unwrap();
+        let staging = Staging::open(cache.path()).unwrap();
+        let wanted = BTreeMap::from([("a.md".to_string(), (blob_sha1(b"a"), Some(1)))]);
+        let blobs = read_blobs(
+            &client,
+            None,
+            "alice/r",
+            Some("clients/q3"),
+            "h1",
+            &wanted,
+            &HeldBytes::new(HELD_BYTES_BUDGET),
+            &staging,
+        )
+        .await
+        .unwrap();
+        assert_eq!(&*blobs["a.md"].load().unwrap(), b"a");
+    }
+
+    // SPEC u291 `converge` 2: a folder copy inside a checkout is collected
+    // as a collection rooted at the checkout and confined to the folder,
+    // the checkout's ignore files applying, every path counted from the
+    // folder.
+    #[test]
+    fn a_folder_copy_is_collected_from_its_checkout() {
+        let cache = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        let w = std::fs::canonicalize(tree.path()).unwrap();
+        let folder = w.join("clients/q3");
+        std::fs::create_dir_all(folder.join("sub")).unwrap();
+        std::fs::write(w.join(".synsignore"), "*.env\n").unwrap();
+        std::fs::write(w.join("outside.md"), "o").unwrap();
+        std::fs::write(folder.join("a.md"), "a").unwrap();
+        std::fs::write(folder.join("k.env"), "k").unwrap();
+        std::fs::write(folder.join("sub/b.md"), "b").unwrap();
+        let scope = scope_at(&folder, "clients/q3", Some(w.clone()));
+        let copy = WorkingCopy::open_folder(cache.path(), &scope).unwrap();
+        let root = FolderRoot::of_scope(&copy.root, &scope, None);
+
+        let collected = collect_folder(&copy, &bare_opts(cache.path()), &[], true, &root).unwrap();
+        assert_eq!(
+            collected.hashes.keys().cloned().collect::<Vec<_>>(),
+            vec!["a.md".to_string(), "sub/b.md".to_string()]
+        );
+        assert_eq!(
+            collected
+                .skipped
+                .iter()
+                .map(|s| (s.path.clone(), s.reason))
+                .collect::<Vec<_>>(),
+            vec![("k.env".to_string(), SkipReason::Synsignore)]
+        );
+        #[cfg(unix)]
+        assert!(
+            copy.stat_record()
+                .entries
+                .keys()
+                .all(|path| !path.starts_with("clients/")),
+            "the record counts its paths from the folder"
+        );
+        assert_eq!(exclude_under("clients/q3", "*.tmp"), "*.tmp");
+        assert_eq!(
+            exclude_under("clients/q3", "sub/b.md"),
+            "clients/q3/sub/b.md"
+        );
+        assert_eq!(exclude_under("clients/q3", "/a.md"), "/clients/q3/a.md");
+        assert_eq!(exclude_under("clients/q3", "dist/"), "dist/");
+    }
+
+    // SPEC u291 Behaviour, `converge` 6.
+    #[test]
+    fn a_folder_base_is_laid_over_its_holders_base() {
+        let cache = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        let w = std::fs::canonicalize(tree.path()).unwrap();
+        std::fs::create_dir_all(w.join("clients/q3")).unwrap();
+        let holder = WorkingCopy::open(cache.path(), "alice", "r", &w).unwrap();
+        holder
+            .record_laid_base(
+                "h1",
+                HashMap::from([
+                    (".page/x.json".to_string(), "x1".to_string()),
+                    ("clients/q3/a.md".to_string(), "a1".to_string()),
+                    ("clients/q3/gone.md".to_string(), "g1".to_string()),
+                ]),
+                Some(5),
+            )
+            .unwrap();
+        let scope = scope_at(&w.join("clients/q3"), "clients/q3", Some(w.clone()));
+        let folder = WorkingCopy::open_folder(cache.path(), &scope).unwrap();
+        folder
+            .record_base(
+                "h3",
+                HashMap::from([
+                    ("a.md".to_string(), "a3".to_string()),
+                    ("b.md".to_string(), "b3".to_string()),
+                ]),
+            )
+            .unwrap();
+
+        lay_over_enclosing(
+            &folder,
+            &folder.base().unwrap(),
+            Some((Some("h1".into()), "h3".into())),
+        );
+        let laid = holder.base().unwrap();
+        assert_eq!(laid.commit_sha(), Some("h3"));
+        assert_eq!(laid.file_sha(".page/x.json"), Some("x1"));
+        assert_eq!(laid.file_sha("clients/q3/a.md"), Some("a3"));
+        assert_eq!(laid.file_sha("clients/q3/b.md"), Some("b3"));
+        assert_eq!(laid.file_sha("clients/q3/gone.md"), None);
+        assert_eq!(laid.recorded_at(), Some(5));
+
+        // A retrieval keeps the commit standing.
+        lay_over_enclosing(&folder, &folder.base().unwrap(), None);
+        assert_eq!(holder.base().unwrap().commit_sha(), Some("h3"));
+
+        // A copy recording no base is left with none.
+        let bare = tempfile::tempdir().unwrap();
+        let v = std::fs::canonicalize(bare.path()).unwrap();
+        std::fs::create_dir_all(v.join("clients/q3")).unwrap();
+        let other_holder = WorkingCopy::open(cache.path(), "alice", "r", &v).unwrap();
+        let other_scope = scope_at(&v.join("clients/q3"), "clients/q3", Some(v.clone()));
+        let other_folder = WorkingCopy::open_folder(cache.path(), &other_scope).unwrap();
+        other_folder
+            .record_base(
+                "h3",
+                HashMap::from([("a.md".to_string(), "a3".to_string())]),
+            )
+            .unwrap();
+        lay_over_enclosing(&other_folder, &other_folder.base().unwrap(), None);
+        assert!(other_holder.base().is_none());
+    }
+
+    // SPEC u291 Behaviour, `converge` 4: a preparation over a path
+    // another copy of the holder holds a resolution for prepares nothing
+    // and answers that resolution and that copy's directory.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_review_pending_in_another_copy_holds_this_one_off_its_paths() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let base: &[u8] = b"a\nb\n";
+        let head_bytes: &[u8] = b"a\nHEAD\n";
+        let server = MockServer::start().await;
+        for (at, bytes) in [("h0", base), ("h1", head_bytes)] {
+            Mock::given(method("GET"))
+                .and(path("/api/v1/repos/alice/r/raw/f/a.md"))
+                .and(query_param("ref", at))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
+                .mount(&server)
+                .await;
+        }
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        let w = std::fs::canonicalize(tree.path()).unwrap();
+        std::fs::create_dir_all(w.join("f")).unwrap();
+        std::fs::write(w.join(".syns.yaml"), "owner: alice\nname: r\n").unwrap();
+        std::fs::write(w.join("f/.syns.yaml"), "holder: alice/r\npath: f\n").unwrap();
+        std::fs::write(w.join("f/a.md"), b"a\nlocal\n").unwrap();
+
+        let scope = scope_at(&w.join("f"), "f", Some(w.clone()));
+        let folder = WorkingCopy::open_folder(cache.path(), &scope).unwrap();
+        let standing = Resolution {
+            recovery_id: "rec-f".into(),
+            base_commit: Some("h0".into()),
+            head_commit: "h1".into(),
+            round: 1,
+            local_paths: vec![],
+            remote_paths: vec![],
+            collisions: vec![("a.md".into(), CollisionKind::ModifyModify)],
+            combined_paths: vec!["a.md".into()],
+            reviewed_tree: None,
+            pending_writes: None,
+        };
+        folder.write_resolution(&standing).unwrap();
+
+        let holder = WorkingCopy::open(cache.path(), "alice", "r", &w).unwrap();
+        let staging = Staging::open(cache.path()).unwrap();
+        let identity = blob_sha1(b"owner: alice\nname: r\n");
+        let folder_identity = blob_sha1(b"holder: alice/r\npath: f\n");
+        let head = Head {
+            commit: Some("h1".into()),
+            files: BTreeMap::from([
+                (".syns.yaml".to_string(), identity.clone()),
+                ("f/.syns.yaml".to_string(), folder_identity.clone()),
+                ("f/a.md".to_string(), blob_sha1(head_bytes)),
+            ]),
+            sizes: BTreeMap::new(),
+            truncated: false,
+        };
+        let prepared = prepare_candidate(
+            &client,
+            None,
+            &holder,
+            &bare_opts(cache.path()),
+            &staging,
+            Candidate {
+                base_commit: Some("h0".into()),
+                base_files: BTreeMap::from([
+                    (".syns.yaml".to_string(), identity),
+                    ("f/.syns.yaml".to_string(), folder_identity),
+                    ("f/a.md".to_string(), blob_sha1(base)),
+                ]),
+                head: &head,
+                publishing: false,
+                existing: None,
+                force_resolution: false,
+                hold_root_identity: Some(false),
+                root: &FolderRoot::whole(&holder.root),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        match prepared {
+            Prepared::Elsewhere(resolution, dir) => {
+                assert_eq!(resolution, standing);
+                assert_eq!(dir, folder.root);
+            }
+            _ => panic!("expected the review standing elsewhere"),
+        }
+        assert!(holder.resolution().unwrap().is_none());
+        assert!(!holder.local_snapshot_path().exists());
+        assert!(!holder.remote_snapshot_path().exists());
+        assert_eq!(std::fs::read(w.join("f/a.md")).unwrap(), b"a\nlocal\n");
     }
 
     #[test]
@@ -3064,9 +4118,11 @@ mod tests {
                 })
                 .collect();
 
-            let answers = read_blobs(&client, None, "alice/r", "h", &wanted, &held, &staging)
-                .await
-                .unwrap();
+            let answers = read_blobs(
+                &client, None, "alice/r", None, "h", &wanted, &held, &staging,
+            )
+            .await
+            .unwrap();
 
             assert_eq!(
                 most.load(Ordering::SeqCst),
@@ -3115,6 +4171,7 @@ mod tests {
             &client,
             None,
             "alice/r",
+            None,
             "h1",
             &wanted(&[("image.png", png), ("a.md", text)]),
             &held,
@@ -3138,6 +4195,7 @@ mod tests {
             &client,
             None,
             "alice/r",
+            None,
             "h2",
             &wanted(&[("image.png", png)]),
             &held,

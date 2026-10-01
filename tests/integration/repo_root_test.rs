@@ -585,9 +585,18 @@ async fn bare_pull_from_subdirectory_writes_into_the_repository_root() {
 
     {
         let _cwd = CwdGuard::enter(&root.join("sub"));
-        cmd_pull(&ctx.config, &ctx.output, None, None, None, false, false)
-            .await
-            .unwrap();
+        cmd_pull(
+            &ctx.config,
+            &ctx.output,
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
     }
 
     assert!(
@@ -628,9 +637,18 @@ async fn bare_pull_from_subdirectory_reconciles_at_the_repository_root() {
 
     {
         let _cwd = CwdGuard::enter(&root.join("sub"));
-        cmd_pull(&ctx.config, &ctx.output, None, None, None, false, false)
-            .await
-            .unwrap();
+        cmd_pull(
+            &ctx.config,
+            &ctx.output,
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
     }
 
     assert!(
@@ -663,6 +681,7 @@ async fn pull_of_another_repository_below_an_identity_file_refuses() {
             None,
             false,
             false,
+            None,
         )
         .await
     };
@@ -805,6 +824,7 @@ async fn pull_into_a_relative_destination_writes_no_nested_identity_file() {
             None,
             false,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -937,6 +957,7 @@ async fn pull_into_a_relative_destination_resolves_the_repository_above_it() {
             None,
             false,
             false,
+            None,
         )
         .await
         .expect("a relative destination must resolve the repository above it");
@@ -997,6 +1018,7 @@ async fn pull_of_another_repository_where_an_identity_file_stands_refuses() {
             None,
             false,
             false,
+            None,
         )
         .await
     };

@@ -100,13 +100,18 @@ pub async fn cmd_edit(
     // 2 — read the path at the parent, addressing it by the resolved
     // version's decimal ordinal where one stands and by the full hash
     // otherwise (`Q-02`).
+    // SPEC u291 `cmd_edit` 1: inside a folder the content edited is the
+    // one at the folder's path joined with the positional, a path leaving
+    // the folder refused before the read; every refusal and the caption
+    // name the positional as typed.
+    let repository_path = target.repository_path(&path)?;
     let client = SynsClient::new(config.server_url())?;
     let reference = target.parent.read_ref();
     let (response, _raw) = client
         .get_file(
             &target.repo_id,
             Some(&target.token),
-            &path,
+            &repository_path,
             Some(&reference),
         )
         .await

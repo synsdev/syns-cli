@@ -123,6 +123,9 @@ enum Commands {
         /// Rewrite local edits with the repository head (a snapshot of each is kept)
         #[arg(long)]
         overwrite: bool,
+        /// Check out this folder of the named repository alone, as a working copy of its own
+        #[arg(long = "path", value_name = "FOLDER")]
+        folder: Option<String>,
     },
     /// Converge this working copy with the repository head, publishing reviewed local work
     Sync {
@@ -510,6 +513,7 @@ async fn run(
             version,
             if_repo,
             overwrite,
+            folder,
         } => {
             // SPEC u262 `run` 1: the positionals bind by spelling before any
             // identity or credential is read; a malformed first of two ends
@@ -526,6 +530,7 @@ async fn run(
                 version,
                 if_repo,
                 overwrite,
+                folder,
             )
             .await?
         }

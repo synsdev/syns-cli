@@ -164,6 +164,158 @@ pub struct CollectOptions {
     /// walk would then report every out-of-scope path as dropped and
     /// `--strict` would refuse every scoped publication.
     pub prefix: Option<String>,
+    /// SPEC u291, `CollectOptions.holder_synsignore`: the walk root's
+    /// `/`-joined place under the holder's root and the bytes of the
+    /// holder's root `.synsignore`, for a collection standing in no
+    /// checkout of its holder. Its lines, anchored at the holder's root
+    /// and matched against each path joined under that place, decide a
+    /// path no `.synsignore` on disk between the walk root and it
+    /// matches, ranking above every `.ignore` and `.gitignore` match at
+    /// any depth, and every path left out carries the reason a
+    /// collection rooted at the holder's root gives it. None leaves both
+    /// walks as u255 and u280 give them.
+    pub holder_synsignore: Option<(String, Vec<u8>)>,
+}
+
+/// The root a holder's `.synsignore` lines are anchored at: no directory
+/// on disk, each walked path joined under it at the walk root's place.
+const HOLDER_ROOT: &str = "/__syns_holder_root__";
+
+/// A walked path counted from the walk root, joined under the holder's
+/// root at the walk root's `place`.
+fn under_holder_root(place: &str, rel: &str) -> PathBuf {
+    match (place.is_empty(), rel.is_empty()) {
+        (true, _) => PathBuf::from(format!("{HOLDER_ROOT}/{rel}")),
+        (false, true) => PathBuf::from(format!("{HOLDER_ROOT}/{place}")),
+        (false, false) => PathBuf::from(format!("{HOLDER_ROOT}/{place}/{rel}")),
+    }
+}
+
+/// The holder's lines as one matcher anchored at `HOLDER_ROOT`, its
+/// negations dropped where `positive_only` holds.
+fn holder_matcher(bytes: &[u8], positive_only: bool) -> Gitignore {
+    let mut builder = GitignoreBuilder::new(HOLDER_ROOT);
+    let from = PathBuf::from(format!("{HOLDER_ROOT}/.synsignore"));
+    for line in String::from_utf8_lossy(bytes).lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if positive_only && trimmed.starts_with('!') {
+            continue;
+        }
+        let _ = builder.add_line(Some(from.clone()), trimmed);
+    }
+    builder.build().unwrap_or_else(|_| Gitignore::empty())
+}
+
+/// Every ignore file named `filename` under `root`, one matcher per
+/// directory holding one, keyed by that directory.
+fn ignore_chain(root: &Path, filename: &str) -> HashMap<PathBuf, Gitignore> {
+    let mut chain = HashMap::new();
+    for entry in WalkBuilder::new(root)
+        .hidden(false)
+        .require_git(false)
+        .parents(false)
+        .standard_filters(false)
+        .filter_entry(|entry| entry.file_name() != OsStr::new(".git"))
+        .build()
+        .flatten()
+    {
+        if entry.file_name() != OsStr::new(filename)
+            || !entry.file_type().is_some_and(|ft| ft.is_file())
+        {
+            continue;
+        }
+        let Some(dir) = entry.path().parent() else {
+            continue;
+        };
+        let mut builder = GitignoreBuilder::new(dir);
+        builder.add(entry.path());
+        if let Ok(matcher) = builder.build() {
+            chain.insert(dir.to_path_buf(), matcher);
+        }
+    }
+    chain
+}
+
+/// The rules a collection handed the holder's root `.synsignore` decides
+/// each walked entry by, in the rank a walk from the holder's root gives
+/// them: the `.synsignore` files on disk nearest first, the holder's
+/// lines, the `.ignore` files, the `.gitignore` files, the global
+/// gitignore (`SPEC_REVIEW_R3.md` R-01, `SPEC_REVIEW_R4.md` R-01).
+struct HolderRules {
+    root: PathBuf,
+    place: String,
+    holder: Gitignore,
+    synsignore: HashMap<PathBuf, Gitignore>,
+    ignore: HashMap<PathBuf, Gitignore>,
+    gitignore: HashMap<PathBuf, Gitignore>,
+    global: Gitignore,
+}
+
+impl HolderRules {
+    fn new(root: &Path, place: &str, bytes: &[u8]) -> HolderRules {
+        HolderRules {
+            root: root.to_path_buf(),
+            place: place.to_string(),
+            holder: holder_matcher(bytes, false),
+            synsignore: ignore_chain(root, ".synsignore"),
+            ignore: ignore_chain(root, ".ignore"),
+            gitignore: ignore_chain(root, ".gitignore"),
+            global: GitignoreBuilder::new("").build_global().0,
+        }
+    }
+
+    /// The nearest matcher of one kind, from the entry's directory up to
+    /// the walk root, that matches it.
+    fn chain_match(
+        &self,
+        chain: &HashMap<PathBuf, Gitignore>,
+        path: &Path,
+        is_dir: bool,
+    ) -> Match<()> {
+        let mut dir = path.parent();
+        while let Some(at) = dir {
+            if !at.starts_with(&self.root) {
+                break;
+            }
+            if let Some(matcher) = chain.get(at) {
+                let matched = matcher.matched(path, is_dir);
+                if !matched.is_none() {
+                    return matched.map(|_| ());
+                }
+            }
+            dir = at.parent();
+        }
+        Match::None
+    }
+
+    /// Whether the walk keeps the entry at `path`.
+    fn keeps(&self, path: &Path, is_dir: bool) -> bool {
+        let Ok(rel) = path.strip_prefix(&self.root) else {
+            return true;
+        };
+        let Some(rel) = to_forward_slash(rel) else {
+            return true;
+        };
+        if rel.is_empty() {
+            return true;
+        }
+        let decided = [
+            self.chain_match(&self.synsignore, path, is_dir),
+            self.holder
+                .matched(under_holder_root(&self.place, &rel), is_dir)
+                .map(|_| ()),
+            self.chain_match(&self.ignore, path, is_dir),
+            self.chain_match(&self.gitignore, path, is_dir),
+            self.global.matched(path, is_dir).map(|_| ()),
+        ]
+        .into_iter()
+        .find(|matched| !matched.is_none())
+        .unwrap_or(Match::None);
+        !decided.is_ignore()
+    }
 }
 
 /// One reason a file was excluded from the push. First match wins per
@@ -349,7 +501,29 @@ fn build_positive_only_matcher(
     extra_filenames: &[&str],
     debug: bool,
 ) -> Gitignore {
-    let mut builder = GitignoreBuilder::new(source);
+    build_positive_only_matcher_at(source, source, filename, extra_filenames, &[], debug)
+}
+
+/// `build_positive_only_matcher` with every line anchored at `anchor`
+/// rather than at the directory walked, and `extra_lines` — the holder's
+/// root `.synsignore` lines (SPEC u291) — added beside them.
+fn build_positive_only_matcher_at(
+    source: &Path,
+    anchor: &Path,
+    filename: &str,
+    extra_filenames: &[&str],
+    extra_lines: &[u8],
+    debug: bool,
+) -> Gitignore {
+    let mut builder = GitignoreBuilder::new(anchor);
+    let holder_from = PathBuf::from(format!("{HOLDER_ROOT}/.synsignore"));
+    for line in String::from_utf8_lossy(extra_lines).lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('!') {
+            continue;
+        }
+        let _ = builder.add_line(Some(holder_from.clone()), trimmed);
+    }
     for entry in WalkBuilder::new(source)
         .hidden(false)
         .require_git(false)
@@ -456,11 +630,27 @@ pub fn collect_files(
     let no_default_excludes = opts.no_default_excludes;
     let kept_root = path.to_path_buf();
     let kept_prefix = opts.prefix.clone();
-    let kept_walker = WalkBuilder::new(path)
+    // SPEC u291: handed the holder's root `.synsignore`, the walk decides
+    // every entry by the ranked rules itself rather than by the crate's
+    // filters, which have no place to rank a file standing nowhere.
+    let holder_rules = opts
+        .holder_synsignore
+        .as_ref()
+        .map(|(place, bytes)| Arc::new(HolderRules::new(path, place, bytes)));
+    let kept_rules = holder_rules.clone();
+    let mut kept_builder = WalkBuilder::new(path);
+    match &holder_rules {
+        None => {
+            kept_builder.add_custom_ignore_filename(".synsignore");
+        }
+        Some(_) => {
+            kept_builder.standard_filters(false);
+        }
+    }
+    let kept_walker = kept_builder
         .hidden(false)
         .require_git(false)
         .parents(false)
-        .add_custom_ignore_filename(".synsignore")
         .overrides(user_overrides.clone())
         .filter_entry(move |entry| {
             let name = entry.file_name();
@@ -473,13 +663,16 @@ pub fn collect_files(
             {
                 return false;
             }
-            if let Some(prefix) = kept_prefix.as_deref() {
-                let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
-                if !prefix_admits(&kept_root, prefix, entry.path(), is_dir) {
-                    return false;
-                }
+            let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+            if let Some(prefix) = kept_prefix.as_deref()
+                && !prefix_admits(&kept_root, prefix, entry.path(), is_dir)
+            {
+                return false;
             }
-            true
+            match &kept_rules {
+                Some(rules) => rules.keeps(entry.path(), is_dir),
+                None => true,
+            }
         })
         .build();
 
@@ -576,9 +769,35 @@ pub fn collect_files(
     // read. The positive-only matchers disambiguate Gitignore vs
     // Synsignore; the gitignore chain also folds in `.ignore` files (M2
     // case 1).
-    let attribution_gitignore =
-        build_positive_only_matcher(path, ".gitignore", &[".ignore"], opts.debug);
-    let attribution_synsignore = build_positive_only_matcher(path, ".synsignore", &[], opts.debug);
+    // SPEC u291: handed the holder's root `.synsignore`, every line is
+    // anchored at the holder's root and every path matched joined under
+    // the walk root's place, as a collection rooted there attributes it.
+    let (attribution_gitignore, attribution_synsignore) = match &opts.holder_synsignore {
+        None => (
+            build_positive_only_matcher(path, ".gitignore", &[".ignore"], opts.debug),
+            build_positive_only_matcher(path, ".synsignore", &[], opts.debug),
+        ),
+        Some((_, bytes)) => {
+            let anchor = Path::new(HOLDER_ROOT);
+            (
+                build_positive_only_matcher_at(
+                    path,
+                    anchor,
+                    ".gitignore",
+                    &[".ignore"],
+                    &[],
+                    opts.debug,
+                ),
+                build_positive_only_matcher_at(path, anchor, ".synsignore", &[], bytes, opts.debug),
+            )
+        }
+    };
+    let attributed = |rel_path_str: &str, rel_path_buf: &Path| -> PathBuf {
+        match &opts.holder_synsignore {
+            Some((place, _)) => under_holder_root(place, rel_path_str),
+            None => rel_path_buf.to_path_buf(),
+        }
+    };
     let full_root = path.to_path_buf();
     let full_prefix = opts.prefix.clone();
     let full_walker = WalkBuilder::new(path)
@@ -644,12 +863,14 @@ pub fn collect_files(
         ) {
             SkipReason::UserExclude
         } else if matches!(
-            attribution_gitignore.matched_path_or_any_parents(&rel_path_buf, false),
+            attribution_gitignore
+                .matched_path_or_any_parents(attributed(&rel_path_str, &rel_path_buf), false),
             Match::Ignore(_)
         ) {
             SkipReason::Gitignore
         } else if matches!(
-            attribution_synsignore.matched_path_or_any_parents(&rel_path_buf, false),
+            attribution_synsignore
+                .matched_path_or_any_parents(attributed(&rel_path_str, &rel_path_buf), false),
             Match::Ignore(_)
         ) {
             SkipReason::Synsignore
@@ -910,6 +1131,82 @@ mod tests {
             None,
             &HeldBytes::new(HELD_BYTES_BUDGET),
         )
+    }
+
+    /// The kept paths and the skips, sorted.
+    fn kept_and_skipped(result: &CollectResult) -> (Vec<String>, Vec<(String, SkipReason)>) {
+        let mut kept: Vec<String> = result.files.keys().cloned().collect();
+        kept.sort();
+        let mut skipped: Vec<(String, SkipReason)> = result
+            .skipped
+            .iter()
+            .map(|s| (s.path.clone(), s.reason))
+            .collect();
+        skipped.sort_by(|a, b| a.0.cmp(&b.0));
+        (kept, skipped)
+    }
+
+    // SPEC u291 Tests, `a_folder_collected_alone_keeps_and_attributes_as_its_holder_root_does`.
+    #[test]
+    fn a_folder_collected_alone_keeps_and_attributes_as_its_holder_root_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = dir.path();
+        let folder = h.join("clients/vela/q3-board");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(h.join(".synsignore"), "*.dat\n!wanted.log\n").unwrap();
+        for (name, content) in [
+            (".gitignore", "*.log\n/anch.dat\n"),
+            (".ignore", "!i.dat\n"),
+            ("a.md", "a"),
+            ("anch.dat", "d"),
+            ("i.dat", "i"),
+            ("wanted.log", "w"),
+            ("other.log", "o"),
+        ] {
+            std::fs::write(folder.join(name), content).unwrap();
+        }
+        let holder = std::fs::read(h.join(".synsignore")).unwrap();
+
+        let alone = collect(
+            &folder,
+            &[],
+            CollectOptions {
+                holder_synsignore: Some(("clients/vela/q3-board".into(), holder)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (kept, skipped) = kept_and_skipped(&alone);
+        assert_eq!(kept, vec![".gitignore", ".ignore", "a.md", "wanted.log"]);
+        assert_eq!(
+            skipped,
+            vec![
+                ("anch.dat".to_string(), SkipReason::Synsignore),
+                ("i.dat".to_string(), SkipReason::Synsignore),
+                ("other.log".to_string(), SkipReason::Gitignore),
+            ]
+        );
+
+        let whole = collect(h, &[], CollectOptions::default()).unwrap();
+        let (whole_kept, whole_skipped) = kept_and_skipped(&whole);
+        let under = |path: &str| {
+            path.strip_prefix("clients/vela/q3-board/")
+                .map(str::to_string)
+        };
+        assert_eq!(
+            whole_kept
+                .iter()
+                .filter_map(|p| under(p))
+                .collect::<Vec<_>>(),
+            kept
+        );
+        assert_eq!(
+            whole_skipped
+                .iter()
+                .filter_map(|(p, r)| under(p).map(|p| (p, *r)))
+                .collect::<Vec<_>>(),
+            skipped
+        );
     }
 
     fn held_bytes(file: &CollectedFile) -> &[u8] {
@@ -1333,6 +1630,7 @@ mod tests {
                 no_default_excludes: true,
                 debug: false,
                 prefix: None,
+                holder_synsignore: None,
             },
         )
         .unwrap();

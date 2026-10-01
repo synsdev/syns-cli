@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -91,6 +92,16 @@ pub struct SmartPushOptions {
     /// itself — a bare `syns push` does — so a convergence leaves the
     /// too-large line to that summary where the publication lands.
     pub renders_publication_summary: bool,
+    /// SPEC u291, `SmartPushOptions.folder`: the recorded path of the
+    /// scoped folder a publication is made from. Where set, every path a
+    /// request carries is this folder joined with the collected path, and
+    /// the publication reads and writes no local record and writes no
+    /// identity file; unset, every request stands as u255 and u280 give it.
+    pub folder: Option<String>,
+    /// SPEC u291, `SmartPushOptions.declined_parent`: the parent a forced
+    /// run held and claimed none of, answered as its meta's
+    /// `unclaimed_parent`.
+    pub declined_parent: Option<String>,
 }
 
 impl Clone for SmartPushOptions {
@@ -118,6 +129,8 @@ impl Clone for SmartPushOptions {
             held: self.held.clone(),
             json_output: self.json_output,
             renders_publication_summary: self.renders_publication_summary,
+            folder: self.folder.clone(),
+            declined_parent: self.declined_parent.clone(),
         }
     }
 }
@@ -233,13 +246,27 @@ fn base64_len(n: usize) -> usize {
     n.div_ceil(3) * 4
 }
 
+/// A collected path as a request carries it: joined under the scoped
+/// folder's recorded path where one stands (SPEC u291 `smart_push` 2).
+fn wire_path<'a>(folder: Option<&str>, path: &'a str) -> Cow<'a, str> {
+    match folder {
+        Some(folder) => Cow::Owned(format!("{folder}/{path}")),
+        None => Cow::Borrowed(path),
+    }
+}
+
 /// The pending entry for one collected file, its bytes taken through
 /// `read_collected` and none of them kept.
-fn pend(root: &Path, path: &str, file: &CollectedFile) -> Result<PendingEntry, CliError> {
+fn pend(
+    root: &Path,
+    path: &str,
+    file: &CollectedFile,
+    folder: Option<&str>,
+) -> Result<PendingEntry, CliError> {
     let bytes = read_collected(root, path, file)?;
     let text = is_text(&bytes);
     let frame = serde_json::to_vec(&PushFileEntry {
-        path: path.to_string(),
+        path: wire_path(folder, path).into_owned(),
         sha: file.sha.clone(),
         content: text.then(String::new),
         content_base64: (!text).then(String::new),
@@ -277,6 +304,7 @@ fn build_push_entries(
     reference_shas: &HashMap<String, String>,
     force: bool,
     prefix: Option<&str>,
+    folder: Option<&str>,
 ) -> Result<(Vec<PendingEntry>, Vec<PushDeleteEntry>), CliError> {
     let mut changed: Vec<&String> = local_files
         .iter()
@@ -286,7 +314,7 @@ fn build_push_entries(
     changed.sort();
     let mut entries = Vec::with_capacity(changed.len());
     for path in changed {
-        entries.push(pend(root, path, &local_files[path])?);
+        entries.push(pend(root, path, &local_files[path], folder)?);
     }
 
     let mut deletes = Vec::new();
@@ -300,7 +328,9 @@ fn build_push_entries(
             {
                 continue;
             }
-            deletes.push(PushDeleteEntry { path: path.clone() });
+            deletes.push(PushDeleteEntry {
+                path: wire_path(folder, path).into_owned(),
+            });
         }
     }
 
@@ -312,6 +342,7 @@ fn build_push_entries(
 fn hash_only_entries(
     local_files: &HashMap<String, CollectedFile>,
     pending: &[PendingEntry],
+    folder: Option<&str>,
 ) -> Vec<PushFileEntry> {
     let carried: std::collections::HashSet<&str> =
         pending.iter().map(|p| p.path.as_str()).collect();
@@ -319,7 +350,7 @@ fn hash_only_entries(
         .iter()
         .filter(|(path, _)| !carried.contains(path.as_str()))
         .map(|(path, file)| PushFileEntry {
-            path: path.clone(),
+            path: wire_path(folder, path).into_owned(),
             sha: file.sha.clone(),
             content: None,
             content_base64: None,
@@ -348,6 +379,7 @@ fn fill_batch(
     frame: &PushRequest,
     batch: &[PendingEntry],
     scratch: &mut Vec<u8>,
+    folder: Option<&str>,
 ) -> Result<Vec<u8>, CliError> {
     let unserialisable = |e: serde_json::Error| CliError::Io {
         message: format!("could not serialise a request body: {e}"),
@@ -376,7 +408,7 @@ fn fill_batch(
             (None, None) => break,
             (Some(_), None) => false,
             (None, Some(_)) => true,
-            (Some(c), Some(p)) => p.path < c.path,
+            (Some(c), Some(p)) => *wire_path(folder, &p.path) < *c.path,
         };
         if !first {
             body.push(b',');
@@ -384,7 +416,7 @@ fn fill_batch(
         first = false;
         if next_is_pending {
             let entry = pending.next().expect("peeked");
-            write_pending(&mut body, root, local_files, entry, scratch)?;
+            write_pending(&mut body, root, local_files, entry, scratch, folder)?;
         } else {
             let entry = carried.next().expect("peeked");
             serde_json::to_writer(&mut body, entry).map_err(unserialisable)?;
@@ -404,6 +436,7 @@ fn write_pending(
     local_files: &HashMap<String, CollectedFile>,
     entry: &PendingEntry,
     scratch: &mut Vec<u8>,
+    folder: Option<&str>,
 ) -> Result<(), CliError> {
     let changed = || CliError::CollectedSetChanged {
         paths: vec![entry.path.clone()],
@@ -420,7 +453,7 @@ fn write_pending(
         }
     };
     body.extend_from_slice(b"{\"path\":");
-    serde_json::to_writer(&mut *body, &entry.path).map_err(unserialisable)?;
+    serde_json::to_writer(&mut *body, &*wire_path(folder, &entry.path)).map_err(unserialisable)?;
     body.extend_from_slice(b",\"sha\":");
     serde_json::to_writer(&mut *body, &entry.sha).map_err(unserialisable)?;
     if entry.text {
@@ -643,6 +676,10 @@ struct Target<'a> {
     owner: &'a str,
     name: &'a str,
     record_base: &'a HashMap<String, String>,
+    /// The scoped folder every carried path is joined under (SPEC u291).
+    folder: Option<&'a str>,
+    /// Whether the run keeps a local record: none inside a folder.
+    saves_record: bool,
 }
 
 /// One publication pass (SPEC u280 `smart_push` 4): `pending` sent beside
@@ -665,6 +702,7 @@ async fn publish_pass(
             request,
             pending,
             &mut scratch,
+            target.folder,
         )
         .map_err(PassRefusal::standing)?;
         match target
@@ -741,6 +779,7 @@ async fn chunked_push(
             base_request,
             &only_batch,
             scratch,
+            target.folder,
         )
         .map_err(PassRefusal::standing)?;
         let bytes_sent = body.len() as u64;
@@ -808,7 +847,14 @@ async fn chunked_push(
             frame.deletions = base_request.deletions.clone();
         }
         // The batch's body is built only now, as it is sent.
-        let body = match fill_batch(target.root, target.local_files, &frame, batch, scratch) {
+        let body = match fill_batch(
+            target.root,
+            target.local_files,
+            &frame,
+            batch,
+            scratch,
+            target.folder,
+        ) {
             Ok(body) => body,
             Err(err) => {
                 batch_failed(k1, &previous_commit_sha);
@@ -850,7 +896,7 @@ async fn chunked_push(
                 // and the server keeping them for good. The Phase 6 write
                 // in `smart_push` takes them out, its batch being the one
                 // that carried them.
-                if k1 < n {
+                if k1 < n && target.saves_record {
                     let cumulative = merged_record(target.record_base, &[], &uploaded);
                     let mut manifest = Manifest::default();
                     manifest.update(response.commit_sha.clone(), cumulative);
@@ -889,8 +935,14 @@ async fn chunked_push(
 }
 
 /// The hash-only paths a `MISSING_BLOBS` refusal's `missing` map names —
-/// the ones a resend pends for their content (SPEC u280 `smart_push` 5).
-fn named_hash_only(error: &CliError, hash_only: &[PushFileEntry]) -> Vec<String> {
+/// the ones a resend pends for their content (SPEC u280 `smart_push` 5),
+/// each counted back from the scoped folder where one stands (SPEC u291
+/// `smart_push` 2).
+fn named_hash_only(
+    error: &CliError,
+    hash_only: &[PushFileEntry],
+    folder: Option<&str>,
+) -> Vec<String> {
     let CliError::Api {
         context: Some(ApiErrorContext::MissingBlobs { missing }),
         ..
@@ -901,7 +953,14 @@ fn named_hash_only(error: &CliError, hash_only: &[PushFileEntry]) -> Vec<String>
     hash_only
         .iter()
         .filter(|entry| missing.contains_key(&entry.path))
-        .map(|entry| entry.path.clone())
+        .filter_map(|entry| match folder {
+            Some(folder) => entry
+                .path
+                .strip_prefix(folder)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .map(str::to_string),
+            None => Some(entry.path.clone()),
+        })
         .collect()
 }
 
@@ -982,7 +1041,11 @@ pub async fn smart_push(
     // written here would land after that record and be refused by the
     // `expected` guard below — the command handlers write it before the
     // convergence collects instead (SPEC u256).
-    if opts.reference.is_none() {
+    //
+    // SPEC u291 `smart_push` 1: a publication from a scoped folder writes
+    // no identity file either.
+    let folder = opts.folder.clone();
+    if opts.reference.is_none() && folder.is_none() {
         write_syns_yaml_where_none_stands(path, owner, name)?;
     }
 
@@ -1001,6 +1064,7 @@ pub async fn smart_push(
                 no_default_excludes: opts.no_default_excludes,
                 debug: opts.debug,
                 prefix: opts.prefix.clone(),
+                holder_synsignore: None,
             },
             None,
             &opts.held_bytes(),
@@ -1059,6 +1123,10 @@ pub async fn smart_push(
     // names a parent.
     let (manifest_existed, record_base, remote_parent_sha) = match &opts.reference {
         Some(reference) => (!reference.is_empty(), reference.clone(), None),
+        // SPEC u291 `smart_push` 1: a publication from a scoped folder
+        // loads no local record and reads no tree; handed no reference it
+        // takes an empty one and claims no parent of its own.
+        None if folder.is_some() => (false, HashMap::new(), None),
         None => {
             // Phase 3b — Load manifest unconditionally (so
             // `manifest_existed` is set even when --force bypasses the
@@ -1115,7 +1183,11 @@ pub async fn smart_push(
         // SPEC u271: the parent `--force` drops rides out on the meta so
         // the command layer can name it — the flag keeps all three of
         // its shipped effects and the run says so (`D-007`).
-        (HashMap::new(), None, remote_parent_sha)
+        (
+            HashMap::new(),
+            None,
+            opts.declined_parent.clone().or(remote_parent_sha),
+        )
     } else {
         (record_base.clone(), remote_parent_sha, None)
     };
@@ -1135,8 +1207,9 @@ pub async fn smart_push(
         &reference_shas,
         opts.force,
         opts.prefix.as_deref(),
+        folder.as_deref(),
     )?;
-    let hash_only = hash_only_entries(&local_files, &pending);
+    let hash_only = hash_only_entries(&local_files, &pending, folder.as_deref());
 
     // Phase 4b — Empty guard. A publication is refused where it
     // carries neither a file nor a deletion, and ALSO where its walk
@@ -1172,7 +1245,15 @@ pub async fn smart_push(
     // The paths this run takes out of the local record (SPEC u255
     // `smart_push` 7). Captured before `deletes` is moved onto the
     // request.
-    let deleted_paths: Vec<String> = deletes.iter().map(|d| d.path.clone()).collect();
+    // Counted from the scoped folder where one stands, as the collection
+    // is, so a caller lays them over a base counted the same way.
+    let deleted_paths: Vec<String> = deletes
+        .iter()
+        .map(|d| match folder.as_deref() {
+            Some(folder) => d.path[folder.len() + 1..].to_string(),
+            None => d.path.clone(),
+        })
+        .collect();
 
     let deletions = if deletes.is_empty() {
         None
@@ -1210,6 +1291,8 @@ pub async fn smart_push(
         owner,
         name,
         record_base: &record_base,
+        folder: folder.as_deref(),
+        saves_record: folder.is_none(),
     };
     let mut pending = pending;
     let mut resent = false;
@@ -1221,7 +1304,7 @@ pub async fn smart_push(
         if resent || !refusal.resendable {
             return Err(refusal.error);
         }
-        let named = named_hash_only(&refusal.error, &request.files);
+        let named = named_hash_only(&refusal.error, &request.files, folder.as_deref());
         if named.is_empty() {
             return Err(refusal.error);
         }
@@ -1233,14 +1316,16 @@ pub async fn smart_push(
                     .ok_or_else(|| CliError::CollectedSetChanged {
                         paths: vec![named_path.clone()],
                     })?;
-            pending.push(pend(path, named_path, file)?);
+            pending.push(pend(path, named_path, file, folder.as_deref())?);
         }
         pending.sort_by(|a, b| a.path.cmp(&b.path));
-        request.files = hash_only_entries(&local_files, &pending);
+        request.files = hash_only_entries(&local_files, &pending, folder.as_deref());
     };
 
     // Phase 6 — Manifest save (guarded per SPEC u213 § 4 Phase 6).
-    if response.commit_sha.is_empty() {
+    if folder.is_some() {
+        // SPEC u291 `smart_push` 1: no local record inside a folder.
+    } else if response.commit_sha.is_empty() {
         eprintln!(
             "warning: server response had empty commit_sha; not updating local manifest \
              (this typically indicates that no files were uploaded — see `syns push --debug`)"
@@ -1342,6 +1427,8 @@ mod tests {
                 held: None,
                 json_output: false,
                 renders_publication_summary: false,
+                folder: None,
+                declined_parent: None,
             },
         )
         .await;
@@ -1449,6 +1536,8 @@ mod tests {
                 held: None,
                 json_output: false,
                 renders_publication_summary: false,
+                folder: None,
+                declined_parent: None,
             },
         )
         .await;
@@ -1538,6 +1627,8 @@ mod tests {
                 held: None,
                 json_output: false,
                 renders_publication_summary: false,
+                folder: None,
+                declined_parent: None,
             },
         )
         .await;
@@ -1646,6 +1737,8 @@ mod tests {
                 held: None,
                 json_output: false,
                 renders_publication_summary: false,
+                folder: None,
+                declined_parent: None,
             },
         )
         .await;
@@ -1747,6 +1840,8 @@ mod tests {
                 held: None,
                 json_output: false,
                 renders_publication_summary: false,
+                folder: None,
+                declined_parent: None,
             },
         )
         .await;
@@ -1804,6 +1899,8 @@ mod tests {
             held: None,
             json_output: false,
             renders_publication_summary: false,
+            folder: None,
+            declined_parent: None,
         }
     }
 
@@ -2184,6 +2281,8 @@ mod tests {
                 held: None,
                 json_output: false,
                 renders_publication_summary: false,
+                folder: None,
+                declined_parent: None,
             },
         )
         .await;
@@ -2314,6 +2413,8 @@ mod tests {
                 held: None,
                 json_output: false,
                 renders_publication_summary: false,
+                folder: None,
+                declined_parent: None,
             },
         )
         .await;
@@ -2456,6 +2557,8 @@ mod tests {
                 held: None,
                 json_output: false,
                 renders_publication_summary: false,
+                folder: None,
+                declined_parent: None,
             },
         )
         .await;
@@ -2597,6 +2700,8 @@ mod tests {
                 held: None,
                 json_output: false,
                 renders_publication_summary: false,
+                folder: None,
+                declined_parent: None,
             },
         )
         .await;
@@ -2653,6 +2758,7 @@ mod tests {
             &reference_shas,
             false,
             Some("sub"),
+            None,
         )
         .unwrap();
 
@@ -2666,8 +2772,15 @@ mod tests {
         let local_files: HashMap<String, CollectedFile> = HashMap::new();
         let reference_shas = sha_map(&[("root-a.md", "aaa"), ("sub/nested.md", "nnn")]);
 
-        let (_entries, deletes) =
-            build_push_entries(Path::new("."), &local_files, &reference_shas, false, None).unwrap();
+        let (_entries, deletes) = build_push_entries(
+            Path::new("."),
+            &local_files,
+            &reference_shas,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
 
         let mut paths: Vec<&str> = deletes.iter().map(|d| d.path.as_str()).collect();
         paths.sort_unstable();
@@ -2921,6 +3034,8 @@ mod unclaimed_parent_tests {
             held: None,
             json_output: false,
             renders_publication_summary: false,
+            folder: None,
+            declined_parent: None,
         }
     }
 
@@ -2986,6 +3101,107 @@ mod unclaimed_parent_tests {
             body.get("deletions").is_none(),
             "the flag names no deletion"
         );
+    }
+
+    /// SPEC u291 `smart_push` 1–2: with `folder` set every carried path
+    /// opens with the folder, a `MISSING_BLOBS` naming a folder path is
+    /// answered with that file's content, and no record and no identity
+    /// file is written.
+    #[tokio::test]
+    async fn a_folder_publication_carries_every_path_under_the_folder() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/repos/alice/notes/push"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "error": "missing_blobs",
+                "missing": {"clients/q3/a.md": blob_sha1(b"a")},
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        mount_push(&server).await;
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(folder.path().join("a.md"), "a").unwrap();
+        std::fs::write(folder.path().join("b.md"), "b two").unwrap();
+        let cache = tempfile::tempdir().unwrap();
+
+        let mut options = opts(cache.path(), false);
+        options.folder = Some("clients/q3".into());
+        options.parent_sha = Some(RECORDED.into());
+        options.reference = Some(HashMap::from([
+            ("a.md".to_string(), blob_sha1(b"a")),
+            ("b.md".to_string(), blob_sha1(b"b one")),
+            ("gone.md".to_string(), blob_sha1(b"g")),
+        ]));
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let (_response, _raw, meta) =
+            smart_push(&client, "t", "alice/notes", folder.path(), options)
+                .await
+                .unwrap();
+
+        let bodies: Vec<serde_json::Value> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.body_json().unwrap())
+            .collect();
+        assert_eq!(bodies.len(), 2);
+        for body in &bodies {
+            assert_eq!(body["parentSha"], serde_json::json!(RECORDED));
+            for file in body["files"].as_array().unwrap() {
+                assert!(
+                    file["path"].as_str().unwrap().starts_with("clients/q3/"),
+                    "{file}"
+                );
+            }
+            assert_eq!(
+                body["deletions"],
+                serde_json::json!([{"path": "clients/q3/gone.md"}])
+            );
+        }
+        let first_a = bodies[0]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["path"] == "clients/q3/a.md")
+            .unwrap();
+        assert!(first_a.get("content").is_none(), "{first_a}");
+        let resent_a = bodies[1]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["path"] == "clients/q3/a.md")
+            .unwrap();
+        assert_eq!(resent_a["content"], serde_json::json!("a"));
+        assert_eq!(meta.deleted, vec!["gone.md".to_string()]);
+        assert!(meta.collected.contains_key("a.md"));
+        assert!(!cache.path().join("alice").exists(), "a record was written");
+        assert!(!folder.path().join(".syns.yaml").exists());
+    }
+
+    /// SPEC u291 Contract Surface, `SmartPushOptions.declined_parent`: a
+    /// forced run answers the parent it was handed to decline as its
+    /// unclaimed parent.
+    #[tokio::test]
+    async fn a_forced_folder_run_names_its_declined_parent() {
+        let server = MockServer::start().await;
+        mount_push(&server).await;
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(folder.path().join("a.md"), "a").unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut options = opts(cache.path(), true);
+        options.folder = Some("clients/q3".into());
+        options.declined_parent = Some("p".into());
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let (_response, _raw, meta) =
+            smart_push(&client, "t", "alice/notes", folder.path(), options)
+                .await
+                .unwrap();
+        assert_eq!(meta.sent_parent, None);
+        assert_eq!(meta.unclaimed_parent.as_deref(), Some("p"));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "a folder run reads no tree");
     }
 
     /// An unforced run claims the record's parent, so there is nothing
@@ -3084,6 +3300,8 @@ mod u280_publication_tests {
             held: None,
             json_output: false,
             renders_publication_summary: false,
+            folder: None,
+            declined_parent: None,
         }
     }
 
@@ -3113,7 +3331,7 @@ mod u280_publication_tests {
         pending: &[PendingEntry],
     ) -> Vec<serde_json::Value> {
         let mut scratch = scratch_for(files, pending);
-        let body = fill_batch(root, files, &bare_frame(), pending, &mut scratch).unwrap();
+        let body = fill_batch(root, files, &bare_frame(), pending, &mut scratch, None).unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         body["files"].as_array().unwrap().clone()
     }
@@ -3138,8 +3356,15 @@ mod u280_publication_tests {
         assert!(collected.files.contains_key("notes.md"));
         assert!(collected.skipped.is_empty());
 
-        let (pending, _) =
-            build_push_entries(dir.path(), &collected.files, &HashMap::new(), false, None).unwrap();
+        let (pending, _) = build_push_entries(
+            dir.path(),
+            &collected.files,
+            &HashMap::new(),
+            false,
+            None,
+            None,
+        )
+        .unwrap();
         let filled = filled_entries(dir.path(), &collected.files, &pending);
         assert_eq!(filled.len(), 1);
         assert!(filled[0].get("content").is_none());
@@ -3167,8 +3392,15 @@ mod u280_publication_tests {
             &HeldBytes::new(0),
         )
         .unwrap();
-        let (pending, _) =
-            build_push_entries(dir.path(), &collected.files, &HashMap::new(), false, None).unwrap();
+        let (pending, _) = build_push_entries(
+            dir.path(),
+            &collected.files,
+            &HashMap::new(),
+            false,
+            None,
+            None,
+        )
+        .unwrap();
         let filled = filled_entries(dir.path(), &collected.files, &pending);
         assert_eq!(filled[0]["content"].as_str(), Some(text));
         assert_eq!(
@@ -3311,6 +3543,7 @@ mod u280_publication_tests {
                 &HashMap::new(),
                 false,
                 None,
+                None,
             )
             .unwrap();
             let mut scratch = scratch_for(&collected.files, &pending);
@@ -3327,6 +3560,7 @@ mod u280_publication_tests {
                 &frame,
                 &pending,
                 &mut scratch,
+                None,
             )
             .unwrap();
 

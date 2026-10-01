@@ -52,6 +52,11 @@ pub enum IdentityForm {
 struct FolderYaml {
     holder: String,
     path: String,
+    /// The commands a reviewed publication continued inside the folder
+    /// must pass (SPEC u291, the folder form's `checks`, `D-078`), none
+    /// where the file declares none.
+    #[serde(default)]
+    checks: Vec<String>,
 }
 
 fn parse_form_text(contents: &str) -> Result<IdentityForm, String> {
@@ -100,14 +105,32 @@ pub fn read_identity_form(file_path: &Path) -> Result<IdentityForm, CliError> {
     }
 }
 
+/// Either form of one identity file's text (SPEC u291, `identity_form_text`):
+/// the identity a `.syns.yaml` read from the server holds, a failure
+/// refused as the malformed-file error.
+pub(crate) fn identity_form_text(contents: &str) -> Result<IdentityForm, CliError> {
+    parse_form_text(contents).map_err(invalid)
+}
+
 /// The required checks the identity file standing at `root` declares,
-/// none where no identity file stands there or it declares none.
+/// in either form, none where no identity file stands there or it
+/// declares none (SPEC u291, the folder form's `checks`). A file mixing
+/// the two forms is refused as it is everywhere.
 pub fn read_required_checks(root: &Path) -> Result<Vec<String>, CliError> {
     let file_path = root.join(SYNS_YAML_FILENAME);
     if !file_path.is_file() {
         return Ok(Vec::new());
     }
-    Ok(parse_syns_yaml(&file_path)?.checks)
+    let contents = read_contents(&file_path)?;
+    let value: serde_yaml::Value = serde_yaml::from_str(&contents).map_err(invalid)?;
+    if value.get("holder").is_none() {
+        return Ok(parse_root_text(&contents).map_err(invalid)?.checks);
+    }
+    if value.get("owner").is_some() || value.get("name").is_some() {
+        return Err(invalid(MIXED_FORMS));
+    }
+    let folder: FolderYaml = serde_yaml::from_value(value).map_err(invalid)?;
+    Ok(folder.checks)
 }
 
 pub(crate) fn find_syns_yaml(path: &Path) -> Option<PathBuf> {
@@ -432,6 +455,48 @@ mod tests {
             read_syns_yaml(dir.path()).unwrap().unwrap().name,
             "proj",
             "an identity file carrying checks still resolves"
+        );
+    }
+
+    // SPEC u291, the folder form's `checks`: a folder form declaring
+    // `checks` answers them in order, one declaring none answers none,
+    // and a file mixing the forms is still refused.
+    #[test]
+    fn read_required_checks_answers_a_folder_forms_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".syns.yaml"),
+            "holder: alice/work\npath: clients/q3\nchecks:\n  - test -f a.md\n  - make lint\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_required_checks(dir.path()).unwrap(),
+            vec!["test -f a.md".to_string(), "make lint".to_string()]
+        );
+        fs::write(
+            dir.path().join(".syns.yaml"),
+            "holder: alice/work\npath: clients/q3\n",
+        )
+        .unwrap();
+        assert!(read_required_checks(dir.path()).unwrap().is_empty());
+        fs::write(
+            dir.path().join(".syns.yaml"),
+            "owner: alice\nname: work\nholder: alice/work\npath: x\nchecks: [a]\n",
+        )
+        .unwrap();
+        assert!(read_required_checks(dir.path()).is_err());
+        assert_eq!(
+            identity_form_text("holder: Alice/Work\npath: x\n").unwrap(),
+            IdentityForm::Folder {
+                holder: "Alice/Work".into(),
+                path: "x".into()
+            }
+        );
+        assert!(
+            identity_form_text("holder: [")
+                .unwrap_err()
+                .to_string()
+                .starts_with("invalid .syns.yaml: ")
         );
     }
 

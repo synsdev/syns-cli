@@ -398,6 +398,8 @@ mod tests {
             owner: "alice".into(),
             name: "work".into(),
             path: "clients/q3".into(),
+            checkout: None,
+            enclosing: Vec::new(),
         }
     }
 

@@ -25,7 +25,7 @@ use crate::push::converge::{
 use crate::push::reconcile::{CONFLICT_MARKERS, CollisionKind};
 use crate::push::smart::SmartPushOptions;
 use crate::push::working_copy::{Resolution, WorkingCopy};
-use crate::repo::if_repo::resolve_full_or_skip;
+use crate::repo::folder::{FolderScope, resolve_scoped_or_skip};
 use crate::repo::root::push_scope;
 use crate::repo::syns_yaml::write_syns_yaml_where_none_stands;
 
@@ -90,6 +90,8 @@ pub fn convergence_options(config: &Config) -> SmartPushOptions {
         held: None,
         json_output: false,
         renders_publication_summary: false,
+        folder: None,
+        declined_parent: None,
     }
 }
 
@@ -130,7 +132,11 @@ fn error_class(err: &CliError) -> Option<ErrorClass> {
         CliError::AuthRequired => Some(ErrorClass::Authentication),
         CliError::RepoIdentityUnknown { .. }
         | CliError::PushEmpty { .. }
-        | CliError::PushPartial { .. } => Some(ErrorClass::Local),
+        | CliError::PushPartial { .. }
+        // SPEC u291 `cmd_sync` 1: a misplaced folder is a local failure,
+        // ending as the validation failure outcome.
+        | CliError::FolderMoved { .. }
+        | CliError::FolderInAnotherCheckout { .. } => Some(ErrorClass::Local),
         CliError::PayloadTooLarge { .. } => Some(ErrorClass::Validation),
         CliError::Api {
             status: Some(_),
@@ -221,10 +227,30 @@ fn path_list(paths: &[String]) -> String {
     }
 }
 
+/// The elsewhere-review line (SPEC u291 Contract Surface): the review a
+/// run answered with stands in another working copy of the holder, whose
+/// absolute directory stands for `{root}`.
+pub const ELSEWHERE_REVIEW: &str = "This review stands in the working copy at {root}; run syns resolution show and syns resolution continue there.";
+
+/// The elsewhere-review line naming `root`.
+pub fn elsewhere_review_line(root: &Path) -> String {
+    ELSEWHERE_REVIEW.replace("{root}", &root.display().to_string())
+}
+
 /// The text an agent is handed when the repository advanced past its
-/// working copy's base while local work stood.
-fn render_resolution_instruction(repo_id: &str, resolution: &Resolution) -> String {
+/// working copy's base while local work stood, opening with the
+/// elsewhere-review line where the review stands in the working copy at
+/// `elsewhere` rather than the run's own (SPEC u291).
+fn render_resolution_instruction(
+    repo_id: &str,
+    resolution: &Resolution,
+    elsewhere: Option<&Path>,
+) -> String {
     let mut text = String::new();
+    if let Some(root) = elsewhere {
+        let _ = writeln!(text, "{}", elsewhere_review_line(root));
+        let _ = writeln!(text);
+    }
     let _ = writeln!(
         text,
         "The repository {repo_id} advanced while this working copy held local work. \
@@ -370,8 +396,9 @@ pub fn render_outcome(
             }
             Ok(())
         }
-        SyncOutcome::ResolutionRequired(resolution) => {
-            let instruction = render_resolution_instruction(repo_label, &resolution);
+        SyncOutcome::ResolutionRequired(resolution, elsewhere) => {
+            let instruction =
+                render_resolution_instruction(repo_label, &resolution, elsewhere.as_deref());
             if !output.is_json() {
                 println!("{instruction}");
             }
@@ -444,24 +471,42 @@ fn render_error(output: &Output, repo_id: Option<&str>, err: CliError) -> Result
     render_outcome(output, repo_id, outcome_for_error(err), Some(cause))
 }
 
-fn resolve_identity(
-    output: &Output,
-    if_repo: bool,
-) -> Result<Option<(PathBuf, String, String)>, CliError> {
+/// The working directory, the holder and the folder a run stands in
+/// (SPEC u291 `cmd_sync` 1): through `resolve_scoped_or_skip`, so a
+/// misplaced folder is refused rather than read as a skip.
+type Bound = (PathBuf, String, String, Option<FolderScope>);
+
+fn resolve_identity(output: &Output, if_repo: bool) -> Result<Option<Bound>, CliError> {
     let cwd = std::env::current_dir().map_err(|err| CliError::Io {
         message: format!("could not determine current directory: {err}"),
     })?;
-    Ok(resolve_full_or_skip(None, &cwd, if_repo, output)?.map(|(owner, name)| (cwd, owner, name)))
+    Ok(resolve_scoped_or_skip(&cwd, if_repo, output)?
+        .map(|(owner, name, folder)| (cwd, owner, name, folder)))
 }
 
+/// The folder copy inside a folder, and the copy at `push_scope`'s root
+/// otherwise.
 fn open_copy(
     config: &Config,
     cwd: &Path,
     owner: &str,
     name: &str,
+    folder: Option<&FolderScope>,
 ) -> Result<WorkingCopy, CliError> {
+    if let Some(scope) = folder {
+        return WorkingCopy::open_folder(config.cache_dir(), scope);
+    }
     let scope = push_scope(None, cwd, owner, name)?;
     WorkingCopy::open(config.cache_dir(), owner, name, &scope.root)
+}
+
+/// Write the identity file where a publication from `copy` would: never
+/// inside a folder, whose own identity file is the folder form.
+fn ensure_copy_identity(copy: &WorkingCopy, owner: &str, name: &str) -> Result<(), CliError> {
+    if copy.folder.is_some() {
+        return Ok(());
+    }
+    ensure_identity_file(&copy.root, owner, name)
 }
 
 fn load_token(config: &Config) -> Result<String, CliError> {
@@ -476,7 +521,7 @@ fn load_token(config: &Config) -> Result<String, CliError> {
 /// past the head, and render the one outcome.
 pub async fn cmd_sync(config: &Config, output: &Output, if_repo: bool) -> Result<(), CliError> {
     // 1
-    let (cwd, owner, name) = match resolve_identity(output, if_repo) {
+    let (cwd, owner, name, folder) = match resolve_identity(output, if_repo) {
         Ok(Some(identity)) => identity,
         Ok(None) => return render_outcome(output, None, SyncOutcome::NoRepository, None),
         Err(err) => return render_error(output, None, err),
@@ -485,12 +530,12 @@ pub async fn cmd_sync(config: &Config, output: &Output, if_repo: bool) -> Result
 
     let run = async {
         // 2
-        let copy = open_copy(config, &cwd, &owner, &name)?;
+        let copy = open_copy(config, &cwd, &owner, &name, folder.as_ref())?;
         // 3
         let token = load_token(config)?;
         // 4
         let client = SynsClient::new(config.server_url())?;
-        ensure_identity_file(&copy.root, &owner, &name)?;
+        ensure_copy_identity(&copy, &owner, &name)?;
         converge(
             &client,
             Some(&token),
@@ -511,7 +556,7 @@ pub async fn cmd_sync(config: &Config, output: &Output, if_repo: bool) -> Result
 
 enum Rendered {
     Outcome(SyncOutcome),
-    Shown(WorkingCopy, Resolution),
+    Shown(Box<WorkingCopy>, Resolution),
     Discarded(Resolution),
 }
 
@@ -541,7 +586,7 @@ fn render_shown(
     copy: &WorkingCopy,
     resolution: Resolution,
 ) -> Result<(), CliError> {
-    let instruction = render_resolution_instruction(repo_id, &resolution);
+    let instruction = render_resolution_instruction(repo_id, &resolution, None);
     let mut markers = serde_json::Map::new();
     for (path, _kind) in &resolution.collisions {
         let text = std::fs::read_to_string(copy.root.join(path)).unwrap_or_default();
@@ -594,7 +639,7 @@ pub async fn cmd_resolution(
     if_repo: bool,
 ) -> Result<(), CliError> {
     // 1
-    let (cwd, owner, name) = match resolve_identity(output, if_repo) {
+    let (cwd, owner, name, folder) = match resolve_identity(output, if_repo) {
         Ok(Some(identity)) => identity,
         Ok(None) => return render_outcome(output, None, SyncOutcome::NoRepository, None),
         Err(err) => return render_error(output, None, err),
@@ -602,18 +647,18 @@ pub async fn cmd_resolution(
     let repo_id = format!("{owner}/{name}");
 
     let run = async {
-        let copy = open_copy(config, &cwd, &owner, &name)?;
+        let copy = open_copy(config, &cwd, &owner, &name, folder.as_ref())?;
         match action {
             // 2
             ResolutionAction::Show => Ok(match copy.resolution()? {
-                Some(resolution) => Rendered::Shown(copy, resolution),
+                Some(resolution) => Rendered::Shown(Box::new(copy), resolution),
                 None => Rendered::Outcome(SyncOutcome::NoChanges),
             }),
             // 3
             ResolutionAction::Continue => {
                 let token = load_token(config)?;
                 let client = SynsClient::new(config.server_url())?;
-                ensure_identity_file(&copy.root, &owner, &name)?;
+                ensure_copy_identity(&copy, &owner, &name)?;
                 let outcome = continue_resolution(
                     &client,
                     &token,
@@ -703,6 +748,26 @@ mod tests {
                 },
                 "validation",
             ),
+            (
+                CliError::FolderMoved {
+                    dir: "/w/a/q3".into(),
+                    holder: "alice/work".into(),
+                    recorded: "q3".into(),
+                    actual: "a/q3".into(),
+                    checkout: "/w".into(),
+                    back: "/w/q3".into(),
+                },
+                "validation",
+            ),
+            (
+                CliError::FolderInAnotherCheckout {
+                    dir: "/v/q3".into(),
+                    holder: "alice/work".into(),
+                    checkout: "/v".into(),
+                    standing: "bob/other".into(),
+                },
+                "validation",
+            ),
             (api(409, "conflict"), "attention"),
             (api(500, "internal_error"), "attention"),
             (api(502, "unknown error"), "attention"),
@@ -759,7 +824,7 @@ mod tests {
         let (doc, exit) = refusal(render_outcome(
             &output,
             Some("alice/proj"),
-            SyncOutcome::ResolutionRequired(resolution()),
+            SyncOutcome::ResolutionRequired(resolution(), None),
             None,
         ));
         assert_eq!(
@@ -823,7 +888,7 @@ mod tests {
 
     #[test]
     fn instruction_names_everything_a_reviewer_needs() {
-        let text = render_resolution_instruction("alice/proj", &resolution());
+        let text = render_resolution_instruction("alice/proj", &resolution(), None);
         for needle in [
             "alice/proj",
             "advanced",
@@ -852,6 +917,46 @@ mod tests {
                 text.contains(needle),
                 "the instruction lacks {needle:?}:\n{text}"
             );
+        }
+    }
+
+    // SPEC u291 Contract Surface, the elsewhere-review line: it opens the
+    // instruction, and the document's `instruction`, only where the
+    // outcome carries a directory.
+    #[test]
+    fn the_elsewhere_line_opens_the_instruction_only_where_a_directory_stands() {
+        let own = render_resolution_instruction("alice/proj", &resolution(), None);
+        assert!(!own.contains("This review stands"), "{own}");
+        let there = render_resolution_instruction(
+            "alice/proj",
+            &resolution(),
+            Some(Path::new("/w/clients/q3")),
+        );
+        assert!(
+            there.starts_with(
+                "This review stands in the working copy at /w/clients/q3; run syns resolution show and syns resolution continue there.\n"
+            ),
+            "{there}"
+        );
+        assert!(there.ends_with(&own), "the rest of the instruction stands");
+
+        let output = Output::new(true);
+        match render_outcome(
+            &output,
+            Some("alice/proj"),
+            SyncOutcome::ResolutionRequired(resolution(), Some("/w/clients/q3".into())),
+            None,
+        ) {
+            Err(CliError::SyncRefusal { document, exit, .. }) => {
+                assert_eq!(exit, 4);
+                assert!(
+                    document["instruction"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("This review stands in the working copy at /w/clients/q3;")
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
         }
     }
 

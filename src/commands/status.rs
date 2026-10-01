@@ -5,20 +5,27 @@ use crate::errors::CliError;
 use crate::output::Output;
 use crate::push::converge::{WorkingCopyState, working_copy_state};
 use crate::push::working_copy::WorkingCopy;
-use crate::repo::if_repo::resolve_full_or_skip;
+use crate::repo::folder::{FolderScope, resolve_scoped_or_skip};
 use crate::repo::root::push_scope;
 
 /// The machine-readable status document: the repository reply with the
-/// working copy's state laid over it (SPEC u256 Q-02).
+/// working copy's state laid over it (SPEC u256 Q-02), and inside a
+/// folder the holder and the folder's recorded path beside them — the
+/// folder status document (SPEC u291).
 fn status_document(
     response: &crate::client::RepoResponse,
     state: WorkingCopyState,
+    folder: Option<&FolderScope>,
 ) -> Result<serde_json::Value, CliError> {
     let mut document = serde_json::to_value(response).map_err(|e| CliError::Io {
         message: format!("could not render the status document: {e}"),
     })?;
     if let Some(object) = document.as_object_mut() {
         object.insert("workingCopyState".into(), state.as_key().into());
+        if let Some(folder) = folder {
+            object.insert("holder".into(), folder.holder().into());
+            object.insert("path".into(), folder.path.clone().into());
+        }
     }
     Ok(document)
 }
@@ -27,8 +34,10 @@ pub async fn cmd_status(config: &Config, output: &Output, if_repo: bool) -> Resu
     let current_dir = std::env::current_dir().map_err(|e| CliError::Io {
         message: format!("could not determine current directory: {e}"),
     })?;
-    let (owner, name) = match resolve_full_or_skip(None, &current_dir, if_repo, output)? {
-        Some(pair) => pair,
+    // SPEC u291 `cmd_status` 1: the holder and the folder the run stands
+    // in, a misplaced folder refused rather than skipped.
+    let (owner, name, folder) = match resolve_scoped_or_skip(&current_dir, if_repo, output)? {
+        Some(bound) => bound,
         None => return Ok(()),
     };
     let repo_id = format!("{owner}/{name}");
@@ -41,19 +50,29 @@ pub async fn cmd_status(config: &Config, output: &Output, if_repo: bool) -> Resu
     let response = client.get_repo(&repo_id, token.as_deref()).await?;
 
     // SPEC u256 `cmd_status` 2: the working copy's state, against a head
-    // read in this same run.
-    let scope = push_scope(None, &current_dir, &owner, &name)?;
-    let copy = WorkingCopy::open(config.cache_dir(), &owner, &name, &scope.root)?;
+    // read in this same run — the folder copy's inside a folder (SPEC
+    // u291 `cmd_status` 2).
+    let copy = match &folder {
+        Some(scope) => WorkingCopy::open_folder(config.cache_dir(), scope)?,
+        None => {
+            let scope = push_scope(None, &current_dir, &owner, &name)?;
+            WorkingCopy::open(config.cache_dir(), &owner, &name, &scope.root)?
+        }
+    };
     let state = working_copy_state(&client, token.as_deref(), &copy).await?;
 
     if output.is_json() {
-        output.json(&status_document(&response, state)?);
+        output.json(&status_document(&response, state, folder.as_ref())?);
     } else {
-        let rows = vec![
-            vec![
-                "Repository".into(),
-                format!("{}/{}", response.owner, response.name),
-            ],
+        let mut rows = vec![vec![
+            "Repository".into(),
+            format!("{}/{}", response.owner, response.name),
+        ]];
+        // SPEC u291 `cmd_status` 3: the recorded path after the holder.
+        if let Some(scope) = &folder {
+            rows.push(vec!["Path".into(), scope.path.clone()]);
+        }
+        rows.extend([
             vec![
                 "Description".into(),
                 response
@@ -90,7 +109,7 @@ pub async fn cmd_status(config: &Config, output: &Output, if_repo: bool) -> Resu
             vec!["Created".into(), response.created_at],
             vec!["Updated".into(), response.updated_at],
             vec!["Working copy".into(), state.label().to_string()],
-        ];
+        ]);
         output.table(&["Property", "Value"], rows);
     }
 
@@ -203,7 +222,7 @@ mod tests {
 
         let client = SynsClient::new(&mock_server.uri()).unwrap();
         let response = client.get_repo("alice/my-project", None).await.unwrap();
-        let document = status_document(&response, WorkingCopyState::LocalChanges).unwrap();
+        let document = status_document(&response, WorkingCopyState::LocalChanges, None).unwrap();
         assert_eq!(document["workingCopyState"], "local_changes");
         assert_eq!(document["name"], "my-project");
     }

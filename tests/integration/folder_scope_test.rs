@@ -1109,36 +1109,20 @@ fn a_folder_with_no_checkout_above_reads_its_recorded_path() {
 #[test]
 #[serial]
 fn commands_outside_this_unit_refuse_inside_a_folder() {
+    // SPEC u291 Files: every command u291 admits works inside a folder,
+    // so of the commands u290 left outside it `syns forks` alone still
+    // reads the folder form as a malformed identity file.
     let d = Deployment::with_credential();
     std::fs::write(d.folder().join("a.md"), "on disk\n").expect("a.md");
     let before = snapshot(&d.w);
 
-    let sync = d.run_in(&d.folder(), b"", &["sync", "--if-repo"]);
-    assert_eq!(exit_of(&sync), 5, "{}", stderr_of(&sync));
+    let out = d.run_in(&d.folder(), b"", &["forks"]);
+    assert_eq!(exit_of(&out), 1, "{}", stderr_of(&out));
     assert!(
-        stderr_of(&sync)
-            .starts_with("error: attention required for this repository: invalid .syns.yaml: "),
+        stderr_of(&out).starts_with("error: invalid .syns.yaml: "),
         "{}",
-        stderr_of(&sync)
+        stderr_of(&out)
     );
-    for (args, stdin) in [
-        (vec!["push"], &b""[..]),
-        (vec!["status"], &b""[..]),
-        (vec!["pull", REPO], &b""[..]),
-        (vec!["forks"], &b""[..]),
-        (
-            vec!["write", "a.md", "--repo", REPO, "--parent", "7"],
-            &b"x"[..],
-        ),
-    ] {
-        let out = d.run_in(&d.folder(), stdin, &args);
-        assert_eq!(exit_of(&out), 1, "{args:?}: {}", stderr_of(&out));
-        assert!(
-            stderr_of(&out).starts_with("error: invalid .syns.yaml: "),
-            "{args:?}: {}",
-            stderr_of(&out)
-        );
-    }
 
     assert!(d.requests().is_empty());
     assert_eq!(snapshot(&d.w), before);

@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use clap::Args;
 
@@ -11,10 +12,16 @@ use crate::commands::sync::{
 use crate::config::Config;
 use crate::errors::{CliError, IdentityRemedy};
 use crate::output::Output;
-use crate::push::collector::{SkippedFile, write_skip_summary};
-use crate::push::converge::{ConvergeMode, SyncOutcome, converge};
+use crate::push::collector::{
+    CollectOptions, HELD_BYTES_BUDGET, HeldBytes, SkippedFile, write_skip_summary,
+};
+use crate::push::converge::{
+    ConvergeMode, FolderRoot, SyncOutcome, collect_in_place, converge, lay_over_enclosing,
+    read_folder_tree, read_holder_synsignore, resolution_elsewhere,
+};
 use crate::push::smart::{PushPipelineMeta, SmartPushOptions, smart_push};
-use crate::push::working_copy::WorkingCopy;
+use crate::push::working_copy::{WorkingCopy, folder_base};
+use crate::repo::folder::{FolderScope, lies_under, place_under, resolve_folder_scope};
 use crate::repo::if_repo::resolve_or_skip;
 use crate::repo::root::{push_scope, resolve_start_path};
 
@@ -93,6 +100,24 @@ async fn resolve_owner(
     Ok(session.user.username)
 }
 
+/// The push-name refusal (SPEC u291 Contract Surface): `--name` standing
+/// inside a scoped folder, `dir` absolute and `holder` lower-cased.
+pub fn push_name_refusal(dir: &Path, holder: &str) -> String {
+    format!(
+        "--name cannot stand inside the folder {}, a folder of {holder}; run syns push there without it, or outside the folder",
+        dir.display()
+    )
+}
+
+/// The message a publication carries: the one given where it is not
+/// blank, and the default otherwise.
+fn message_of(args: &PushArgs) -> String {
+    args.message
+        .clone()
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_COMMIT_MESSAGE.to_string())
+}
+
 pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Result<(), CliError> {
     // The directory the identity walk starts at (SPEC u255 `cmd_push`
     // 1), in ABSOLUTE form — see `resolve_start_path`, which is what
@@ -100,6 +125,12 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
     // seeds the scope resolution below, so the identity and the
     // content root can never be resolved from two different places.
     let start_path = resolve_start_path(args.path.as_deref())?;
+
+    // SPEC u291 `cmd_push` 1: inside a scoped folder — the starting
+    // directory, or the path argument — the folder is what publishes.
+    if let Some(scope) = resolve_folder_scope(&start_path)? {
+        return push_folder(config, output, args, scope, &start_path).await;
+    }
 
     // `syns push [PATH]` accepts `--name`, so its identity refusal names
     // that option (SPEC u262 `cmd_push` 1).
@@ -138,11 +169,7 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
     let status = args.status.clone().map(Into::into);
     let visibility = args.visibility.clone().map(Into::into);
 
-    let message = args
-        .message
-        .clone()
-        .filter(|message| !message.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_COMMIT_MESSAGE.to_string());
+    let message = message_of(args);
 
     let opts = SmartPushOptions {
         force: args.force,
@@ -176,6 +203,8 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
         // SPEC u280 `converge` 3: a landed publication's own summary
         // carries the too-large line.
         renders_publication_summary: true,
+        folder: None,
+        declined_parent: None,
     };
 
     let client = match client {
@@ -192,7 +221,7 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
             return render_outcome(
                 output,
                 Some(&repo_id),
-                SyncOutcome::ResolutionRequired(resolution),
+                SyncOutcome::ResolutionRequired(resolution, None),
                 None,
             );
         }
@@ -216,7 +245,18 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
 
     // `cmd_push` 4 — a bare publication converges.
     ensure_identity_file(&copy.root, &owner, &name)?;
-    let outcome = match converge(&client, Some(&token), &copy, ConvergeMode::Publish, opts).await {
+    let converged = converge(&client, Some(&token), &copy, ConvergeMode::Publish, opts).await;
+    render_bare(output, &repo_id, converged)
+}
+
+/// A bare publication's one outcome, rendered (SPEC u256 `cmd_push` 4).
+fn render_bare(
+    output: &Output,
+    repo_id: &str,
+    converged: Result<SyncOutcome, CliError>,
+) -> Result<(), CliError> {
+    let repo_id = repo_id.to_string();
+    let outcome = match converged {
         Ok(outcome) => outcome,
         // SPEC u280: the left-out refusal is carried as `error` under
         // attention required, as `syns sync` carries it.
@@ -258,6 +298,215 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
             Ok(())
         }
         other => render_outcome(output, Some(&repo_id), other, None),
+    }
+}
+
+/// The publication of a scoped folder (SPEC u291 Behaviour, `cmd_push`):
+/// options acting on the holder refused before the credential, then a
+/// forced or path-scoped publication standing on the folder's base, or a
+/// bare one converging the folder copy. No path outside the folder is
+/// collected, sent or deleted.
+async fn push_folder(
+    config: &Config,
+    output: &Output,
+    args: &PushArgs,
+    scope: FolderScope,
+    start_path: &Path,
+) -> Result<(), CliError> {
+    let holder = scope.holder();
+
+    // 2 — `--name` names a repository a folder cannot become.
+    if args.name.is_some() {
+        return Err(CliError::Config {
+            message: push_name_refusal(&scope.dir, &holder),
+        });
+    }
+
+    // 3 — an option changing the holder's record (`D-102`).
+    let acting = [
+        ("description", args.description.is_some()),
+        ("tag", !args.tag.is_empty()),
+        ("status", args.status.is_some()),
+        ("visibility", args.visibility.is_some()),
+    ];
+    if let Some((option, _)) = acting.iter().find(|(_, standing)| *standing) {
+        return Err(CliError::HolderActing {
+            command: format!("syns push --{option}"),
+            holder,
+            dir: scope.dir,
+        });
+    }
+
+    // 4 — the credential and the folder copy.
+    let token = TokenStore::new(config.credentials_path())
+        .read()?
+        .ok_or(CliError::AuthRequired)?;
+    let client = SynsClient::new(config.server_url())?;
+    let copy = WorkingCopy::open_folder(config.cache_dir(), &scope)?;
+    let held = HeldBytes::new(HELD_BYTES_BUDGET);
+    let mut opts = SmartPushOptions {
+        force: args.force,
+        message: message_of(args),
+        author: None,
+        parent_sha: None,
+        excludes: args.exclude.clone(),
+        cache_dir: config.cache_dir().to_path_buf(),
+        description: None,
+        tags: None,
+        status: None,
+        visibility: None,
+        strict: args.strict,
+        allow_empty: args.allow_empty,
+        debug: args.debug,
+        no_default_excludes: args.no_default_excludes,
+        prefix: None,
+        reference: None,
+        expected: None,
+        provenance: provenance_from_env(),
+        collected: None,
+        held: Some(held.clone()),
+        json_output: output.is_json(),
+        renders_publication_summary: true,
+        folder: Some(scope.path.clone()),
+        declined_parent: None,
+    };
+
+    // 6 — a bare publication converges the folder copy.
+    if !args.force && args.path.is_none() {
+        let converged = converge(&client, Some(&token), &copy, ConvergeMode::Publish, opts).await;
+        return render_bare(output, &holder, converged);
+    }
+
+    // 5 — a forced or path-scoped publication, refused past a review
+    // standing over the folder here or in another copy of the holder.
+    if let Some(resolution) = copy.resolution()? {
+        return render_outcome(
+            output,
+            Some(&holder),
+            SyncOutcome::ResolutionRequired(resolution, None),
+            None,
+        );
+    }
+    if let Some((resolution, dir)) =
+        resolution_elsewhere(&copy, |path| lies_under(path, &scope.path))?
+    {
+        return render_outcome(
+            output,
+            Some(&holder),
+            SyncOutcome::ResolutionRequired(resolution, Some(dir)),
+            None,
+        );
+    }
+    let prefix = match &args.path {
+        None => None,
+        Some(_) => {
+            if !start_path.exists() {
+                return Err(CliError::Io {
+                    message: format!(
+                        "path is neither a directory nor a file: {}",
+                        start_path.display()
+                    ),
+                });
+            }
+            Some(place_under(start_path, &scope.dir)).filter(|place| !place.is_empty())
+        }
+    };
+    let based = folder_base(&copy.cache_dir(), &scope);
+    let (reference, parent) = match &based {
+        Some(base) => (
+            base.file_paths()
+                .filter_map(|path| {
+                    base.file_sha(path)
+                        .map(|sha| (path.to_string(), sha.to_string()))
+                })
+                .collect::<HashMap<String, String>>(),
+            base.commit_sha().map(String::from),
+        ),
+        None => {
+            let head = read_folder_tree(&client, Some(&token), &holder, &scope.path, None).await?;
+            (head.files.into_iter().collect(), head.commit)
+        }
+    };
+    let holder_bytes = match &scope.checkout {
+        Some(_) => None,
+        None => read_holder_synsignore(&client, Some(&token), &holder, parent.as_deref()).await?,
+    };
+    let root = FolderRoot::of_scope(&copy.root, &scope, holder_bytes);
+    opts.collected = Some(collect_in_place(
+        &root,
+        &args.exclude,
+        CollectOptions {
+            no_default_excludes: args.no_default_excludes,
+            debug: args.debug,
+            prefix: prefix.clone(),
+            holder_synsignore: None,
+        },
+        None,
+        &held,
+    )?);
+    opts.prefix = prefix;
+    if args.force {
+        opts.declined_parent = parent;
+    } else {
+        opts.reference = Some(reference);
+        opts.parent_sha = parent;
+    }
+    let (response, raw, meta) = smart_push(&client, &token, &holder, &copy.root, opts).await?;
+    // The publication laid over the base it stood on — the one
+    // `folder_base` answered, the folder copy's own or an enclosing
+    // copy's narrowed to the folder — recorded as the folder copy's base,
+    // and that base laid over every copy enclosing the folder.
+    if let Some(base) = based
+        && lay_folder_publication(&copy, base, &response, &meta)
+        && let Some(recorded) = copy.base()
+    {
+        lay_over_enclosing(
+            &copy,
+            &recorded,
+            Some((meta.sent_parent.clone(), response.commit_sha.clone())),
+        );
+    }
+    format_response(output, &response, &raw, &holder, &meta);
+    Ok(())
+}
+
+/// Where `base` — the base a folder's forced or scoped publication stood
+/// on — names the parent the publication sent, record the acknowledged
+/// commit as the folder copy's base with the collected set laid over it
+/// and the named deletions taken out, as `lay_publication_over_base` does
+/// for a copy's own base. Answers whether it recorded one; a failed write
+/// leaves the base as it stood.
+fn lay_folder_publication(
+    copy: &WorkingCopy,
+    base: crate::push::manifest::Manifest,
+    response: &PushResponse,
+    meta: &PushPipelineMeta,
+) -> bool {
+    if response.commit_sha.is_empty()
+        || base.commit_sha().is_none()
+        || base.commit_sha() != meta.sent_parent.as_deref()
+    {
+        return false;
+    }
+    let Ok(_lock) = copy.lock() else {
+        return false;
+    };
+    let mut files: HashMap<String, String> = base
+        .file_paths()
+        .filter_map(|p| base.file_sha(p).map(|s| (p.to_string(), s.to_string())))
+        .collect();
+    for path in &meta.deleted {
+        files.remove(path);
+    }
+    for (path, sha) in &meta.collected {
+        files.insert(path.clone(), sha.clone());
+    }
+    match copy.record_base(&response.commit_sha, files) {
+        Ok(()) => true,
+        Err(err) => {
+            eprintln!("warning: could not record the working copy base: {err}");
+            false
+        }
     }
 }
 

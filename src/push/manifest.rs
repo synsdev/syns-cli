@@ -7,6 +7,13 @@ use std::path::Path;
 pub struct Manifest {
     commit_sha: Option<String>,
     files: HashMap<String, String>,
+    /// SPEC u291, `Manifest.recorded_at`: the nanoseconds since the Unix
+    /// epoch the system clock read as a working copy recorded this base,
+    /// carried in the record's own bytes so records written back to back
+    /// are ordered whatever their files' modification times say. None on
+    /// a record written before u291 and on every local record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recorded_at: Option<u64>,
 }
 
 impl Manifest {
@@ -31,12 +38,18 @@ impl Manifest {
 
     pub fn save(&self, cache_dir: &Path, owner: &str, name: &str) -> Result<(), CliError> {
         let path = cache_dir.join(owner).join(format!("{name}.json"));
+        // A local record carries no recorded time (SPEC u291).
+        let record = Manifest {
+            commit_sha: self.commit_sha.clone(),
+            files: self.files.clone(),
+            recorded_at: None,
+        };
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|err| CliError::Io {
                 message: format!("could not create manifest directory: {err}"),
             })?;
         }
-        let json = serde_json::to_string_pretty(self).map_err(|e| CliError::Io {
+        let json = serde_json::to_string_pretty(&record).map_err(|e| CliError::Io {
             message: format!("could not serialize manifest: {e}"),
         })?;
         std::fs::write(&path, json).map_err(|err| CliError::Io {
@@ -60,6 +73,16 @@ impl Manifest {
     pub fn file_paths(&self) -> impl Iterator<Item = &str> {
         self.files.keys().map(|s| s.as_str())
     }
+
+    /// When a working copy recorded this base (SPEC u291), none where the
+    /// record carries no time.
+    pub fn recorded_at(&self) -> Option<u64> {
+        self.recorded_at
+    }
+
+    pub fn set_recorded_at(&mut self, recorded_at: Option<u64>) {
+        self.recorded_at = recorded_at;
+    }
 }
 
 #[cfg(test)]
@@ -82,6 +105,37 @@ mod tests {
         assert_eq!(loaded.commit_sha(), Some("abc123"));
         assert_eq!(loaded.file_sha("src/main.rs"), Some("deadbeef"));
         assert_eq!(loaded.file_sha("README.md"), Some("cafebabe"));
+    }
+
+    // SPEC u291, `Manifest.recorded_at`: a record carrying a time
+    // round-trips it, one written before u291 loads none, and a local
+    // record is saved carrying none.
+    #[test]
+    fn recorded_at_round_trips_and_no_local_record_carries_one() {
+        let mut manifest = Manifest::default();
+        manifest.update(
+            "h1".to_string(),
+            HashMap::from([("a.md".to_string(), "1".to_string())]),
+        );
+        manifest.set_recorded_at(Some(7));
+        let text = serde_json::to_string(&manifest).unwrap();
+        let read: Manifest = serde_json::from_str(&text).unwrap();
+        assert_eq!(read.recorded_at(), Some(7));
+
+        let older: Manifest =
+            serde_json::from_str(r#"{"commit_sha":"h1","files":{"a.md":"1"}}"#).unwrap();
+        assert_eq!(older.recorded_at(), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        manifest.save(dir.path(), "alice", "work").unwrap();
+        let saved = std::fs::read_to_string(dir.path().join("alice/work.json")).unwrap();
+        assert!(!saved.contains("recorded_at"), "{saved}");
+        assert_eq!(
+            Manifest::load(dir.path(), "alice", "work")
+                .unwrap()
+                .recorded_at(),
+            None
+        );
     }
 
     #[test]

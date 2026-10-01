@@ -6,12 +6,19 @@ use crate::errors::{CliError, IdentityRemedy};
 use crate::output::Output;
 use crate::push::collector::{HELD_BYTES_BUDGET, HeldBytes};
 use crate::push::converge::{
-    ConvergeMode, Staging, SyncOutcome, converge, read_blobs, replace_file_whole,
+    ConvergeMode, FolderRoot, Staging, SyncOutcome, collect_in_place, converge, folder_root,
+    read_blobs, replace_file_whole,
 };
 use crate::push::working_copy::WorkingCopy;
+use crate::repo::folder::{
+    FolderScope, enclosing_folders, folder_checkout, lies_under, resolve_folder_scope,
+};
 use crate::repo::if_repo::resolve_full_or_skip;
 use crate::repo::root::resolve_start_path;
-use crate::repo::syns_yaml::{nearest_identity, write_syns_yaml_where_none_stands};
+use crate::repo::syns_yaml::{
+    IdentityForm, find_syns_yaml, identity_form_text, nearest_identity, read_identity_form,
+    write_syns_yaml_where_none_stands,
+};
 use console::style;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -133,6 +140,62 @@ fn write_identity_file(
     Ok(())
 }
 
+/// The folder checkout refusal for `--path` standing with no repository
+/// named (SPEC u291 Contract Surface, the folder checkout refusals).
+pub fn path_needs_repository() -> String {
+    "--path needs the repository named: syns pull OWNER/NAME --path PATH".to_string()
+}
+
+/// The folder checkout refusal for a `--path` that is no `INV-30` folder.
+pub fn path_not_a_folder(typed: &str) -> String {
+    format!(
+        "--path must name a folder with no leading /, no empty segment and no . or .. segment (got {typed})"
+    )
+}
+
+/// The folder checkout refusal for a destination already holding an
+/// identity file other than the folder's own.
+pub fn destination_holds_identity(dest: &Path, standing: &str, holder: &str, path: &str) -> String {
+    format!(
+        "{} already holds the identity file of {standing}; check {holder}'s {path} out into a directory holding none",
+        dest.display()
+    )
+}
+
+/// The folder checkout refusal for a folder whose identity file the
+/// holder's version does not carry.
+pub fn folder_unmarked(holder: &str, path: &str, at: &str) -> String {
+    format!(
+        "{holder} holds no .syns.yaml naming the folder {path} at {at}; only a folder its identity file marks is checked out alone"
+    )
+}
+
+/// `--path` with any trailing `/` removed, refused unless it is an
+/// `INV-30` folder path (SPEC u291 `cmd_pull` 1).
+fn folder_argument(typed: &str) -> Result<String, CliError> {
+    let refused = || CliError::Config {
+        message: path_not_a_folder(typed),
+    };
+    let trimmed = typed.trim_end_matches('/');
+    if trimmed.is_empty()
+        || trimmed.starts_with('/')
+        || trimmed.split('/').any(|segment| segment.is_empty())
+    {
+        return Err(refused());
+    }
+    crate::push::converge::check_server_path(trimmed).map_err(|_| refused())?;
+    Ok(trimmed.to_string())
+}
+
+/// An identity file as a refusal names what it stands for: the root form
+/// as its pair, the folder form as its holder's folder.
+fn standing_of(form: &IdentityForm) -> String {
+    match form {
+        IdentityForm::Root { owner, name } => format!("{owner}/{name}"),
+        IdentityForm::Folder { holder, path } => format!("{holder}'s {path}"),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn cmd_pull(
     config: &Config,
@@ -142,12 +205,51 @@ pub async fn cmd_pull(
     version: Option<String>,
     if_repo: bool,
     overwrite_local: bool,
+    folder: Option<String>,
 ) -> Result<(), CliError> {
+    // SPEC u291 `cmd_pull` 1: `--path` stands only beside a repository
+    // named, as an `INV-30` folder path, refused before any request.
+    if let Some(typed) = &folder {
+        let Some((owner, name)) = &repository else {
+            return Err(CliError::Config {
+                message: path_needs_repository(),
+            });
+        };
+        let path = folder_argument(typed)?;
+        return pull_folder_alone(
+            config,
+            output,
+            owner,
+            name,
+            &path,
+            path_arg.as_deref(),
+            version,
+            overwrite_local,
+        )
+        .await;
+    }
+
     // SPEC u263 `cmd_pull` 1: the directory the identity walk starts at,
     // in ABSOLUTE form — see `resolve_start_path`. This is NOT yet the
     // write root: a bare retrieval writes into the repository root,
     // whichever descendant of it the run started in.
     let start_dir = resolve_start_path(path_arg.as_deref().map(Path::new))?;
+
+    // SPEC u291 `cmd_pull` 2–3: inside a folder the folder alone is
+    // retrieved into the folder's directory, a positional naming another
+    // repository than its holder refused before any request.
+    if let Some(scope) = resolve_folder_scope(&start_dir)? {
+        if let Some((owner, name)) = &repository
+            && format!("{owner}/{name}") != scope.holder()
+        {
+            return Err(CliError::PathBelongsToAnotherRepository {
+                path: scope.dir.clone(),
+                standing: scope.holder(),
+                requested: format!("{owner}/{name}"),
+            });
+        }
+        return pull_into_folder(config, output, scope, version, overwrite_local).await;
+    }
 
     // `cmd_pull` 2: only a run naming no repository resolves one.
     let bound = repository.is_some();
@@ -225,6 +327,7 @@ pub async fn cmd_pull(
             &name,
             &version,
             config.cache_dir(),
+            None,
         )
         .await;
     }
@@ -267,8 +370,20 @@ pub async fn cmd_pull(
     if let Some(base) = &base {
         base.save(config.cache_dir(), &owner, &name)?;
     }
-    let commit_sha = base.as_ref().and_then(|b| b.commit_sha().map(String::from));
-    let head_count = base.as_ref().map(|b| b.file_paths().count()).unwrap_or(0);
+    render_pulled(output, &repo_id, base.as_ref(), &written, &removed);
+    Ok(())
+}
+
+/// The retrieval's summary over the base the convergence recorded.
+fn render_pulled(
+    output: &Output,
+    repo_id: &str,
+    base: Option<&crate::push::manifest::Manifest>,
+    written: &[String],
+    removed: &[String],
+) {
+    let commit_sha = base.and_then(|b| b.commit_sha().map(String::from));
+    let head_count = base.map(|b| b.file_paths().count()).unwrap_or(0);
     let downloaded = written.len();
     let unchanged = head_count.saturating_sub(downloaded);
     let deleted = removed.len();
@@ -286,9 +401,169 @@ pub async fn cmd_pull(
             "Pulled {repo_id}: {downloaded} downloaded, {unchanged} unchanged, {deleted} deleted"
         ));
     }
+}
 
+/// SPEC u291 `cmd_pull` 3: the whole folder retrieved into the folder's
+/// directory — the folder's tree at `--version` as the registered
+/// snapshot retrieval writes one, or a convergence of the folder copy —
+/// writing no identity file and no local record.
+async fn pull_into_folder(
+    config: &Config,
+    output: &Output,
+    scope: FolderScope,
+    version: Option<String>,
+    overwrite_local: bool,
+) -> Result<(), CliError> {
+    let repo_id = scope.holder();
+    let token = TokenStore::new(config.credentials_path())
+        .read()
+        .ok()
+        .flatten();
+    let client = SynsClient::new(config.server_url())?;
+    let copy = WorkingCopy::open_folder(config.cache_dir(), &scope)?;
+
+    if let Some(version) = version {
+        return pull_snapshot(
+            output,
+            &client,
+            token.as_deref(),
+            &repo_id,
+            &None,
+            &copy.root,
+            &scope.owner,
+            &scope.name,
+            &version,
+            config.cache_dir(),
+            Some(&copy),
+        )
+        .await;
+    }
+
+    let outcome = converge(
+        &client,
+        token.as_deref(),
+        &copy,
+        ConvergeMode::Retrieve {
+            overwrite: overwrite_local,
+        },
+        convergence_options_for(config, output),
+    )
+    .await?;
+    let (written, removed) = match outcome {
+        SyncOutcome::Synced {
+            written, removed, ..
+        } => (written, removed),
+        SyncOutcome::NoChanges => (Vec::new(), Vec::new()),
+        other => return render_outcome(output, Some(&repo_id), other, None),
+    };
+    if !output.is_json() {
+        render_transfer_lines(&written, &removed);
+    }
+    render_pulled(output, &repo_id, copy.base().as_ref(), &written, &removed);
     Ok(())
 }
+
+/// SPEC u291 `cmd_pull` 4–7: one folder of `owner/name` checked out alone
+/// into the path argument, or the working directory, every refusal raised
+/// before anything is written.
+#[allow(clippy::too_many_arguments)]
+async fn pull_folder_alone(
+    config: &Config,
+    output: &Output,
+    owner: &str,
+    name: &str,
+    path: &str,
+    path_arg: Option<&str>,
+    version: Option<String>,
+    overwrite_local: bool,
+) -> Result<(), CliError> {
+    let holder = format!("{owner}/{name}");
+    let dest = resolve_start_path(path_arg.map(Path::new))?;
+
+    // 4 — the nearest identity file at or above the destination, a folder
+    // form counting as its holder, then one standing in the destination.
+    if let Some(file) = find_syns_yaml(&dest) {
+        let form = read_identity_form(&file)?;
+        let named = match &form {
+            IdentityForm::Root { owner, name } => format!("{owner}/{name}"),
+            IdentityForm::Folder { holder, .. } => holder.clone(),
+        };
+        let standing_dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
+        if !named.eq_ignore_ascii_case(&holder) {
+            return Err(CliError::PathBelongsToAnotherRepository {
+                path: standing_dir,
+                standing: named,
+                requested: holder,
+            });
+        }
+        let ours = matches!(&form, IdentityForm::Folder { path: recorded, .. } if recorded == path);
+        if standing_dir == dest && !ours {
+            return Err(CliError::Config {
+                message: destination_holds_identity(&dest, &standing_of(&form), &holder, path),
+            });
+        }
+    }
+
+    // 5 — the place check, as a folder standing there would take it.
+    let checkout = folder_checkout(&dest, &holder, path)?;
+
+    // 6 — the folder's identity file at the version asked or the tip.
+    let token = TokenStore::new(config.credentials_path())
+        .read()
+        .ok()
+        .flatten();
+    let client = SynsClient::new(config.server_url())?;
+    let at = version.as_deref().unwrap_or("the tip");
+    let unmarked = || CliError::Config {
+        message: folder_unmarked(&holder, path, at),
+    };
+    let marker = match client
+        .get_raw(
+            &holder,
+            token.as_deref(),
+            &format!("{path}/.syns.yaml"),
+            version.as_deref(),
+            None,
+        )
+        .await
+    {
+        Ok(raw) => raw.bytes,
+        Err(CliError::Api {
+            status: Some(404),
+            ref error,
+            ..
+        }) if error == "not_found" => return Err(unmarked()),
+        Err(err) => return Err(err),
+    };
+    let marked = std::str::from_utf8(&marker)
+        .ok()
+        .and_then(|text| identity_form_text(text).ok());
+    match marked {
+        Some(IdentityForm::Folder {
+            holder: recorded_holder,
+            path: recorded,
+        }) if recorded_holder.eq_ignore_ascii_case(&holder) && recorded == path => {}
+        _ => return Err(unmarked()),
+    }
+
+    // 7 — the destination, and the folder retrieved into it.
+    std::fs::create_dir_all(&dest).map_err(|e| CliError::Io {
+        message: format!("could not create target directory: {e}"),
+    })?;
+    let enclosing = enclosing_folders(&dest, &holder, path)?;
+    let scope = FolderScope {
+        dir: dest,
+        owner: owner.to_string(),
+        name: name.to_string(),
+        path: path.to_string(),
+        checkout,
+        enclosing,
+    };
+    pull_into_folder(config, output, scope, version, overwrite_local).await
+}
+
+/// One file a version's tree serves: its path, its hash and its size.
+type ServedFile = (String, Option<String>, Option<u64>);
 
 /// The registered snapshot retrieval at `--version`: every file at that
 /// version written, nothing removed, no record kept — but for a local file
@@ -308,20 +583,51 @@ async fn pull_snapshot(
     name: &str,
     version: &str,
     cache_dir: &Path,
+    folder: Option<&WorkingCopy>,
 ) -> Result<(), CliError> {
-    let (tree_response, _raw) = client
-        .get_tree(repo_id, token, None, true, Some(version))
-        .await?;
-
-    let server_files: Vec<_> = tree_response
-        .entries
-        .iter()
-        .filter(|e| e.entry_type == EntryType::File)
-        .collect();
+    // SPEC u291 `cmd_pull` 3: inside a folder, the folder's tree at the
+    // version, every path counted from the folder.
+    let recorded = folder.and_then(|copy| copy.folder.as_ref().map(|s| s.path.clone()));
+    let (commit_sha, server_files): (String, Vec<ServedFile>) = match &recorded {
+        None => {
+            let (tree_response, _raw) = client
+                .get_tree(repo_id, token, None, true, Some(version))
+                .await?;
+            (
+                tree_response.commit_sha.clone(),
+                tree_response
+                    .entries
+                    .iter()
+                    .filter(|e| e.entry_type == EntryType::File)
+                    .map(|e| (e.path.clone(), e.sha.clone(), e.size))
+                    .collect(),
+            )
+        }
+        Some(folder) => {
+            let (tree_response, _raw) = client
+                .get_tree(repo_id, token, Some(folder), true, Some(version))
+                .await?;
+            (
+                tree_response.commit_sha.clone(),
+                tree_response
+                    .entries
+                    .iter()
+                    .filter(|e| e.entry_type == EntryType::File && lies_under(&e.path, folder))
+                    .map(|e| {
+                        (
+                            e.path[folder.len() + 1..].to_string(),
+                            e.sha.clone(),
+                            e.size,
+                        )
+                    })
+                    .collect(),
+            )
+        }
+    };
     // 1 — every path the version's tree carries checked before anything
     // is read or written.
-    for entry in &server_files {
-        validate_entry_path(&entry.path)?;
+    for (path, _, _) in &server_files {
+        validate_entry_path(path)?;
     }
 
     let staging = Staging::open(cache_dir)?;
@@ -330,8 +636,12 @@ async fn pull_snapshot(
     })?;
 
     let held = HeldBytes::new(HELD_BYTES_BUDGET);
-    let collected = crate::push::collector::collect_files(
-        target_dir,
+    let root = match folder {
+        Some(copy) => folder_root(client, token, copy).await?,
+        None => FolderRoot::whole(target_dir),
+    };
+    let collected = collect_in_place(
+        &root,
         &[],
         crate::push::collector::CollectOptions::default(),
         None,
@@ -340,7 +650,7 @@ async fn pull_snapshot(
     let mut excluded = crate::push::converge::excluded_local_files(
         target_dir,
         |path| collected.files.contains_key(path),
-        server_files.iter().map(|e| &e.path),
+        server_files.iter().map(|(path, _, _)| path),
     );
     drop(collected);
 
@@ -351,35 +661,46 @@ async fn pull_snapshot(
     if identity_stands {
         excluded.remove(".syns.yaml");
     }
-    let kept = usize::from(identity_stands && server_files.iter().any(|e| e.path == ".syns.yaml"));
+    let kept =
+        usize::from(identity_stands && server_files.iter().any(|(p, _, _)| p == ".syns.yaml"));
 
     let wanted: BTreeMap<String, (String, Option<u64>)> = server_files
         .iter()
-        .filter(|e| !(identity_stands && e.path == ".syns.yaml"))
-        .filter(|e| !excluded.contains(&e.path))
-        .map(|e| (e.path.clone(), (e.sha.clone().unwrap_or_default(), e.size)))
+        .filter(|(path, _, _)| !(identity_stands && path == ".syns.yaml"))
+        .filter(|(path, _, _)| !excluded.contains(path))
+        .map(|(path, sha, size)| (path.clone(), (sha.clone().unwrap_or_default(), *size)))
         .collect();
-    let blobs = read_blobs(client, token, repo_id, version, &wanted, &held, &staging).await?;
+    let blobs = read_blobs(
+        client,
+        token,
+        repo_id,
+        recorded.as_deref(),
+        version,
+        &wanted,
+        &held,
+        &staging,
+    )
+    .await?;
 
-    for entry in &server_files {
-        if identity_stands && entry.path == ".syns.yaml" {
+    for (path, _, _) in &server_files {
+        if identity_stands && path == ".syns.yaml" {
             continue;
         }
-        if excluded.contains(&entry.path) {
+        if excluded.contains(path) {
             if !output.is_json() {
-                eprintln!("  {}", style(format!("excluded: {}", entry.path)).yellow());
+                eprintln!("  {}", style(format!("excluded: {path}")).yellow());
             }
             continue;
         }
-        let Some(content) = blobs.get(&entry.path) else {
+        let Some(content) = blobs.get(path) else {
             continue;
         };
-        safe_join(target_dir, &entry.path)?;
+        safe_join(target_dir, path)?;
         // 2 — replaced whole, so a run killed part-way leaves the file as
         // it stood rather than torn.
-        replace_file_whole(target_dir, &entry.path, content)?;
+        replace_file_whole(target_dir, path, content)?;
         if !output.is_json() {
-            eprintln!("  {}", style(format!("downloaded: {}", entry.path)).green());
+            eprintln!("  {}", style(format!("downloaded: {path}")).green());
         }
     }
     drop(blobs);
@@ -390,7 +711,7 @@ async fn pull_snapshot(
     if output.is_json() {
         output.json(&json!({
             "repo": repo_id,
-            "commitSha": tree_response.commit_sha,
+            "commitSha": commit_sha,
             "downloaded": downloaded,
             "unchanged": 0,
             "deleted": 0,
@@ -511,7 +832,7 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_pull(&config, &output, None, None, None, true, false).await;
+        let result = cmd_pull(&config, &output, None, None, None, true, false, None).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
         unsafe { std::env::remove_var("SYNS_CACHE_DIR") };
 
@@ -529,7 +850,7 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_pull(&config, &output, None, None, None, true, false).await;
+        let result = cmd_pull(&config, &output, None, None, None, true, false, None).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
@@ -561,6 +882,7 @@ mod tests {
             None,
             true,
             false,
+            None,
         )
         .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
@@ -655,7 +977,7 @@ mod tests {
         // repo_arg = None, path_arg = None, version = None, if_repo = true.
         // Reaches resolve_full_or_skip, which under u252 emits skip via the
         // narrowed resolve_or_skip and returns Ok(None).
-        let result = cmd_pull(&config, &output, None, None, None, true, false).await;
+        let result = cmd_pull(&config, &output, None, None, None, true, false, None).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         // AC7 representative: a pull from a directory whose only identity source
