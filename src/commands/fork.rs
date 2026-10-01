@@ -3,7 +3,8 @@ use crate::client::{ForkRequest, SynsClient};
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
-use crate::repo::syns_yaml::{nearest_identity, write_syns_yaml};
+use crate::repo::folder::refuse_holder_change;
+use crate::repo::syns_yaml::write_syns_yaml;
 use console::style;
 
 fn validate_repo_id(repo: &str) -> Result<(), CliError> {
@@ -34,12 +35,13 @@ pub async fn cmd_fork(
 ) -> Result<(), CliError> {
     validate_repo_id(&repo)?;
 
-    // The identity file nearest the working directory, read before the
-    // credential and the request: the folder form, and a file parsing as
-    // neither form, end the run with nothing requested and no file
-    // written (SPEC u290 Behaviour, `cmd_fork` 1).
+    // Inside a scoped folder the fork would replace the folder's identity
+    // file, a file its holder tracks, so it is refused as acting on the
+    // holder before the credential, the request and the identity write;
+    // a misplaced folder, and a nearest file parsing as neither form, end
+    // the run the same way (SPEC u290 Behaviour, `cmd_fork` 1, `D-108`).
     if let Ok(cwd) = std::env::current_dir() {
-        nearest_identity(&cwd)?;
+        refuse_holder_change(&cwd, "syns fork")?;
     }
 
     let token = TokenStore::new(config.credentials_path())

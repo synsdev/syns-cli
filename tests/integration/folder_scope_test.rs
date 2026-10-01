@@ -894,6 +894,56 @@ fn repo_inside_a_folder_answers_the_holder_and_the_folder() {
 
 #[test]
 #[serial]
+fn repo_at_a_root_answers_the_head_version_number() {
+    let d = Deployment::new();
+    std::fs::remove_dir_all(d.w.join("clients")).expect("no folder");
+    let mut record = repo_body();
+    record["commitSha"] = json!("h42");
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path_matcher(format!("/api/v1/repos/{REPO}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(record)),
+    );
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path_matcher(format!("/api/v1/repos/{REPO}/versions")))
+            .and(query_param("limit", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [version_body(42, "h42", &["a.md"])],
+                "total": 42, "limit": 1, "offset": 0,
+            }))),
+    );
+
+    let json_run = d.run_in(&d.w, b"", &["--json", "repo"]);
+
+    assert_eq!(exit_of(&json_run), 0, "{}", stderr_of(&json_run));
+    let document = one_document(&json_run);
+    assert_eq!(document["owner"], json!("alice"));
+    assert_eq!(document["name"], json!("work"));
+    assert_eq!(document["commitSha"], json!("h42"));
+    assert_eq!(document["version"], json!(42));
+    let keys = document.as_object().expect("an object");
+    assert!(!keys.contains_key("holder"), "{document}");
+    assert!(!keys.contains_key("path"), "{document}");
+    let after_json = d.requests().len();
+
+    let rendered = d.run_in(&d.w, b"", &["repo"]);
+
+    assert_eq!(exit_of(&rendered), 0, "{}", stderr_of(&rendered));
+    assert!(
+        stdout_of(&rendered)
+            .lines()
+            .all(|line| !line.contains("Path")),
+        "{}",
+        stdout_of(&rendered)
+    );
+    let second: Vec<Request> = d.requests().into_iter().skip(after_json).collect();
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert_eq!(second[0].url.path(), format!("/api/v1/repos/{REPO}"));
+}
+
+#[test]
+#[serial]
 fn repo_option_and_the_holder_root_read_the_whole_holder() {
     let d = Deployment::new();
     d.mount_reference();
@@ -956,6 +1006,7 @@ fn a_moved_folder_is_refused_naming_both_paths() {
         vec!["history"],
         vec!["diff"],
         vec!["delete", "--if-repo"],
+        vec!["fork", "bob/other"],
     ] {
         let out = d.run_in(&moved, b"", &args);
         assert_eq!(exit_of(&out), 2, "{args:?}: {}", stderr_of(&out));
@@ -1051,7 +1102,6 @@ fn commands_outside_this_unit_refuse_inside_a_folder() {
         (vec!["status"], &b""[..]),
         (vec!["pull", REPO], &b""[..]),
         (vec!["forks"], &b""[..]),
-        (vec!["fork", "bob/other"], &b""[..]),
         (
             vec!["write", "a.md", "--repo", REPO, "--parent", "7"],
             &b"x"[..],
@@ -1100,6 +1150,8 @@ fn commands_changing_the_holder_are_refused_inside_a_folder() {
     for (args, command) in [
         (vec!["repo", "--tag", "x"], "syns repo --tag"),
         (vec!["delete", "--if-repo"], "syns delete"),
+        (vec!["fork", REPO], "syns fork"),
+        (vec!["fork", "bob/other"], "syns fork"),
         (vec!["collaborators"], "syns collaborators"),
         (
             vec!["collaborators", "add", "bob", "--role", "read"],
@@ -1124,6 +1176,10 @@ fn commands_changing_the_holder_are_refused_inside_a_folder() {
         assert!(err.contains("alice/work"), "{err}");
     }
     assert!(d.requests().is_empty());
+    assert_eq!(
+        std::fs::read(d.folder().join(".syns.yaml")).expect("folder identity"),
+        FOLDER_YAML.as_bytes()
+    );
 
     let root = d.run_in(&d.w, b"", &["repo", "--visibility", "public"]);
     assert_eq!(exit_of(&root), 0, "{}", stderr_of(&root));
@@ -1161,6 +1217,7 @@ fn a_file_mixing_both_forms_is_refused_by_every_command() {
             vec!["write", "a.md", "--repo", REPO, "--parent", "7"],
             &b"x"[..],
         ),
+        (vec!["fork", "bob/other"], &b""[..]),
         (vec!["ls"], &b""[..]),
     ] {
         let out = d.run_in(&d.folder(), stdin, &args);
@@ -1248,6 +1305,12 @@ fn repo_inside_a_folder_renders_the_path_row_after_the_identity_row() {
     let out = d.run_in(&d.folder(), b"", &["repo"]);
 
     assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert!(
+        d.requests()
+            .iter()
+            .all(|r| !r.url.path().contains("/versions")),
+        "the rendered record read a version"
+    );
     let text = stdout_of(&out);
     let row = |label: &str| {
         text.lines()

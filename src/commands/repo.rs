@@ -104,24 +104,28 @@ pub async fn cmd_repo_create(
     Ok(())
 }
 
-/// The scoped folder a record is answered inside, beside the number of
-/// the version the holder's head names (SPEC u290).
-struct FolderAnswer<'a> {
-    folder: &'a FolderScope,
+/// What a read of the record answers beside it (SPEC u290, the read
+/// repository document): the number of the version the head names, and
+/// the scoped folder the record is answered inside, where one stands.
+struct ReadAnswer<'a> {
+    folder: Option<&'a FolderScope>,
     version: Option<u32>,
 }
 
-fn display_repo(output: &Output, response: &RepoResponse, inside: Option<FolderAnswer<'_>>) {
+fn display_repo(output: &Output, response: &RepoResponse, read: Option<ReadAnswer<'_>>) {
     if output.is_json() {
-        match inside {
-            // The folder repository document: the holder's record with
-            // the head's number, the holder and the recorded path added.
-            Some(FolderAnswer { folder, version }) => {
+        match read {
+            // The read repository document: the record with the head's
+            // number, and inside a folder the holder and the recorded
+            // path, added.
+            Some(ReadAnswer { folder, version }) => {
                 let mut document = serde_json::to_value(response).unwrap_or_default();
                 if let Some(map) = document.as_object_mut() {
                     map.insert("version".to_string(), serde_json::Value::from(version));
-                    map.insert("holder".to_string(), folder.holder().into());
-                    map.insert("path".to_string(), folder.path.clone().into());
+                    if let Some(folder) = folder {
+                        map.insert("holder".to_string(), folder.holder().into());
+                        map.insert("path".to_string(), folder.path.clone().into());
+                    }
                 }
                 output.json(&document);
             }
@@ -132,7 +136,11 @@ fn display_repo(output: &Output, response: &RepoResponse, inside: Option<FolderA
             "Repository".into(),
             format!("{}/{}", response.owner, response.name),
         ]];
-        if let Some(FolderAnswer { folder, .. }) = &inside {
+        if let Some(ReadAnswer {
+            folder: Some(folder),
+            ..
+        }) = &read
+        {
             rows.push(vec!["Path".into(), folder.path.clone()]);
         }
         rows.extend([
@@ -272,34 +280,37 @@ pub async fn cmd_repo(
     // 3 — the holder's record.
     let response = client.get_repo(&repo_id, token.as_deref()).await?;
 
-    // 4 — inside a folder, the number of the version the head names: the
-    // newest row of the version list where its hash is the head's, and
-    // the single version at the head only where it is not.
-    let inside = match &folder {
-        None => None,
-        Some(folder) => {
-            let version = match response.commit_sha.as_deref() {
-                None => None,
-                Some(head) => {
-                    let (page, _raw) = client
-                        .list_versions(&repo_id, token.as_deref(), 1, 0, None)
-                        .await?;
-                    match page.data.first() {
-                        Some(newest) if newest.sha == head => Some(newest.version),
-                        _ => {
-                            let (entry, _raw) =
-                                client.get_version(&repo_id, token.as_deref(), head).await?;
-                            Some(entry.version)
-                        }
-                    }
+    // 4 — under `--json`, at a root and inside a folder alike, the number
+    // of the version the head names: the newest row of the version list
+    // where its hash is the head's, and the single version at the head
+    // only where it is not. The render carries no number, so it reads
+    // neither.
+    let version = match response.commit_sha.as_deref() {
+        Some(head) if output.is_json() => {
+            let (page, _raw) = client
+                .list_versions(&repo_id, token.as_deref(), 1, 0, None)
+                .await?;
+            match page.data.first() {
+                Some(newest) if newest.sha == head => Some(newest.version),
+                _ => {
+                    let (entry, _raw) =
+                        client.get_version(&repo_id, token.as_deref(), head).await?;
+                    Some(entry.version)
                 }
-            };
-            Some(FolderAnswer { folder, version })
+            }
         }
+        _ => None,
     };
 
-    // 5 — the record, inside a folder as the folder repository document.
-    display_repo(output, &response, inside);
+    // 5 — the read repository document, or the record's render.
+    display_repo(
+        output,
+        &response,
+        Some(ReadAnswer {
+            folder: folder.as_ref(),
+            version,
+        }),
+    );
     Ok(())
 }
 
