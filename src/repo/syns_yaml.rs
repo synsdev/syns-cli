@@ -122,15 +122,167 @@ pub fn read_required_checks(root: &Path) -> Result<Vec<String>, CliError> {
         return Ok(Vec::new());
     }
     let contents = read_contents(&file_path)?;
-    let value: serde_yaml::Value = serde_yaml::from_str(&contents).map_err(invalid)?;
+    declared_checks(&contents).map_err(invalid)
+}
+
+/// The `checks` list an identity file's text declares in either form, in
+/// order, empty where it declares none, and the parse reason where the
+/// text reads as neither form (SPEC u293 Contract Surface,
+/// `declared_checks`).
+pub fn declared_checks(contents: &str) -> Result<Vec<String>, String> {
+    let value: serde_yaml::Value = serde_yaml::from_str(contents).map_err(|e| e.to_string())?;
     if value.get("holder").is_none() {
-        return Ok(parse_root_text(&contents).map_err(invalid)?.checks);
+        return Ok(parse_root_text(contents)?.checks);
     }
     if value.get("owner").is_some() || value.get("name").is_some() {
-        return Err(invalid(MIXED_FORMS));
+        return Err(MIXED_FORMS.to_string());
     }
-    let folder: FolderYaml = serde_yaml::from_value(value).map_err(invalid)?;
+    let folder: FolderYaml = serde_yaml::from_value(value).map_err(|e| e.to_string())?;
     Ok(folder.checks)
+}
+
+/// The template a folder was placed from (SPEC u293 Contract Surface,
+/// `TemplateOrigin`): `repo` its `OWNER/NAME` lower-cased, `version` the
+/// version number placed, `sha` that version's full commit hash, and
+/// `checks` the commands the template's identity file declared there,
+/// in its order.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TemplateOrigin {
+    pub repo: String,
+    pub version: u32,
+    pub sha: String,
+    #[serde(default)]
+    pub checks: Vec<String>,
+}
+
+/// Whether `scalar`, written plain in `template`'s one placeholder,
+/// reads back as that string through `read`.
+fn reads_back_plain(
+    template: &str,
+    scalar: &str,
+    read: impl Fn(serde_yaml::Value) -> Option<serde_yaml::Value>,
+) -> bool {
+    if scalar.is_empty() || scalar.contains(['\n', '\r']) {
+        return false;
+    }
+    serde_yaml::from_str::<serde_yaml::Value>(&template.replace("{}", scalar))
+        .ok()
+        .and_then(read)
+        .is_some_and(|value| value.as_str() == Some(scalar))
+}
+
+/// `scalar` inside double quotes, each `\`, `"`, line break and
+/// character outside YAML's printable set written as its escape.
+fn double_quoted(scalar: &str) -> String {
+    let mut out = String::with_capacity(scalar.len() + 2);
+    out.push('"');
+    for c in scalar.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{85}' => out.push_str("\\N"),
+            '\u{2028}' => out.push_str("\\L"),
+            '\u{2029}' => out.push_str("\\P"),
+            c if is_yaml_printable(c) => out.push(c),
+            c if (c as u32) <= 0xff => out.push_str(&format!("\\x{:02X}", c as u32)),
+            c if (c as u32) <= 0xffff => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push_str(&format!("\\U{:08X}", c as u32)),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// YAML's printable character set, line breaks aside.
+fn is_yaml_printable(c: char) -> bool {
+    matches!(c as u32,
+        0x09 | 0x20..=0x7e | 0x85 | 0xa0..=0xd7ff | 0xe000..=0xfffd | 0x10000..=0x10ffff)
+}
+
+/// A mapping value written plain where it reads back verbatim, and
+/// double-quoted otherwise.
+fn mapping_scalar(scalar: &str) -> String {
+    if reads_back_plain("k: {}", scalar, |v| v.get("k").cloned()) {
+        scalar.to_string()
+    } else {
+        double_quoted(scalar)
+    }
+}
+
+/// A sequence item written plain where it reads back verbatim, and
+/// double-quoted otherwise.
+fn item_scalar(scalar: &str) -> String {
+    if reads_back_plain("- {}", scalar, |v| v.get(0).cloned()) {
+        scalar.to_string()
+    } else {
+        double_quoted(scalar)
+    }
+}
+
+/// The folder identity file a placement writes (SPEC u293 Contract
+/// Surface, `folder_identity_text`): `holder`, `path`, and the `template`
+/// mapping recording `origin`, its `checks` only where it holds any — and
+/// no top-level `checks`, so no command it brings runs anywhere.
+pub fn folder_identity_text(holder: &str, path: &str, origin: &TemplateOrigin) -> String {
+    let mut text = format!(
+        "holder: {holder}\npath: {}\ntemplate:\n  repo: {}\n  version: {}\n  sha: {}\n",
+        mapping_scalar(path),
+        origin.repo,
+        origin.version,
+        mapping_scalar(&origin.sha),
+    );
+    if !origin.checks.is_empty() {
+        text.push_str("  checks:\n");
+        for command in &origin.checks {
+            text.push_str(&format!("  - {}\n", item_scalar(command)));
+        }
+    }
+    text
+}
+
+/// The `template` mapping a folder form's text carries (SPEC u293
+/// Contract Surface, `template_origin`): none where the text carries no
+/// such key, and the parse reason where the text or the mapping reads
+/// otherwise.
+pub fn template_origin(contents: &str) -> Result<Option<TemplateOrigin>, String> {
+    let value: serde_yaml::Value = serde_yaml::from_str(contents).map_err(|e| e.to_string())?;
+    let Some(template) = value.get("template") else {
+        return Ok(None);
+    };
+    serde_yaml::from_value(template.clone())
+        .map(Some)
+        .map_err(|e| format!("template: {e}"))
+}
+
+/// The folder form's text with `commands` appended, in order, to its
+/// top-level `checks` (SPEC u293 Contract Surface, `enable_checks_text`,
+/// `D-112`): that key added last where none stands, every other key kept
+/// at its value in the order it stood, and the text serialised again, so
+/// its comments, blank lines and quoting choices are not carried.
+pub fn enable_checks_text(contents: &str, commands: &[String]) -> Result<String, String> {
+    let value: serde_yaml::Value = serde_yaml::from_str(contents).map_err(|e| e.to_string())?;
+    let serde_yaml::Value::Mapping(mut mapping) = value else {
+        return Err("the file holds no mapping".to_string());
+    };
+    let key = serde_yaml::Value::from("checks");
+    let mut checks = match mapping.get(&key) {
+        None => Vec::new(),
+        Some(serde_yaml::Value::Sequence(items)) if items.iter().all(|i| i.is_string()) => {
+            items.clone()
+        }
+        Some(_) => return Err("checks must be a list of commands".to_string()),
+    };
+    checks.extend(commands.iter().map(|c| serde_yaml::Value::from(c.as_str())));
+    match mapping.get_mut(&key) {
+        Some(standing) => *standing = serde_yaml::Value::Sequence(checks),
+        None => {
+            mapping.insert(key, serde_yaml::Value::Sequence(checks));
+        }
+    }
+    serde_yaml::to_string(&mapping).map_err(|e| e.to_string())
 }
 
 pub(crate) fn find_syns_yaml(path: &Path) -> Option<PathBuf> {
@@ -750,6 +902,117 @@ mod tests {
             read_identity_form(&file),
             Err(CliError::Io { .. })
         ));
+    }
+
+    fn origin(sha: &str, checks: &[&str]) -> TemplateOrigin {
+        TemplateOrigin {
+            repo: "bartsoj/syns-whiteboard-template".into(),
+            version: 14,
+            sha: sha.into(),
+            checks: checks.iter().map(|c| c.to_string()).collect(),
+        }
+    }
+
+    // SPEC u293 Tests, the row of this name.
+    #[test]
+    fn folder_identity_text_reads_back_through_the_folder_form() {
+        let origin = origin(
+            &"1234567890".repeat(4),
+            &["test: x", "exit 1", "set -e\ntest -f x"],
+        );
+        for path in ["a/b", "2024", "q3 #2"] {
+            let text = folder_identity_text("alice/work", path, &origin);
+            assert_eq!(template_origin(&text), Ok(Some(origin.clone())), "{text}");
+            assert_eq!(declared_checks(&text), Ok(Vec::new()), "{text}");
+            assert_eq!(
+                identity_form_text(&text).unwrap(),
+                IdentityForm::Folder {
+                    holder: "alice/work".into(),
+                    path: path.into()
+                },
+                "{text}"
+            );
+        }
+    }
+
+    // SPEC u293 Tests, `place_records_the_checks_not_turned_on_and_prints_them`:
+    // the exact text, and a template declaring no checks recording none.
+    #[test]
+    fn folder_identity_text_writes_the_pinned_text() {
+        let sha = "f".repeat(40);
+        assert_eq!(
+            folder_identity_text(
+                "alice/work",
+                "clients/vela/q3-board",
+                &origin(&sha, &["test ! -d clients"])
+            ),
+            format!(
+                "holder: alice/work\npath: clients/vela/q3-board\ntemplate:\n  repo: bartsoj/syns-whiteboard-template\n  version: 14\n  sha: {sha}\n  checks:\n  - test ! -d clients\n"
+            )
+        );
+        let bare = folder_identity_text("alice/work", "q3", &origin(&sha, &[]));
+        assert!(!bare.contains("checks"), "{bare}");
+        assert_eq!(
+            template_origin(&bare).unwrap().unwrap().checks,
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_double_quoted_scalar_escapes_what_yaml_reads_otherwise() {
+        let odd = "a\\b\"c\rd\u{85}e\u{2028}f\u{2029}g\u{1}h\u{7f}i\u{feff}\u{fffe}";
+        let text = folder_identity_text("alice/work", "q3", &origin(&"a".repeat(40), &[odd, ""]));
+        assert_eq!(
+            template_origin(&text).unwrap().unwrap().checks,
+            vec![odd.to_string(), String::new()],
+            "{text}"
+        );
+        assert!(
+            text.contains("\\x01") && text.contains("\\x7F") && text.contains("\\uFFFE"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn template_origin_answers_none_without_the_mapping_and_the_reason_otherwise() {
+        assert_eq!(template_origin("holder: alice/work\npath: q3\n"), Ok(None));
+        assert!(template_origin("holder: alice/work\npath: q3\ntemplate: x\n").is_err());
+        assert!(template_origin("checks: [").is_err());
+    }
+
+    // SPEC u293 Tests, `enable_checks_keeps_every_key_a_hand_edit_wrote`.
+    #[test]
+    fn enable_checks_text_appends_to_the_top_level_list_keeping_every_key() {
+        let hand = "# kept by hand\nnote: kept\nholder: alice/work\npath: clients/vela/q3-board\nchecks: [exit 0]\ntemplate:\n  repo: bartsoj/syns-whiteboard-template\n  version: 14\n  sha: t14\n  checks:\n  - test ! -d clients\n";
+        assert_eq!(
+            enable_checks_text(hand, &["test ! -d clients".to_string()]).unwrap(),
+            "note: kept\nholder: alice/work\npath: clients/vela/q3-board\nchecks:\n- exit 0\n- test ! -d clients\ntemplate:\n  repo: bartsoj/syns-whiteboard-template\n  version: 14\n  sha: t14\n  checks:\n  - test ! -d clients\n"
+        );
+        let placed = folder_identity_text(
+            "alice/work",
+            "clients/vela/q3-board",
+            &origin(&"f".repeat(40), &["test ! -d clients"]),
+        );
+        assert_eq!(
+            enable_checks_text(&placed, &["test ! -d clients".to_string()]).unwrap(),
+            format!("{placed}checks:\n- test ! -d clients\n")
+        );
+        assert!(enable_checks_text("holder: a/b\npath: q\nchecks: [1]\n", &[]).is_err());
+        assert!(enable_checks_text("- a\n", &[]).is_err());
+    }
+
+    #[test]
+    fn declared_checks_reads_either_form() {
+        assert_eq!(
+            declared_checks("owner: bartsoj\nname: t\nchecks: [\"test ! -d clients\"]\n"),
+            Ok(vec!["test ! -d clients".to_string()])
+        );
+        assert_eq!(
+            declared_checks("holder: alice/work\npath: q3\nchecks:\n  - make lint\n"),
+            Ok(vec!["make lint".to_string()])
+        );
+        assert_eq!(declared_checks("owner: bartsoj\nname: t\n"), Ok(Vec::new()));
+        assert!(declared_checks("checks: [").is_err());
     }
 
     #[test]

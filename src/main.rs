@@ -380,6 +380,24 @@ enum Commands {
         #[arg(long, short = 'n')]
         name: Option<String>,
     },
+    /// Place a template into a new folder of this repository, its checks recorded and not turned on
+    Place {
+        /// The template repository, as OWNER/NAME
+        #[arg(value_name = "OWNER/NAME", value_parser = read::parse_repo_id)]
+        template: String,
+        /// The new folder, counted from the checkout's root or from the folder the run stands in
+        #[arg(value_name = "PATH")]
+        path: String,
+        /// Place the template at a specific version (number or SHA)
+        #[arg(long)]
+        version: Option<String>,
+    },
+    /// Turn on, for everyone working in the holder, the checks a placed folder recorded
+    EnableChecks {
+        /// The placed folder, counted as syns place counts its own; the folder the run stands in where absent
+        #[arg(value_name = "PATH")]
+        path: Option<String>,
+    },
     /// List the repositories copied from a repository
     Forks {
         /// Maximum number of forks to show
@@ -701,6 +719,14 @@ async fn run(
         }
         Commands::Fork { repo, name } => {
             commands::fork::cmd_fork(config, output, repo, name).await?
+        }
+        Commands::Place {
+            template,
+            path,
+            version,
+        } => commands::place::cmd_place(config, output, template, path, version).await?,
+        Commands::EnableChecks { path } => {
+            commands::enable_checks::cmd_enable_checks(config, output, path).await?
         }
         Commands::Forks {
             limit,

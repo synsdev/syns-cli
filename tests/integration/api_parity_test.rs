@@ -704,7 +704,9 @@ fn repo_create_refuses_the_nouns_update_options() {
 /// The invocation spellings the argument tree is to register: the set
 /// `CLI_IA.md` § Command Inventory carries, with the ten this unit adds
 /// standing beside them. `teams role` stands in it, `repos` and
-/// `repo list` both stand, and nothing else does.
+/// `repo list` both stand, and nothing else does. SPEC u293: `place` and
+/// `enable-checks` stand beside `fork`, `unregistered` in `CLI_IA.md`
+/// until that inventory carries them.
 const REGISTERED: &[(&str, &[&str])] = &[
     (
         "",
@@ -732,6 +734,8 @@ const REGISTERED: &[(&str, &[&str])] = &[
             "delete",
             "explore",
             "fork",
+            "place",
+            "enable-checks",
             "forks",
             "users",
             "user",

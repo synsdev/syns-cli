@@ -631,6 +631,26 @@ fn caption(opts: &WriteOptions, default: &str) -> Result<String, CliError> {
     }
 }
 
+/// One content's entry in a push body, moved rather than copied: `Text`
+/// as `content` beside its derived hash, `Encoded` as `contentBase64`
+/// beside the hash it carries (SPEC u283).
+pub(crate) fn push_file_entry(path: String, content: FileContent) -> PushFileEntry {
+    match content {
+        FileContent::Text(text) => PushFileEntry {
+            path,
+            sha: blob_sha1(text.as_bytes()),
+            content: Some(text),
+            content_base64: None,
+        },
+        FileContent::Encoded { base64, sha } => PushFileEntry {
+            path,
+            sha,
+            content: None,
+            content_base64: Some(base64),
+        },
+    }
+}
+
 /// The body this run sends (`commit_changeset` 2 and 3). Each content
 /// is moved into its entry rather than copied, riding as `content` where
 /// it is `Text` and as `contentBase64` where it is `Encoded` (SPEC u283).
@@ -644,20 +664,7 @@ fn push_body(
         files: changeset
             .files
             .into_iter()
-            .map(|(path, content)| match content {
-                FileContent::Text(text) => PushFileEntry {
-                    path,
-                    sha: blob_sha1(text.as_bytes()),
-                    content: Some(text),
-                    content_base64: None,
-                },
-                FileContent::Encoded { base64, sha } => PushFileEntry {
-                    path,
-                    sha,
-                    content: None,
-                    content_base64: Some(base64),
-                },
-            })
+            .map(|(path, content)| push_file_entry(path, content))
             .collect(),
         deletions: if changeset.deletions.is_empty() {
             None
@@ -771,7 +778,7 @@ const PARENT_SHA_KEY: &[u8] = b"\"parentSha\":\"";
 /// The key is sought from the end: `parentSha` is serialised after
 /// `files`, and inside any JSON string a quote stands escaped, so the
 /// last unescaped `"parentSha":"` is the key itself.
-fn with_parent_sha(body: bytes::Bytes, head: &str) -> bytes::Bytes {
+pub(crate) fn with_parent_sha(body: bytes::Bytes, head: &str) -> bytes::Bytes {
     let Some(start) = body
         .windows(PARENT_SHA_KEY.len())
         .rposition(|window| window == PARENT_SHA_KEY)
@@ -822,18 +829,25 @@ async fn send_keeping(
     (answer, kept)
 }
 
+/// A landed publication: the served result, its body, and the full hash
+/// the landing send claimed as `parentSha` (SPEC u293 Contract Surface,
+/// `publish_changeset`).
+pub type Published = (PushResponse, serde_json::Value, String);
+
 /// SPEC u292 Behaviour, `commit_changeset` 1 to 5 inside a folder: the
 /// one serialised body sent at the pinned parent — or, where the
 /// repository read named another head, at none until the folder check
 /// answers — and then at each head a refusal names while no version
 /// after the pinned parent changed the folder, at most
-/// `FOLDER_SEND_BOUND` sends in all.
+/// `FOLDER_SEND_BOUND` sends in all. SPEC u293: the landing send's
+/// claimed parent is answered beside its answer — the pinned parent on a
+/// first send, and the named head after it.
 async fn send_inside_folder(
     client: &SynsClient,
     target: &WriteTarget,
     folder: &FolderScope,
     body: bytes::Bytes,
-) -> Result<(PushResponse, serde_json::Value), CliError> {
+) -> Result<Published, CliError> {
     let pinned = &target.parent.commit_sha;
     let conflict = |head: &str| CliError::WriteConflict {
         parent: pinned.clone(),
@@ -851,7 +865,7 @@ async fn send_inside_folder(
             let (answer, kept) = send_keeping(client, target, body).await;
             body = kept;
             match answer {
-                Ok(landed) => return Ok(landed),
+                Ok((response, raw)) => return Ok((response, raw, pinned.clone())),
                 Err(err) => match named_head(&err) {
                     Some(head) => head.to_string(),
                     None => return Err(fold_conflict(err, pinned)),
@@ -888,7 +902,7 @@ async fn send_inside_folder(
         let (answer, kept) = send_keeping(client, target, body).await;
         body = kept;
         match answer {
-            Ok(landed) => return Ok(landed),
+            Ok((response, raw)) => return Ok((response, raw, named)),
             Err(err) => match named_head(&err) {
                 Some(head) => named = head.to_string(),
                 None => return Err(fold_conflict(err, pinned)),
@@ -898,14 +912,8 @@ async fn send_inside_folder(
 }
 
 /// Publishes the changeset as one commit, and writes the run's one
-/// answer (SPEC u271 Behaviour, `commit_changeset`).
-///
-/// Outside a folder, one call of `EP-push` per run and no second request
-/// of any kind: the claimed parent is `target.parent.commit_sha` under
-/// every combination of options, nothing is retried and nothing is
-/// resent, and no file of any folder is read, written or removed. Inside
-/// one (SPEC u292), the same body is sent again at a head that moved only
-/// by versions that changed no path under the folder.
+/// answer (SPEC u271 Behaviour, `commit_changeset`): `publish_changeset`
+/// followed by the write report.
 pub async fn commit_changeset(
     config: &Config,
     output: &Output,
@@ -914,6 +922,33 @@ pub async fn commit_changeset(
     opts: &WriteOptions,
     default_message: &str,
 ) -> Result<(), CliError> {
+    let (response, raw, _claimed) =
+        publish_changeset(config, target, changeset, opts, default_message).await?;
+
+    // 4 and 5 — compose the run's one answer and render it.
+    report(output, target, &response, raw);
+    Ok(())
+}
+
+/// Publishes the changeset as one commit, rendering nothing (SPEC u293
+/// Contract Surface, `publish_changeset`): it sends exactly what
+/// `commit_changeset` sends and refuses exactly where it refuses, and
+/// answers the served result, its body and the full hash the landing send
+/// claimed as `parentSha`.
+///
+/// Outside a folder, one call of `EP-push` per run and no second request
+/// of any kind: the claimed parent is `target.parent.commit_sha` under
+/// every combination of options, nothing is retried and nothing is
+/// resent, and no file of any folder is read, written or removed. Inside
+/// one (SPEC u292), the same body is sent again at a head that moved only
+/// by versions that changed no path under the folder.
+pub async fn publish_changeset(
+    config: &Config,
+    target: &WriteTarget,
+    changeset: Changeset,
+    opts: &WriteOptions,
+    default_message: &str,
+) -> Result<Published, CliError> {
     // SPEC u291 `commit_changeset` 1 — inside a folder, every file and
     // deletion the changeset names taken as a path in the holder, a path
     // leaving the folder refused before the push.
@@ -946,17 +981,16 @@ pub async fn commit_changeset(
     drop(request);
     let body = bytes::Bytes::from(body);
     let client = SynsClient::new(config.server_url())?;
-    let (response, raw) = match &target.folder {
-        None => client
-            .push_body(&target.repo_id, &target.token, body)
-            .await
-            .map_err(|err| fold_conflict(err, &target.parent.commit_sha))?,
-        Some(folder) => send_inside_folder(&client, target, folder, body).await?,
-    };
-
-    // 4 and 5 — compose the run's one answer and render it.
-    report(output, target, &response, raw);
-    Ok(())
+    match &target.folder {
+        None => {
+            let (response, raw) = client
+                .push_body(&target.repo_id, &target.token, body)
+                .await
+                .map_err(|err| fold_conflict(err, &target.parent.commit_sha))?;
+            Ok((response, raw, target.parent.commit_sha.clone()))
+        }
+        Some(folder) => send_inside_folder(&client, target, folder, body).await,
+    }
 }
 
 #[cfg(test)]
@@ -1893,6 +1927,117 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    // SPEC u293 `publish_changeset`: outside a folder the claimed parent
+    // is the pinned one, and nothing is rendered.
+    #[tokio::test]
+    #[serial]
+    async fn a_publication_outside_a_folder_answers_the_pinned_parent() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path_matcher("/api/v1/repos/alice/notes/push"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(push_body(1, 2, MOVED_SHA)))
+            .mount(&server)
+            .await;
+        let env = env_for(&server.uri());
+
+        let (response, raw, claimed) = publish_changeset(
+            &env.config,
+            &target_at(None),
+            Changeset {
+                files: vec![("a.md".to_string(), FileContent::Text("a".to_string()))],
+                deletions: Vec::new(),
+            },
+            &write_options(HEAD_SHA),
+            "write a.md",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(claimed, HEAD_SHA);
+        assert_eq!(response.commit_sha, MOVED_SHA);
+        assert_eq!(raw["version"], serde_json::json!(2));
+    }
+
+    // SPEC u293 `publish_changeset`: inside a folder whose first send was
+    // refused naming a head past the pinned parent, the claimed parent is
+    // that head.
+    #[tokio::test]
+    #[serial]
+    async fn a_folder_publication_after_a_moved_head_answers_that_head() {
+        use wiremock::matchers::{body_partial_json, query_param};
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path_matcher("/api/v1/repos/alice/notes/push"))
+            .and(body_partial_json(
+                serde_json::json!({"parentSha": MOVED_SHA}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(push_body(
+                1,
+                3,
+                "e".repeat(40).as_str(),
+            )))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path_matcher("/api/v1/repos/alice/notes/push"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "error": "conflict", "currentSha": MOVED_SHA,
+            })))
+            .mount(&server)
+            .await;
+        let mut at_parent = version_body(1, HEAD_SHA);
+        at_parent["filesChanged"] = serde_json::json!(["q3/board.json"]);
+        Mock::given(method("GET"))
+            .and(path_matcher("/api/v1/repos/alice/notes/versions"))
+            .and(query_param("path", "q3"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [at_parent], "total": 1, "limit": 1, "offset": 0,
+            })))
+            .mount(&server)
+            .await;
+        let env = env_for(&server.uri());
+        let work = tempfile::tempdir().unwrap();
+        let mut target = target_at(None);
+        target.parent.version = Some(1);
+        target.head = Some(HEAD_SHA.to_string());
+        target.folder = Some(FolderScope {
+            dir: work.path().to_path_buf(),
+            owner: "alice".to_string(),
+            name: "notes".to_string(),
+            path: "q3".to_string(),
+            checkout: None,
+            enclosing: Vec::new(),
+        });
+
+        let (response, _raw, claimed) = publish_changeset(
+            &env.config,
+            &target,
+            Changeset {
+                files: vec![(
+                    "board.json".to_string(),
+                    FileContent::Text("{}".to_string()),
+                )],
+                deletions: Vec::new(),
+            },
+            &write_options(HEAD_SHA),
+            "write board.json",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(claimed, MOVED_SHA);
+        assert_eq!(response.commit_sha, "e".repeat(40));
+        let pushes = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method.as_str() == "PUT")
+            .count();
+        assert_eq!(pushes, 2);
     }
 
     // SPEC u292 Tests, `a_shared_body_is_copied_once_for_the_next_send`.

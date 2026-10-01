@@ -1292,8 +1292,11 @@ impl SynsClient {
         process_response_raw(response).await
     }
 
+    /// The raw entry's request under `method` (SPEC u293): `GET` for a
+    /// read of its bytes, `HEAD` for whether a file stands there.
     fn raw_request(
         &self,
+        method: reqwest::Method,
         repo_id: &str,
         token: Option<&str>,
         path: &str,
@@ -1305,7 +1308,7 @@ impl SynsClient {
             repo_id,
             encode_path_segments(path)
         );
-        let mut req = self.client.get(&url);
+        let mut req = self.client.request(method, &url);
         if let Some(r) = version_ref {
             req = req.query(&[("ref", r)]);
         }
@@ -1331,7 +1334,7 @@ impl SynsClient {
         capacity: Option<usize>,
     ) -> Result<RawFile, CliError> {
         let response = self
-            .raw_request(repo_id, token, path, version_ref)
+            .raw_request(reqwest::Method::GET, repo_id, token, path, version_ref)
             .send_empty_bounded()
             .await?;
         let response = check_response(response).await?;
@@ -1346,6 +1349,38 @@ impl SynsClient {
         })
     }
 
+    /// Whether a file stands at `path` at `version_ref` (SPEC u293
+    /// Contract Surface, `SynsClient::raw_holds_file`): one `HEAD` of the
+    /// raw entry, true on `200` and false on any `404` whatever it carries
+    /// — a `HEAD` answer carries no refusal envelope, so a missing path and
+    /// a missing repository read alike — every other status raised as
+    /// `get_raw` raises it, and no body read.
+    pub async fn raw_holds_file(
+        &self,
+        repo_id: &str,
+        token: Option<&str>,
+        path: &str,
+        version_ref: &str,
+    ) -> Result<bool, CliError> {
+        let response = self
+            .raw_request(
+                reqwest::Method::HEAD,
+                repo_id,
+                token,
+                path,
+                Some(version_ref),
+            )
+            .send_empty_bounded()
+            .await?;
+        match check_response(response).await {
+            Ok(_) => Ok(true),
+            Err(CliError::Api {
+                status: Some(404), ..
+            }) => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
     /// The `GET` `get_raw` sends, its body written into a file created at
     /// `dest` as it arrives rather than held.
     pub async fn get_raw_staged(
@@ -1357,7 +1392,7 @@ impl SynsClient {
         dest: &std::path::Path,
     ) -> Result<StagedRaw, CliError> {
         let response = self
-            .raw_request(repo_id, token, path, version_ref)
+            .raw_request(reqwest::Method::GET, repo_id, token, path, version_ref)
             .send_empty_bounded()
             .await?;
         let response = check_response(response).await?;
@@ -4017,6 +4052,55 @@ mod u280_transport_tests {
             matches!(&err, CliError::Api { status: Some(404), error, .. } if error == "not_found"),
             "{err:?}"
         );
+    }
+
+    /// SPEC u293 `SynsClient::raw_holds_file`: one `HEAD` carrying the
+    /// reference, true on `200`, false on a bodiless `404`, and a `500`
+    /// raised as the raw read raises it.
+    #[tokio::test]
+    async fn a_raw_head_answers_whether_a_file_stands_at_the_reference() {
+        let server = MockServer::start().await;
+        for (name, status) in [("a.md", 200), ("gone.md", 404), ("broken.md", 500)] {
+            Mock::given(method("HEAD"))
+                .and(path(format!("/api/v1/repos/alice/r/raw/{name}")))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+        }
+        let client = SynsClient::new(&server.uri()).unwrap();
+
+        assert!(
+            client
+                .raw_holds_file("alice/r", Some("t"), "a.md", "h1")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !client
+                .raw_holds_file("alice/r", Some("t"), "gone.md", "h1")
+                .await
+                .unwrap()
+        );
+        let err = client
+            .raw_holds_file("alice/r", Some("t"), "broken.md", "h1")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CliError::Api {
+                    status: Some(500),
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 3);
+        for request in &requests {
+            assert_eq!(request.method.as_str(), "HEAD");
+            assert_eq!(request.url.query(), Some("ref=h1"));
+        }
     }
 
     #[tokio::test]

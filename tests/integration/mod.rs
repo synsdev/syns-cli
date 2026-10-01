@@ -10,6 +10,7 @@ mod folder_scope_test;
 mod folder_working_copy_test;
 mod history_file_test;
 mod if_repo_test;
+mod place_test;
 mod pull_identity_test;
 mod pull_positionals_test;
 mod push_empty_test;
