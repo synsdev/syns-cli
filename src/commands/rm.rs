@@ -6,10 +6,16 @@
 //! answer counts the entry removed rather than the files under it, and a
 //! path the parent's tree does not hold leaves the head where it stood
 //! at exit `0` — both measured in `units/cli/u271/prototype/`.
+//!
+//! A `PATH` empty once trimmed is refused before any request, credential
+//! read or folder resolution, inside a scoped folder or not and with or
+//! without `--repo`: inside a folder it would name the folder itself, and
+//! outside one it names nothing (SPEC u297 Behaviour, `cmd_rm` 1).
 
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
+use crate::read::refuse_empty_path;
 use crate::write::{
     Changeset, WriteOptions, commit_changeset, default_message, resolve_write_target,
 };
@@ -20,20 +26,25 @@ pub async fn cmd_rm(
     path: String,
     opts: WriteOptions,
 ) -> Result<(), CliError> {
-    // 1 — resolve the write target, which has already read the
-    // repository by the time it answers.
+    // 1 — refuse an empty `PATH` ahead of the `--parent` spelling
+    // refusals and of every request.
+    refuse_empty_path(&path)?;
+
+    // 2 — resolve the write target, which has already read the
+    // repository by the time it answers; compose the one deletion and
+    // commit it.
     let cwd = std::env::current_dir().map_err(|e| CliError::Io {
         message: format!("could not determine current directory: {e}"),
     })?;
     let target = resolve_write_target(config, &cwd, &opts).await?;
 
-    // 2 — one path as a deletion and no file.
+    // One path as a deletion and no file.
     let changeset = Changeset {
         files: Vec::new(),
         deletions: vec![path.clone()],
     };
 
-    // 3 — commit it.
+    // Commit it.
     let message = default_message("rm", Some(&path));
     commit_changeset(config, output, &target, changeset, &opts, &message).await
 }

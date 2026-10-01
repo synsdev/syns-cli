@@ -223,7 +223,10 @@ pub fn default_message(verb: &str, path: Option<&str>) -> String {
 /// folder answers the folder's directory and a folder holding unpublished
 /// work is refused naming that directory, whatever the rest of its
 /// holder's checkout holds; with `--repo` naming that repository there,
-/// the holder checkout above the folder is guarded whole.
+/// the holder checkout above the folder is guarded whole, and a folder
+/// checked out alone, standing in no checkout of its holder, is guarded
+/// as it is with no `--repo` (SPEC u297 Behaviour, `checkout_of` 3), so
+/// no option lifts the guard on it.
 pub async fn checkout_of(
     config: &Config,
     cwd: &Path,
@@ -237,7 +240,9 @@ pub async fn checkout_of(
         Some(scope) if !scope.holder().eq_ignore_ascii_case(repo_id) => Ok(None),
         Some(scope) if repo_named => match &scope.checkout {
             Some(checkout) => guard_root(config, checkout, repo_id).map(Some),
-            None => Ok(None),
+            None => guard_folder(config, &scope, repo_id, client, token)
+                .await
+                .map(Some),
         },
         Some(scope) => guard_folder(config, &scope, repo_id, client, token)
             .await

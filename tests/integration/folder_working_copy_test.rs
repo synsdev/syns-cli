@@ -14,6 +14,12 @@
 //! `alice/work` with the folder `W/clients/vela/q3-board` recording its own
 //! place and an empty `sub` under it, `W` and the folder each converged at
 //! `h1` by a `pull` run in it, unless its setup says otherwise.
+//!
+//! The binary rows of SPEC u297 Tests stand here too, under the names
+//! that table gives them, each over the same deployment with the folder
+//! also checked out alone at `U/q3` where its setup names it;
+//! `repository_argument_refuses_an_empty_value_inside_a_folder_alone`
+//! stands in the tests module of `src/read/mod.rs`.
 
 use assert_cmd::Command as AssertCommand;
 use base64::Engine as _;
@@ -78,6 +84,9 @@ struct State {
     raw_refusals: HashMap<String, (u16, &'static str)>,
     /// `EP-file-read` answers by path.
     file_answers: HashMap<String, String>,
+    /// SPEC u297: the `EP-file-read` answer at every path, ahead of
+    /// `file_answers`, where one stands.
+    file_answer_everywhere: Option<String>,
     /// The delay the first tree answer is held for.
     hold_first_tree: Option<Duration>,
     trees_answered: usize,
@@ -111,6 +120,7 @@ impl State {
             visibility: "public",
             raw_refusals: HashMap::new(),
             file_answers: HashMap::new(),
+            file_answer_everywhere: None,
             hold_first_tree: None,
             trees_answered: 0,
             pin_head: false,
@@ -242,7 +252,11 @@ impl Respond for Server {
         if method == "GET"
             && let Some(file) = rest.strip_prefix("/files/")
         {
-            let content = match state.file_answers.get(file) {
+            let answer = state
+                .file_answer_everywhere
+                .as_ref()
+                .or_else(|| state.file_answers.get(file));
+            let content = match answer {
                 Some(content) => content.clone(),
                 None => {
                     let Some(at) = state.commit_at(query(request, "ref").as_deref()) else {
@@ -2502,4 +2516,291 @@ fn ten_page_saves_land_between_ten_pushes_outside_the_folder() {
             .expect("commitSha")
             .to_string();
     }
+}
+
+// ---- SPEC u297 --------------------------------------------------------
+
+/// The preamble's deployment with the folder also checked out alone at
+/// `U/q3`, answering `U`'s directory and `U/q3`.
+fn converged_with_q3() -> (Deployment, TempDir, PathBuf) {
+    let d = Deployment::converged();
+    let (u_dir, u) = empty_u();
+    let pull = d.run_in(&u, b"", &["pull", REPO, "--path", FOLDER, "q3"]);
+    assert_eq!(exit_of(&pull), 0, "setup pull: {}", stderr_of(&pull));
+    (d, u_dir, u.join("q3"))
+}
+
+const EMPTY_PATH: &str = "error: configuration error: path cannot be empty";
+
+/// Whether `request` reads a path at or under the folder, by raw read or
+/// by `EP-file-read`.
+fn reads_under_folder(request: &Request) -> bool {
+    let path = decoded(request.url.path());
+    ["/raw/", "/files/"].iter().any(|kind| {
+        path.strip_prefix(&format!("{PREFIX}{kind}"))
+            .is_some_and(|file| file == FOLDER || file.starts_with(&format!("{FOLDER}/")))
+    })
+}
+
+fn is_push(request: &Request) -> bool {
+    request.method.as_str() == "PUT" && request.url.path().ends_with("/push")
+}
+
+#[test]
+#[serial]
+fn rm_of_an_empty_path_is_refused_before_any_request_wherever_it_runs() {
+    let (d, _u_dir, q3) = converged_with_q3();
+    let (_e_dir, e) = empty_u();
+    let bare_config = tempfile::tempdir().expect("config dir with no credential");
+    let bare = bare_config.path().to_str().expect("utf-8 config dir");
+    let parent = h(1);
+    let before_q3 = snapshot(&q3);
+    let before_w = snapshot(&d.w);
+    let mark = d.mark();
+
+    let refused = |cwd: &Path, envs: &[(&str, &str)], args: &[&str]| {
+        let out = d.run_with(cwd, envs, b"", args);
+        assert_eq!(exit_of(&out), 1, "{args:?}: {}", stderr_of(&out));
+        assert_eq!(stderr_of(&out).trim_end(), EMPTY_PATH, "{args:?}");
+    };
+    refused(&q3, &[], &["rm", "", "--parent", &parent]);
+    refused(&q3, &[], &["rm", " ", "--parent", &parent]);
+    refused(&d.w, &[], &["rm", "", "--parent", &parent]);
+    refused(
+        &e,
+        &[("SYNS_CONFIG_DIR", bare)],
+        &["rm", "", "--repo", REPO, "--parent", &parent],
+    );
+    let json = d.run_in(&d.folder(), b"", &["--json", "rm", "", "--parent", &parent]);
+    assert_eq!(exit_of(&json), 1, "{}", stderr_of(&json));
+    let document = one_document(&json);
+    let error = document["error"].as_str().expect("an error string");
+    assert!(error.contains("path cannot be empty"), "{document}");
+
+    assert!(
+        d.requests_since(mark).is_empty(),
+        "{:?}",
+        d.requests_since(mark)
+    );
+    assert_eq!(snapshot(&q3), before_q3);
+    assert_eq!(snapshot(&d.w), before_w);
+}
+
+#[test]
+#[serial]
+fn writes_naming_an_empty_path_inside_a_folder_publish_nothing() {
+    let (d, _u_dir, q3) = converged_with_q3();
+    d.state().file_answer_everywhere = Some("a".to_string());
+    let parent = h(1);
+    let runs: [(Vec<&str>, &[u8]); 4] = [
+        (vec!["write", "", "--parent", &parent], b"x"),
+        (
+            vec!["edit", " ", "--old", "a", "--new", "b", "--parent", &parent],
+            b"",
+        ),
+        (
+            vec!["commit", "--parent", &parent],
+            br#"{"deletions":[{"path":""}]}"#,
+        ),
+        (
+            vec!["commit", "--parent", &parent],
+            br#"{"files":[{"path":" ","content":"x"}]}"#,
+        ),
+    ];
+    for (args, stdin) in runs {
+        let mark = d.mark();
+        let out = d.run_in(&q3, stdin, &args);
+        assert_eq!(exit_of(&out), 1, "{args:?}: {}", stderr_of(&out));
+        assert_eq!(stderr_of(&out).trim_end(), EMPTY_PATH, "{args:?}");
+        let requests = d.requests_since(mark);
+        assert!(!requests.iter().any(is_push), "{args:?}: a push was sent");
+        assert!(
+            !requests.iter().any(reads_under_folder),
+            "{args:?}: a path under the folder was read"
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn reading_verbs_naming_an_empty_path_inside_a_folder_are_refused_before_any_request() {
+    let (d, _u_dir, q3) = converged_with_q3();
+    let runs: [Vec<&str>; 7] = [
+        vec!["cat", ""],
+        vec!["read", " "],
+        vec!["ls", ""],
+        vec!["glob", "*", "--path", ""],
+        vec!["grep", "x", "--path", ""],
+        vec!["history", "--file", ""],
+        vec!["revert", "", "--to", "1"],
+    ];
+    for args in runs {
+        let mark = d.mark();
+        let out = d.run_in(&q3, b"", &args);
+        assert_eq!(exit_of(&out), 1, "{args:?}: {}", stderr_of(&out));
+        assert_eq!(stderr_of(&out).trim_end(), EMPTY_PATH, "{args:?}");
+        assert!(
+            d.requests_since(mark).is_empty(),
+            "{args:?}: {:?}",
+            d.requests_since(mark)
+        );
+    }
+    let ls = d.run_in(&q3, b"", &["ls"]);
+    assert_eq!(exit_of(&ls), 0, "{}", stderr_of(&ls));
+    let listed = stdout_of(&ls);
+    assert!(
+        listed.contains(".page") && listed.contains(".syns.yaml"),
+        "{listed}"
+    );
+}
+
+/// SPEC u297: the repository `bob/other` at a head of its own, answering
+/// its repository read and each push with one changed file, mounted
+/// ahead of the `alice/work` responder.
+const OTHER_PREFIX: &str = "/api/v1/repos/bob/other";
+
+struct Other;
+
+impl Respond for Other {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let path = decoded(request.url.path());
+        let rest = path.strip_prefix(OTHER_PREFIX).unwrap_or(&path);
+        match (request.method.as_str(), rest) {
+            ("GET", "") => ResponseTemplate::new(200).set_body_json(json!({
+                "owner": "bob", "name": "other", "description": null,
+                "commitSha": other_head(), "status": "active", "author": null, "tags": [],
+                "visibility": "public", "forkedFrom": null, "forkCount": 0,
+                "fileCount": 1, "role": null,
+                "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+            })),
+            ("PUT", "/push") => ResponseTemplate::new(200).set_body_json(json!({
+                "commitSha": "e".repeat(40), "version": 4,
+                "filesChanged": 1, "created": false,
+            })),
+            _ => refusal(404, "not_found"),
+        }
+    }
+}
+
+fn other_head() -> String {
+    "d".repeat(40)
+}
+
+fn mount_other(d: &Deployment) {
+    d.rt.block_on(
+        Mock::given(wiremock::matchers::path_regex(format!("^{OTHER_PREFIX}")))
+            .respond_with(Other)
+            .with_priority(1)
+            .mount(&d.server),
+    );
+}
+
+#[test]
+#[serial]
+fn a_repo_write_from_a_folder_checked_out_alone_holding_unpublished_work_is_refused() {
+    let d = Deployment::converged();
+    let (_f_dir, f) = empty_u();
+    write(&f.join(".syns.yaml"), FOLDER_YAML);
+    write(&f.join("notes.md"), "kept\n");
+    let parent = h(1);
+    let changeset = br#"{"files":[{"path":"notes.md","content":"x"}]}"#;
+    let runs: [(Vec<&str>, &[u8]); 4] = [
+        (
+            vec!["write", "notes.md", "--parent", &parent, "--repo", REPO],
+            b"new",
+        ),
+        (
+            vec![
+                "edit", "notes.md", "--old", "a", "--new", "b", "--parent", &parent, "--repo", REPO,
+            ],
+            b"",
+        ),
+        (
+            vec!["rm", "notes.md", "--parent", &parent, "--repo", REPO],
+            b"",
+        ),
+        (
+            vec!["commit", "--parent", &parent, "--repo", REPO],
+            changeset,
+        ),
+    ];
+    let refusal_dir = f.display().to_string();
+    for (args, stdin) in runs {
+        let mark = d.mark();
+        let out = d.run_in(&f, stdin, &args);
+        assert_eq!(exit_of(&out), 1, "{args:?}: {}", stderr_of(&out));
+        let stderr = stderr_of(&out);
+        assert!(stderr.contains("the checkout at "), "{args:?}: {stderr}");
+        assert!(stderr.contains(&refusal_dir), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("holds unpublished local changes for alice/work"),
+            "{args:?}: {stderr}"
+        );
+        for request in d.requests_since(mark) {
+            let path = decoded(request.url.path());
+            assert_ne!(path, PREFIX, "{args:?}: the repository was read");
+            assert!(!path.ends_with("/notes.md"), "{args:?}: notes.md was read");
+            assert!(!is_push(&request), "{args:?}: a push was sent");
+        }
+    }
+    assert_eq!(read(&f.join("notes.md")), "kept\n");
+}
+
+#[test]
+#[serial]
+fn a_repo_write_from_a_folder_checked_out_alone_lands_where_the_folder_is_clean_or_another_repository_is_named()
+ {
+    let (d, _u_dir, q3) = converged_with_q3();
+    mount_other(&d);
+    let parent = h(1);
+
+    let mark = d.mark();
+    let page = d.run_in(
+        &q3,
+        b"{}",
+        &[
+            "--json",
+            "write",
+            ".page/x.json",
+            "--parent",
+            &parent,
+            "--repo",
+            REPO,
+        ],
+    );
+    assert_eq!(exit_of(&page), 0, "{}", stderr_of(&page));
+    let pushes: Vec<Request> = d.requests_since(mark).into_iter().filter(is_push).collect();
+    assert_eq!(pushes.len(), 1, "{pushes:?}");
+    assert_eq!(decoded(pushes[0].url.path()), format!("{PREFIX}/push"));
+    let body: Value = serde_json::from_slice(&pushes[0].body).expect("push body");
+    assert_eq!(named(&body), vec![".page/x.json".to_string()]);
+    assert_eq!(body["parentSha"], json!(h(1)));
+    assert_eq!(
+        one_document(&page)["checkoutBehind"],
+        json!(q3.display().to_string())
+    );
+
+    write(&q3.join("notes.md"), "noted\n");
+    let mark = d.mark();
+    let other = d.run_in(
+        &q3,
+        b"x",
+        &[
+            "write",
+            "notes.md",
+            "--repo",
+            "bob/other",
+            "--parent",
+            &other_head(),
+        ],
+    );
+    assert_eq!(exit_of(&other), 0, "{}", stderr_of(&other));
+    let pushes: Vec<Request> = d.requests_since(mark).into_iter().filter(is_push).collect();
+    assert_eq!(pushes.len(), 1, "{pushes:?}");
+    assert_eq!(
+        decoded(pushes[0].url.path()),
+        format!("{OTHER_PREFIX}/push")
+    );
+    let body: Value = serde_json::from_slice(&pushes[0].body).expect("push body");
+    assert_eq!(named(&body), vec!["notes.md".to_string()]);
 }

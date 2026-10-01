@@ -119,6 +119,45 @@ pub(crate) fn refuse_reference_spelling(value: &str) -> Result<(), CliError> {
     Ok(())
 }
 
+/// The empty-path refusal (SPEC u297 Contract Surface): a path typed
+/// empty, which inside a scoped folder would name the folder itself and
+/// under `syns rm` would name the folder or nothing at all.
+pub const EMPTY_PATH_REFUSAL: &str = "path cannot be empty";
+
+/// Refuses a typed path left empty once every character the `file path`
+/// field kind trims is taken off its ends (SPEC u297 Contract Surface,
+/// `refuse_empty_path`). The set is ECMAScript's `String.prototype.trim`,
+/// which the server applies, rather than Rust's `char::is_whitespace`:
+/// `U+FEFF` is taken off and `U+0085` is not, so the refusal answers
+/// exactly where the server would read the path as empty.
+pub fn refuse_empty_path(typed: &str) -> Result<(), CliError> {
+    if typed.chars().all(trimmed_by_the_file_path_field_kind) {
+        return Err(CliError::Config {
+            message: EMPTY_PATH_REFUSAL.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Whether ECMAScript's `String.prototype.trim` takes `c` off an end:
+/// its WhiteSpace and LineTerminator productions.
+fn trimmed_by_the_file_path_field_kind(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0009}'..='\u{000D}'
+            | '\u{0020}'
+            | '\u{00A0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200A}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202F}'
+            | '\u{205F}'
+            | '\u{3000}'
+            | '\u{FEFF}'
+    )
+}
+
 /// Binds the repository, resolves the reference, and pins the pair as
 /// the run's one reference (SPEC u270 Behaviour, `resolve_read_target`).
 ///
@@ -239,6 +278,9 @@ fn leaving_folder(typed: &str, folder: &FolderScope) -> CliError {
 /// value unchanged; inside a folder the folder's path where nothing was
 /// typed and the typed value joined under it otherwise, a value opening
 /// with `/` or holding a `.` or `..` segment refused before any request.
+/// Inside a folder a value `refuse_empty_path` refuses is refused with
+/// the empty-path refusal, so no typed value names the folder's own path
+/// (SPEC u297 Behaviour, `repository_argument` 3).
 pub fn repository_argument(
     folder: Option<&FolderScope>,
     typed: Option<&str>,
@@ -249,6 +291,7 @@ pub fn repository_argument(
     let Some(typed) = typed else {
         return Ok(Some(folder.path.clone()));
     };
+    refuse_empty_path(typed)?;
     if typed.starts_with('/') || typed.split('/').any(|seg| seg == "." || seg == "..") {
         return Err(leaving_folder(typed, folder));
     }
@@ -431,6 +474,52 @@ mod tests {
                 )
             );
             assert_eq!(err.exit_code(), 1);
+        }
+    }
+
+    // SPEC u297 Tests, `repository_argument_refuses_an_empty_value_inside_a_folder_alone`.
+    #[test]
+    fn repository_argument_refuses_an_empty_value_inside_a_folder_alone() {
+        let folder = q3();
+        for typed in ["", "  ", "\u{FEFF}"] {
+            let err = repository_argument(Some(&folder), Some(typed)).unwrap_err();
+            assert!(
+                matches!(&err, CliError::Config { message } if message == "path cannot be empty"),
+                "{typed:?} answered {err:?}"
+            );
+            assert_eq!(err.exit_code(), 1);
+        }
+        assert_eq!(
+            repository_argument(Some(&folder), None).unwrap().as_deref(),
+            Some("clients/q3")
+        );
+        assert_eq!(
+            repository_argument(Some(&folder), Some("a.md"))
+                .unwrap()
+                .as_deref(),
+            Some("clients/q3/a.md")
+        );
+        assert_eq!(
+            repository_argument(None, Some("")).unwrap().as_deref(),
+            Some("")
+        );
+    }
+
+    // SPEC u297 Contract Surface, `refuse_empty_path`: the set
+    // ECMAScript's `String.prototype.trim` takes off, never `U+0085`.
+    #[test]
+    fn refuse_empty_path_takes_off_the_file_path_field_kind_set() {
+        let every_trimmed = "\u{9}\u{A}\u{B}\u{C}\u{D}\u{20}\u{A0}\u{1680}\u{2000}\u{200A}\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}\u{FEFF}";
+        for typed in ["", "\u{3000}\t\u{FEFF}", every_trimmed] {
+            let err = refuse_empty_path(typed).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "configuration error: path cannot be empty",
+                "{typed:?}"
+            );
+        }
+        for typed in ["\u{0085}", "a", " a ", "\u{FEFF}a"] {
+            assert!(refuse_empty_path(typed).is_ok(), "{typed:?} was refused");
         }
     }
     use serial_test::serial;
