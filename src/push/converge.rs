@@ -1857,19 +1857,27 @@ struct Candidate<'a> {
     /// (`publish_reviewed` 8).
     force_resolution: bool,
     /// Whether this run holds the root identity file out (u263), decided
-    /// once and applied to every collection; `None` leaves the first pass
-    /// to decide it from its own collection.
-    hold_root_identity: Option<bool>,
+    /// once and applied to every collection, and the held file's hash.
+    hold_root_identity: IdentityHold,
     /// Whether the root identity file is the record a retrieval wrote,
     /// through `held_root_identity` over the base the run loaded (SPEC
     /// u306 `converge` 1), read once for the run.
     written_root_identity: bool,
-    /// The hash of the root identity file the caller held out of the
-    /// collection it hands in, before `hold_root_identity` dropped it
-    /// (u306 CR1-1); `None` where the caller held nothing.
-    held_root_identity_hash: Option<String>,
     /// Where every collection of the run is taken from (SPEC u291).
     root: &'a FolderRoot,
+}
+
+/// A run's hold over the root identity file (u263), carrying the held
+/// file's hash so a collection handed in already held still records the
+/// base's own entry for it (SPEC u306 `converge` 5, u306 CR2-1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum IdentityHold {
+    /// The first pass decides it from its own collection.
+    Undecided,
+    /// The run holds nothing out.
+    Released,
+    /// The run holds the file out; the hash it had before it was dropped.
+    Held(String),
 }
 
 /// Where a pass's write takes its bytes from.
@@ -1952,7 +1960,7 @@ async fn prepare_candidate(
     let mut collisions: BTreeMap<String, CollisionKind> = BTreeMap::new();
     let mut resumed_combined: BTreeSet<String> = BTreeSet::new();
     let mut first_folder = first_folder;
-    let mut hold = candidate.hold_root_identity;
+    let mut hold = candidate.hold_root_identity.clone();
     // Paths a pass refused on as changed since its collection, their
     // record entries dropped before the next collection (`D-093`).
     let mut forget: Vec<String> = Vec::new();
@@ -1995,25 +2003,35 @@ async fn prepare_candidate(
             None => collect_folder(copy, opts, &forget, true, candidate.root)?,
         };
         forget.clear();
-        let holding = *hold.get_or_insert_with(|| {
-            holds_root_identity(
-                !candidate.publishing,
-                candidate.written_root_identity,
-                &candidate.base_files,
-                &folder,
-                head,
-            )
-        });
+        if hold == IdentityHold::Undecided {
+            hold = match folder.hashes.get(ROOT_IDENTITY) {
+                Some(hash)
+                    if holds_root_identity(
+                        !candidate.publishing,
+                        candidate.written_root_identity,
+                        &candidate.base_files,
+                        &folder,
+                        head,
+                    ) =>
+                {
+                    IdentityHold::Held(hash.clone())
+                }
+                _ => IdentityHold::Released,
+            };
+        }
         // SPEC u306 `converge` 5: the held file's hash, kept for the base
-        // a synced pass records — the caller's where the collection it
-        // handed in is already held (u306 CR1-1).
+        // a synced pass records — the hold's own where the collection the
+        // caller handed in is already held (u306 CR1-1, CR2-1).
         let mut held_hash: Option<String> = None;
-        if holding {
-            held_hash = folder
-                .hashes
-                .get(ROOT_IDENTITY)
-                .cloned()
-                .or_else(|| candidate.held_root_identity_hash.clone());
+        let holding = matches!(hold, IdentityHold::Held(_));
+        if let IdentityHold::Held(hash) = &hold {
+            held_hash = Some(
+                folder
+                    .hashes
+                    .get(ROOT_IDENTITY)
+                    .cloned()
+                    .unwrap_or_else(|| hash.clone()),
+            );
             hold_root_identity(&mut folder);
         }
         let excluded = excluded_on_disk(
@@ -3014,9 +3032,11 @@ async fn converge_from_resolution(
             publishing: mode == ConvergeMode::Publish,
             existing: None,
             force_resolution: false,
-            hold_root_identity: Some(hold),
+            hold_root_identity: match held {
+                Some(hash) => IdentityHold::Held(hash),
+                None => IdentityHold::Released,
+            },
             written_root_identity: written,
-            held_root_identity_hash: held,
             root,
         },
         Some(folder),
@@ -3072,9 +3092,8 @@ async fn finish_preparation(
             publishing: mode == ConvergeMode::Publish,
             existing: Some(standing),
             force_resolution: true,
-            hold_root_identity: None,
+            hold_root_identity: IdentityHold::Undecided,
             written_root_identity: written,
-            held_root_identity_hash: None,
             root,
         },
         folder,
@@ -3658,9 +3677,8 @@ async fn guard_refused(
             publishing: true,
             existing,
             force_resolution: true,
-            hold_root_identity: Some(false),
+            hold_root_identity: IdentityHold::Released,
             written_root_identity: false,
-            held_root_identity_hash: None,
             root,
         },
         None,
@@ -4004,9 +4022,8 @@ mod tests {
                 publishing: false,
                 existing: None,
                 force_resolution: false,
-                hold_root_identity: Some(false),
+                hold_root_identity: IdentityHold::Released,
                 written_root_identity: false,
-                held_root_identity_hash: None,
                 root: &FolderRoot::whole(&copy.root),
             },
             None,
@@ -4446,9 +4463,8 @@ mod tests {
                 publishing: false,
                 existing: None,
                 force_resolution: false,
-                hold_root_identity: Some(false),
+                hold_root_identity: IdentityHold::Released,
                 written_root_identity: false,
-                held_root_identity_hash: None,
                 root: &FolderRoot::whole(&holder.root),
             },
             None,
@@ -4544,9 +4560,8 @@ mod tests {
                             publishing: false,
                             existing: None,
                             force_resolution: false,
-                            hold_root_identity: Some(false),
+                            hold_root_identity: IdentityHold::Released,
                             written_root_identity: false,
-                            held_root_identity_hash: None,
                             root: &FolderRoot::of_scope(&folder.root, &scope, None),
                         },
                         None,
