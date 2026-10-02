@@ -1782,3 +1782,52 @@ fn a_placement_through_an_identity_past_a_moved_folder_leaves_its_base_standing(
     assert_eq!(base.commit_sha(), Some(H4));
     assert!(base.file_sha("appendix/board.html").is_none());
 }
+
+// CR4-1: where the folder's check after the refusal is itself refused on
+// a code that is not transient, the placement still lands and the
+// identity copy's base is left where it stood, the folder unread being
+// answered as a folder that may have moved.
+#[test]
+#[serial]
+fn a_placement_through_an_identity_whose_folder_check_is_refused_leaves_its_base_standing() {
+    let d = Deployment::new();
+    write(&d.folder().join("document.html"), DOC);
+    d.record_base(H4);
+    serve_template(&d);
+    identity_push_past_h6(&d);
+    // The head the placement reads answers `H4`; the folder's check after
+    // the refusal is refused `403`.
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path(format!("{IDENTITY}/versions")))
+            .and(query_param("limit", "1"))
+            .and(query_param_is_missing("path"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(page(vec![version(4, H4, &["document.html"])], 1)),
+            )
+            .up_to_n_times(1)
+            .with_priority(1),
+    );
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path(format!("{IDENTITY}/versions")))
+            .and(query_param("limit", "1"))
+            .and(query_param_is_missing("path"))
+            .respond_with(refusal(403, "forbidden"))
+            .with_priority(2),
+    );
+
+    let out = d.run(&["--json", "place", "bob/board-template", "appendix"]);
+
+    assert_eq!(exit_of(&out), 0, "{}{}", stderr_of(&out), stdout_of(&out));
+    let pushes = d.pushes(IDENTITY);
+    assert_eq!(pushes.len(), 2, "{:?}", d.targets());
+    assert_eq!(pushes[1]["parentSha"], json!(H6));
+    let copy = WorkingCopy::open_existing(&d.stores(), "alice", "docs-q3-plan", &d.folder())
+        .unwrap()
+        .expect("the identity copy");
+    let base = copy.base().unwrap();
+    assert_eq!(base.commit_sha(), Some(H4));
+    assert!(base.file_sha("appendix/board.html").is_none());
+}
