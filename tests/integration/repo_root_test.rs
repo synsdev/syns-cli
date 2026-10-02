@@ -807,6 +807,7 @@ async fn push_naming_another_repository_leaves_a_standing_identity_file_alone() 
 
     assert_refused_as_another_repository(&result, &folder, "alice/proj", "bob/other");
     assert_no_request(&ctx).await;
+    assert_no_working_copy(&ctx, "bob");
     assert_eq!(fs::read(folder.join(".syns.yaml")).unwrap(), before);
 }
 
@@ -1125,6 +1126,22 @@ async fn assert_no_request(ctx: &TestContext) {
     );
 }
 
+/// SPEC u309 Contract Surface, `cmd_push`: a refused publication opens no
+/// working copy of the repository it named (CR1-1).
+fn assert_no_working_copy(ctx: &TestContext, owner: &str) {
+    let opened = ctx
+        .config
+        .stores()
+        .default
+        .join("working-copies")
+        .join(owner);
+    assert!(
+        !opened.exists(),
+        "the refused publication opened a working copy at {}",
+        opened.display()
+    );
+}
+
 // SPEC u309 Tests, the row of this name: issue 231's reproduction.
 #[tokio::test(flavor = "current_thread")]
 #[serial]
@@ -1144,6 +1161,7 @@ async fn forced_push_naming_another_repository_refuses_before_any_request() {
 
     assert_refused_as_another_repository(&result, &folder, "alice/proj", "bob/other");
     assert_no_request(&ctx).await;
+    assert_no_working_copy(&ctx, "bob");
     assert_eq!(fs::read(folder.join(".syns.yaml")).unwrap(), before);
 }
 
@@ -1182,6 +1200,7 @@ async fn bare_push_naming_another_repository_refuses_and_converges_nothing() {
 
     assert_refused_as_another_repository(&result, &folder, "alice/proj", "bob/other");
     assert_no_request(&ctx).await;
+    assert_no_working_copy(&ctx, "bob");
     assert_eq!(files_under(&folder), [".syns.yaml", "a.md", "sub/b.md"]);
     assert_eq!(fs::read(folder.join(".syns.yaml")).unwrap(), before);
 }
