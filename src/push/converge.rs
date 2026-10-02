@@ -673,6 +673,72 @@ pub(crate) async fn read_blobs(
     }
 }
 
+/// Whether `err` is a base read finding the base commit does not hold a
+/// wanted path at the hash the base names: `NOT_FOUND`, or the mismatch
+/// refusal naming that path and that hash (SPEC u304 Q-01).
+fn base_unheld(
+    err: &CliError,
+    folder: Option<&str>,
+    wanted: &BTreeMap<String, (String, Option<u64>)>,
+) -> bool {
+    if is_not_found(err) {
+        return true;
+    }
+    let CliError::Api {
+        status: Some(200),
+        error,
+        context: None,
+    } = err
+    else {
+        return false;
+    };
+    wanted.iter().any(|(path, (hash, _))| {
+        let remote = match folder {
+            Some(folder) => format!("{folder}/{path}"),
+            None => path.clone(),
+        };
+        let named = crate::client::hash_mismatch(&remote, hash, "");
+        matches!(named, CliError::Api { error: prefix, .. } if error.starts_with(&prefix))
+    })
+}
+
+/// A modify/modify collision's base contents read as `read_blobs` reads
+/// them, beside every wanted path the base commit does not hold at the
+/// hash the base names (SPEC u304 Q-01): where the one read is refused so,
+/// each path is read on its own, and a path whose own read is refused so
+/// is answered among the unheld rather than read; every other refusal
+/// ends the run.
+#[allow(clippy::too_many_arguments)]
+async fn read_base_blobs(
+    client: &SynsClient,
+    token: Option<&str>,
+    repo_id: &str,
+    folder: Option<&str>,
+    at: &str,
+    wanted: &BTreeMap<String, (String, Option<u64>)>,
+    held: &Arc<HeldBytes>,
+    staging: &Staging,
+) -> Result<(BTreeMap<String, Blob>, BTreeSet<String>), CliError> {
+    match read_blobs(client, token, repo_id, folder, at, wanted, held, staging).await {
+        Ok(blobs) => return Ok((blobs, BTreeSet::new())),
+        Err(err) if base_unheld(&err, folder, wanted) => {}
+        Err(err) => return Err(err),
+    }
+    let mut blobs = BTreeMap::new();
+    let mut unheld = BTreeSet::new();
+    for (path, entry) in wanted {
+        let one = BTreeMap::from([(path.clone(), entry.clone())]);
+        match read_blobs(client, token, repo_id, folder, at, &one, held, staging).await {
+            Ok(read) => blobs.extend(read),
+            Err(err) if base_unheld(&err, folder, &one) => {
+                unheld.insert(path.clone());
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok((blobs, unheld))
+}
+
 fn forget_weight(outstanding: &mut Vec<u64>, weight: u64) {
     if let Some(at) = outstanding.iter().position(|w| *w == weight) {
         outstanding.swap_remove(at);
@@ -1891,7 +1957,7 @@ async fn prepare_candidate(
             &folder.hashes,
             candidate.base_files.keys().chain(head.files.keys()),
         );
-        let rec = reconcile(
+        let mut rec = reconcile(
             &without(&candidate.base_files, &excluded),
             &folder.hashes,
             &without(&head.files, &excluded),
@@ -1947,7 +2013,7 @@ async fn prepare_candidate(
         };
         let base_blobs = match (&candidate.base_commit, base_wanted.is_empty()) {
             (Some(base_commit), false) => {
-                read_blobs(
+                let (blobs, unheld) = read_base_blobs(
                     client,
                     token,
                     &repo,
@@ -1957,7 +2023,15 @@ async fn prepare_candidate(
                     &held,
                     staging,
                 )
-                .await?
+                .await?;
+                // SPEC u304 Q-01: a base path its commit does not hold at
+                // the hash the base names reads as added on both sides.
+                for (path, kind) in rec.collisions.iter_mut() {
+                    if *kind == CollisionKind::ModifyModify && unheld.contains(path) {
+                        *kind = CollisionKind::AddAdd;
+                    }
+                }
+                blobs
             }
             _ => BTreeMap::new(),
         };

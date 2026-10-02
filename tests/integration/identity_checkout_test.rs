@@ -1726,13 +1726,30 @@ fn a_placement_through_an_identity_past_a_holder_version_outside_the_folder_leav
     assert_eq!(pushed_paths(&pushes[2]), vec!["document.html"]);
 }
 
-// V1-13 of u302's VERIFICATION.md: where a version after the one the
-// folder's base stands on changed the folder by the time the placement is
-// sent again, the placement still lands, and the identity copy's base is
-// left where it stood, so the folder's next sync retrieves that change.
+/// The identity copy recording `H4` with the placed identity file and
+/// `appendix/board.html` at the hashes of the bytes written.
+fn assert_placed_at_h4(d: &Deployment, copy: &WorkingCopy) {
+    let base = copy.base().unwrap();
+    assert_eq!(base.commit_sha(), Some(H4));
+    let identity = std::fs::read(d.folder().join("appendix/.syns.yaml")).unwrap();
+    assert_eq!(
+        base.file_sha("appendix/.syns.yaml"),
+        Some(blob_sha1(&identity).as_str())
+    );
+    assert_eq!(
+        base.file_sha("appendix/board.html"),
+        Some(blob_sha1(BOARD.as_bytes()).as_str())
+    );
+}
+
+// SPEC u304 Tests, the row of this name: where a version after the one
+// the folder's base stands on changed the folder by the time the
+// placement is sent again, the placement still lands, and the identity
+// copy's base takes the placed files at its own commit, so the folder's
+// next sync retrieves that change and the placed files read as no work.
 #[test]
 #[serial]
-fn a_placement_through_an_identity_past_a_moved_folder_leaves_its_base_standing() {
+fn a_placement_through_an_identity_past_a_moved_folder_lays_its_files_and_keeps_its_commit() {
     let d = Deployment::new();
     write(&d.folder().join("document.html"), DOC);
     d.record_base(H4);
@@ -1778,18 +1795,18 @@ fn a_placement_through_an_identity_past_a_moved_folder_leaves_its_base_standing(
     let copy = WorkingCopy::open_existing(&d.stores(), "alice", "docs-q3-plan", &d.folder())
         .unwrap()
         .expect("the identity copy");
-    let base = copy.base().unwrap();
-    assert_eq!(base.commit_sha(), Some(H4));
-    assert!(base.file_sha("appendix/board.html").is_none());
+    assert_placed_at_h4(&d, &copy);
 }
 
-// CR4-1: where the folder's check after the refusal is itself refused on
-// a code that is not transient, the placement still lands and the
-// identity copy's base is left where it stood, the folder unread being
-// answered as a folder that may have moved.
+// SPEC u304 Tests, the row of this name: where the folder's check after
+// the refusal is itself refused on a code that is not transient, the
+// placement still lands and the identity copy's base takes the placed
+// files at its own commit, the folder unread being answered as a folder
+// that may have moved.
 #[test]
 #[serial]
-fn a_placement_through_an_identity_whose_folder_check_is_refused_leaves_its_base_standing() {
+fn a_placement_through_an_identity_whose_folder_check_is_refused_lays_its_files_and_keeps_its_commit()
+ {
     let d = Deployment::new();
     write(&d.folder().join("document.html"), DOC);
     d.record_base(H4);
@@ -1827,7 +1844,5 @@ fn a_placement_through_an_identity_whose_folder_check_is_refused_leaves_its_base
     let copy = WorkingCopy::open_existing(&d.stores(), "alice", "docs-q3-plan", &d.folder())
         .unwrap()
         .expect("the identity copy");
-    let base = copy.base().unwrap();
-    assert_eq!(base.commit_sha(), Some(H4));
-    assert!(base.file_sha("appendix/board.html").is_none());
+    assert_placed_at_h4(&d, &copy);
 }

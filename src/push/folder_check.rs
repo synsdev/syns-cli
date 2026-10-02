@@ -77,6 +77,54 @@ fn changed_the_folder(entry: &VersionEntry, folder: &str) -> bool {
         .any(|path| path == folder || lies_under(path, folder))
 }
 
+/// Whether `repo_id`'s history shows `landed` as the newest version
+/// changing a path at or under `folder` and no version numbered after
+/// `since` and before `landed` changing one (SPEC u304 Behaviour,
+/// `folder_unmoved_until` 1–4): false on every refusal and every answer
+/// leaving either unshown, and nothing written to either stream — the
+/// caller keeps a copy's commit on false and loses nothing else.
+pub async fn folder_unmoved_until(
+    client: &SynsClient,
+    token: Option<&str>,
+    repo_id: &str,
+    folder: &str,
+    since: &str,
+    landed: &str,
+) -> bool {
+    // 1 — the folder's two newest changes.
+    let Ok((page, _raw)) = client
+        .list_versions(repo_id, token, 2, 0, Some(folder))
+        .await
+    else {
+        return false;
+    };
+    // 2 — a page not narrowed to the folder, or one whose newest change
+    // is not the landed version.
+    if page
+        .data
+        .iter()
+        .any(|entry| !changed_the_folder(entry, folder))
+    {
+        return false;
+    }
+    match page.data.first() {
+        Some(newest) if newest.sha == landed => {}
+        _ => return false,
+    }
+    // 3 — the change before the landed one is the base's own commit.
+    let Some(before) = page.data.get(1) else {
+        return false;
+    };
+    if before.sha == since {
+        return true;
+    }
+    // 4 — that change numbered at or below the base's commit.
+    match client.get_version(repo_id, token, since).await {
+        Ok((entry, _raw)) => before.version <= entry.version,
+        Err(_) => false,
+    }
+}
+
 impl FolderCheck {
     /// A read of the check refused: a `transient` refusal answers as a
     /// folder that moved once the unread-check line is written, and any
@@ -407,6 +455,59 @@ mod tests {
             Err(CliError::FolderWriteUnsupported { folder }) => assert_eq!(folder, FOLDER),
             other => panic!("expected the unsupported-server refusal, got {other:?}"),
         }
+    }
+
+    // SPEC u304 Tests, the row of this name.
+    #[tokio::test]
+    async fn a_folder_counts_unmoved_until_the_landed_version_only_where_its_history_shows_it() {
+        let changed = &["budget/board/.syns.yaml"][..];
+        let pages = [
+            ResponseTemplate::new(200).set_body_json(page(vec![
+                version(3, "h3", changed),
+                version(1, "h1", changed),
+            ])),
+            ResponseTemplate::new(200).set_body_json(page(vec![
+                version(3, "h3", changed),
+                version(2, "h2", changed),
+            ])),
+            ResponseTemplate::new(200).set_body_json(page(vec![version(3, "h3", changed)])),
+            ResponseTemplate::new(200).set_body_json(page(vec![
+                version(4, "h4", changed),
+                version(3, "h3", changed),
+            ])),
+            ResponseTemplate::new(200).set_body_json(page(vec![version(3, "h3", &["README.md"])])),
+            ResponseTemplate::new(503).set_body_json(serde_json::json!({"error": "unavailable"})),
+        ];
+        let mut answers = Vec::new();
+        let mut first_reads = None;
+        for answer in pages {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(format!("/api/v1/repos/{REPO}/versions")))
+                .and(query_param("path", "budget"))
+                .and(query_param("limit", "2"))
+                .and(query_param("offset", "0"))
+                .respond_with(answer)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/api/v1/repos/{REPO}/versions/h1")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(version(
+                    1,
+                    "h1",
+                    &["README.md"],
+                )))
+                .mount(&server)
+                .await;
+            let client = SynsClient::new(&server.uri()).unwrap();
+            answers
+                .push(folder_unmoved_until(&client, Some("t"), REPO, "budget", "h1", "h3").await);
+            if first_reads.is_none() {
+                first_reads = Some(single_version_reads(&server).await);
+            }
+        }
+        assert_eq!(answers, [true, false, false, false, false, false]);
+        assert_eq!(first_reads, Some(0));
     }
 
     // SPEC u292 Behaviour, `FolderCheck::folder_moved` 1: a refusal of

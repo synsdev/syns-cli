@@ -823,6 +823,52 @@ impl WorkingCopy {
         self.write_state(BASE_FILE, &manifest)
     }
 
+    /// Lay `files`, each path already counted from this copy's root, over
+    /// the base it records (SPEC u304 Behaviour, `WorkingCopy::lay_files`
+    /// 1–2): under the state lock, where the copy holds no resolution and
+    /// no outbox and records a base, that base then carries each of
+    /// `files` at its hash beside every path it carried, its commit
+    /// `landed` exactly where it was `advance_from` and its own otherwise,
+    /// the record's time kept. True where the base was laid; false, with
+    /// nothing written and no state created, otherwise.
+    pub fn lay_files(
+        &self,
+        files: &HashMap<String, String>,
+        advance_from: Option<&str>,
+        landed: &str,
+    ) -> Result<bool, CliError> {
+        // 1 — nothing written to a copy recording no base, before the lock
+        // creates its write home.
+        if self.base().is_none() {
+            return Ok(false);
+        }
+        let _lock = self.lock()?;
+        if self.resolution()?.is_some() || self.outbox()?.is_some() {
+            return Ok(false);
+        }
+        let Some(standing) = self.base() else {
+            return Ok(false);
+        };
+        // 2 — every path the base carried, beside each of `files`.
+        let mut laid: HashMap<String, String> = standing
+            .file_paths()
+            .filter_map(|path| {
+                standing
+                    .file_sha(path)
+                    .map(|sha| (path.to_string(), sha.to_string()))
+            })
+            .collect();
+        for (path, sha) in files {
+            laid.insert(path.clone(), sha.clone());
+        }
+        let commit = match standing.commit_sha() {
+            Some(own) if advance_from == Some(own) => landed,
+            own => own.unwrap_or_default(),
+        };
+        self.record_laid_base(commit, laid, standing.recorded_at())?;
+        Ok(true)
+    }
+
     pub fn resolution(&self) -> Result<Option<Resolution>, CliError> {
         match self.read_path(RESOLUTION_FILE) {
             Some(path) => read_json(&path),
@@ -1905,6 +1951,106 @@ mod tests {
         )
         .unwrap();
         (cache, tree, copy)
+    }
+
+    // ---- u304: a base laid with a landed version's paths -----------------
+
+    /// A fresh copy recording base `h1` with `a.md` at `b1` and the
+    /// recorded time `7`.
+    fn copy_at_h1() -> (tempfile::TempDir, tempfile::TempDir, WorkingCopy) {
+        let (cache, tree, copy) = open_copy();
+        copy.record_laid_base(
+            "h1",
+            HashMap::from([("a.md".to_string(), "b1".to_string())]),
+            Some(7),
+        )
+        .unwrap();
+        (cache, tree, copy)
+    }
+
+    fn laid(copy: &WorkingCopy) -> (Option<String>, Vec<(String, String)>, Option<u64>) {
+        let base = copy.base().expect("a base");
+        let mut files: Vec<(String, String)> = base
+            .file_paths()
+            .map(|p| (p.to_string(), base.file_sha(p).unwrap().to_string()))
+            .collect();
+        files.sort();
+        (
+            base.commit_sha().map(str::to_string),
+            files,
+            base.recorded_at(),
+        )
+    }
+
+    /// Each state file the test wrote, at the bytes it holds.
+    fn written(copy: &WorkingCopy) -> Vec<(&'static str, Option<Vec<u8>>)> {
+        [BASE_FILE, RESOLUTION_FILE, OUTBOX_FILE, STATE_STAMP]
+            .into_iter()
+            .map(|name| (name, std::fs::read(copy.state_dir.join(name)).ok()))
+            .collect()
+    }
+
+    // SPEC u304 Tests, the row of this name.
+    #[test]
+    fn lay_files_lays_over_a_clean_base_advancing_only_from_the_named_commit() {
+        let files = HashMap::from([("x/y.md".to_string(), "b2".to_string())]);
+        let carried = vec![
+            ("a.md".to_string(), "b1".to_string()),
+            ("x/y.md".to_string(), "b2".to_string()),
+        ];
+
+        let (_cache, _tree, copy) = copy_at_h1();
+        assert!(copy.lay_files(&files, Some("h1"), "h3").unwrap());
+        assert_eq!(laid(&copy), (Some("h3".into()), carried.clone(), Some(7)));
+
+        let (_cache, _tree, copy) = copy_at_h1();
+        assert!(copy.lay_files(&files, Some("h2"), "h3").unwrap());
+        assert_eq!(laid(&copy), (Some("h1".into()), carried, Some(7)));
+    }
+
+    // SPEC u304 Tests, the row of this name.
+    #[test]
+    fn lay_files_leaves_a_copy_holding_work_or_no_base_as_it_stood() {
+        let files = HashMap::from([("x/y.md".to_string(), "b2".to_string())]);
+
+        let (_cache, _tree, copy) = copy_at_h1();
+        copy.write_resolution(&Resolution {
+            recovery_id: "r".into(),
+            base_commit: Some("h1".into()),
+            head_commit: "h0".into(),
+            round: 1,
+            local_paths: Vec::new(),
+            remote_paths: Vec::new(),
+            collisions: Vec::new(),
+            combined_paths: Vec::new(),
+            reviewed_tree: None,
+            pending_writes: None,
+        })
+        .unwrap();
+        let before = written(&copy);
+        assert!(!copy.lay_files(&files, Some("h1"), "h3").unwrap());
+        assert_eq!(written(&copy), before, "a resolution standing");
+
+        let (_cache, _tree, copy) = copy_at_h1();
+        copy.write_outbox(&Outbox {
+            parent_commit: Some("h1".into()),
+            tree: BTreeMap::new(),
+        })
+        .unwrap();
+        let before = written(&copy);
+        assert!(!copy.lay_files(&files, Some("h1"), "h3").unwrap());
+        assert_eq!(written(&copy), before, "an outbox standing");
+
+        let (_cache, _tree, copy) = open_copy();
+        let listed = |copy: &WorkingCopy| {
+            std::fs::read_dir(&copy.state_dir)
+                .map(|dir| dir.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        let standing = listed(&copy);
+        assert!(!copy.lay_files(&files, Some("h1"), "h3").unwrap());
+        assert!(copy.base().is_none());
+        assert_eq!(listed(&copy), standing, "no state created");
     }
 
     #[test]

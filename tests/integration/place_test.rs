@@ -22,6 +22,8 @@ use serial_test::serial;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use syns_cli::config::StoreRoots;
+use syns_cli::push::working_copy::WorkingCopy;
 use tempfile::TempDir;
 use wiremock::matchers::any;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -35,6 +37,8 @@ const CHECK: &str = "test ! -d clients";
 const INDEX_14: &str = "<!doctype html><title>board</title>\n";
 const INDEX_12: &str = "<!doctype html><title>board twelve</title>\n";
 const LOGO: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\xff";
+const BUDGET_YAML: &str = "holder: alice/work\npath: budget\n";
+const BUDGET_DOC: &str = "<p>budget</p>\n";
 
 /// The holder's commit hash named for `n`: forty hex characters.
 fn h(n: u32) -> String {
@@ -201,6 +205,8 @@ struct State {
     /// these changes is made, and the push refused naming it.
     races: VecDeque<Vec<(String, Option<Vec<u8>>)>>,
     next: u32,
+    /// Folder paths whose `EP-versions` requests answer `503`.
+    unread_folders: Vec<String>,
 }
 
 impl State {
@@ -321,6 +327,9 @@ impl Respond for Server {
             };
         }
         if method == "GET" && rest == "/versions" {
+            if query(request, "path").is_some_and(|folder| state.unread_folders.contains(&folder)) {
+                return refusal(503, "unavailable");
+            }
             return versions_answer(repo, request);
         }
         if method == "GET"
@@ -515,6 +524,9 @@ struct Deployment {
     cache: TempDir,
     _work: TempDir,
     w: PathBuf,
+    _scratch: TempDir,
+    /// A second directory, no identity file standing in or above it.
+    u: PathBuf,
 }
 
 impl Deployment {
@@ -537,6 +549,7 @@ impl Deployment {
             repos: BTreeMap::from([(HOLDER.to_string(), holder), (TEMPLATE.to_string(), tmpl)]),
             races: VecDeque::new(),
             next: 2,
+            unread_folders: Vec::new(),
         }));
         rt.block_on(
             Mock::given(any())
@@ -548,6 +561,8 @@ impl Deployment {
         std::fs::write(w.join(".syns.yaml"), W_YAML).expect("W identity");
         std::fs::write(w.join("README.md"), README).expect("README");
         std::fs::create_dir_all(w.join("sub")).expect("sub");
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let u = std::fs::canonicalize(scratch.path()).expect("canonical U");
         let home = tempfile::tempdir().expect("config dir");
         std::fs::write(
             home.path().join("credentials.json"),
@@ -562,6 +577,8 @@ impl Deployment {
             cache: tempfile::tempdir().expect("cache dir"),
             _work: work,
             w,
+            _scratch: scratch,
+            u,
         }
     }
 
@@ -575,6 +592,48 @@ impl Deployment {
         let d = Deployment::fixture();
         d.pull_in(&d.w.clone());
         d
+    }
+
+    /// The fixture with the holder's `h1` also holding the folder
+    /// `budget`, and `U/budget` converged at `h1` by a `pull` run there.
+    fn budget() -> Deployment {
+        let mut holder = h1_tree();
+        holder.insert("budget/.syns.yaml".into(), BUDGET_YAML.as_bytes().to_vec());
+        holder.insert(
+            "budget/document.html".into(),
+            BUDGET_DOC.as_bytes().to_vec(),
+        );
+        let d = Deployment::over(holder, template_tree(&[CHECK]));
+        write(&d.budget_dir().join(".syns.yaml"), BUDGET_YAML);
+        d.pull_in(&d.budget_dir());
+        d
+    }
+
+    /// `U/budget`.
+    fn budget_dir(&self) -> PathBuf {
+        self.u.join("budget")
+    }
+
+    fn stores(&self) -> StoreRoots {
+        StoreRoots::resolve(
+            Some(self.cache.path()),
+            self.cache.path(),
+            self.cache.path(),
+        )
+    }
+
+    /// The base the copy of `alice/work` at `dir` records: its commit and
+    /// every path it carries at its hash.
+    fn base_at(&self, dir: &Path) -> (String, BTreeMap<String, String>) {
+        let copy = WorkingCopy::open_existing(&self.stores(), "alice", "work", dir)
+            .expect("open")
+            .unwrap_or_else(|| panic!("no copy at {}", dir.display()));
+        let base = copy.base().expect("a base");
+        let files = base
+            .file_paths()
+            .map(|p| (p.to_string(), base.file_sha(p).unwrap().to_string()))
+            .collect();
+        (base.commit_sha().unwrap_or_default().to_string(), files)
     }
 
     fn pull_in(&self, dir: &Path) {
@@ -637,6 +696,14 @@ impl Deployment {
     fn run_in(&self, cwd: &Path, args: &[&str]) -> std::process::Output {
         self.command(cwd, args)
             .write_stdin(Vec::new())
+            .output()
+            .expect("run syns")
+    }
+
+    /// `syns` with `args` in `cwd`, `stdin` on standard input.
+    fn run_with(&self, cwd: &Path, args: &[&str], stdin: &str) -> std::process::Output {
+        self.command(cwd, args)
+            .write_stdin(stdin.as_bytes().to_vec())
             .output()
             .expect("run syns")
     }
@@ -1716,4 +1783,259 @@ fn place_into_the_state_home_sends_nothing() {
     assert!(!d.w.join(".syns-state/planted").exists());
     assert!(!d.w.join(".Syns-State/planted").exists());
     assert_eq!(snapshot(&d.w), before);
+}
+
+// ---- u304: placing and turning on past a holder version -----------------
+
+const VELA_YAML: &str = "holder: alice/work\npath: clients/vela\n";
+
+/// Each placed path under `dir`, counted from a root that reaches it as
+/// `prefix`, at the hash of the bytes written there.
+fn written_hashes(dir: &Path, prefix: &str) -> BTreeMap<String, String> {
+    [".syns.yaml", ".page/index.html", ".page/logo.png"]
+        .into_iter()
+        .map(|p| {
+            let bytes = std::fs::read(dir.join(p)).expect("a placed file");
+            (format!("{prefix}/{p}"), blob_sha1(&bytes))
+        })
+        .collect()
+}
+
+/// Whether `files` carries every one of `expected` at its hash.
+fn carries(files: &BTreeMap<String, String>, expected: &BTreeMap<String, String>) -> bool {
+    expected
+        .iter()
+        .all(|(path, sha)| files.get(path) == Some(sha))
+}
+
+/// One race: the holder's next version changing `path` to `content`.
+fn changing(path: &str, content: &str) -> Vec<(String, Option<Vec<u8>>)> {
+    vec![(path.to_string(), Some(content.as_bytes().to_vec()))]
+}
+
+/// The placement from `U/budget` of the fixture's template at `board`,
+/// the folder copy's base after it, and the commit it landed.
+fn place_board(d: &Deployment) -> (String, BTreeMap<String, String>, String) {
+    let out = d.run_in(&d.budget_dir(), &["--json", "place", TEMPLATE, "board"]);
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    let (commit, files) = d.base_at(&d.budget_dir());
+    (commit, files, d.holder_head())
+}
+
+/// The write of `x` to `path` from `dir` at `parent`, answering the one
+/// push it sent.
+fn write_lands(d: &Deployment, dir: &Path, path: &str, parent: &str) {
+    let mark = d.mark();
+    let out = d.run_with(dir, &["--json", "write", path, "--parent", parent], "x");
+    assert_eq!(exit_of(&out), 0, "{}{}", stderr_of(&out), stdout_of(&out));
+    let pushes = d.pushes_since(mark);
+    assert_eq!(pushes.len(), 1, "{pushes:?}");
+    assert_eq!(pushes[0]["parentSha"], json!(parent));
+}
+
+// SPEC u304 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_placement_in_a_folder_alone_past_a_holder_version_outside_it_lets_the_next_write_land() {
+    let d = Deployment::budget();
+    d.state()
+        .races
+        .push_back(changing("README.md", "# raced\n"));
+
+    let (commit, files, placed) = place_board(&d);
+
+    assert_eq!(commit, placed);
+    assert_eq!(
+        files.get("document.html"),
+        Some(&blob_sha1(BUDGET_DOC.as_bytes()))
+    );
+    let board = written_hashes(&d.budget_dir().join("board"), "board");
+    assert!(carries(&files, &board), "{files:?}");
+    write_lands(&d, &d.budget_dir(), "document.html", &placed);
+}
+
+// SPEC u304 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_placement_in_a_folder_alone_past_a_version_changing_it_keeps_its_commit_and_lets_the_next_write_land()
+ {
+    let d = Deployment::budget();
+    d.state()
+        .races
+        .push_back(changing("budget/document.html", "<p>raced</p>\n"));
+
+    let (commit, files, placed) = place_board(&d);
+
+    assert_eq!(commit, h(1));
+    assert_eq!(
+        files.get("document.html"),
+        Some(&blob_sha1(BUDGET_DOC.as_bytes()))
+    );
+    let board = written_hashes(&d.budget_dir().join("board"), "board");
+    assert!(carries(&files, &board), "{files:?}");
+    write_lands(&d, &d.budget_dir(), "document.html", &placed);
+}
+
+// SPEC u304 Tests, the row of this name.
+#[test]
+#[serial]
+fn an_unread_folder_history_keeps_the_enclosing_commit() {
+    let d = Deployment::budget();
+    d.state()
+        .races
+        .push_back(changing("README.md", "# raced\n"));
+    d.state().unread_folders.push("budget".into());
+
+    let (commit, files, _) = place_board(&d);
+
+    assert_eq!(commit, h(1));
+    let board = written_hashes(&d.budget_dir().join("board"), "board");
+    assert!(carries(&files, &board), "{files:?}");
+}
+
+// SPEC u304 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_placement_in_a_whole_checkout_past_a_holder_version_keeps_its_commit_and_converges() {
+    let d = Deployment::converged();
+    d.state()
+        .races
+        .push_back(changing("README.md", "# raced\n"));
+
+    let out = d.run_in(&d.w, &["--json", "place", TEMPLATE, FOLDER]);
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    let placed = d.holder_head();
+    let (commit, files) = d.base_at(&d.w);
+    assert_eq!(commit, h(1));
+    assert_eq!(files.get("README.md"), Some(&blob_sha1(README.as_bytes())));
+    assert!(
+        carries(&files, &written_hashes(&d.folder(), FOLDER)),
+        "{files:?}"
+    );
+
+    let status = d.run_in(&d.w, &["--json", "status"]);
+    assert_eq!(exit_of(&status), 0, "{}", stderr_of(&status));
+    assert_eq!(one_document(&status)["workingCopyState"], "remote_changes");
+
+    write_lands(&d, &d.w, "top.md", &placed);
+
+    let mark = d.mark();
+    let sync = d.run_in(&d.w, &["--json", "sync"]);
+    assert_eq!(exit_of(&sync), 0, "{}", stderr_of(&sync));
+    assert!(d.pushes_since(mark).is_empty());
+    assert_eq!(read(&d.w.join("README.md")), "# raced\n");
+    assert_eq!(read(&d.w.join("top.md")), "x");
+}
+
+// SPEC u304 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_placement_advances_an_enclosing_folder_whose_folder_did_not_move() {
+    let mut holder = h1_tree();
+    holder.insert(
+        "clients/vela/.syns.yaml".into(),
+        VELA_YAML.as_bytes().to_vec(),
+    );
+    let d = Deployment::over(holder, template_tree(&[CHECK]));
+    // The folder's pull first: run after `W`'s, it finds the folder
+    // converged through `W`'s record and records no base of its own.
+    let vela = d.w.join("clients/vela");
+    write(&vela.join(".syns.yaml"), VELA_YAML);
+    d.pull_in(&vela);
+    d.pull_in(&d.w.clone());
+    d.state()
+        .races
+        .push_back(changing("README.md", "# raced\n"));
+
+    let out = d.run_in(&d.w, &["--json", "place", TEMPLATE, FOLDER]);
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    let placed = d.holder_head();
+
+    let (commit, files) = d.base_at(&d.w);
+    assert_eq!(commit, h(1));
+    assert!(
+        carries(&files, &written_hashes(&d.folder(), FOLDER)),
+        "{files:?}"
+    );
+    let (commit, files) = d.base_at(&vela);
+    assert_eq!(commit, placed);
+    assert!(
+        carries(&files, &written_hashes(&d.folder(), "q3-board")),
+        "{files:?}"
+    );
+    write_lands(&d, &vela, "notes.md", &placed);
+}
+
+/// The turning-on of `path`'s checks from `dir`, answering the commit it
+/// landed.
+fn turn_on(d: &Deployment, dir: &Path, path: &str) -> String {
+    let out = d.run_in(dir, &["--json", "enable-checks", path]);
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    d.holder_head()
+}
+
+// SPEC u304 Tests, the row of this name.
+#[test]
+#[serial]
+fn turning_checks_on_past_a_holder_version_lays_the_file_over_a_behind_checkout() {
+    let d = Deployment::converged();
+    let out = d.run_in(&d.w, &["--json", "place", TEMPLATE, FOLDER]);
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    let placed = d.holder_head();
+    d.state().advance(&changing("README.md", "# raced\n"));
+
+    let enabled = turn_on(&d, &d.w, FOLDER);
+
+    let (commit, files) = d.base_at(&d.w);
+    assert_eq!(commit, placed);
+    let turned_on = std::fs::read(d.folder().join(".syns.yaml")).expect("turned on");
+    assert_eq!(
+        files.get(&in_folder(".syns.yaml")),
+        Some(&blob_sha1(&turned_on))
+    );
+    write_lands(&d, &d.w, "top.md", &enabled);
+}
+
+/// The budget deployment with the template placed at `board` from
+/// `U/budget`, then the holder's next version made of `changes`;
+/// answering the placed commit.
+fn budget_placed_then(d: &Deployment, changes: &[(String, Option<Vec<u8>>)]) -> String {
+    let (commit, _, placed) = place_board(d);
+    assert_eq!(commit, placed, "the placement advanced U/budget");
+    d.state().advance(changes);
+    placed
+}
+
+// SPEC u304 Tests, the row of this name.
+#[test]
+#[serial]
+fn turning_checks_on_past_a_holder_version_advances_an_enclosing_folder_whose_folder_did_not_move()
+{
+    let d = Deployment::budget();
+    budget_placed_then(&d, &changing("README.md", "# raced\n"));
+
+    let enabled = turn_on(&d, &d.budget_dir(), "board");
+
+    let (commit, files) = d.base_at(&d.budget_dir());
+    assert_eq!(commit, enabled);
+    let turned_on = std::fs::read(d.budget_dir().join("board/.syns.yaml")).expect("turned on");
+    assert_eq!(files.get("board/.syns.yaml"), Some(&blob_sha1(&turned_on)));
+    write_lands(&d, &d.budget_dir(), "document.html", &enabled);
+}
+
+// SPEC u304 Tests, the row of this name.
+#[test]
+#[serial]
+fn turning_checks_on_past_a_version_changing_an_enclosing_folder_lays_the_file_and_keeps_its_commit()
+ {
+    let d = Deployment::budget();
+    let placed = budget_placed_then(&d, &changing("budget/document.html", "<p>raced</p>\n"));
+
+    let enabled = turn_on(&d, &d.budget_dir(), "board");
+
+    let (commit, files) = d.base_at(&d.budget_dir());
+    assert_eq!(commit, placed);
+    let turned_on = std::fs::read(d.budget_dir().join("board/.syns.yaml")).expect("turned on");
+    assert_eq!(files.get("board/.syns.yaml"), Some(&blob_sha1(&turned_on)));
+    write_lands(&d, &d.budget_dir(), "document.html", &enabled);
 }

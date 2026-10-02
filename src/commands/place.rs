@@ -14,7 +14,7 @@ use crate::config::Config;
 use crate::errors::{CliError, IdentityRemedy};
 use crate::output::Output;
 use crate::push::converge::check_server_path;
-use crate::push::folder_check::{FolderCheck, named_head};
+use crate::push::folder_check::{FolderCheck, folder_unmoved_until, named_head};
 use crate::push::hash::blob_sha1;
 use crate::push::working_copy::{WorkingCopy, holds_in_root_home};
 use crate::read::{refuse_reference_spelling, version_not_found_refusal};
@@ -630,6 +630,8 @@ pub async fn cmd_place(
     from_folder.insert(SYNS_YAML.to_string(), identity_sha);
     record_bases(
         config,
+        &client,
+        &token,
         &counted,
         &folder_dir,
         &repository_path,
@@ -637,7 +639,8 @@ pub async fn cmd_place(
         claimed.as_deref(),
         stood_on.as_deref(),
         &landed.sha,
-    )?;
+    )
+    .await?;
 
     // 19 — the document, or the report.
     let enable = enable_command(&path);
@@ -717,53 +720,35 @@ fn base_refusal(copy: &WorkingCopy, err: CliError) -> CliError {
     }
 }
 
-/// Lay `placed`, each path mapped by `counted` into the copy's own
-/// paths, over the base `copy` records, where it holds no resolution and
-/// no outbox and its commit is `claimed`, the commit becoming `landed`
-/// and the record's time kept. One copy's lock is held at a time.
-fn lay_placed(
+/// Lay `files` over `copy`'s base through `WorkingCopy::lay_files`, a
+/// refusal raised as the base refusal naming the state directory.
+fn lay(
     copy: &WorkingCopy,
-    placed: &HashMap<String, String>,
-    counted: impl Fn(&str) -> Option<String>,
-    claimed: Option<&str>,
+    files: &HashMap<String, String>,
+    advance_from: Option<&str>,
     landed: &str,
 ) -> Result<(), CliError> {
-    let _lock = copy.lock().map_err(|err| base_refusal(copy, err))?;
-    if copy.resolution()?.is_some() || copy.outbox()?.is_some() {
-        return Ok(());
-    }
-    let Some(standing) = copy.base() else {
-        return Ok(());
-    };
-    if claimed.is_none() || standing.commit_sha() != claimed {
-        return Ok(());
-    }
-    let mut files: HashMap<String, String> = standing
-        .file_paths()
-        .filter_map(|path| {
-            standing
-                .file_sha(path)
-                .map(|sha| (path.to_string(), sha.to_string()))
-        })
-        .collect();
-    for (path, sha) in placed {
-        if let Some(at) = counted(path) {
-            files.insert(at, sha.clone());
-        }
-    }
-    copy.record_laid_base(landed, files, standing.recorded_at())
+    copy.lay_files(files, advance_from, landed)
+        .map(drop)
         .map_err(|err| base_refusal(copy, err))
 }
 
-/// `cmd_place` 18: the holder checkout's base and each enclosing folder
-/// copy's laid where it stood at the claimed parent, then the new
-/// folder's own base recorded at the placed commit. Inside a folder bound
-/// to its identity, the identity copy's base is laid where it stood at
-/// `stood_on`, the identity's newest listed version the placement was
-/// sent over, rather than at the holder head the landing send claimed.
+/// `cmd_place` 18 (SPEC u304 Behaviour, `record_bases` 1–5): every copy
+/// enclosing the new folder that holds no resolution or outbox and
+/// records a base carries the placed paths. Inside a folder bound to its
+/// identity, the identity copy's base is laid, its commit advancing only
+/// where it stood at `stood_on`, the identity's newest listed version the
+/// placement was sent over. Otherwise the holder checkout's base is laid,
+/// advancing only from the claimed parent; each enclosing folder copy's,
+/// advancing from the claimed parent or from its own commit where its
+/// folder stood unmoved from that commit up to the landed version; and
+/// the new folder's own base recorded at the placed commit. One copy's
+/// lock is held at a time, and none across a read.
 #[allow(clippy::too_many_arguments)]
-fn record_bases(
+async fn record_bases(
     config: &Config,
+    client: &SynsClient,
+    token: &str,
     counted: &Counted,
     folder_dir: &Path,
     repository_path: &str,
@@ -779,30 +764,33 @@ fn record_bases(
         .unwrap_or((counted.holder.as_str(), ""));
     let in_holder = |path: &str| format!("{repository_path}/{path}");
 
-    // SPEC u302 `cmd_place` 1: inside a folder bound to its identity the
-    // placed files are laid over the identity folder's copy at the typed
-    // path, the placed folder recording no base of its own — it is a
-    // directory of that identity.
+    // 1 — inside a folder bound to its identity, the placed files laid
+    // over the identity folder's copy at the typed path, the placed folder
+    // recording no base of its own: it is a directory of that identity.
     if let Some(scope) = counted.scope.as_ref().filter(|s| s.identity.is_some()) {
         if let Some(copy) = WorkingCopy::open_existing_folder(cache, scope)? {
             let place = place_under(folder_dir, &scope.dir);
-            lay_placed(
-                &copy,
-                from_folder,
-                |p| Some(format!("{place}/{p}")),
-                stood_on,
-                landed,
-            )?;
+            let files = from_folder
+                .iter()
+                .map(|(path, sha)| (format!("{place}/{path}"), sha.clone()))
+                .collect();
+            lay(&copy, &files, stood_on, landed)?;
         }
         return Ok(());
     }
 
+    // 2 — the holder checkout, advancing from the claimed parent alone.
     if let Some(checkout) = &counted.checkout
         && let Some(copy) = WorkingCopy::open_existing(cache, owner, name, checkout)?
     {
-        lay_placed(&copy, from_folder, |p| Some(in_holder(p)), claimed, landed)?;
+        let files = from_folder
+            .iter()
+            .map(|(path, sha)| (in_holder(path), sha.clone()))
+            .collect();
+        lay(&copy, &files, claimed, landed)?;
     }
 
+    // 3 and 4 — each enclosing folder copy.
     let scope = resolve_folder_scope(folder_dir)?.ok_or_else(|| CliError::Io {
         message: format!(
             "could not read the folder identity file in {}",
@@ -810,17 +798,41 @@ fn record_bases(
         ),
     })?;
     for enclosing in &scope.enclosing {
-        if let Some(copy) = WorkingCopy::open_existing_folder(cache, enclosing)? {
-            lay_placed(
-                &copy,
-                from_folder,
-                |p| enclosing.folder_path(&in_holder(p)),
-                claimed,
-                landed,
-            )?;
-        }
+        let Some(copy) = WorkingCopy::open_existing_folder(cache, enclosing)? else {
+            continue;
+        };
+        let standing = copy
+            .base()
+            .and_then(|base| base.commit_sha().map(str::to_string));
+        let advance_from = match standing {
+            Some(own)
+                if claimed != Some(own.as_str())
+                    && folder_unmoved_until(
+                        client,
+                        Some(token),
+                        &counted.holder,
+                        &enclosing.path,
+                        &own,
+                        landed,
+                    )
+                    .await =>
+            {
+                Some(own)
+            }
+            _ => claimed.map(str::to_string),
+        };
+        let files = from_folder
+            .iter()
+            .filter_map(|(path, sha)| {
+                enclosing
+                    .folder_path(&in_holder(path))
+                    .map(|at| (at, sha.clone()))
+            })
+            .collect();
+        lay(&copy, &files, advance_from.as_deref(), landed)?;
     }
 
+    // 5 — the new folder's own base.
     let copy = WorkingCopy::open_folder(cache, &scope)?;
     let _lock = copy.lock().map_err(|err| base_refusal(&copy, err))?;
     copy.record_base(landed, from_folder.clone())
@@ -875,104 +887,6 @@ mod tests {
             }
         }
         assert_eq!(placement_path("a/syns-state").unwrap(), "a/syns-state");
-    }
-
-    /// A working copy of `alice/work` at a directory of its own, its base
-    /// recording `h1` over `README.md`.
-    fn copy_at_h1() -> (tempfile::TempDir, tempfile::TempDir, WorkingCopy) {
-        let cache = tempfile::tempdir().unwrap();
-        let root = tempfile::tempdir().unwrap();
-        let copy = WorkingCopy::open(
-            &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
-            "alice",
-            "work",
-            root.path(),
-        )
-        .unwrap();
-        copy.record_laid_base(
-            "h1",
-            HashMap::from([("README.md".to_string(), "r1".to_string())]),
-            Some(7),
-        )
-        .unwrap();
-        (cache, root, copy)
-    }
-
-    fn recorded(copy: &WorkingCopy) -> (Option<String>, Vec<(String, String)>, Option<u64>) {
-        let base = copy.base().expect("a base");
-        let mut files: Vec<(String, String)> = base
-            .file_paths()
-            .map(|p| (p.to_string(), base.file_sha(p).unwrap().to_string()))
-            .collect();
-        files.sort();
-        (
-            base.commit_sha().map(str::to_string),
-            files,
-            base.recorded_at(),
-        )
-    }
-
-    /// A review standing over `h1` and `h0`, prepared and not continued.
-    fn a_resolution() -> crate::push::working_copy::Resolution {
-        crate::push::working_copy::Resolution {
-            recovery_id: "r".into(),
-            base_commit: Some("h1".into()),
-            head_commit: "h0".into(),
-            round: 1,
-            local_paths: Vec::new(),
-            remote_paths: Vec::new(),
-            collisions: Vec::new(),
-            combined_paths: Vec::new(),
-            reviewed_tree: None,
-            pending_writes: None,
-        }
-    }
-
-    // CR1-1: `lay_placed` lays over a base standing at the claimed
-    // parent alone, and over none holding an outbox or a resolution.
-    #[test]
-    fn a_placement_lays_only_over_a_clean_base_at_the_claimed_parent() {
-        let placed = HashMap::from([(".syns.yaml".to_string(), "y".to_string())]);
-        let counted = |p: &str| Some(format!("q3/{p}"));
-        let standing = (
-            Some("h1".to_string()),
-            vec![("README.md".to_string(), "r1".to_string())],
-            Some(7),
-        );
-
-        let (_c, _r, copy) = copy_at_h1();
-        copy.write_outbox(&crate::push::working_copy::Outbox {
-            parent_commit: Some("h1".to_string()),
-            tree: Default::default(),
-        })
-        .unwrap();
-        lay_placed(&copy, &placed, counted, Some("h1"), "h2").unwrap();
-        assert_eq!(recorded(&copy), standing);
-
-        let (_c, _r, copy) = copy_at_h1();
-        copy.write_resolution(&a_resolution()).unwrap();
-        lay_placed(&copy, &placed, counted, Some("h1"), "h2").unwrap();
-        assert_eq!(recorded(&copy), standing, "a resolution standing");
-
-        for claimed in [Some("h0"), None] {
-            let (_c, _r, copy) = copy_at_h1();
-            lay_placed(&copy, &placed, counted, claimed, "h2").unwrap();
-            assert_eq!(recorded(&copy), standing, "{claimed:?}");
-        }
-
-        let (_c, _r, copy) = copy_at_h1();
-        lay_placed(&copy, &placed, counted, Some("h1"), "h2").unwrap();
-        assert_eq!(
-            recorded(&copy),
-            (
-                Some("h2".to_string()),
-                vec![
-                    ("README.md".to_string(), "r1".to_string()),
-                    ("q3/.syns.yaml".to_string(), "y".to_string())
-                ],
-                Some(7)
-            )
-        );
     }
 
     fn landed() -> Landed {

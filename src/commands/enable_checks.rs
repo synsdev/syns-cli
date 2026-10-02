@@ -7,9 +7,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::config::Config;
+use crate::client::SynsClient;
+use crate::config::{Config, StoreRoots};
 use crate::errors::CliError;
 use crate::output::Output;
+use crate::push::folder_check::folder_unmoved_until;
 use crate::push::hash::blob_sha1;
 use crate::push::working_copy::{WorkingCopy, folder_base};
 use crate::repo::folder::{FolderScope, current_dir, place_under, resolve_folder_scope};
@@ -234,15 +236,19 @@ pub async fn cmd_enable_checks(
 
     // 9 — every base standing at the parent laid at the landed commit.
     let sha = blob_sha1(turned_on.as_bytes());
+    let client = SynsClient::new(config.server_url())?;
     lay_turned_on(
         cache,
+        &client,
+        &target.token,
         &scope,
         &at,
         &sha,
         &parent,
         &claimed,
         &response.commit_sha,
-    )?;
+    )
+    .await?;
 
     // 10 — the document, or the report.
     if output.is_json() {
@@ -280,14 +286,21 @@ fn base_refusal(copy: &WorkingCopy, err: CliError) -> CliError {
     }
 }
 
-/// `cmd_enable_checks` 9: the folder copy's base where its commit is the
-/// parent step 5 read or the one the landing send claimed, stamped anew;
-/// then the holder checkout's and each enclosing folder copy's where it
-/// holds no resolution and no outbox and its commit is the claimed
-/// parent, each keeping its recorded time. One copy's lock is held at a
-/// time, every other base is left standing, and no state is created.
-fn lay_turned_on(
-    cache: &crate::config::StoreRoots,
+/// `cmd_enable_checks` 9 (SPEC u304 Behaviour, `lay_turned_on` 1–4): the
+/// folder copy's base where its commit is the parent step 5 read or the
+/// one the landing send claimed, stamped anew; then the holder
+/// checkout's and each enclosing folder copy's, where it holds no
+/// resolution and no outbox and records a base, taking the turned-on
+/// identity file at `sha` and keeping its recorded time — the holder
+/// checkout's commit advancing only from the claimed parent, an enclosing
+/// copy's from the claimed parent or from its own commit where its folder
+/// stood unmoved from that commit up to the landed version. One copy's
+/// lock is held at a time, none across a read, and no state is created.
+#[allow(clippy::too_many_arguments)]
+async fn lay_turned_on(
+    cache: &StoreRoots,
+    client: &SynsClient,
+    token: &str,
     scope: &FolderScope,
     at: &str,
     sha: &str,
@@ -295,56 +308,65 @@ fn lay_turned_on(
     claimed: &str,
     landed: &str,
 ) -> Result<(), CliError> {
-    let files_of = |base: &crate::push::manifest::Manifest| -> HashMap<String, String> {
-        base.file_paths()
-            .filter_map(|p| base.file_sha(p).map(|s| (p.to_string(), s.to_string())))
-            .collect()
-    };
     let identity_in_holder = scope.repository_path(at);
 
+    // 1 — the turned-on folder's own copy.
     if let Some(copy) = WorkingCopy::open_existing_folder(cache, scope)? {
         let _lock = copy.lock().map_err(|err| base_refusal(&copy, err))?;
         if let Some(base) = copy.base()
             && matches!(base.commit_sha(), Some(c) if c == parent || c == claimed)
         {
-            let mut files = files_of(&base);
+            let mut files: HashMap<String, String> = base
+                .file_paths()
+                .filter_map(|p| base.file_sha(p).map(|s| (p.to_string(), s.to_string())))
+                .collect();
             files.insert(at.to_string(), sha.to_string());
             copy.record_base(landed, files)
                 .map_err(|err| base_refusal(&copy, err))?;
         }
     }
 
-    let mut targets: Vec<(WorkingCopy, Option<&FolderScope>)> = Vec::new();
+    // 2 — the holder checkout, advancing from the claimed parent alone.
     if let Some(checkout) = &scope.checkout
         && let Some(copy) = WorkingCopy::open_existing(cache, &scope.owner, &scope.name, checkout)?
     {
-        targets.push((copy, None));
+        let files = HashMap::from([(identity_in_holder.clone(), sha.to_string())]);
+        copy.lay_files(&files, Some(claimed), landed)
+            .map_err(|err| base_refusal(&copy, err))?;
     }
+
+    // 3 and 4 — each enclosing folder copy.
+    let holder = scope.holder();
     for enclosing in &scope.enclosing {
-        if let Some(copy) = WorkingCopy::open_existing_folder(cache, enclosing)? {
-            targets.push((copy, Some(enclosing)));
-        }
-    }
-    for (copy, enclosing) in targets {
-        let _lock = copy.lock().map_err(|err| base_refusal(&copy, err))?;
-        if copy.resolution()?.is_some() || copy.outbox()?.is_some() {
-            continue;
-        }
-        let Some(base) = copy.base() else {
+        let Some(copy) = WorkingCopy::open_existing_folder(cache, enclosing)? else {
             continue;
         };
-        if base.commit_sha() != Some(claimed) {
-            continue;
-        }
-        let at = match enclosing {
-            None => Some(identity_in_holder.clone()),
-            Some(enclosing) => enclosing.folder_path(&identity_in_holder),
+        let standing = copy
+            .base()
+            .and_then(|base| base.commit_sha().map(str::to_string));
+        let advance_from = match standing {
+            Some(own)
+                if own != claimed
+                    && folder_unmoved_until(
+                        client,
+                        Some(token),
+                        &holder,
+                        &enclosing.path,
+                        &own,
+                        landed,
+                    )
+                    .await =>
+            {
+                own
+            }
+            _ => claimed.to_string(),
         };
-        let mut files = files_of(&base);
-        if let Some(at) = at {
-            files.insert(at, sha.to_string());
-        }
-        copy.record_laid_base(landed, files, base.recorded_at())
+        let files: HashMap<String, String> = enclosing
+            .folder_path(&identity_in_holder)
+            .map(|at| (at, sha.to_string()))
+            .into_iter()
+            .collect();
+        copy.lay_files(&files, Some(&advance_from), landed)
             .map_err(|err| base_refusal(&copy, err))?;
     }
     Ok(())
@@ -383,8 +405,10 @@ mod tests {
     // claimed parent, and no folder copy standing at neither the parent
     // nor the claimed one; a holder copy it lays keeps its recorded time,
     // and the folder copy's is stamped anew.
-    #[test]
-    fn turning_checks_on_lays_only_over_clean_bases_at_the_parent() {
+    #[tokio::test]
+    async fn turning_checks_on_lays_only_over_clean_bases_at_the_parent() {
+        // No enclosing folder copy stands, so no request reaches this.
+        let client = SynsClient::new("http://127.0.0.1:9").unwrap();
         let cache = tempfile::tempdir().unwrap();
         let w = tempfile::tempdir().unwrap();
         let w = std::fs::canonicalize(w.path()).unwrap();
@@ -426,6 +450,8 @@ mod tests {
 
         lay_turned_on(
             &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+            &client,
+            "t",
             &scope,
             SYNS_YAML,
             "new",
@@ -433,6 +459,7 @@ mod tests {
             "h3",
             "h4",
         )
+        .await
         .unwrap();
 
         assert_eq!(
@@ -459,6 +486,8 @@ mod tests {
             .unwrap();
         lay_turned_on(
             &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+            &client,
+            "t",
             &scope,
             SYNS_YAML,
             "new",
@@ -466,6 +495,7 @@ mod tests {
             "h3",
             "h4",
         )
+        .await
         .unwrap();
         assert_eq!(
             recorded(&holder),
@@ -477,6 +507,8 @@ mod tests {
         holder.record_laid_base("h2", held, Some(7)).unwrap();
         lay_turned_on(
             &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+            &client,
+            "t",
             &scope,
             SYNS_YAML,
             "new",
@@ -484,11 +516,18 @@ mod tests {
             "h3",
             "h4",
         )
+        .await
         .unwrap();
-        assert_eq!(recorded(&holder).0.as_deref(), Some("h2"));
+        assert_eq!(
+            recorded(&holder),
+            standing("h2", "q3/.syns.yaml", "new", Some(7)),
+            "a holder copy behind the claimed parent takes the file at its own commit"
+        );
 
         lay_turned_on(
             &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+            &client,
+            "t",
             &scope,
             SYNS_YAML,
             "new",
@@ -496,6 +535,7 @@ mod tests {
             "h2",
             "h4",
         )
+        .await
         .unwrap();
         assert_eq!(
             recorded(&holder),

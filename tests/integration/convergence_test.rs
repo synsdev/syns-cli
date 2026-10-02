@@ -1130,6 +1130,51 @@ async fn retrieval_with_lost_base_prepares_every_differing_path() {
     );
 }
 
+// SPEC u304 Open Questions, Q-01, its recommended option: a base laid
+// with a path its kept commit does not hold at that hash — absent there,
+// as a placed path, or held at other bytes, as a turned-on identity file —
+// meeting a collision both sides modified reads as added on both sides,
+// put to the person with both contents, the convergence going on.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_collision_on_a_base_path_its_commit_does_not_hold_reads_as_both_added() {
+    let at_base: [&[(&str, &str)]; 2] =
+        [&[("k.md", "k\n")], &[("k.md", "k\n"), ("x.md", "old x\n")]];
+    for files in at_base {
+        let e = env().await;
+        let dir = e.dir();
+        let copy = e.copy(&dir);
+        let base = e.fake.commit(files);
+        checkout(&e.fake, &copy, &base);
+        let laid = HashMap::from([("x.md".to_string(), blob_sha1(b"laid x\n"))]);
+        assert!(copy.lay_files(&laid, None, "unused").unwrap());
+        write_files(&dir, &[("x.md", "local x\n")]);
+        e.fake.commit_changes(&[("x.md", Some("remote x\n"))]);
+
+        let resolution = expect_resolution(
+            converge(
+                &e.fake.client(),
+                Some(TOKEN),
+                &copy,
+                ConvergeMode::Retrieve { overwrite: false },
+                e.opts(),
+            )
+            .await
+            .unwrap(),
+        );
+
+        assert_eq!(
+            resolution.collisions,
+            vec![("x.md".to_string(), CollisionKind::AddAdd)],
+            "{files:?}"
+        );
+        assert!(
+            read(&dir, "x.md").lines().any(|l| l == "<<<<<<< local"),
+            "{files:?}"
+        );
+    }
+}
+
 /// A tree before and after a head swaps a file and a folder of one name.
 type Swap = (
     &'static str,
