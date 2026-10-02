@@ -842,6 +842,122 @@ fn a_write_inside_an_identity_folder_holding_unpublished_work_is_refused() {
     assert!(d.pushes(IDENTITY).is_empty() && d.pushes(HOLDER).is_empty());
 }
 
+// The ruling on round 1's open question: a write naming the holder
+// through `--repo`, run inside a folder bound to its identity while that
+// folder holds unpublished work, is refused as a write to the identity
+// there is, so no write to the holder lands over the folder's local work.
+#[test]
+#[serial]
+fn a_write_to_the_holder_inside_an_identity_folder_holding_unpublished_work_is_refused() {
+    let d = Deployment::new();
+    write(&d.folder().join("document.html"), DOC);
+    d.record_base(H4);
+    write(&d.folder().join("document.html"), "<p>edited</p>\n");
+    d.serves(
+        "GET",
+        HOLDER,
+        ResponseTemplate::new(200).set_body_json(record("alice", "docs", Some(H4), false)),
+    );
+    d.serves(
+        "PUT",
+        &format!("{HOLDER}/push"),
+        ResponseTemplate::new(200).set_body_json(json!({
+            "commitSha": H5, "version": 5, "filesChanged": 1, "created": false,
+        })),
+    );
+
+    let out = d.run_with(
+        &d.folder(),
+        &[
+            "--json",
+            "write",
+            "--repo",
+            "alice/docs",
+            "q3-plan/document.html",
+            "--parent",
+            H4,
+        ],
+        "x",
+    );
+
+    assert_eq!(exit_of(&out), 1, "{}", stderr_of(&out));
+    let said = format!("{}{}", stdout_of(&out), stderr_of(&out));
+    assert!(
+        said.contains(&format!(
+            "the checkout at {} holds unpublished local changes for alice/docs-q3-plan",
+            d.folder().display()
+        )),
+        "{said}"
+    );
+    assert!(d.pushes(IDENTITY).is_empty() && d.pushes(HOLDER).is_empty());
+}
+
+// The ruling on round 1's open question, the clean side: the same write
+// from a folder holding no unpublished work goes to the holder.
+#[test]
+#[serial]
+fn a_write_to_the_holder_inside_a_clean_identity_folder_lands_on_the_holder() {
+    let d = Deployment::new();
+    write(&d.folder().join("document.html"), DOC);
+    d.record_base(H4);
+    d.serves(
+        "GET",
+        HOLDER,
+        ResponseTemplate::new(200).set_body_json(record("alice", "docs", Some(H4), false)),
+    );
+    d.serves(
+        "PUT",
+        &format!("{HOLDER}/push"),
+        ResponseTemplate::new(200).set_body_json(json!({
+            "commitSha": H5, "version": 5, "filesChanged": 1, "created": false,
+        })),
+    );
+
+    let out = d.run_with(
+        &d.folder(),
+        &[
+            "--json",
+            "write",
+            "--repo",
+            "alice/docs",
+            "q3-plan/document.html",
+            "--parent",
+            H4,
+        ],
+        "x",
+    );
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    let pushes = d.pushes(HOLDER);
+    assert_eq!(pushes.len(), 1, "{:?}", d.targets());
+    assert_eq!(pushed_paths(&pushes[0]), vec!["q3-plan/document.html"]);
+    assert!(d.pushes(IDENTITY).is_empty());
+}
+
+// The ruling on UNP1-1: a `shared_as` spelling no repository name under
+// the holder's owner stays refused, before any request.
+#[test]
+#[serial]
+fn a_shared_as_spelling_no_repository_name_is_refused() {
+    let d = Deployment::new();
+    write(
+        &d.folder().join(".syns.yaml"),
+        "holder: alice/docs\npath: q3-plan\nshared_as: ../docs\n",
+    );
+
+    let out = d.run(&["ls"]);
+
+    assert_eq!(exit_of(&out), 1, "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains(
+            "invalid .syns.yaml: shared_as must name a repository under alice (got ../docs)"
+        ),
+        "{}",
+        stderr_of(&out)
+    );
+    assert!(d.targets().is_empty(), "{:?}", d.targets());
+}
+
 // SPEC u302 Tests, the row of this name.
 #[test]
 #[serial]

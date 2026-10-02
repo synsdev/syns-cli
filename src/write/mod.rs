@@ -228,7 +228,9 @@ pub fn default_message(verb: &str, path: Option<&str>) -> String {
 /// the holder checkout above the folder is guarded whole, and a folder
 /// checked out alone, standing in no checkout of its holder, is guarded
 /// as it is with no `--repo` (SPEC u297 Behaviour, `checkout_of` 3), so
-/// no option lifts the guard on it.
+/// no option lifts the guard on it. Inside a folder bound to its
+/// identity, `--repo` naming the identity or its holder guards that
+/// folder alike.
 pub async fn checkout_of(
     config: &Config,
     cwd: &Path,
@@ -239,6 +241,17 @@ pub async fn checkout_of(
 ) -> Result<Option<PathBuf>, CliError> {
     // 1 — the folder the run stands in, where one stands.
     match resolve_folder_scope(cwd)? {
+        // The ruling on u302 round 1's open question: a write to the
+        // holder from inside a folder bound to its identity is guarded as
+        // a write to that identity, so it cannot land over the folder's
+        // unpublished work; the refusal names the identity, the copy the
+        // folder's work stands in.
+        Some(scope) if scope.identity.is_some() && scope.holder().eq_ignore_ascii_case(repo_id) => {
+            let address = scope.address();
+            guard_folder(config, &scope, &address, client, token)
+                .await
+                .map(Some)
+        }
         // SPEC u302 `checkout_of` 1: a folder bound to its identity stands
         // for that identity.
         Some(scope) if !scope.address().eq_ignore_ascii_case(repo_id) => Ok(None),
