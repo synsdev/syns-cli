@@ -456,6 +456,29 @@ fn read_identity_by_local_side(file_path: &Path) -> Result<SynsYaml, CliError> {
     }
 }
 
+/// Refuse a publication from the content root `root` whose `.syns.yaml`
+/// holds a marked block and parses as no root form as written, with the
+/// malformed-file error carrying the reason the file as written gives.
+///
+/// The root readers take such a file by its local side, so a run inside a
+/// checkout whose sync left markers in it reaches the standing resolution;
+/// a publication while no resolution stands would carry the marked file to
+/// the head, where every collaborator's next retrieval writes it and the
+/// required-checks reading refuses it. A block opens on any `<<<<<<< `
+/// label, a git merge's `HEAD` included, not only a convergence's `local`.
+/// No file at `root`, and a file parsing as written, pass.
+pub fn refuse_marked_root_identity(root: &Path) -> Result<(), CliError> {
+    let file_path = root.join(SYNS_YAML_FILENAME);
+    if !file_path.is_file() {
+        return Ok(());
+    }
+    let contents = read_contents(&file_path)?;
+    if local_side_of_collision(&contents).is_none() {
+        return Ok(());
+    }
+    parse_root_text(&contents).map(|_| ()).map_err(invalid)
+}
+
 /// The text a marked file held on its local side before the collision,
 /// none where it carries no marked block.
 fn local_side_of_collision(contents: &str) -> Option<String> {
@@ -940,6 +963,43 @@ mod tests {
             expected
         );
         assert_eq!(message(nearest_identity(&r).map(|_| ())), expected);
+    }
+
+    // u308 round 2, ruled: a publication refuses a root identity file
+    // holding a marked block, whatever label opens it, with the reason the
+    // file as written gives.
+    #[test]
+    fn a_marked_root_identity_is_refused_for_publication_with_the_raw_reason() {
+        for written in [
+            "owner: alice\nname: proj\n<<<<<<< HEAD\nchecks:\n  - make local\n=======\nchecks:\n  - exit 0\n>>>>>>> feature\n",
+            "owner: alice\nname: proj\n<<<<<<< local\nchecks:\n  - make local\n=======\nchecks:\n  - exit 0\n>>>>>>> remote\n",
+        ] {
+            let r = tempfile::tempdir().unwrap();
+            fs::write(r.path().join(".syns.yaml"), written).unwrap();
+            let Err(raw) = parse_root_text(written) else {
+                panic!("the file as written parsed as the root form");
+            };
+
+            match refuse_marked_root_identity(r.path()) {
+                Err(CliError::Io { message }) => {
+                    assert_eq!(message, format!("invalid .syns.yaml: {raw}"))
+                }
+                other => panic!("expected the malformed-file error, got {other:?}"),
+            }
+            assert!(read_syns_yaml(r.path()).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn an_unmarked_or_absent_root_identity_is_not_refused_for_publication() {
+        let r = tempfile::tempdir().unwrap();
+        refuse_marked_root_identity(r.path()).unwrap();
+        fs::write(
+            r.path().join(".syns.yaml"),
+            "owner: alice\nname: proj\nchecks:\n  - exit 0\n",
+        )
+        .unwrap();
+        refuse_marked_root_identity(r.path()).unwrap();
     }
 
     #[test]

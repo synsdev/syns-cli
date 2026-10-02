@@ -5052,3 +5052,111 @@ async fn reading_verbs_in_a_marked_checkout_resolve_its_repository() {
 
     assert_eq!(resolved, Some(("alice".into(), "proj".into(), None)));
 }
+
+// ---- a marked root identity file while no resolution stands --------------
+
+/// u308 round 2, ruled: a root identity file a git merge marked, its block
+/// labelled other than a convergence's `local`, over `I`.
+const IDENTITY_MERGE_MARKED: &str = "owner: alice\nname: proj\n<<<<<<< HEAD\nchecks:\n  - make local\n=======\nchecks:\n  - exit 0\n>>>>>>> feature\n";
+
+/// A copy of `alice/proj` at the environment's folder, checked out at a
+/// base holding `a.md`, `sub/b.md` and `I`, whose `.syns.yaml` then reads
+/// `IDENTITY_MERGE_MARKED` with `a.md` edited, and no resolution standing.
+fn merge_marked_checkout(e: &Env) -> (PathBuf, WorkingCopy, String) {
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let h0 = e.fake.commit(&[
+        ("a.md", "a\n"),
+        ("sub/b.md", "b\n"),
+        (".syns.yaml", IDENTITY),
+    ]);
+    checkout(&e.fake, &copy, &h0);
+    write_files(
+        &dir,
+        &[(".syns.yaml", IDENTITY_MERGE_MARKED), ("a.md", "a1\n")],
+    );
+    assert!(copy.resolution().unwrap().is_none());
+    (dir, copy, h0)
+}
+
+/// The malformed-file refusal's line, a panic naming any other answer.
+fn malformed_refusal(answer: Result<(), CliError>) -> String {
+    let line = match answer {
+        Err(CliError::SyncRefusal { line, .. }) => line,
+        Err(err) => err.to_string(),
+        Ok(()) => panic!("expected the malformed-file refusal, got Ok"),
+    };
+    assert!(line.contains("invalid .syns.yaml: "), "{line}");
+    line
+}
+
+/// Nothing published, the head still at the base, and the marked file
+/// as written.
+fn published_nothing(e: &Env, dir: &Path, h0: &str) {
+    assert!(e.fake.push_bodies().is_empty());
+    assert_eq!(e.fake.head().0, h0);
+    assert_eq!(read(dir, ".syns.yaml"), IDENTITY_MERGE_MARKED);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn sync_refuses_a_merge_marked_root_identity_while_no_resolution_stands() {
+    let e = env().await;
+    let (dir, _copy, h0) = merge_marked_checkout(&e);
+
+    let synced = {
+        let _cwd = CwdGuard::enter(&dir.join("sub"));
+        cmd_sync(&e.config, &e.output, false).await
+    };
+
+    malformed_refusal(synced);
+    published_nothing(&e, &dir, &h0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn bare_push_refuses_a_merge_marked_root_identity_while_no_resolution_stands() {
+    let e = env().await;
+    let (dir, _copy, h0) = merge_marked_checkout(&e);
+
+    let pushed = {
+        let _cwd = CwdGuard::enter(&dir.join("sub"));
+        cmd_push(&e.config, &e.output, &push_args(None)).await
+    };
+
+    malformed_refusal(pushed);
+    published_nothing(&e, &dir, &h0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn forced_or_scoped_push_refuses_a_merge_marked_root_identity() {
+    let e = env().await;
+    let (dir, _copy, h0) = merge_marked_checkout(&e);
+    write_files(&dir, &[("sub/b.md", "b1\n")]);
+
+    let _cwd = CwdGuard::enter(&dir);
+    let mut forced = push_args(None);
+    forced.force = true;
+    let forced = cmd_push(&e.config, &e.output, &forced).await;
+    let scoped = cmd_push(&e.config, &e.output, &push_args(Some(dir.join("sub")))).await;
+
+    malformed_refusal(forced);
+    malformed_refusal(scoped);
+    published_nothing(&e, &dir, &h0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn continue_refuses_a_merge_marked_root_identity_while_no_resolution_stands() {
+    let e = env().await;
+    let (dir, _copy, h0) = merge_marked_checkout(&e);
+
+    let continued = {
+        let _cwd = CwdGuard::enter(&dir.join("sub"));
+        cmd_resolution(&e.config, &e.output, ResolutionAction::Continue, false).await
+    };
+
+    malformed_refusal(continued);
+    published_nothing(&e, &dir, &h0);
+}

@@ -46,6 +46,7 @@ use crate::repo::folder::{FolderScope, lies_under};
 use crate::repo::identity::identity_head;
 use crate::repo::syns_yaml::{
     IdentityForm, held_root_identity, identity_text, read_identity_form, read_required_checks,
+    refuse_marked_root_identity,
 };
 
 /// The last round a resolution stands at before attention is required:
@@ -2903,6 +2904,12 @@ async fn converge_from_resolution(
             ConvergeMode::Retrieve { overwrite: true } => {}
             _ => return Ok(SyncOutcome::ResolutionRequired(standing.clone(), None)),
         }
+    }
+    // u308 round 2, ruled: a publication with no resolution standing refuses
+    // a root identity file holding a marked block, before any request, as
+    // it was refused before the root readers took it by its local side.
+    if mode == ConvergeMode::Publish && copy.folder.is_none() {
+        refuse_marked_root_identity(&copy.root)?;
     }
 
     // 5 — the one base read, held as its manifest for the written test

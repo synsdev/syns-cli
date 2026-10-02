@@ -27,6 +27,7 @@ use crate::repo::folder::{FolderScope, lies_under, place_under, resolve_folder_s
 use crate::repo::identity::identity_head;
 use crate::repo::if_repo::resolve_or_skip;
 use crate::repo::root::{push_scope, resolve_start_path};
+use crate::repo::syns_yaml::refuse_marked_root_identity;
 
 /// The message a publication carries where the invocation names none.
 pub(crate) const DEFAULT_COMMIT_MESSAGE: &str = "push";
@@ -228,6 +229,8 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
                 None,
             );
         }
+        // u308 round 2, ruled: nor past a marked root identity file.
+        refuse_marked_root_identity(&scope.root)?;
 
         // `cmd_push` 3 — the registered publication, unchanged.
         //
