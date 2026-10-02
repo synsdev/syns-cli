@@ -1175,6 +1175,44 @@ async fn a_collision_on_a_base_path_its_commit_does_not_hold_reads_as_both_added
     }
 }
 
+// CR1-2: where the base read meets a path its commit does not hold, a
+// path beside it that commit does hold keeps its base contents and stands
+// as modified on both sides.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_held_base_path_beside_an_unheld_one_keeps_its_base() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let base = e.fake.commit(&[("k.md", "k\n")]);
+    checkout(&e.fake, &copy, &base);
+    let laid = HashMap::from([("x.md".to_string(), blob_sha1(b"laid x\n"))]);
+    assert!(copy.lay_files(&laid, None, "unused").unwrap());
+    write_files(&dir, &[("x.md", "local x\n"), ("k.md", "k local\n")]);
+    e.fake
+        .commit_changes(&[("x.md", Some("remote x\n")), ("k.md", Some("k remote\n"))]);
+
+    let resolution = expect_resolution(
+        converge(
+            &e.fake.client(),
+            Some(TOKEN),
+            &copy,
+            ConvergeMode::Retrieve { overwrite: false },
+            e.opts(),
+        )
+        .await
+        .unwrap(),
+    );
+
+    assert_eq!(
+        resolution.collisions,
+        vec![
+            ("k.md".to_string(), CollisionKind::ModifyModify),
+            ("x.md".to_string(), CollisionKind::AddAdd),
+        ]
+    );
+}
+
 /// A tree before and after a head swaps a file and a folder of one name.
 type Swap = (
     &'static str,

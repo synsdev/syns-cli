@@ -510,6 +510,42 @@ mod tests {
         assert_eq!(first_reads, Some(0));
     }
 
+    // CR1-1: a base commit that changed nothing under the folder counts
+    // the folder unmoved where the folder's change before the landed one
+    // is numbered at or below it, and moved where that number is unread.
+    #[tokio::test]
+    async fn a_folder_counts_unmoved_past_a_base_commit_that_changed_nothing_under_it() {
+        let changed = &["budget/document.html"][..];
+        let numbered = [
+            ResponseTemplate::new(200).set_body_json(version(1, "h1", &["README.md"])),
+            ResponseTemplate::new(503).set_body_json(serde_json::json!({"error": "unavailable"})),
+        ];
+        let mut answers = Vec::new();
+        for answer in numbered {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(format!("/api/v1/repos/{REPO}/versions")))
+                .and(query_param("path", "budget"))
+                .and(query_param("limit", "2"))
+                .and(query_param("offset", "0"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(page(vec![
+                    version(3, "h3", changed),
+                    version(0, "h0", changed),
+                ])))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/api/v1/repos/{REPO}/versions/h1")))
+                .respond_with(answer)
+                .mount(&server)
+                .await;
+            let client = SynsClient::new(&server.uri()).unwrap();
+            answers
+                .push(folder_unmoved_until(&client, Some("t"), REPO, "budget", "h1", "h3").await);
+        }
+        assert_eq!(answers, [true, false]);
+    }
+
     // SPEC u292 Behaviour, `FolderCheck::folder_moved` 1: a refusal of
     // any class but `transient` ends the check on it.
     #[tokio::test]

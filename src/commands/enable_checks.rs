@@ -401,10 +401,11 @@ mod tests {
     }
 
     // CR1-2, CR2-1: `lay_turned_on` lays over no holder copy holding an
-    // outbox or a resolution, none standing at another commit than the
-    // claimed parent, and no folder copy standing at neither the parent
-    // nor the claimed one; a holder copy it lays keeps its recorded time,
-    // and the folder copy's is stamped anew.
+    // outbox or a resolution, and no folder copy standing at neither the
+    // parent nor the claimed one; a holder copy standing at another commit
+    // than the claimed parent takes the turned-on file at its own commit
+    // (SPEC u304 `lay_turned_on` 2); a holder copy it lays keeps its
+    // recorded time, and the folder copy's is stamped anew.
     #[tokio::test]
     async fn turning_checks_on_lays_only_over_clean_bases_at_the_parent() {
         // No enclosing folder copy stands, so no request reaches this.
