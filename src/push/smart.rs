@@ -1019,6 +1019,25 @@ pub(crate) fn strict_refuses(skipped: &[SkippedFile]) -> bool {
     skipped.iter().any(|sf| sf.reason == SkipReason::TooLarge)
 }
 
+/// Whether the tree read `smart_push` 1 makes where no local record loads
+/// answered a repository holding no commit: any `404`, as the run read it
+/// before (`not_found` and `repo_not_found` among them), or the empty
+/// repository's `422` `validation_error` (SPEC u300 `smart_push` 1, issue
+/// 220), as `converge`'s `is_empty_repository` reads it.
+fn holds_no_commit(err: &CliError) -> bool {
+    match err {
+        CliError::Api {
+            status: Some(404), ..
+        } => true,
+        CliError::Api {
+            status: Some(422),
+            error,
+            ..
+        } => error == "validation_error",
+        _ => false,
+    }
+}
+
 pub async fn smart_push(
     client: &SynsClient,
     token: &str,
@@ -1171,9 +1190,12 @@ pub async fn smart_push(
                         let parent = Some(tree.commit_sha.clone());
                         (tree_to_sha_map(&tree), parent)
                     }
-                    Err(CliError::Api {
-                        status: Some(404), ..
-                    }) => (HashMap::new(), None),
+                    // SPEC u300 `smart_push` 1: a repository not found, and
+                    // one created empty — whose tree read answers `422`
+                    // `validation_error` (issue 220) — read as a head holding
+                    // no file and no commit, so the publication claims no
+                    // parent; every other refusal stops the run.
+                    Err(err) if holds_no_commit(&err) => (HashMap::new(), None),
                     Err(e) => return Err(e),
                 },
             };

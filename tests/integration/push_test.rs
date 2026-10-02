@@ -260,3 +260,132 @@ async fn push_413_html_body_surfaces_as_payload_too_large_with_rejecter() {
         other => panic!("expected Err(CliError::PayloadTooLarge), got: {other:?}"),
     }
 }
+
+// ---- SPEC u300: a publication into a repository holding no commit ----
+
+/// `syns push` with `args`, from `cwd`, against `env`'s deployment, its
+/// standard input closed and `CI` and the provenance variables removed.
+fn run_push(
+    env: &super::common::SpawnEnv,
+    cwd: &std::path::Path,
+    args: &[&str],
+) -> std::process::Output {
+    assert_cmd::Command::cargo_bin("syns")
+        .expect("syns binary")
+        .current_dir(cwd)
+        .env("SYNS_CONFIG_DIR", env.config_dir.path())
+        .env("SYNS_CACHE_DIR", env.cache_dir.path())
+        .env_remove("SYNS_URL")
+        .env_remove("SYNS_INTEGRATION")
+        .env_remove("SYNS_RUN")
+        .env_remove("SYNS_TRIGGER")
+        .env_remove("SYNS_TASK")
+        .env_remove("CI")
+        .args(["--server", &env.mock_uri, "push"])
+        .args(args)
+        .write_stdin(Vec::new())
+        .output()
+        .expect("run syns")
+}
+
+/// A deployment of `alice/empty` whose `EP-tree` answers `status` with
+/// `body`, mounted over the helper's `404`, and `EP-push` `200`.
+fn empty_repository_env(status: u16, body: serde_json::Value) -> super::common::SpawnEnv {
+    let env = super::common::spawn_mock_env(super::common::SpawnOpts {
+        put_response: Some(super::common::default_push_response()),
+        owner: Some("alice"),
+        repo: Some("empty"),
+        ..Default::default()
+    });
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/empty/tree"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(body))
+            .with_priority(1)
+            .mount(&env.server),
+    );
+    env
+}
+
+/// The bodies of every `EP-push` request `env` has received.
+fn push_bodies(env: &super::common::SpawnEnv) -> Vec<serde_json::Value> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(env.server.received_requests())
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.method.as_str() == "PUT" && r.url.path() == "/api/v1/repos/alice/empty/push")
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect()
+}
+
+// SPEC u300 Tests, the row of this name: issue 220's reproduction.
+#[test]
+#[serial]
+fn a_scoped_or_forced_push_into_a_repository_holding_no_commit_publishes() {
+    let env = empty_repository_env(
+        422,
+        json!({"error": "validation_error", "message": "empty_repo"}),
+    );
+    let root = env.project_dir.path();
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::create_dir_all(root.join("forced")).unwrap();
+    fs::write(root.join("docs/a.md"), "hello").unwrap();
+    fs::write(root.join("forced/a.md"), "hello").unwrap();
+
+    for (cwd, args) in [
+        (root.to_path_buf(), vec!["docs", "-n", "empty", "--json"]),
+        (
+            root.join("forced"),
+            vec!["--force", "-n", "empty", "--json"],
+        ),
+    ] {
+        let before = push_bodies(&env).len();
+        let out = run_push(&env, &cwd, &args);
+
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let bodies = push_bodies(&env);
+        assert_eq!(bodies.len(), before + 1, "{args:?}: one EP-push");
+        let body = &bodies[before];
+        assert!(body.get("parentSha").is_none(), "{args:?}: {body}");
+        let a = body["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["path"] == "a.md")
+            .unwrap_or_else(|| panic!("{args:?}: no a.md in {body}"));
+        assert_eq!(a["content"], "hello", "{args:?}: {body}");
+    }
+}
+
+// SPEC u300 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_tree_read_refused_otherwise_stops_the_scoped_push() {
+    let env = empty_repository_env(403, json!({"error": "forbidden"}));
+    let root = env.project_dir.path();
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::write(root.join("docs/a.md"), "hello").unwrap();
+
+    let out = run_push(&env, root, &["docs", "-n", "empty", "--json"]);
+
+    assert_eq!(out.status.code(), Some(1));
+    let document: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).expect("one document");
+    assert!(
+        document["error"].as_str().unwrap().contains("forbidden"),
+        "{document}"
+    );
+    assert!(push_bodies(&env).is_empty());
+}
