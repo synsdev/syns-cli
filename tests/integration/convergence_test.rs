@@ -3831,6 +3831,105 @@ async fn version_retrieval_names_each_excluded_path() {
     );
 }
 
+// u306 TR-01, SV-17: a publication meeting a head past the base, the
+// base and the head naming no `.syns.yaml` and the identity text a
+// retrieval wrote the folder's only difference from the base, letter case
+// aside, writes no resolution: it writes the head's changes, records the
+// head as the base and publishes nothing, the state then reading
+// converged, and the identity text goes out with the next publication,
+// which finds the head at the base's commit.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn sync_over_a_moved_head_beside_a_written_identity_file_both_lack_publishes_nothing() {
+    let e = env().await;
+    for local in [IDENTITY, "owner: Alice\nname: Proj\n"] {
+        for (change, moved) in [(("c.md", None), "c.md"), (("d.md", Some("d\n")), "d.md")] {
+            let (fake, folder, copy, h1) =
+                identity_setup(&e, &[("a.md", "a\n"), ("c.md", "c\n")], local, &[change]).await;
+
+            let outcome = publish(&fake, &copy, &e).await;
+
+            match &outcome {
+                SyncOutcome::Synced {
+                    written,
+                    removed,
+                    published: None,
+                } => assert!(
+                    written.iter().chain(removed).any(|p| p == moved),
+                    "{local:?} {moved}: {outcome:?}"
+                ),
+                other => panic!("{local:?} {moved}: expected Synced, got {other:?}"),
+            }
+            assert!(copy.resolution().unwrap().is_none(), "{local:?} {moved}");
+            assert!(fake.push_bodies().is_empty(), "{local:?} {moved}");
+            assert_eq!(fake.head().0, h1, "{local:?} {moved}");
+            assert_eq!(
+                read(folder.path(), ".syns.yaml"),
+                local,
+                "{local:?} {moved}"
+            );
+            assert_eq!(
+                copy.base().unwrap().commit_sha(),
+                Some(h1.as_str()),
+                "{local:?} {moved}"
+            );
+            assert_eq!(base_identity_entry(&copy), None, "{local:?} {moved}");
+            assert_eq!(
+                working_copy_state(&fake.client(), Some(TOKEN), &copy)
+                    .await
+                    .unwrap(),
+                WorkingCopyState::Converged,
+                "{local:?} {moved}"
+            );
+
+            let next = publish(&fake, &copy, &e).await;
+
+            assert!(
+                matches!(
+                    next,
+                    SyncOutcome::Synced {
+                        published: Some(_),
+                        ..
+                    }
+                ),
+                "{local:?} {moved}: {next:?}"
+            );
+            assert_ne!(fake.head().0, h1, "{local:?} {moved}");
+            assert_eq!(
+                fake.head().1.get(".syns.yaml").map(String::as_str),
+                Some(local),
+                "{local:?} {moved}"
+            );
+        }
+    }
+}
+
+// u306 TR-01: a publication meeting a head past the base beside local work
+// and the identity text a retrieval wrote, the base and the head naming no
+// `.syns.yaml`, writes the resolution its local work asks for, holding the
+// identity text out of its local paths.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn sync_over_a_moved_head_holds_a_written_identity_file_out_of_the_local_paths() {
+    let e = env().await;
+    let (fake, folder, copy, _) =
+        identity_setup(&e, &[("a.md", "a\n")], IDENTITY, &[("c.md", Some("c\n"))]).await;
+    write_files(folder.path(), &[("b.md", "b\n")]);
+
+    let resolution = expect_resolution(publish(&fake, &copy, &e).await);
+
+    assert_eq!(resolution.local_paths, vec!["b.md".to_string()]);
+    assert!(
+        !resolution
+            .combined_paths
+            .contains(&".syns.yaml".to_string()),
+        "{resolution:?}"
+    );
+    assert!(resolution.collisions.is_empty(), "{resolution:?}");
+    assert_eq!(read(folder.path(), ".syns.yaml"), IDENTITY);
+    assert!(fake.push_bodies().is_empty());
+}
+
 // ---- an interrupted preparation -------------------------------------------
 
 fn set_readonly(path: &Path, readonly: bool) {

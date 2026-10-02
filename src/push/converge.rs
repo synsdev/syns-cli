@@ -1562,6 +1562,23 @@ fn holds_root_identity(
     retrieving && !(head_differs && unedited)
 }
 
+/// Whether a publication holds the root identity file out of every
+/// comparison of its run, as a retrieval does (u306 TR-01, `SAGA-cli-pull`
+/// step 6): the head stands past the base, neither names `.syns.yaml`, the
+/// folder holds it, and `held` — `held_root_identity`, the one test the
+/// working-copy state and the checkout guard read the record a retrieval
+/// wrote through — holds. The file then counts as no local work, so the
+/// publication writes no resolution for it and records the head as the
+/// base, naming no `.syns.yaml`; it goes out with the next publication,
+/// which finds the head at the base's commit.
+fn publication_holds_root_identity(held: bool, base: &Base, folder: &Folder, head: &Head) -> bool {
+    held && head.commit.is_some()
+        && head.commit != base.commit
+        && folder.hashes.contains_key(ROOT_IDENTITY)
+        && !base.files.contains_key(ROOT_IDENTITY)
+        && !head.files.contains_key(ROOT_IDENTITY)
+}
+
 /// Drop the root identity file from a collected folder, so the exclusion
 /// test that follows counts it as a file standing on disk that the
 /// comparison leaves alone.
@@ -2955,13 +2972,21 @@ async fn converge_from_resolution(
     };
     let written =
         retrieval_wrote_root_identity(&copy.root, &copy.owner, &copy.name, base_manifest.as_ref());
+    // u306 TR-01: a publication past the base holds it out alike where
+    // neither side names it and it is the record a retrieval wrote.
     let hold = holds_root_identity(
         matches!(mode, ConvergeMode::Retrieve { .. }),
         written,
         &base.files,
         &folder,
         &head,
-    );
+    ) || mode == ConvergeMode::Publish
+        && publication_holds_root_identity(
+            held_root_identity(&copy.root, &copy.owner, &copy.name, base_manifest.as_ref()),
+            &base,
+            &folder,
+            &head,
+        );
     let mut held: Option<String> = None;
     if hold {
         held = folder.hashes.get(ROOT_IDENTITY).cloned();
