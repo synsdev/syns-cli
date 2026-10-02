@@ -2830,20 +2830,25 @@ async fn converge_locked(
         Ok(OutboxStep::Completed(outcome)) => Ok(outcome),
         Ok(OutboxStep::Resume(parent)) => match token {
             None => Err(CliError::AuthRequired),
-            Some(token) => {
-                publish_reviewed(
-                    client,
-                    token,
-                    copy,
-                    opts,
-                    &staging,
-                    Some(parent),
-                    Some(folder),
-                    None,
-                    &root,
-                )
-                .await
-            }
+            // u308 CR2-1: a retrieval resuming an interrupted publication
+            // publishes, so it is refused as a publication is.
+            Some(token) => match refuse_unresolved_marked_identity(copy) {
+                Err(err) => Err(err),
+                Ok(()) => {
+                    publish_reviewed(
+                        client,
+                        token,
+                        copy,
+                        opts,
+                        &staging,
+                        Some(parent),
+                        Some(folder),
+                        None,
+                        &root,
+                    )
+                    .await
+                }
+            },
         },
         Ok(OutboxStep::CarryOn) => {
             converge_from_resolution(

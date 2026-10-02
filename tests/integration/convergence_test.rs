@@ -5181,3 +5181,25 @@ async fn sync_or_continue_resuming_an_outbox_refuses_a_merge_marked_root_identit
     published_nothing(&e, &dir, &h0);
     assert!(copy.outbox().unwrap().is_some());
 }
+
+// u308 CR2-1: a retrieval resuming an interrupted publication publishes,
+// so it refuses the marked root identity file as a publication does.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn bare_pull_resuming_an_outbox_refuses_a_merge_marked_root_identity() {
+    let e = env().await;
+    let (dir, copy, h0) = merge_marked_checkout(&e);
+    copy.write_outbox(&Outbox {
+        parent_commit: Some(h0.clone()),
+        tree: folder_hashes(&dir),
+    })
+    .unwrap();
+
+    let pulled = {
+        let _cwd = CwdGuard::enter(&dir.join("sub"));
+        cmd_pull(&e.config, &e.output, None, None, None, false, false, None).await
+    };
+
+    malformed_refusal(pulled);
+    published_nothing(&e, &dir, &h0);
+}
