@@ -1902,7 +1902,11 @@ struct Candidate<'a> {
     /// The resolution a recomputation keeps the recovery id and round of.
     existing: Option<Resolution>,
     /// Write a resolution whatever the reconciliation finds
-    /// (`publish_reviewed` 8).
+    /// (`publish_reviewed` 8), but where the pass holds the root identity
+    /// file out: the held record a retrieval wrote is no local work, so a
+    /// recomputation finding no local path, no collision and no resolution
+    /// standing records the head as the base and answers synced, nothing
+    /// published (SPEC u306 `converge` 5, under Q-01).
     force_resolution: bool,
     /// Whether this run holds the root identity file out (u263), decided
     /// once and applied to every collection, and the held file's hash.
@@ -2316,7 +2320,11 @@ async fn prepare_candidate(
         // resolution, take the holder's review lock, then prepare nothing
         // over a path another copy standing over the same files holds a
         // resolution for.
-        let resolving = candidate.force_resolution
+        // SPEC u306 `converge` 5 under Q-01: a recomputation holding the
+        // root identity file out is forced to no resolution, so one finding
+        // no local path, no collision and none standing records the head.
+        let forced = candidate.force_resolution && !holding;
+        let resolving = forced
             || resolution.is_some()
             || !collisions.is_empty()
             || !rec.collisions.is_empty()
@@ -2448,7 +2456,7 @@ async fn prepare_candidate(
         snapshots_written = true;
         drop(remote_entries);
 
-        let needs_resolution = candidate.force_resolution
+        let needs_resolution = forced
             || resolution.is_some()
             || !collisions.is_empty()
             || candidate.publishing && !local_paths.is_empty();
@@ -3734,7 +3742,11 @@ async fn publish_reviewed(
 
 /// `publish_reviewed` 7 and 8: raise the round, wait its backoff, and
 /// prepare the candidate again over the newest head with the refused
-/// parent standing as the base.
+/// parent standing as the base — forced to a resolution but where the
+/// recomputation holds the root identity file a retrieval wrote out and
+/// finds no other local work, which answers synced carrying no
+/// publication, the head recorded as the base (SPEC u306 `converge` 5,
+/// under Q-01).
 #[allow(clippy::too_many_arguments)]
 async fn guard_refused(
     client: &SynsClient,
@@ -3764,10 +3776,17 @@ async fn guard_refused(
 
     // SPEC u306 `converge` 5: the one base read, for whether a base is
     // recorded and whether the root identity file is the record a
-    // retrieval wrote, so the recomputation takes the head's file over it.
+    // retrieval wrote, so the recomputation takes the head's file over it,
+    // and — through `held_root_identity` over the base recorded when the
+    // send was refused — holds that file out of every comparison wherever
+    // `publication_holds_root_identity` holds over the refused parent, the
+    // folder and the head read here, so the resolution it writes lists the
+    // other local work alone.
     let base_manifest = base_of(copy);
     let written =
         retrieval_wrote_root_identity(&copy.root, &copy.owner, &copy.name, base_manifest.as_ref());
+    let held_identity =
+        held_root_identity(&copy.root, &copy.owner, &copy.name, base_manifest.as_ref());
     let head = read_head(
         client,
         Some(token),
@@ -3797,9 +3816,9 @@ async fn guard_refused(
             publishing: true,
             existing,
             force_resolution: true,
-            hold_root_identity: IdentityHold::Released,
+            hold_root_identity: IdentityHold::Undecided,
             written_root_identity: written,
-            held_root_identity: false,
+            held_root_identity: held_identity,
             root,
         },
         None,

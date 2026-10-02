@@ -198,6 +198,9 @@ struct FakeRepo {
     /// Every request received: method, target and body.
     requests: Vec<(String, String, Vec<u8>)>,
     drop_next_push: bool,
+    /// Changes laid over the head as a fresh commit before the next
+    /// publication is answered, so that publication meets a moved head.
+    move_head_before_next_push: Option<Vec<(String, Option<Vec<u8>>)>>,
     /// Refuse every publication as the server refuses a first push over a
     /// content store already holding commits: `CONFLICT` naming no head.
     identity_taken: bool,
@@ -293,6 +296,20 @@ impl FakeRepo {
                 if self.drop_next_push {
                     self.drop_next_push = false;
                     return None;
+                }
+                if let Some(changes) = self.move_head_before_next_push.take() {
+                    let mut tree = self
+                        .commits
+                        .last()
+                        .map(|(_, f)| f.clone())
+                        .unwrap_or_default();
+                    for (path, content) in changes {
+                        match content {
+                            Some(content) => tree.insert(path, content),
+                            None => tree.remove(&path),
+                        };
+                    }
+                    self.add_commit(tree);
                 }
                 if self.identity_taken {
                     return Some(Answer::json(409, error_body("conflict")));
@@ -604,6 +621,17 @@ impl Fake {
 
     pub(crate) fn drop_next_push(&self) {
         self.repo.lock().unwrap().drop_next_push = true;
+    }
+
+    /// Lay `changes` over the head, `None` removing a path, as a fresh
+    /// commit just before the next publication is answered.
+    pub(crate) fn move_head_before_next_push(&self, changes: &[(&str, Option<&str>)]) {
+        self.repo.lock().unwrap().move_head_before_next_push = Some(
+            changes
+                .iter()
+                .map(|(p, c)| (p.to_string(), c.map(|c| c.as_bytes().to_vec())))
+                .collect(),
+        );
     }
 
     pub(crate) fn take_identity(&self) {
@@ -3981,6 +4009,139 @@ async fn sync_over_a_moved_head_beside_an_added_identity_file_both_lack_writes_a
     assert_eq!(resolution.local_paths, vec![".syns.yaml".to_string()]);
     assert_eq!(fake.head().0, h1);
     assert_eq!(read(folder.path(), ".syns.yaml"), IDENTITY_WITH_LOCAL_CHECK);
+}
+
+// SPEC u306 Tests, `continuing_a_resolution_that_held_a_written_identity_file_out_publishes_it`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn continuing_a_resolution_that_held_a_written_identity_file_out_publishes_it() {
+    let e = env().await;
+    let (fake, folder, copy, h1) =
+        identity_setup(&e, &[("a.md", "a\n")], IDENTITY, &[("c.md", Some("c\n"))]).await;
+    write_files(folder.path(), &[("b.md", "b\n")]);
+    expect_resolution(publish(&fake, &copy, &e).await);
+
+    let outcome = continue_resolution(&fake.client(), TOKEN, &copy, e.opts())
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(
+            outcome,
+            SyncOutcome::Synced {
+                published: Some(_),
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    let (head, files) = fake.head();
+    assert_ne!(head, h1);
+    assert_eq!(files.get(".syns.yaml").map(String::as_str), Some(IDENTITY));
+    assert_eq!(files.get("b.md").map(String::as_str), Some("b\n"));
+    assert_eq!(files.get("c.md").map(String::as_str), Some("c\n"));
+    assert!(copy.resolution().unwrap().is_none());
+    assert_eq!(
+        base_identity_entry(&copy),
+        Some(blob_sha1(IDENTITY.as_bytes()))
+    );
+    assert_eq!(
+        working_copy_state(&fake.client(), Some(TOKEN), &copy)
+            .await
+            .unwrap(),
+        WorkingCopyState::Converged
+    );
+}
+
+// SPEC u306 Tests, `continuing_a_resolution_that_held_a_written_identity_file_out_past_a_refusal_keeps_it_out`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn continuing_a_resolution_that_held_a_written_identity_file_out_past_a_refusal_keeps_it_out()
+{
+    let e = env().await;
+    let (fake, folder, copy, _) =
+        identity_setup(&e, &[("a.md", "a\n")], IDENTITY, &[("c.md", Some("c\n"))]).await;
+    write_files(folder.path(), &[("b.md", "b\n")]);
+    expect_resolution(publish(&fake, &copy, &e).await);
+    let h2 = fake.commit_changes(&[("d.md", Some("d\n"))]);
+
+    let outcome = continue_resolution(&fake.client(), TOKEN, &copy, e.opts())
+        .await
+        .unwrap();
+
+    let resolution = expect_resolution(outcome);
+    assert_eq!(resolution.round, 2);
+    assert_eq!(resolution.head_commit, h2);
+    assert_eq!(resolution.local_paths, vec!["b.md".to_string()]);
+    assert!(
+        !resolution
+            .combined_paths
+            .contains(&".syns.yaml".to_string()),
+        "{resolution:?}"
+    );
+    assert_eq!(read(folder.path(), ".syns.yaml"), IDENTITY);
+}
+
+// SPEC u306 `converge` 5 under Q-01: a sync at the base's commit sending
+// the identity text a retrieval wrote alone, refused at a head past it
+// naming no `.syns.yaml`, writes no resolution — the recomputation writes
+// the head's changes, records the head as the base naming no `.syns.yaml`
+// and publishes nothing, the next publication at the base's commit
+// carrying the file.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_refused_sync_sending_only_a_written_identity_file_writes_no_resolution() {
+    let e = env().await;
+    let fake = Fake::start().await;
+    let folder = tempfile::tempdir().unwrap();
+    let copy = e.copy(folder.path());
+    let h0 = fake.commit(&[("a.md", "a\n")]);
+    checkout(&fake, &copy, &h0);
+    write_files(folder.path(), &[(".syns.yaml", IDENTITY)]);
+    fake.move_head_before_next_push(&[("c.md", Some("c\n"))]);
+
+    let outcome = publish(&fake, &copy, &e).await;
+
+    match &outcome {
+        SyncOutcome::Synced {
+            written,
+            published: None,
+            ..
+        } => assert_eq!(written, &vec!["c.md".to_string()], "{outcome:?}"),
+        other => panic!("expected Synced carrying no publication, got {other:?}"),
+    }
+    assert!(copy.resolution().unwrap().is_none());
+    assert_eq!(fake.push_bodies().len(), 1);
+    let (h1, files) = fake.head();
+    assert_ne!(h1, h0);
+    assert!(!files.contains_key(".syns.yaml"), "{files:?}");
+    assert_eq!(copy.base().unwrap().commit_sha(), Some(h1.as_str()));
+    assert_eq!(base_identity_entry(&copy), None);
+    assert_eq!(read(folder.path(), "c.md"), "c\n");
+    assert_eq!(
+        working_copy_state(&fake.client(), Some(TOKEN), &copy)
+            .await
+            .unwrap(),
+        WorkingCopyState::Converged
+    );
+
+    let next = publish(&fake, &copy, &e).await;
+
+    assert!(
+        matches!(
+            next,
+            SyncOutcome::Synced {
+                published: Some(_),
+                ..
+            }
+        ),
+        "{next:?}"
+    );
+    assert_ne!(fake.head().0, h1);
+    assert_eq!(
+        fake.head().1.get(".syns.yaml").map(String::as_str),
+        Some(IDENTITY)
+    );
 }
 
 // ---- an interrupted preparation -------------------------------------------
