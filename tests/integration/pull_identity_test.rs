@@ -12,29 +12,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use syns_cli::push::hash::blob_sha1;
 use tempfile::TempDir;
-use wiremock::matchers::{method, path, path_regex};
+use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// A mock server, temporary config and cache directories, and a canonical
 /// temporary working area `W`, so a path the child prints spells the same
 /// path the test expects.
-/// The record every repository answers, marking no shared folder, which
-/// `syns pull OWNER/NAME` reads into a directory no identity file reaches
-/// (SPEC u302 `cmd_pull` 2).
-async fn mount_records(server: &MockServer) {
-    Mock::given(method("GET"))
-        .and(path_regex(r"^/api/v1/repos/[^/]+/[^/]+$"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "owner": "alice", "name": "repo", "description": null,
-            "commitSha": null, "status": "active", "author": null, "tags": [],
-            "visibility": "private", "forkedFrom": null, "forkCount": 0,
-            "fileCount": 0, "role": "owner", "sharedFolder": false,
-            "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
-        })))
-        .mount(server)
-        .await;
-}
-
 struct Env {
     runtime: tokio::runtime::Runtime,
     server: MockServer,
@@ -51,7 +34,7 @@ impl Env {
             .build()
             .unwrap();
         let server = runtime.block_on(MockServer::start());
-        runtime.block_on(mount_records(&server));
+        runtime.block_on(super::common::mount_records(&server));
         let work = tempfile::tempdir().unwrap();
         let w = fs::canonicalize(work.path()).unwrap();
         Env {

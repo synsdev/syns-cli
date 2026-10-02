@@ -896,7 +896,20 @@ fn bare_collaborators_inside_an_identity_folder_address_it() {
             }))),
     );
 
+    // CR1-3: the role change binds the identity as the add does.
+    d.mount(
+        Mock::given(method("PATCH"))
+            .and(path_regex(r"^/api/v1/repos/[^/]+/[^/]+/collaborators/dave$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "user": {"id": "dave", "name": "Dave", "username": "dave", "email": "dave@example.test",
+                         "emailVerified": true, "image": null,
+                         "createdAt": "2026-10-02T00:00:00Z", "updatedAt": "2026-10-02T00:00:00Z"},
+                "role": "write", "addedBy": "alice", "createdAt": "2026-10-02T00:00:00Z",
+            }))),
+    );
+
     let bare = d.run(&["--json", "collaborators", "add", "dave", "--role", "read"]);
+    let role = d.run(&["--json", "collaborators", "role", "dave", "--role", "write"]);
     let named = d.run(&[
         "--json",
         "collaborators",
@@ -908,18 +921,19 @@ fn bare_collaborators_inside_an_identity_folder_address_it() {
         "alice/docs-q3-plan",
     ]);
 
-    for out in [&bare, &named] {
+    for out in [&bare, &role, &named] {
         assert_eq!(exit_of(out), 0, "{}", stderr_of(out));
     }
-    let posts: Vec<String> = d
+    let sent: Vec<String> = d
         .targets()
         .into_iter()
-        .filter(|t| t.starts_with("POST "))
+        .filter(|t| t.starts_with("POST ") || t.starts_with("PATCH "))
         .collect();
     assert_eq!(
-        posts,
+        sent,
         vec![
             format!("POST {IDENTITY}/collaborators"),
+            format!("PATCH {IDENTITY}/collaborators/dave"),
             format!("POST {IDENTITY}/collaborators"),
         ]
     );
@@ -932,6 +946,15 @@ fn bare_collaborators_inside_an_identity_folder_address_it() {
             "dave",
             "--role",
             "read",
+            "--repo",
+            "alice/docs",
+        ],
+        vec![
+            "collaborators",
+            "role",
+            "dave",
+            "--role",
+            "write",
             "--repo",
             "alice/docs",
         ],
@@ -1133,5 +1156,177 @@ fn share_inside_an_identity_folder_counts_from_the_holder() {
             .any(|t| t == &format!("GET {HOLDER}/shares/q3-plan/appendix")),
         "{:?}",
         d.targets()
+    );
+}
+
+// ---- the paths the review found untested (CR1-1, CR1-2, CR1-4) ---------
+
+/// The holder's answers once `q3-plan` was unshared: its file there
+/// naming no identity, its tree at `q3-plan` at `H8` holding that file
+/// and `document.html` at the base's hash, and the identity's version
+/// list answering `404` `not_found`.
+fn unshared(d: &Deployment) {
+    d.overrides(
+        "GET",
+        &format!("{IDENTITY}/versions"),
+        refusal(404, "not_found"),
+    );
+    d.serves(
+        "GET",
+        &format!("{HOLDER}/raw/q3-plan/.syns.yaml"),
+        raw(UNSHARED),
+    );
+    d.serves(
+        "GET",
+        &format!("{HOLDER}/raw/q3-plan/document.html"),
+        raw(DOC),
+    );
+    d.serves(
+        "GET",
+        &format!("{HOLDER}/tree/q3-plan"),
+        ResponseTemplate::new(200).set_body_json(json!({
+            "entries": [
+                tree_entry("q3-plan/.syns.yaml", UNSHARED),
+                tree_entry("q3-plan/document.html", DOC),
+            ],
+            "commitSha": H8, "truncated": false,
+        })),
+    );
+}
+
+// SPEC u302 Behaviour, `cmd_sync` 2 (CR1-1): a sync meeting an unshared
+// identity returns the folder to its holder and converges it there.
+#[test]
+#[serial]
+fn an_unshared_identity_returns_a_holder_reader_to_the_holder_on_sync() {
+    let d = Deployment::new();
+    write(&d.folder().join("document.html"), DOC);
+    d.record_base(H4);
+    unshared(&d);
+
+    let out = d.run(&["--json", "sync"]);
+
+    assert_eq!(exit_of(&out), 0, "{}{}", stderr_of(&out), stdout_of(&out));
+    assert!(d.pushes(IDENTITY).is_empty() && d.pushes(HOLDER).is_empty());
+    let holder = WorkingCopy::open_existing(&d.stores(), "alice", "docs", &d.folder())
+        .unwrap()
+        .expect("the holder's copy");
+    assert_eq!(holder.base().unwrap().commit_sha(), Some(H8));
+    let yaml = std::fs::read_to_string(d.folder().join(".syns.yaml")).unwrap();
+    assert!(!yaml.contains("shared_as"), "{yaml}");
+}
+
+// SPEC u302 Behaviour, `cmd_pull` 1 at `--version` (CR1-4): the
+// identity's whole tree is read at the version, every path as served.
+#[test]
+#[serial]
+fn a_pull_at_a_version_inside_an_identity_folder_reads_its_whole_tree() {
+    let d = Deployment::new();
+    d.record_base(H4);
+
+    let out = d.run(&["--json", "pull", "--version", "4"]);
+
+    assert_eq!(exit_of(&out), 0, "{}{}", stderr_of(&out), stdout_of(&out));
+    let trees: Vec<String> = d
+        .targets()
+        .into_iter()
+        .filter(|t| t.contains("/tree"))
+        .collect();
+    assert_eq!(
+        trees,
+        vec![format!("GET {IDENTITY}/tree?recursive=true&ref=4")]
+    );
+    assert_eq!(
+        std::fs::read_to_string(d.folder().join("document.html")).unwrap(),
+        DOC
+    );
+}
+
+const TEMPLATE: &str = "/api/v1/repos/bob/board-template";
+const T9: &str = "9999999999999999999999999999999999999999";
+const BOARD: &str = "<p>board</p>\n";
+
+// SPEC u302 Behaviour, `cmd_place` 1 (CR1-2): a placement inside a folder
+// bound to its identity is sent through the identity at the typed path,
+// its identity file recording the holder and the holder path, and laid
+// over the identity copy's base.
+#[test]
+#[serial]
+fn place_inside_an_identity_folder_goes_through_it() {
+    let d = Deployment::new();
+    write(&d.folder().join("document.html"), DOC);
+    d.record_base(H4);
+    d.serves(
+        "GET",
+        TEMPLATE,
+        ResponseTemplate::new(200).set_body_json(record("bob", "board-template", Some(T9), false)),
+    );
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path(format!("{TEMPLATE}/versions")))
+            .and(query_param("limit", "1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(page(vec![version(9, T9, &["board.html"])], 1)),
+            ),
+    );
+    d.serves(
+        "GET",
+        &format!("{TEMPLATE}/tree"),
+        ResponseTemplate::new(200).set_body_json(json!({
+            "entries": [tree_entry("board.html", BOARD)],
+            "commitSha": T9, "truncated": false,
+        })),
+    );
+    d.serves("GET", &format!("{TEMPLATE}/raw/board.html"), raw(BOARD));
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"^/api/v1/repos/alice/docs-q3-plan/(raw|tree)/appendix",
+            ))
+            .respond_with(refusal(404, "not_found")),
+    );
+    d.serves(
+        "PUT",
+        &format!("{IDENTITY}/push"),
+        ResponseTemplate::new(200).set_body_json(json!({
+            "commitSha": H5, "version": 5, "filesChanged": 2, "created": false,
+        })),
+    );
+
+    let out = d.run(&["--json", "place", "bob/board-template", "appendix"]);
+
+    assert_eq!(exit_of(&out), 0, "{}{}", stderr_of(&out), stdout_of(&out));
+    let pushes = d.pushes(IDENTITY);
+    assert_eq!(pushes.len(), 1, "{:?}", d.targets());
+    assert_eq!(
+        pushed_paths(&pushes[0]),
+        vec!["appendix/.syns.yaml", "appendix/board.html"]
+    );
+    assert_eq!(pushes[0]["parentSha"], json!(H4));
+    assert!(d.pushes(HOLDER).is_empty());
+    let placed = std::fs::read_to_string(d.folder().join("appendix/.syns.yaml")).unwrap();
+    assert!(
+        placed.contains("holder: alice/docs") && placed.contains("path: q3-plan/appendix"),
+        "{placed}"
+    );
+    let copy = WorkingCopy::open_existing(&d.stores(), "alice", "docs-q3-plan", &d.folder())
+        .unwrap()
+        .expect("the identity copy");
+    let base = copy.base().unwrap();
+    assert_eq!(base.commit_sha(), Some(H5));
+    assert!(base.file_sha("appendix/.syns.yaml").is_some());
+    assert!(base.file_sha("appendix/board.html").is_some());
+    assert!(
+        !d.folder().join("appendix").join(".syns-state").exists()
+            && WorkingCopy::open_existing(
+                &d.stores(),
+                "alice",
+                "docs",
+                &d.folder().join("appendix")
+            )
+            .unwrap()
+            .is_none(),
+        "the placed folder recorded a base of its own"
     );
 }

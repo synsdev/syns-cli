@@ -14,7 +14,7 @@
 use serde_json::{Value, json};
 use syns_cli::auth::token::TokenStore;
 use tempfile::TempDir;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Convenience knobs for `spawn_mock_env`. Each field is independent;
@@ -128,4 +128,21 @@ pub fn default_push_response() -> Value {
         "filesChanged": 1,
         "created": true,
     })
+}
+
+/// The record every repository answers, marking no shared folder, which
+/// `syns pull OWNER/NAME` reads into a directory no identity file reaches
+/// (SPEC u302 `cmd_pull` 2).
+pub async fn mount_records(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v1/repos/[^/]+/[^/]+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "owner": "alice", "name": "repo", "description": null,
+            "commitSha": null, "status": "active", "author": null, "tags": [],
+            "visibility": "private", "forkedFrom": null, "forkCount": 0,
+            "fileCount": 0, "role": "owner", "sharedFolder": false,
+            "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+        })))
+        .mount(server)
+        .await;
 }
