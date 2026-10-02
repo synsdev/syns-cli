@@ -547,6 +547,144 @@ fn unshare_under_ci_without_yes_removes_nothing() {
     assert!(d.sent("DELETE").is_empty());
 }
 
+// CR1-1: an answer typed at the confirmation.
+#[test]
+#[serial]
+fn unshare_refused_at_the_confirmation_removes_nothing() {
+    let d = Deployment::new(Some("alice/docs"));
+    d.serves(
+        "GET",
+        "/api/v1/repos/alice/docs/shares/q3-plan",
+        ResponseTemplate::new(200).set_body_json(record("alice", "docs-q3-plan", true)),
+    );
+    d.serves(
+        "DELETE",
+        "/api/v1/repos/alice/docs/shares/q3-plan",
+        ResponseTemplate::new(204),
+    );
+    let answering = |answer: &[u8]| {
+        d.command(&d.w.clone(), &["unshare", "q3-plan", "--json"])
+            .write_stdin(answer.to_vec())
+            .output()
+            .expect("run syns")
+    };
+
+    let refused = answering(b"n\n");
+
+    assert_eq!(exit_of(&refused), 0, "{}", stderr_of(&refused));
+    assert_eq!(
+        stderr_of(&refused),
+        "Stop sharing q3-plan of alice/docs as alice/docs-q3-plan, removing its collaborators? [y/N]: Aborted.\n"
+    );
+    assert_eq!(
+        document(&refused),
+        json!({
+            "unshared": false,
+            "holder": "alice/docs",
+            "path": "q3-plan",
+            "owner": "alice",
+            "name": "docs-q3-plan",
+        })
+    );
+    assert!(d.sent("DELETE").is_empty());
+
+    let confirmed = answering(b"y\n");
+
+    assert_eq!(exit_of(&confirmed), 0, "{}", stderr_of(&confirmed));
+    assert_eq!(document(&confirmed)["unshared"], true);
+    assert_eq!(
+        d.sent("DELETE"),
+        vec!["/api/v1/repos/alice/docs/shares/q3-plan".to_string()]
+    );
+}
+
+// CR1-3: the share lines and the unshare lines outside `--json`.
+#[test]
+#[serial]
+fn share_lines_report_on_the_diagnostic_stream_and_name_the_identity() {
+    let d = Deployment::new(Some("alice/docs"));
+    for (folder, answer) in [
+        ("q3-plan", refusal(404, "not_found")),
+        ("budget", refusal(404, "not_found")),
+        (
+            "old",
+            ResponseTemplate::new(200).set_body_json(record("alice", "docs-old", true)),
+        ),
+    ] {
+        d.serves(
+            "GET",
+            &format!("/api/v1/repos/alice/docs/shares/{folder}"),
+            answer,
+        );
+    }
+    d.serves(
+        "POST",
+        "/api/v1/repos/alice/docs/shares",
+        ResponseTemplate::new(201).set_body_json(record("alice", "docs-q3-plan", true)),
+    );
+    d.serves(
+        "DELETE",
+        "/api/v1/repos/alice/docs/shares/old",
+        ResponseTemplate::new(204),
+    );
+    let expect = |args: &[&str], stdout: &str, stderr: &str| {
+        let out = d.run(args);
+        assert_eq!(exit_of(&out), 0, "{args:?}: {}", stderr_of(&out));
+        assert_eq!(stdout_of(&out), stdout, "{args:?}");
+        assert_eq!(stderr_of(&out), stderr, "{args:?}");
+    };
+
+    expect(
+        &["share", "q3-plan"],
+        "alice/docs-q3-plan\n",
+        "shared q3-plan of alice/docs as alice/docs-q3-plan; add people with: syns collaborators add USER --role read --repo alice/docs-q3-plan\n",
+    );
+    expect(
+        &["share", "old"],
+        "alice/docs-old\n",
+        "old of alice/docs is already shared as alice/docs-old\n",
+    );
+    expect(
+        &["share", "old", "--show"],
+        "alice/docs-old\n",
+        "old of alice/docs is shared as alice/docs-old\n",
+    );
+    expect(
+        &["share", "budget", "--show"],
+        "",
+        "budget of alice/docs is not shared; syns share offers the name docs-budget\n",
+    );
+    expect(
+        &["unshare", "old", "--yes"],
+        "",
+        "stopped sharing old of alice/docs: alice/docs-old is retired and its collaborators removed\n",
+    );
+
+    let scoped = Deployment::new(Some("alice/work"));
+    let vela = scoped.w.join("clients/vela");
+    write(
+        &vela.join(".syns.yaml"),
+        "holder: alice/work\npath: clients/vela\n",
+    );
+    scoped.serves(
+        "GET",
+        "/api/v1/repos/alice/work/shares/clients/vela/q3-board",
+        refusal(404, "not_found"),
+    );
+    scoped.serves(
+        "POST",
+        "/api/v1/repos/alice/work/shares",
+        ResponseTemplate::new(201).set_body_json(record("alice", "work-q3-board", true)),
+    );
+    let out = scoped.run_in(&vela, &["share", "q3-board"]);
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(stdout_of(&out), "alice/work-q3-board\n");
+    assert_eq!(
+        stderr_of(&out),
+        "shared clients/vela/q3-board of alice/work as alice/work-q3-board\n"
+    );
+}
+
 // ---- collaborators through an identity ---------------------------------
 
 /// The deployment `alice/docs` checked out at `W`, its scoped folder

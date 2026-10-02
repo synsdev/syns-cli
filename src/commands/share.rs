@@ -8,7 +8,7 @@ use std::io::{BufRead, IsTerminal, Write};
 use serde_json::{Value, json};
 
 use crate::auth::token::TokenStore;
-use crate::client::{RepoResponse, SynsClient};
+use crate::client::{CollaboratorRole, RepoResponse, SynsClient};
 use crate::commands::place::{counted_from, placement_path};
 use crate::config::Config;
 use crate::errors::{ApiErrorContext, CliError};
@@ -205,45 +205,55 @@ pub(crate) async fn share_with_names(
 // ---- the prompts ------------------------------------------------------
 
 /// Whether the name prompt can be raised for a caller holding `role` on
-/// the holder: standard input a terminal, `--json` off, `CI` absent
-/// whatever its value, and the role `owner` or `admin`.
-fn prompt_can_be_raised(output: &Output, role: Option<&crate::client::CollaboratorRole>) -> bool {
-    use crate::client::CollaboratorRole;
-    terminal_prompt(output)
-        && matches!(
-            role,
-            Some(CollaboratorRole::Owner | CollaboratorRole::Admin)
-        )
+/// the holder: the prompt gate holding, and `may_prompt_for` the role.
+fn prompt_can_be_raised(output: &Output, role: Option<&CollaboratorRole>) -> bool {
+    terminal_prompt(output) && may_prompt_for(role)
 }
 
-/// The prompt gate before the role is known.
+/// Whether a caller holding `role` on the holder may be asked for a name:
+/// `owner` or `admin` alone (SPEC u300 Behaviour, `cmd_share` 6).
+fn may_prompt_for(role: Option<&CollaboratorRole>) -> bool {
+    matches!(
+        role,
+        Some(CollaboratorRole::Owner | CollaboratorRole::Admin)
+    )
+}
+
+/// The prompt gate before the role is known: standard input a terminal,
+/// `--json` off, and `CI` absent whatever its value.
 fn terminal_prompt(output: &Output) -> bool {
     std::io::stdin().is_terminal() && !output.is_json() && std::env::var_os("CI").is_none()
 }
 
-/// One line read after writing `prompt` on the diagnostic stream, none at
+/// One line read from `input` after writing `prompt` on `diag`, none at
 /// end of input or where the line cannot be read.
-fn read_answer(prompt: &str) -> Option<String> {
-    eprint!("{prompt}");
-    std::io::stderr().flush().ok()?;
+fn read_answer(input: &mut dyn BufRead, diag: &mut dyn Write, prompt: &str) -> Option<String> {
+    write!(diag, "{prompt}").ok()?;
+    diag.flush().ok()?;
     let mut line = String::new();
-    match std::io::stdin().lock().read_line(&mut line) {
+    match input.read_line(&mut line) {
         Ok(0) | Err(_) => None,
         Ok(_) => Some(line.trim().to_string()),
     }
 }
 
-/// The name prompt for the folder at `path` of `holder`: an empty answer
-/// takes `offer`, or asks again where none stands; an answer
-/// `share_name_problem` refuses writes its line and asks again; none at
-/// end of input.
-fn ask_name(path: &str, holder: &str, offer: Option<&str>) -> Option<String> {
+/// The name prompt for the folder at `path` of `holder`, read from
+/// `input` and written on `diag`: an empty answer takes `offer`, or asks
+/// again where none stands; an answer `share_name_problem` refuses writes
+/// its line and asks again; none at end of input.
+fn ask_name(
+    input: &mut dyn BufRead,
+    diag: &mut dyn Write,
+    path: &str,
+    holder: &str,
+    offer: Option<&str>,
+) -> Option<String> {
     let prompt = match offer {
         Some(offer) => format!("name for {path} of {holder} [{offer}]: "),
         None => format!("name for {path} of {holder}: "),
     };
     loop {
-        let answer = read_answer(&prompt)?;
+        let answer = read_answer(input, diag, &prompt)?;
         if answer.is_empty() {
             match offer {
                 Some(offer) => return Some(offer.to_string()),
@@ -251,10 +261,21 @@ fn ask_name(path: &str, holder: &str, offer: Option<&str>) -> Option<String> {
             }
         }
         match share_name_problem(&answer) {
-            Some(line) => eprintln!("{line}"),
+            Some(line) => writeln!(diag, "{line}").ok()?,
             None => return Some(answer),
         }
     }
+}
+
+/// `ask_name` over the run's standard input and diagnostic stream.
+fn ask_name_here(path: &str, holder: &str, offer: Option<&str>) -> Option<String> {
+    ask_name(
+        &mut std::io::stdin().lock(),
+        &mut std::io::stderr(),
+        path,
+        holder,
+        offer,
+    )
 }
 
 // ---- the lines --------------------------------------------------------
@@ -351,14 +372,15 @@ pub async fn cmd_share(
                     None => typed,
                     Some(line) if can_prompt => {
                         eprintln!("{line}");
-                        ask_name(&target.path, &target.holder, None).ok_or_else(no_name_refusal)?
+                        ask_name_here(&target.path, &target.holder, None)
+                            .ok_or_else(no_name_refusal)?
                     }
                     Some(line) => return Err(CliError::Config { message: line }),
                 },
                 None => {
                     let offer = offered_share_name(&target.holder, &target.path);
                     if can_prompt {
-                        ask_name(&target.path, &target.holder, offer.as_deref())
+                        ask_name_here(&target.path, &target.holder, offer.as_deref())
                             .ok_or_else(no_name_refusal)?
                     } else {
                         offer.ok_or_else(no_name_refusal)?
@@ -370,7 +392,7 @@ pub async fn cmd_share(
             let (path, holder_id) = (target.path.clone(), target.holder.clone());
             let mut again = move |held: &str| {
                 eprintln!("{}", held_line(held));
-                ask_name(&path, &holder_id, None)
+                ask_name_here(&path, &holder_id, None)
             };
             let ask: Option<AskName<'_>> = if can_prompt { Some(&mut again) } else { None };
             share_with_names(&client, &token, &target, name, ask).await?
@@ -715,5 +737,50 @@ mod tests {
         assert_eq!(requests.len(), 1, "one share request and no lookup");
         assert_eq!(requests[0].method.as_str(), "POST");
         assert_eq!(calls, 0);
+    }
+
+    // CR1-2: the name prompt, read from a given input.
+    #[test]
+    fn the_name_prompt_takes_the_offer_asks_again_and_ends_at_end_of_input() {
+        let ask = |input: &str, offer: Option<&str>| {
+            let mut diag = Vec::new();
+            let answer = ask_name(
+                &mut std::io::Cursor::new(input.as_bytes().to_vec()),
+                &mut diag,
+                "q3-plan",
+                "alice/docs",
+                offer,
+            );
+            (answer, String::from_utf8(diag).unwrap())
+        };
+
+        let (answer, diag) = ask("\n", Some("docs-q3-plan"));
+        assert_eq!(answer.as_deref(), Some("docs-q3-plan"));
+        assert_eq!(diag, "name for q3-plan of alice/docs [docs-q3-plan]: ");
+
+        let (answer, diag) = ask("\nDocs\nq3\n", None);
+        assert_eq!(answer.as_deref(), Some("q3"));
+        let prompt = "name for q3-plan of alice/docs: ";
+        assert_eq!(
+            diag,
+            format!(
+                "{prompt}{prompt}{}\n{prompt}",
+                share_name_problem("Docs").unwrap()
+            )
+        );
+
+        assert_eq!(ask("", Some("docs-q3-plan")).0, None);
+        assert_eq!(ask("Docs\n", None).0, None);
+    }
+
+    // CR1-2: the role half of the prompt gate.
+    #[test]
+    fn only_an_owner_or_an_admin_of_the_holder_is_asked_for_a_name() {
+        assert!(may_prompt_for(Some(&CollaboratorRole::Owner)));
+        assert!(may_prompt_for(Some(&CollaboratorRole::Admin)));
+        assert!(!may_prompt_for(Some(&CollaboratorRole::Write)));
+        assert!(!may_prompt_for(Some(&CollaboratorRole::Read)));
+        assert!(!may_prompt_for(Some(&CollaboratorRole::Unknown)));
+        assert!(!may_prompt_for(None));
     }
 }
