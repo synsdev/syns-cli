@@ -803,12 +803,15 @@ pub(crate) async fn send_bounded(
         Err(_elapsed) => Err(unreachable_at(&url)),
         Ok(Err(err)) if err.is_builder() => Err(CliError::from(err)),
         // SPEC u298 `send_bounded` 1: a failure the TLS layer itself
-        // raised ends as the TLS refusal; a connection closed, reset or
-        // stalled during the handshake carries none and stays unreachable.
-        Ok(Err(transport)) => match tls_refusal(&transport) {
+        // raised while connecting, where the handshake runs, ends as the
+        // TLS refusal; a connection closed, reset or stalled during the
+        // handshake carries none, and a failure on a connection already
+        // established is no handshake's, so both stay unreachable.
+        Ok(Err(transport)) if transport.is_connect() => match tls_refusal(&transport) {
             Some(reason) => Err(CliError::TlsRefused { url, reason }),
             None => Err(unreachable_at(&url)),
         },
+        Ok(Err(_transport)) => Err(unreachable_at(&url)),
         Ok(Ok(response)) => Ok(response),
     }
 }
@@ -2191,6 +2194,92 @@ impl SynsClient {
 
 #[cfg(test)]
 mod tests {
+    /// A loopback listener serving `tests/fixtures/tls/localhost.pem`
+    /// that completes each handshake, reads the request, and answers it
+    /// with one application-data record no key decrypts.
+    fn serve_an_undecryptable_record() -> u16 {
+        use rustls::pki_types::pem::PemObject;
+        use std::io::Write;
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tls");
+        let certs = vec![
+            rustls::pki_types::CertificateDer::from_pem_file(fixtures.join("localhost.pem"))
+                .unwrap(),
+        ];
+        let key = rustls::pki_types::PrivateKeyDer::from_pem_file(fixtures.join("localhost.key"))
+            .unwrap();
+        let config = std::sync::Arc::new(
+            rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap(),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            sock.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let mut conn = rustls::ServerConnection::new(config).unwrap();
+            while conn.is_handshaking() {
+                if conn.complete_io(&mut sock).is_err() {
+                    return;
+                }
+            }
+            // The request's records, then a record failing decryption.
+            let _ = conn.complete_io(&mut sock);
+            let mut record = vec![0x17, 0x03, 0x03, 0x00, 0x40];
+            record.extend_from_slice(&[0x41; 0x40]);
+            let _ = sock.write_all(&record);
+            let _ = sock.flush();
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        });
+        port
+    }
+
+    // CR1-1: a TLS-layer failure on a connection whose handshake completed
+    // is no handshake's, and stays unreachable.
+    #[tokio::test]
+    async fn a_tls_failure_after_the_handshake_stays_unreachable() {
+        use rustls::pki_types::pem::PemObject;
+        let port = serve_an_undecryptable_record();
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(
+                rustls::pki_types::CertificateDer::from_pem_file(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/tls/root.pem"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut tls = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let client = reqwest::Client::builder()
+            .tls_backend_preconfigured(tls)
+            .build()
+            .unwrap();
+        let url = format!("https://localhost:{port}/api/auth/get-session");
+
+        let answer = super::send_bounded(client.get(&url), 0).await;
+
+        assert!(
+            matches!(answer, Err(CliError::ServerUnreachable { .. })),
+            "{answer:?}"
+        );
+    }
+
     // SPEC u298 `send_bounded` 1: a `rustls::Error` anywhere in a
     // transport failure's source chain, inside an I/O error included, is
     // the TLS layer's reason; a connection closed during the handshake
