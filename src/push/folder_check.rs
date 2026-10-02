@@ -230,36 +230,12 @@ impl FolderCheck {
             }
         };
 
-        // 5 — the number of the commit the work stands on, read once.
-        let since_version = match self.since_version {
-            Some(version) => version,
-            None => {
-                let mut numbered = None;
-                for repo_id in numbering {
-                    match client.get_version(repo_id, token, &self.since).await {
-                        Ok((entry, _raw)) => {
-                            numbered = Some(entry.version);
-                            break;
-                        }
-                        // A parent naming no commit of the repository
-                        // passes to the next, and reads as changed past
-                        // the last.
-                        Err(CliError::Api {
-                            status: Some(404),
-                            ref error,
-                            ..
-                        }) if error == "not_found" => continue,
-                        Err(err) => return Self::unread(folder, err),
-                    }
-                }
-                match numbered {
-                    Some(version) => {
-                        self.since_version = Some(version);
-                        version
-                    }
-                    None => return Ok(true),
-                }
-            }
+        // 5 — the number of the commit the work stands on, read once; a
+        // parent no repository numbers reads as changed.
+        let since_version = match self.number_since(client, token, numbering).await {
+            Ok(Some(version)) => version,
+            Ok(None) => return Ok(true),
+            Err(err) => return Self::unread(folder, err),
         };
 
         // 6
@@ -294,35 +270,44 @@ impl FolderCheck {
             return Ok(false);
         }
         // 3 — `since` numbered through the identity, then the holder.
-        let since_version = match self.since_version {
-            Some(version) => version,
-            None => {
-                let mut numbered = None;
-                for repo_id in [self.repo_id.clone(), holder.to_string()] {
-                    match client.get_version(&repo_id, token, &self.since).await {
-                        Ok((entry, _raw)) => {
-                            numbered = Some(entry.version);
-                            break;
-                        }
-                        Err(CliError::Api {
-                            status: Some(404),
-                            ref error,
-                            ..
-                        }) if error == "not_found" => continue,
-                        Err(err) => return Self::unread(&self.folder, err),
-                    }
-                }
-                match numbered {
-                    Some(version) => {
-                        self.since_version = Some(version);
-                        version
-                    }
-                    None => return Ok(true),
-                }
-            }
+        let numbering = [self.repo_id.clone(), holder.to_string()];
+        let since_version = match self.number_since(client, token, &numbering).await {
+            Ok(Some(version)) => version,
+            Ok(None) => return Ok(true),
+            Err(err) => return Self::unread(&self.folder, err),
         };
         // 4
         Ok(newest.version > since_version)
+    }
+
+    /// The number of `since`, the one already held answered as it stands,
+    /// and otherwise read through each of `numbering` in turn and kept: a
+    /// `404` `not_found` passes to the next repository, none where every
+    /// one answers it, and any other refusal is answered as it came.
+    async fn number_since(
+        &mut self,
+        client: &SynsClient,
+        token: Option<&str>,
+        numbering: &[String],
+    ) -> Result<Option<u32>, CliError> {
+        if let Some(version) = self.since_version {
+            return Ok(Some(version));
+        }
+        for repo_id in numbering {
+            match client.get_version(repo_id, token, &self.since).await {
+                Ok((entry, _raw)) => {
+                    self.since_version = Some(entry.version);
+                    return Ok(Some(entry.version));
+                }
+                Err(CliError::Api {
+                    status: Some(404),
+                    ref error,
+                    ..
+                }) if error == "not_found" => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(None)
     }
 }
 

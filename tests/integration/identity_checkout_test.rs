@@ -1613,6 +1613,33 @@ fn a_turn_on_beneath_an_identity_folder_past_a_version_changing_it_is_refused() 
     );
 }
 
+// CR1-1: beneath an identity folder where neither the placed folder's own
+// copy nor the identity copy records a base, the checkout guard refusal
+// names the placed folder's directory and nothing is sent or written.
+#[test]
+#[serial]
+fn a_turn_on_beneath_an_identity_folder_with_no_base_names_the_placed_folder() {
+    let d = Deployment::new();
+    write(&d.folder().join("document.html"), DOC);
+    write(&d.folder().join("appendix/.syns.yaml"), APPENDIX);
+
+    let out = d.run(&["--json", "enable-checks", "appendix"]);
+
+    assert_eq!(exit_of(&out), 1, "{}{}", stderr_of(&out), stdout_of(&out));
+    assert_eq!(
+        document(&out)["error"],
+        json!(syns_cli::write::checkout_guard_refusal(
+            &d.folder().join("appendix"),
+            "alice/docs"
+        ))
+    );
+    assert!(d.pushes(IDENTITY).is_empty() && d.pushes(HOLDER).is_empty());
+    assert_eq!(
+        std::fs::read_to_string(d.folder().join("appendix/.syns.yaml")).unwrap(),
+        APPENDIX
+    );
+}
+
 // SPEC u302 Tests, the row of this name.
 #[test]
 #[serial]
