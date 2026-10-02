@@ -45,7 +45,7 @@ use crate::push::working_copy::{
 use crate::repo::folder::{FolderScope, lies_under};
 use crate::repo::identity::identity_head;
 use crate::repo::syns_yaml::{
-    IdentityForm, held_root_identity, read_identity_form, read_required_checks,
+    IdentityForm, held_root_identity, identity_text, read_identity_form, read_required_checks,
 };
 
 /// The last round a resolution stands at before attention is required:
@@ -1540,9 +1540,9 @@ const ROOT_IDENTITY: &str = ".syns.yaml";
 /// only under `Retrieve`, only where the collected folder holds the file,
 /// and not where the head carries other content while the folder holds
 /// the file unedited against the base or `written` holds — the identity
-/// record a retrieval wrote, through `held_root_identity` (SPEC u306
-/// Contract Surface, `holds_root_identity`) — that head content is taken
-/// like any other.
+/// record a retrieval wrote, through `retrieval_wrote_root_identity` (SPEC
+/// u306 Contract Surface, `holds_root_identity`) — that head content is
+/// taken like any other.
 fn holds_root_identity(
     retrieving: bool,
     written: bool,
@@ -1593,6 +1593,30 @@ fn recorded_entries(
         }
     }
     entries
+}
+
+/// Whether the root identity file of the copy at `root` is the record a
+/// retrieval wrote (SPEC u306 Contract Surface,
+/// `retrieval_wrote_root_identity`): a base is recorded, whatever it names
+/// for `.syns.yaml`, and the file holds `identity_text` of `owner` and
+/// `name`, ASCII letter case aside. A missing or unreadable file answers
+/// false. Unlike `held_root_identity`, which the working-copy state and
+/// the checkout guard keep, a base naming the file does not answer false,
+/// so a checkout whose base a released binary's retrieval left naming the
+/// head's file reads its identity text as written.
+fn retrieval_wrote_root_identity(
+    root: &Path,
+    owner: &str,
+    name: &str,
+    base: Option<&Manifest>,
+) -> bool {
+    if base.is_none() {
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(root.join(ROOT_IDENTITY)) else {
+        return false;
+    };
+    bytes.eq_ignore_ascii_case(identity_text(owner, name).as_bytes())
 }
 
 fn without(
@@ -1860,8 +1884,8 @@ struct Candidate<'a> {
     /// once and applied to every collection, and the held file's hash.
     hold_root_identity: IdentityHold,
     /// Whether the root identity file is the record a retrieval wrote,
-    /// through `held_root_identity` over the base the run loaded (SPEC
-    /// u306 `converge` 1), read once for the run.
+    /// through `retrieval_wrote_root_identity` over the base the run
+    /// loaded (SPEC u306 `converge` 1), read once for the run.
     written_root_identity: bool,
     /// Where every collection of the run is taken from (SPEC u291).
     root: &'a FolderRoot,
@@ -2039,15 +2063,21 @@ async fn prepare_candidate(
             &folder.hashes,
             candidate.base_files.keys().chain(head.files.keys()),
         );
-        // SPEC u306 `converge` 5: a retrieval over the identity record a
-        // retrieval wrote, not held, reads the base as naming it at the
+        // SPEC u306 `converge` 5: a run of either mode over the identity
+        // record a retrieval wrote, not held, while the head names the
+        // file at other bytes, reads the base as naming it at the
         // folder's hash, so the head's bytes replace it as a remote-only
-        // change; `candidate.base_files` stays whole for the base reads.
+        // change no publication carries; a head naming no `.syns.yaml`
+        // leaves the file compared as it stands. `candidate.base_files`
+        // stays whole for the base reads.
         let mut compared_base = without(&candidate.base_files, &excluded);
         if !holding
-            && !candidate.publishing
             && candidate.written_root_identity
             && let Some(local) = folder.hashes.get(ROOT_IDENTITY)
+            && head
+                .files
+                .get(ROOT_IDENTITY)
+                .is_some_and(|remote| remote != local)
         {
             compared_base.insert(ROOT_IDENTITY.to_string(), local.clone());
         }
@@ -2901,7 +2931,8 @@ async fn converge_from_resolution(
         Some(folder) => folder,
         None => collect_folder(copy, &opts, &[], true, root)?,
     };
-    let written = held_root_identity(&copy.root, &copy.owner, &copy.name, base_manifest.as_ref());
+    let written =
+        retrieval_wrote_root_identity(&copy.root, &copy.owner, &copy.name, base_manifest.as_ref());
     let hold = holds_root_identity(
         matches!(mode, ConvergeMode::Retrieve { .. }),
         written,
@@ -2961,9 +2992,19 @@ async fn converge_from_resolution(
     }
 
     // 9 — SPEC u306 `converge` 4: only where the base and the head name
-    // the root identity file alike; a base keeping its own entry for a
-    // held file the head names otherwise goes on to the candidate.
-    if head.commit == base.commit && base.files.get(ROOT_IDENTITY) == head.files.get(ROOT_IDENTITY)
+    // the root identity file alike, and no identity record a retrieval
+    // wrote stands while the head names that path at other bytes; a base
+    // keeping its own entry for a held file the head names otherwise, and
+    // a written file a released binary's base names at the head's bytes,
+    // go on to the candidate.
+    let head_replaces_written = written
+        && folder
+            .hashes
+            .get(ROOT_IDENTITY)
+            .is_some_and(|local| head.files.get(ROOT_IDENTITY).is_some_and(|r| r != local));
+    if head.commit == base.commit
+        && base.files.get(ROOT_IDENTITY) == head.files.get(ROOT_IDENTITY)
+        && !head_replaces_written
     {
         return match mode {
             ConvergeMode::Retrieve { .. } => Ok(SyncOutcome::NoChanges),
@@ -3062,7 +3103,8 @@ async fn finish_preparation(
     root: &FolderRoot,
 ) -> Result<SyncOutcome, CliError> {
     let base_manifest = base_of(copy);
-    let written = held_root_identity(&copy.root, &copy.owner, &copy.name, base_manifest.as_ref());
+    let written =
+        retrieval_wrote_root_identity(&copy.root, &copy.owner, &copy.name, base_manifest.as_ref());
     let base = base_from(base_manifest.as_ref());
     let base_files = match &standing.base_commit {
         Some(commit) if base.commit.as_ref() == Some(commit) => base.files,
@@ -3647,13 +3689,18 @@ async fn guard_refused(
         tokio::time::sleep(Duration::from_secs(BACKOFF_SECONDS[index])).await;
     }
 
-    let has_base = base_of(copy).is_some();
+    // SPEC u306 `converge` 5: the one base read, for whether a base is
+    // recorded and whether the root identity file is the record a
+    // retrieval wrote, so the recomputation takes the head's file over it.
+    let base_manifest = base_of(copy);
+    let written =
+        retrieval_wrote_root_identity(&copy.root, &copy.owner, &copy.name, base_manifest.as_ref());
     let head = read_head(
         client,
         Some(token),
         copy,
         HeadReading::Publication,
-        has_base,
+        base_manifest.is_some(),
     )
     .await?;
     if head.truncated {
@@ -3678,7 +3725,7 @@ async fn guard_refused(
             existing,
             force_resolution: true,
             hold_root_identity: IdentityHold::Released,
-            written_root_identity: false,
+            written_root_identity: written,
             root,
         },
         None,

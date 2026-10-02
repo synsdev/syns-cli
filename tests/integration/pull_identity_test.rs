@@ -416,9 +416,10 @@ fn malformed_ancestor_identity_refuses_before_any_request() {
     assert!(!env.w.join("sub").exists());
 }
 
+// SPEC u306 Tests, `letter_case_identity_file_stands_until_a_base_is_recorded`.
 #[test]
 #[serial]
-fn letter_case_identity_file_is_left_as_it_stands() {
+fn letter_case_identity_file_stands_until_a_base_is_recorded() {
     let env = Env::new();
     let d = seed_d(&env);
     env.mount_notes(true);
@@ -430,10 +431,14 @@ fn letter_case_identity_file_is_left_as_it_stands() {
         "{}",
         stdout(&first)
     );
+    assert_eq!(
+        fs::read_to_string(d.join(".syns.yaml")).unwrap(),
+        LETTER_CASE_IDENTITY
+    );
     let second = env.syns(&env.w, &["pull", "alice/notes", "d"]);
     assert_eq!(second.status.code(), Some(0), "{}", stderr(&second));
     assert!(
-        stdout(&second).contains("0 downloaded"),
+        stdout(&second).contains("Pulled alice/notes: 1 downloaded,"),
         "{}",
         stdout(&second)
     );
@@ -448,7 +453,7 @@ fn letter_case_identity_file_is_left_as_it_stands() {
     assert_eq!(fs::read_to_string(d.join("a.md")).unwrap(), "a");
     assert_eq!(
         fs::read_to_string(d.join(".syns.yaml")).unwrap(),
-        LETTER_CASE_IDENTITY
+        "owner: alice\nname: notes\n"
     );
 }
 
