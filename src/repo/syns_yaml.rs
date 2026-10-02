@@ -112,6 +112,36 @@ pub(crate) fn identity_form_text(contents: &str) -> Result<IdentityForm, CliErro
     parse_form_text(contents).map_err(invalid)
 }
 
+/// The string the folder-form identity file in `dir` carries under
+/// `shared_as` (SPEC u300 Contract Surface, `folder_shared_as`), read raw
+/// and then by its local side where it carries collision markers, as
+/// `read_identity_form` reads it. None where no identity file stands in
+/// `dir`, where it is the root form, or where the key is absent or holds
+/// anything but a string; the key never makes the file malformed, and a
+/// file read as neither form is refused as `read_identity_form` refuses it.
+pub fn folder_shared_as(dir: &Path) -> Result<Option<String>, CliError> {
+    let file_path = dir.join(SYNS_YAML_FILENAME);
+    if !file_path.is_file() {
+        return Ok(None);
+    }
+    let contents = read_contents(&file_path)?;
+    let text = match parse_form_text(&contents) {
+        Ok(_) => contents,
+        Err(raw) => match local_side_of_collision(&contents) {
+            Some(local) if parse_form_text(&local).is_ok() => local,
+            _ => return Err(invalid(raw)),
+        },
+    };
+    let value: serde_yaml::Value = serde_yaml::from_str(&text).map_err(invalid)?;
+    if value.get("holder").is_none() {
+        return Ok(None);
+    }
+    Ok(value
+        .get("shared_as")
+        .and_then(serde_yaml::Value::as_str)
+        .map(str::to_string))
+}
+
 /// The required checks the identity file standing at `root` declares,
 /// in either form, none where no identity file stands there or it
 /// declares none (SPEC u291, the folder form's `checks`). A file mixing
@@ -1023,5 +1053,42 @@ mod tests {
 
         let raw = fs::read_to_string(dir.path().join(".syns.yaml")).unwrap();
         assert_eq!(raw, "owner: bob\nname: second\n");
+    }
+
+    // SPEC u300 Contract Surface, `folder_shared_as`: a string, any other
+    // value, an absent key, the root form and a collision-marked file.
+    #[test]
+    fn folder_shared_as_reads_a_string_alone_and_the_local_side() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(SYNS_YAML_FILENAME);
+        let cases: [(&str, Option<&str>); 6] = [
+            (
+                "holder: alice/docs\npath: q3-plan\nshared_as: docs-q3-plan\n",
+                Some("docs-q3-plan"),
+            ),
+            (
+                "holder: alice/docs\npath: plan\nshared_as:\n  - docs-plan\n",
+                None,
+            ),
+            ("holder: alice/docs\npath: plan\nshared_as: 7\n", None),
+            ("holder: alice/docs\npath: budget\n", None),
+            ("owner: alice\nname: docs\nshared_as: docs-x\n", None),
+            (
+                "holder: alice/docs\npath: q3-plan\n<<<<<<< local\nshared_as: docs-q3-plan\n=======\nshared_as: docs-other\n>>>>>>> remote\n",
+                Some("docs-q3-plan"),
+            ),
+        ];
+        for (text, expected) in cases {
+            std::fs::write(&file, text).unwrap();
+            assert_eq!(
+                folder_shared_as(dir.path()).unwrap().as_deref(),
+                expected,
+                "{text}"
+            );
+        }
+        std::fs::write(&file, "holder: [\n").unwrap();
+        assert!(folder_shared_as(dir.path()).is_err());
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(folder_shared_as(dir.path()).unwrap(), None);
     }
 }

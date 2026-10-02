@@ -21,6 +21,7 @@ mod push_strict_test;
 mod push_test;
 mod reads_test;
 mod repo_root_test;
+mod share_test;
 mod state_home_test;
 mod teams_remove_json_test;
 mod tls_refusal_test;

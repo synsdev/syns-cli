@@ -221,6 +221,14 @@ pub struct CreateRepoRequest {
     pub visibility: Option<Visibility>,
 }
 
+/// The share routes' create body (SPEC u300, `SynsClient::share_folder`):
+/// the folder's holder path and the identity's name, and nothing else.
+#[derive(Serialize, Debug)]
+pub struct ShareFolderRequest {
+    pub path: String,
+    pub name: String,
+}
+
 /// `EP-create-user-link`'s body.
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -412,6 +420,10 @@ pub struct RepoResponse {
     pub role: Option<CollaboratorRole>,
     pub created_at: String,
     pub updated_at: String,
+    /// Whether the record is a shared folder's identity (SPEC u300,
+    /// `RepoResponse.shared_folder`; `D-119`), false where it carries none.
+    #[serde(default)]
+    pub shared_folder: bool,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -737,6 +749,14 @@ struct AddCollaboratorErrorBody {
     error: String,
     #[serde(default)]
     reason: Option<String>,
+}
+
+/// The share routes' address for the folder at `path` of `holder`.
+fn share_url(base_url: &str, holder: &str, path: &str) -> String {
+    format!(
+        "{base_url}/api/v1/repos/{holder}/shares/{}",
+        encode_path_segments(path)
+    )
 }
 
 fn encode_path_segments(path: &str) -> String {
@@ -1931,6 +1951,67 @@ impl SynsClient {
             .await?;
         process_response_raw(response).await
     }
+
+    /// Shares the folder at `path` of `holder` under the identity `name`
+    /// (SPEC u300, `SynsClient::share_folder`): one request to the share
+    /// routes' create, its body carrying `path` and `name` alone.
+    pub async fn share_folder(
+        &self,
+        holder: &str,
+        token: &str,
+        path: &str,
+        name: &str,
+    ) -> Result<(RepoResponse, serde_json::Value), CliError> {
+        let url = format!("{}/api/v1/repos/{}/shares", self.base_url, holder);
+        let request = ShareFolderRequest {
+            path: path.to_string(),
+            name: name.to_string(),
+        };
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(token)
+            .send_json_bounded(&request)
+            .await?;
+        process_response_raw(response).await
+    }
+
+    /// The identity the folder at `path` of `holder` stands shared under
+    /// (SPEC u300, `SynsClient::get_share`): one request to the share
+    /// routes' lookup, each segment of `path` percent-encoded once.
+    pub async fn get_share(
+        &self,
+        holder: &str,
+        token: Option<&str>,
+        path: &str,
+    ) -> Result<(RepoResponse, serde_json::Value), CliError> {
+        let url = share_url(&self.base_url, holder, path);
+        let mut req = self.client.get(&url);
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        let response = req.send_empty_bounded().await?;
+        process_response_raw(response).await
+    }
+
+    /// Stops sharing the folder at `path` of `holder` (SPEC u300,
+    /// `SynsClient::unshare_folder`): one request to the share routes'
+    /// removal, each segment of `path` percent-encoded once.
+    pub async fn unshare_folder(
+        &self,
+        holder: &str,
+        token: &str,
+        path: &str,
+    ) -> Result<(), CliError> {
+        let url = share_url(&self.base_url, holder, path);
+        let response = self
+            .client
+            .delete(&url)
+            .bearer_auth(token)
+            .send_empty_bounded()
+            .await?;
+        process_empty_response(response).await
+    }
 }
 
 // --- Team Methods ---
@@ -2800,6 +2881,7 @@ mod tests {
                 role: Some(CollaboratorRole::Owner),
                 created_at: "2025-01-01T00:00:00Z".to_string(),
                 updated_at: "2026-05-07T13:00:01Z".to_string(),
+                shared_folder: false,
             }],
             total: 1,
             limit: 20,
@@ -2807,8 +2889,105 @@ mod tests {
         };
 
         let actual = serde_json::to_string(&response).unwrap();
-        let expected = r#"{"data":[{"owner":"bart","name":"syns","description":"a repo","commitSha":"abc123","status":"active","author":"Alice","tags":["alpha","beta"],"visibility":"public","forkedFrom":{"owner":"upstream","name":"syns"},"forkCount":2,"fileCount":436,"role":"owner","createdAt":"2025-01-01T00:00:00Z","updatedAt":"2026-05-07T13:00:01Z"}],"total":1,"limit":20,"offset":0}"#;
+        let expected = r#"{"data":[{"owner":"bart","name":"syns","description":"a repo","commitSha":"abc123","status":"active","author":"Alice","tags":["alpha","beta"],"visibility":"public","forkedFrom":{"owner":"upstream","name":"syns"},"forkCount":2,"fileCount":436,"role":"owner","createdAt":"2025-01-01T00:00:00Z","updatedAt":"2026-05-07T13:00:01Z","sharedFolder":false}],"total":1,"limit":20,"offset":0}"#;
         assert_eq!(actual, expected);
+    }
+
+    // ---- SPEC u300: the share routes and the shared folder marker ----
+
+    fn identity_body(shared_folder: Option<bool>) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "owner": "alice", "name": "docs-q3-plan", "description": null,
+            "commitSha": null, "status": "active", "author": null, "tags": [],
+            "visibility": "private", "forkedFrom": null, "forkCount": 0,
+            "fileCount": 0, "role": "owner",
+            "createdAt": "2026-10-02T00:00:00Z", "updatedAt": "2026-10-02T00:00:00Z",
+        });
+        if let Some(marked) = shared_folder {
+            body["sharedFolder"] = serde_json::json!(marked);
+        }
+        body
+    }
+
+    // SPEC u300 Contract Surface, `RepoResponse.shared_folder`.
+    #[test]
+    fn the_shared_folder_marker_reads_false_where_the_record_carries_none() {
+        let read = |body| serde_json::from_value::<RepoResponse>(body).unwrap();
+        assert!(!read(identity_body(None)).shared_folder);
+        assert!(!read(identity_body(Some(false))).shared_folder);
+        assert!(read(identity_body(Some(true))).shared_folder);
+    }
+
+    // SPEC u300 Contract Surface, `SynsClient::share_folder`.
+    #[tokio::test]
+    async fn share_folder_sends_the_path_and_the_name_alone() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/repos/alice/docs/shares"))
+            .and(header("authorization", "Bearer t"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(identity_body(Some(true))))
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let (typed, raw) = client
+            .share_folder("alice/docs", "t", "clients/q3 plan", "docs-q3-plan")
+            .await
+            .unwrap();
+
+        assert_eq!(typed.name, "docs-q3-plan");
+        assert!(typed.shared_folder);
+        assert_eq!(raw["sharedFolder"], serde_json::json!(true));
+        let received = mock_server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"path": "clients/q3 plan", "name": "docs-q3-plan"})
+        );
+    }
+
+    // SPEC u300 Contract Surface, `SynsClient::get_share` and
+    // `SynsClient::unshare_folder`: each segment encoded once, the bearer
+    // only where a token stands.
+    #[tokio::test]
+    async fn the_lookup_and_the_removal_encode_each_segment_once() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/docs/shares/q3%20plan/a%25b"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(identity_body(Some(true))))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/v1/repos/alice/docs/shares/q3%20plan/a%25b"))
+            .and(header("authorization", "Bearer t"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let (typed, _) = client
+            .get_share("alice/docs", None, "q3 plan/a%b")
+            .await
+            .unwrap();
+        assert_eq!(typed.name, "docs-q3-plan");
+        client
+            .get_share("alice/docs", Some("t"), "q3 plan/a%b")
+            .await
+            .unwrap();
+        client
+            .unshare_folder("alice/docs", "t", "q3 plan/a%b")
+            .await
+            .unwrap();
+
+        let received = mock_server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 3);
+        assert!(!received[0].headers.contains_key("authorization"));
+        assert_eq!(
+            received[1].headers.get("authorization").unwrap(),
+            "Bearer t"
+        );
+        assert_eq!(received[2].method.as_str(), "DELETE");
     }
 
     // --- process_response_raw tests (u210) ---

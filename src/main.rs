@@ -343,6 +343,9 @@ enum Commands {
         /// Silently skip (exit 0) when no Syns repo identity resolves
         #[arg(long)]
         if_repo: bool,
+        /// The repository whose collaborators to manage, a shared folder's identity included, as OWNER/NAME
+        #[arg(long, global = true, value_name = "OWNER/NAME", value_parser = read::parse_repo_id)]
+        repo: Option<String>,
     },
     /// Delete a repository
     Delete {
@@ -397,6 +400,33 @@ enum Commands {
         /// The placed folder, counted as syns place counts its own; the folder the run stands in where absent
         #[arg(value_name = "PATH")]
         path: Option<String>,
+    },
+    /// Share a folder of this repository under an identity of its own, or show which it stands under
+    Share {
+        /// The folder, counted as syns place counts its own; . names the folder the run stands in
+        #[arg(value_name = "PATH")]
+        path: String,
+        /// The identity's name; offered as <holder name>-<folder name> where absent
+        #[arg(long, short = 'n')]
+        name: Option<String>,
+        /// The repository the folder stands in, as OWNER/NAME
+        #[arg(long, value_name = "OWNER/NAME", value_parser = read::parse_repo_id)]
+        repo: Option<String>,
+        /// Show the identity the folder stands shared under, sharing nothing
+        #[arg(long, conflicts_with = "name")]
+        show: bool,
+    },
+    /// Stop sharing a folder, retiring its identity and removing its collaborators
+    Unshare {
+        /// The folder, counted as syns place counts its own; . names the folder the run stands in
+        #[arg(value_name = "PATH")]
+        path: String,
+        /// The repository the folder stands in, as OWNER/NAME
+        #[arg(long, value_name = "OWNER/NAME", value_parser = read::parse_repo_id)]
+        repo: Option<String>,
+        /// Skip confirmation prompt
+        #[arg(long, short)]
+        yes: bool,
     },
     /// List the repositories copied from a repository
     Forks {
@@ -684,6 +714,7 @@ async fn run(
             limit,
             offset,
             if_repo: parent_if_repo,
+            repo,
         } => {
             let action_if_repo = match &action {
                 Some(CollaboratorsAction::Add { if_repo, .. }) => *if_repo,
@@ -698,6 +729,7 @@ async fn run(
                 config,
                 output,
                 action,
+                repo,
                 parent_if_repo || action_if_repo,
                 limit,
                 offset,
@@ -727,6 +759,21 @@ async fn run(
         } => commands::place::cmd_place(config, output, template, path, version).await?,
         Commands::EnableChecks { path } => {
             commands::enable_checks::cmd_enable_checks(config, output, path).await?
+        }
+        Commands::Share {
+            path,
+            name,
+            repo,
+            show,
+        } => {
+            if show {
+                commands::share::cmd_share_show(config, output, path, repo).await?
+            } else {
+                commands::share::cmd_share(config, output, path, name, repo).await?
+            }
+        }
+        Commands::Unshare { path, repo, yes } => {
+            commands::share::cmd_unshare(config, output, path, repo, yes).await?
         }
         Commands::Forks {
             limit,

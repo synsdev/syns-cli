@@ -8,8 +8,9 @@ use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
 use crate::prompts::{ConfirmOutcome, confirm_or_yes};
-use crate::repo::folder::{current_dir, refuse_holder_change};
+use crate::repo::folder::{current_dir, refuse_holder_change, resolve_folder_scope};
 use crate::repo::if_repo::resolve_full_or_skip;
+use crate::repo::syns_yaml::folder_shared_as;
 use clap::Subcommand;
 use serde_json::json;
 
@@ -47,7 +48,7 @@ pub enum CollaboratorsAction {
         /// Username or email of the user to add
         #[arg()]
         target: String,
-        /// Role to assign
+        /// Role to assign: admin, write or read; a shared folder's grant takes write or read
         #[arg(long)]
         role: AssignableRole,
         /// Silently skip (exit 0) when no Syns repo identity resolves
@@ -59,7 +60,7 @@ pub enum CollaboratorsAction {
         /// User ID of the collaborator whose role changes
         #[arg(value_name = "USER_ID")]
         user_id: String,
-        /// Role to assign
+        /// Role to assign: admin, write or read; a shared folder's grant takes write or read
         #[arg(long)]
         role: AssignableRole,
         /// Silently skip (exit 0) when no Syns repo identity resolves
@@ -123,17 +124,21 @@ pub async fn cmd_collaborators_role(
     output: &Output,
     user_id: String,
     role: AssignableRole,
+    repo: Option<String>,
     if_repo: bool,
 ) -> Result<(), CliError> {
-    // 1 — bind the repository from the working directory.
-    let current_dir = std::env::current_dir().map_err(|e| CliError::Io {
-        message: format!("could not determine current directory: {e}"),
-    })?;
-    let (owner, name) = match resolve_full_or_skip(None, &current_dir, if_repo, output)? {
-        Some(pair) => pair,
-        None => return Ok(()),
+    // 1 — refuse inside a scoped folder unless `--repo` names its own
+    // identity, and bind the repository (SPEC u300, `cmd_collaborators`
+    // 1 and 2).
+    let current_dir = current_dir()?;
+    admit_repository(&current_dir, "syns collaborators role", repo.as_deref())?;
+    let repo_id = match repo {
+        Some(repo) => repo.to_ascii_lowercase(),
+        None => match resolve_full_or_skip(None, &current_dir, if_repo, output)? {
+            Some((owner, name)) => format!("{owner}/{name}"),
+            None => return Ok(()),
+        },
     };
-    let repo_id = format!("{owner}/{name}");
 
     // 2 — require a stored credential, before any request.
     let token = TokenStore::new(config.credentials_path())
@@ -162,42 +167,73 @@ pub async fn cmd_collaborators_role(
 
 /// The repository the noun's listing, add and remove arms all act on,
 /// with the client addressing it — `None` where the skip envelope was
-/// written under `--if-repo`.
+/// written under `--if-repo`. A `--repo` stands in for the working
+/// directory's identity, lower-cased, and finds nothing to skip (SPEC
+/// u300, `cmd_collaborators` 2).
 fn bind_repo(
     config: &Config,
     output: &Output,
+    repo: Option<&str>,
     if_repo: bool,
 ) -> Result<Option<(String, SynsClient)>, CliError> {
-    let current_dir = std::env::current_dir().map_err(|e| CliError::Io {
-        message: format!("could not determine current directory: {e}"),
-    })?;
-    let Some((owner, name)) = resolve_full_or_skip(None, &current_dir, if_repo, output)? else {
-        return Ok(None);
+    let repo_id = match repo {
+        Some(repo) => repo.to_ascii_lowercase(),
+        None => {
+            let current_dir = current_dir()?;
+            let Some((owner, name)) = resolve_full_or_skip(None, &current_dir, if_repo, output)?
+            else {
+                return Ok(None);
+            };
+            format!("{owner}/{name}")
+        }
     };
-    Ok(Some((
-        format!("{owner}/{name}"),
-        SynsClient::new(config.server_url())?,
-    )))
+    Ok(Some((repo_id, SynsClient::new(config.server_url())?)))
+}
+
+/// Inside a scoped folder the noun acts on the holder, so it is refused
+/// through `refuse_holder_change` (SPEC u290, `D-102`) unless `repo`
+/// names, letter case aside, the holder's owner joined by `/` to the
+/// identity the folder's own identity file records under `shared_as`
+/// (SPEC u300 Behaviour, `cmd_collaborators` 1).
+fn admit_repository(
+    cwd: &std::path::Path,
+    command: &str,
+    repo: Option<&str>,
+) -> Result<(), CliError> {
+    let Some(scope) = resolve_folder_scope(cwd)? else {
+        return Ok(());
+    };
+    if let Some(repo) = repo
+        && let Some(shared_as) = folder_shared_as(&scope.dir)?
+        && repo.eq_ignore_ascii_case(&format!("{}/{shared_as}", scope.owner))
+    {
+        return Ok(());
+    }
+    refuse_holder_change(cwd, command)
 }
 
 pub async fn cmd_collaborators(
     config: &Config,
     output: &Output,
     action: Option<CollaboratorsAction>,
+    repo: Option<String>,
     if_repo: bool,
     limit: u32,
     offset: u32,
 ) -> Result<(), CliError> {
     // Inside a scoped folder the listing and every verb act on the
     // holder, so each is refused before its identity, credential,
-    // confirmation and request (SPEC u290, `D-102`).
+    // confirmation and request (SPEC u290, `D-102`), unless `--repo`
+    // names the folder's own identity (SPEC u300).
     let command = match &action {
         None => "syns collaborators",
         Some(CollaboratorsAction::Add { .. }) => "syns collaborators add",
         Some(CollaboratorsAction::Role { .. }) => "syns collaborators role",
         Some(CollaboratorsAction::Remove { .. }) => "syns collaborators remove",
     };
-    refuse_holder_change(&current_dir()?, command)?;
+    if !matches!(action, Some(CollaboratorsAction::Role { .. })) {
+        admit_repository(&current_dir()?, command, repo.as_deref())?;
+    }
 
     match action {
         // The role change binds the repository itself (SPEC u272
@@ -205,10 +241,10 @@ pub async fn cmd_collaborators(
         // the noun's own routing rather than a second route to the
         // same verb (CR1-4).
         Some(CollaboratorsAction::Role { user_id, role, .. }) => {
-            return cmd_collaborators_role(config, output, user_id, role, if_repo).await;
+            return cmd_collaborators_role(config, output, user_id, role, repo, if_repo).await;
         }
         None => {
-            let (repo_id, client) = match bind_repo(config, output, if_repo)? {
+            let (repo_id, client) = match bind_repo(config, output, repo.as_deref(), if_repo)? {
                 Some(pair) => pair,
                 None => return Ok(()),
             };
@@ -237,7 +273,7 @@ pub async fn cmd_collaborators(
             }
         }
         Some(CollaboratorsAction::Add { target, role, .. }) => {
-            let (repo_id, client) = match bind_repo(config, output, if_repo)? {
+            let (repo_id, client) = match bind_repo(config, output, repo.as_deref(), if_repo)? {
                 Some(pair) => pair,
                 None => return Ok(()),
             };
@@ -301,7 +337,7 @@ pub async fn cmd_collaborators(
             }
         }
         Some(CollaboratorsAction::Remove { user_id, yes, .. }) => {
-            let (repo_id, client) = match bind_repo(config, output, if_repo)? {
+            let (repo_id, client) = match bind_repo(config, output, repo.as_deref(), if_repo)? {
                 Some(pair) => pair,
                 None => return Ok(()),
             };
@@ -394,7 +430,7 @@ mod tests {
         ];
         let mut refused = Vec::new();
         for (action, expected) in routes {
-            match cmd_collaborators(&config, &output, action, true, 20, 0).await {
+            match cmd_collaborators(&config, &output, action, None, true, 20, 0).await {
                 Err(CliError::HolderActing { command, .. }) => {
                     assert_eq!(command, expected);
                     refused.push(command);
@@ -446,6 +482,7 @@ mod tests {
                 role: AssignableRole::Write,
                 if_repo: false,
             }),
+            None,
             false,
             DEFAULT_COLLABORATOR_LIMIT,
             DEFAULT_COLLABORATOR_OFFSET,
@@ -502,6 +539,7 @@ mod tests {
                 role: AssignableRole::Admin,
                 if_repo: false,
             }),
+            None,
             false,
             DEFAULT_COLLABORATOR_LIMIT,
             DEFAULT_COLLABORATOR_OFFSET,
@@ -550,6 +588,7 @@ mod tests {
                 role: AssignableRole::Write,
                 if_repo: false,
             }),
+            None,
             false,
             DEFAULT_COLLABORATOR_LIMIT,
             DEFAULT_COLLABORATOR_OFFSET,
@@ -605,6 +644,7 @@ mod tests {
                 role: AssignableRole::Write,
                 if_repo: false,
             }),
+            None,
             false,
             DEFAULT_COLLABORATOR_LIMIT,
             DEFAULT_COLLABORATOR_OFFSET,
@@ -671,6 +711,7 @@ mod tests {
                 role: AssignableRole::Write,
                 if_repo: false,
             }),
+            None,
             false,
             DEFAULT_COLLABORATOR_LIMIT,
             DEFAULT_COLLABORATOR_OFFSET,
@@ -735,6 +776,7 @@ mod tests {
                 role: AssignableRole::Write,
                 if_repo: false,
             }),
+            None,
             false,
             DEFAULT_COLLABORATOR_LIMIT,
             DEFAULT_COLLABORATOR_OFFSET,
@@ -800,6 +842,7 @@ mod tests {
                 role: AssignableRole::Write,
                 if_repo: false,
             }),
+            None,
             false,
             DEFAULT_COLLABORATOR_LIMIT,
             DEFAULT_COLLABORATOR_OFFSET,
@@ -880,6 +923,7 @@ mod tests {
                 role: AssignableRole::Write,
                 if_repo: false,
             }),
+            None,
             false,
             DEFAULT_COLLABORATOR_LIMIT,
             DEFAULT_COLLABORATOR_OFFSET,
@@ -956,6 +1000,7 @@ mod tests {
                 role: AssignableRole::Write,
                 if_repo: false,
             }),
+            None,
             false,
             DEFAULT_COLLABORATOR_LIMIT,
             DEFAULT_COLLABORATOR_OFFSET,
@@ -1005,6 +1050,7 @@ mod tests {
                 yes: true,
                 if_repo: false,
             }),
+            None,
             false,
             DEFAULT_COLLABORATOR_LIMIT,
             DEFAULT_COLLABORATOR_OFFSET,
@@ -1044,6 +1090,7 @@ mod tests {
             &config,
             &output,
             None,
+            None,
             true,
             DEFAULT_COLLABORATOR_LIMIT,
             DEFAULT_COLLABORATOR_OFFSET,
@@ -1068,6 +1115,7 @@ mod tests {
         let result = cmd_collaborators(
             &config,
             &output,
+            None,
             None,
             true,
             DEFAULT_COLLABORATOR_LIMIT,
@@ -1113,6 +1161,7 @@ mod tests {
                 role: AssignableRole::Write,
                 if_repo: true,
             }),
+            None,
             true,
             DEFAULT_COLLABORATOR_LIMIT,
             DEFAULT_COLLABORATOR_OFFSET,
@@ -1142,6 +1191,7 @@ mod tests {
                 role: AssignableRole::Read,
                 if_repo: true,
             }),
+            None,
             true,
             DEFAULT_COLLABORATOR_LIMIT,
             DEFAULT_COLLABORATOR_OFFSET,
@@ -1186,6 +1236,7 @@ mod tests {
                 yes: true,
                 if_repo: true,
             }),
+            None,
             true,
             DEFAULT_COLLABORATOR_LIMIT,
             DEFAULT_COLLABORATOR_OFFSET,
@@ -1215,6 +1266,7 @@ mod tests {
                 yes: true,
                 if_repo: true,
             }),
+            None,
             true,
             DEFAULT_COLLABORATOR_LIMIT,
             DEFAULT_COLLABORATOR_OFFSET,
@@ -1303,6 +1355,7 @@ mod tests {
             &output,
             "u272user1111111111111111111111111".to_string(),
             AssignableRole::Write,
+            None,
             false,
         )
         .await;
@@ -1339,6 +1392,7 @@ mod tests {
             &output,
             "u-bob".to_string(),
             AssignableRole::Read,
+            None,
             false,
         )
         .await
@@ -1366,6 +1420,7 @@ mod tests {
             &output,
             "u-bob".to_string(),
             AssignableRole::Read,
+            None,
             true,
         )
         .await;
@@ -1395,7 +1450,7 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_collaborators(&config, &output, None, false, 2, 1).await;
+        let result = cmd_collaborators(&config, &output, None, None, false, 2, 1).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok(), "got {:?}", result.err());
@@ -1426,6 +1481,7 @@ mod tests {
             &config,
             &output,
             None,
+            None,
             false,
             DEFAULT_COLLABORATOR_LIMIT,
             DEFAULT_COLLABORATOR_OFFSET,
@@ -1447,7 +1503,7 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let err = cmd_collaborators(&config, &output, None, false, 0, 0)
+        let err = cmd_collaborators(&config, &output, None, None, false, 0, 0)
             .await
             .unwrap_err();
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };

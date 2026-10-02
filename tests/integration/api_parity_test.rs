@@ -706,7 +706,8 @@ fn repo_create_refuses_the_nouns_update_options() {
 /// standing beside them. `teams role` stands in it, `repos` and
 /// `repo list` both stand, and nothing else does. SPEC u293: `place` and
 /// `enable-checks` stand beside `fork`, `unregistered` in `CLI_IA.md`
-/// until that inventory carries them.
+/// until that inventory carries them; SPEC u300: `share` and `unshare`
+/// stand beside them, `unregistered` in `CLI_IA.md` alike.
 const REGISTERED: &[(&str, &[&str])] = &[
     (
         "",
@@ -736,6 +737,8 @@ const REGISTERED: &[(&str, &[&str])] = &[
             "fork",
             "place",
             "enable-checks",
+            "share",
+            "unshare",
             "forks",
             "users",
             "user",

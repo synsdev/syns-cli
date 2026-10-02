@@ -23,6 +23,7 @@ pub mod repo;
 pub mod repos;
 pub mod revert;
 pub mod rm;
+pub mod share;
 pub mod status;
 pub mod sync;
 pub mod teams;
