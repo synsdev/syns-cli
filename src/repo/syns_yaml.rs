@@ -339,7 +339,7 @@ pub fn read_syns_yaml(path: &Path) -> Result<Option<RepoIdentity>, CliError> {
         None => return Ok(None),
     };
 
-    let yaml = parse_syns_yaml(&file_path)?;
+    let yaml = read_identity_by_local_side(&file_path)?;
 
     Ok(Some(RepoIdentity {
         owner: Some(yaml.owner),
@@ -368,6 +368,14 @@ pub fn read_syns_yaml(path: &Path) -> Result<Option<RepoIdentity>, CliError> {
 /// naming this same repository — the artefact an earlier accidental
 /// subtree publication left behind — still wins over the outer root;
 /// removing that file is the closure the trigger records.
+///
+/// That nearest file is read by its local side where it carries
+/// collision markers, through the one reading `read_syns_yaml` and
+/// `nearest_identity` take (SPEC u308 Contract Surface), so a checkout
+/// whose sync left markers in its root identity file resolves its
+/// repository and its content root from the side that stood there before
+/// the collision; a file parsing neither way raises the malformed-file
+/// error carrying the reason the file as written gave.
 pub fn find_repo_root_for(
     start: &Path,
     owner: &str,
@@ -378,7 +386,7 @@ pub fn find_repo_root_for(
         None => return Ok(None),
     };
 
-    let yaml = parse_syns_yaml(&file_path)?;
+    let yaml = read_identity_by_local_side(&file_path)?;
 
     if !yaml.owner.eq_ignore_ascii_case(owner) || !yaml.name.eq_ignore_ascii_case(name) {
         return Ok(None);
@@ -850,6 +858,88 @@ mod tests {
             }
             other => panic!("expected the malformed-file error, got {other:?}"),
         }
+    }
+
+    // SPEC u308 Tests, `root_readers_read_a_marked_file_by_its_local_side`.
+    #[test]
+    fn root_readers_read_a_marked_file_by_its_local_side() {
+        let r = tempfile::tempdir().unwrap();
+        let r = r.path();
+        let sub = r.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(
+            r.join(".syns.yaml"),
+            "owner: alice\nname: proj\n<<<<<<< local\nchecks:\n  - make local\n||||||| base\n=======\nchecks:\n  - exit 0\n>>>>>>> remote\n",
+        )
+        .unwrap();
+
+        let identity = read_syns_yaml(&sub).unwrap().unwrap();
+        assert_eq!(
+            (identity.owner.as_deref(), identity.name.as_str()),
+            (Some("alice"), "proj")
+        );
+        assert_eq!(
+            find_repo_root_for(&sub, "Alice", "Proj").unwrap(),
+            Some(r.to_path_buf())
+        );
+    }
+
+    // SPEC u308 Tests,
+    // `root_readers_take_the_local_side_where_the_sides_name_two_repositories`.
+    #[test]
+    fn root_readers_take_the_local_side_where_the_sides_name_two_repositories() {
+        let r = tempfile::tempdir().unwrap();
+        let r = r.path();
+        fs::write(
+            r.join(".syns.yaml"),
+            "<<<<<<< local\nowner: alice\nname: proj\n=======\nowner: bob\nname: other\n>>>>>>> remote\n",
+        )
+        .unwrap();
+
+        let identity = read_syns_yaml(r).unwrap().unwrap();
+        assert_eq!(
+            (identity.owner.as_deref(), identity.name.as_str()),
+            (Some("alice"), "proj")
+        );
+        assert_eq!(
+            find_repo_root_for(r, "alice", "proj").unwrap(),
+            Some(r.to_path_buf())
+        );
+        assert_eq!(find_repo_root_for(r, "bob", "other").unwrap(), None);
+    }
+
+    // SPEC u308 Tests,
+    // `root_readers_raise_the_raw_error_where_neither_reading_parses`.
+    #[test]
+    fn root_readers_raise_the_raw_error_where_neither_reading_parses() {
+        let w = tempfile::tempdir().unwrap();
+        let w = w.path();
+        let r = w.join("r");
+        fs::create_dir_all(&r).unwrap();
+        write_syns_yaml(w, "alice", "proj").unwrap();
+        let written =
+            "<<<<<<< local\nowner: [alice\n=======\nowner: alice\nname: proj\n>>>>>>> remote\n";
+        fs::write(r.join(".syns.yaml"), written).unwrap();
+
+        let Err(raw) = parse_root_text(written) else {
+            panic!("the file as written parsed as the root form");
+        };
+        let Err(local) = parse_root_text("owner: [alice\n") else {
+            panic!("the local side parsed as the root form");
+        };
+        assert_ne!(raw, local);
+        let expected = format!("invalid .syns.yaml: {raw}");
+
+        let message = |result: Result<(), CliError>| match result {
+            Err(CliError::Io { message }) => message,
+            other => panic!("expected the malformed-file error, got {other:?}"),
+        };
+        assert_eq!(message(read_syns_yaml(&r).map(|_| ())), expected);
+        assert_eq!(
+            message(find_repo_root_for(&r, "alice", "proj").map(|_| ())),
+            expected
+        );
+        assert_eq!(message(nearest_identity(&r).map(|_| ())), expected);
     }
 
     #[test]

@@ -17,7 +17,8 @@ use serial_test::serial;
 use syns_cli::client::{PushRequest, SynsClient};
 use syns_cli::commands::pull::cmd_pull;
 use syns_cli::commands::push::{PushArgs, cmd_push};
-use syns_cli::commands::sync::cmd_sync;
+use syns_cli::commands::status::cmd_status;
+use syns_cli::commands::sync::{ResolutionAction, cmd_resolution, cmd_sync};
 use syns_cli::config::Config;
 use syns_cli::errors::CliError;
 use syns_cli::output::Output;
@@ -30,6 +31,7 @@ use syns_cli::push::hash::blob_sha1;
 use syns_cli::push::reconcile::CollisionKind;
 use syns_cli::push::smart::SmartPushOptions;
 use syns_cli::push::working_copy::{Outbox, Resolution, WorkingCopy};
+use syns_cli::repo::folder::resolve_scoped_or_skip;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -4824,4 +4826,229 @@ async fn a_large_text_collision_merges_outside_the_budget() {
         merged.push(text);
     }
     assert!(merged[0] == merged[1], "the two candidates differ");
+}
+
+// ---- a checkout whose sync left markers in its root identity file ---------
+
+/// SPEC u308 Tests preamble, `M`: a copy of `alice/proj` at `dir` holding
+/// an empty `dir/sub`, against a fake and a config of its own, whose
+/// `cmd_sync` from `dir` answered resolution required under `recovery`,
+/// leaving `marked` in `dir/.syns.yaml`.
+struct MarkedCheckout {
+    fake: Fake,
+    config: Config,
+    _folder: tempfile::TempDir,
+    dir: PathBuf,
+    copy: WorkingCopy,
+    recovery: String,
+    h1: String,
+    marked: Vec<u8>,
+}
+
+impl MarkedCheckout {
+    fn sub(&self) -> PathBuf {
+        self.dir.join("sub")
+    }
+
+    fn identity_bytes(&self) -> Vec<u8> {
+        std::fs::read(self.dir.join(".syns.yaml")).unwrap()
+    }
+}
+
+/// The exit-`4` refusal's outcome document, a panic naming any other
+/// answer.
+fn refusal_document(answer: Result<(), CliError>) -> Value {
+    match answer {
+        Err(CliError::SyncRefusal {
+            document, exit: 4, ..
+        }) => document,
+        other => panic!("expected the exit-4 refusal, got {other:?}"),
+    }
+}
+
+async fn marked_identity_checkout(e: &Env) -> MarkedCheckout {
+    let fake = Fake::start().await;
+    let config = Config::new(Some(&fake.uri)).unwrap();
+    let folder = tempfile::tempdir().unwrap();
+    let dir = std::fs::canonicalize(folder.path()).unwrap();
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    let copy = e.copy(&dir);
+    let h0 = fake.commit(&[("a.md", "a\n"), (".syns.yaml", IDENTITY)]);
+    checkout(&fake, &copy, &h0);
+    write_files(&dir, &[(".syns.yaml", IDENTITY_WITH_LOCAL_CHECK)]);
+    let h1 = fake.commit_changes(&[(".syns.yaml", Some(IDENTITY_WITH_CHECK))]);
+
+    let synced = {
+        let _cwd = CwdGuard::enter(&dir);
+        cmd_sync(&config, &e.output, false).await
+    };
+    let document = refusal_document(synced);
+    let recovery = document["resolution"]["recoveryId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let marked = std::fs::read(dir.join(".syns.yaml")).unwrap();
+    assert!(
+        String::from_utf8_lossy(&marked)
+            .lines()
+            .any(|l| l.starts_with("<<<<<<< ")),
+        "{}",
+        String::from_utf8_lossy(&marked)
+    );
+    MarkedCheckout {
+        fake,
+        config,
+        _folder: folder,
+        dir,
+        copy,
+        recovery,
+        h1,
+        marked,
+    }
+}
+
+// SPEC u308 Tests, `resolution_show_in_a_marked_checkout_renders_the_standing_resolution`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn resolution_show_in_a_marked_checkout_renders_the_standing_resolution() {
+    let e = env().await;
+    let m = marked_identity_checkout(&e).await;
+
+    let shown = {
+        let _cwd = CwdGuard::enter(&m.sub());
+        cmd_resolution(&m.config, &e.output, ResolutionAction::Show, false).await
+    };
+
+    let document = refusal_document(shown);
+    assert_eq!(document["outcome"], "resolution_required", "{document}");
+    assert_eq!(document["repo"], "alice/proj", "{document}");
+    assert_eq!(
+        document["resolution"]["recoveryId"],
+        m.recovery.as_str(),
+        "{document}"
+    );
+    assert!(
+        document["resolution"]["collisions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"path": ".syns.yaml", "kind": "modify_modify"})),
+        "{document}"
+    );
+    assert!(
+        document["markers"].get(".syns.yaml").is_some(),
+        "{document}"
+    );
+}
+
+// SPEC u308 Tests, `resolution_continue_in_a_marked_checkout_publishes_nothing`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn resolution_continue_in_a_marked_checkout_publishes_nothing() {
+    let e = env().await;
+    let m = marked_identity_checkout(&e).await;
+
+    let continued = {
+        let _cwd = CwdGuard::enter(&m.sub());
+        cmd_resolution(&m.config, &e.output, ResolutionAction::Continue, false).await
+    };
+
+    let document = refusal_document(continued);
+    assert_eq!(document["outcome"], "resolution_required", "{document}");
+    assert_eq!(
+        document["resolution"]["recoveryId"],
+        m.recovery.as_str(),
+        "{document}"
+    );
+    assert!(m.fake.push_bodies().is_empty());
+    assert_eq!(m.identity_bytes(), m.marked);
+}
+
+// SPEC u308 Tests, `resolution_discard_in_a_marked_checkout_restores_the_local_edit`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn resolution_discard_in_a_marked_checkout_restores_the_local_edit() {
+    let e = env().await;
+    let m = marked_identity_checkout(&e).await;
+
+    let discarded = {
+        let _cwd = CwdGuard::enter(&m.sub());
+        cmd_resolution(&m.config, &e.output, ResolutionAction::Discard, false).await
+    };
+
+    assert!(discarded.is_ok(), "{discarded:?}");
+    assert_eq!(read(&m.dir, ".syns.yaml"), IDENTITY_WITH_LOCAL_CHECK);
+    assert_eq!(read(&m.dir, "a.md"), "a\n");
+    assert!(m.copy.resolution().unwrap().is_none());
+}
+
+// SPEC u308 Tests, `sync_in_a_marked_checkout_answers_the_standing_resolution`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn sync_in_a_marked_checkout_answers_the_standing_resolution() {
+    let e = env().await;
+    let m = marked_identity_checkout(&e).await;
+
+    let synced = {
+        let _cwd = CwdGuard::enter(&m.sub());
+        cmd_sync(&m.config, &e.output, false).await
+    };
+
+    let document = refusal_document(synced);
+    assert_eq!(document["outcome"], "resolution_required", "{document}");
+    assert_eq!(
+        document["resolution"]["recoveryId"],
+        m.recovery.as_str(),
+        "{document}"
+    );
+    assert!(m.fake.push_bodies().is_empty());
+    assert_eq!(m.fake.head().0, m.h1);
+}
+
+// SPEC u308 Tests, `bare_pull_in_a_marked_checkout_answers_the_standing_resolution`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn bare_pull_in_a_marked_checkout_answers_the_standing_resolution() {
+    let e = env().await;
+    let m = marked_identity_checkout(&e).await;
+
+    let pulled = {
+        let _cwd = CwdGuard::enter(&m.sub());
+        cmd_pull(&m.config, &e.output, None, None, None, false, false, None).await
+    };
+
+    let document = refusal_document(pulled);
+    assert_eq!(
+        document["resolution"]["recoveryId"],
+        m.recovery.as_str(),
+        "{document}"
+    );
+    assert_eq!(m.identity_bytes(), m.marked);
+    assert_eq!(read(&m.dir, "a.md"), "a\n");
+}
+
+// SPEC u308 Tests, `status_in_a_marked_checkout_reads_its_repository`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn status_in_a_marked_checkout_reads_its_repository() {
+    let e = env().await;
+    let m = marked_identity_checkout(&e).await;
+
+    let status = {
+        let _cwd = CwdGuard::enter(&m.sub());
+        cmd_status(&m.config, &e.output, false).await
+    };
+
+    assert!(status.is_ok(), "{status:?}");
+}
+
+// SPEC u308 Tests, `reading_verbs_in_a_marked_checkout_resolve_its_repository`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn reading_verbs_in_a_marked_checkout_resolve_its_repository() {
+    let e = env().await;
+    let m = marked_identity_checkout(&e).await;
+
+    let resolved = resolve_scoped_or_skip(&m.sub(), true, &e.output).unwrap();
+
+    assert_eq!(resolved, Some(("alice".into(), "proj".into(), None)));
 }

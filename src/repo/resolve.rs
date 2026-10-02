@@ -284,4 +284,21 @@ mod tests {
         assert_eq!(identity.name, "proj");
         assert_eq!(source, IdentitySource::SynsYaml);
     }
+
+    // SPEC u308 Tests, `marked_root_identity_resolves_by_its_local_side`.
+    #[test]
+    fn marked_root_identity_resolves_by_its_local_side() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".syns.yaml"),
+            "owner: Alice\nname: Proj\n<<<<<<< local\nchecks:\n  - make local\n||||||| base\n=======\nchecks:\n  - exit 0\n>>>>>>> remote\n",
+        )
+        .unwrap();
+
+        let (identity, source) = resolve_repo_identity(None, dir.path()).unwrap();
+
+        assert_eq!(identity.owner.as_deref(), Some("alice"));
+        assert_eq!(identity.name, "proj");
+        assert_eq!(source, IdentitySource::SynsYaml);
+    }
 }
