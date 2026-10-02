@@ -938,6 +938,113 @@ fn a_write_to_the_holder_inside_a_clean_identity_folder_lands_on_the_holder() {
         document(&out)["checkoutBehind"],
         json!(d.folder().display().to_string())
     );
+
+    // Outside `--json`, the write report names the folder as left behind
+    // (CR3-3).
+    let out = d.run_with(
+        &d.folder(),
+        &[
+            "write",
+            "--repo",
+            "alice/docs",
+            "q3-plan/document.html",
+            "--parent",
+            H4,
+        ],
+        "x",
+    );
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains(&format!(
+            "the checkout at {} is now one version behind; syns sync converges it",
+            d.folder().display()
+        )),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
+// The ruling on round 2's open question, the deletion side: a deletion
+// naming the holder under the folder's holder path leaves the clean
+// folder behind as a written file does (CR3-2).
+#[test]
+#[serial]
+fn a_deletion_from_the_holder_under_a_clean_identity_folder_names_it_left_behind() {
+    let d = Deployment::new();
+    write(&d.folder().join("document.html"), DOC);
+    d.record_base(H4);
+    d.serves(
+        "GET",
+        HOLDER,
+        ResponseTemplate::new(200).set_body_json(record("alice", "docs", Some(H4), false)),
+    );
+    d.serves(
+        "PUT",
+        &format!("{HOLDER}/push"),
+        ResponseTemplate::new(200).set_body_json(json!({
+            "commitSha": H5, "version": 5, "filesChanged": 1, "created": false,
+        })),
+    );
+
+    let out = d.run_in(
+        &d.folder(),
+        &[
+            "--json",
+            "rm",
+            "--repo",
+            "alice/docs",
+            "q3-plan/document.html",
+            "--parent",
+            H4,
+        ],
+    );
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    let pushes = d.pushes(HOLDER);
+    assert_eq!(pushes.len(), 1, "{:?}", d.targets());
+    assert_eq!(pushes[0]["files"], json!([]));
+    assert_eq!(
+        pushes[0]["deletions"],
+        json!([{"path": "q3-plan/document.html"}])
+    );
+    assert!(d.pushes(IDENTITY).is_empty());
+    assert_eq!(
+        document(&out)["checkoutBehind"],
+        json!(d.folder().display().to_string())
+    );
+}
+
+// A clean write through the identity, naming no `--repo`, leaves the
+// folder behind whatever path it writes: the holder path bounds only a
+// write naming the holder (CR3-1).
+#[test]
+#[serial]
+fn a_write_through_a_clean_identity_folder_names_it_left_behind() {
+    let d = Deployment::new();
+    write(&d.folder().join("document.html"), DOC);
+    d.record_base(H4);
+    d.identity_record(H4);
+    d.serves(
+        "PUT",
+        &format!("{IDENTITY}/push"),
+        ResponseTemplate::new(200).set_body_json(json!({
+            "commitSha": H5, "version": 5, "filesChanged": 1, "created": false,
+        })),
+    );
+
+    let out = d.run_with(
+        &d.folder(),
+        &["--json", "write", "document.html", "--parent", H4],
+        "x",
+    );
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(d.pushes(IDENTITY).len(), 1, "{:?}", d.targets());
+    assert!(d.pushes(HOLDER).is_empty());
+    assert_eq!(
+        document(&out)["checkoutBehind"],
+        json!(d.folder().display().to_string())
+    );
 }
 
 // The ruling on round 2's open question: a clean write to the holder
