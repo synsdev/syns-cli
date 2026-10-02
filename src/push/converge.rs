@@ -1571,11 +1571,17 @@ fn holds_root_identity(
 /// publication writes no resolution for it and records the head as the
 /// base, naming no `.syns.yaml`; it goes out with the next publication,
 /// which finds the head at the base's commit.
-fn publication_holds_root_identity(held: bool, base: &Base, folder: &Folder, head: &Head) -> bool {
+fn publication_holds_root_identity(
+    held: bool,
+    base_commit: Option<&String>,
+    base_files: &BTreeMap<String, String>,
+    folder: &Folder,
+    head: &Head,
+) -> bool {
     held && head.commit.is_some()
-        && head.commit != base.commit
+        && head.commit.as_ref() != base_commit
         && folder.hashes.contains_key(ROOT_IDENTITY)
-        && !base.files.contains_key(ROOT_IDENTITY)
+        && !base_files.contains_key(ROOT_IDENTITY)
         && !head.files.contains_key(ROOT_IDENTITY)
 }
 
@@ -1905,6 +1911,11 @@ struct Candidate<'a> {
     /// through `retrieval_wrote_root_identity` over the base the run
     /// loaded (SPEC u306 `converge` 1), read once for the run.
     written_root_identity: bool,
+    /// Whether the root identity file is the record a retrieval wrote,
+    /// through `held_root_identity`, the test the working-copy state and
+    /// the checkout guard read, over the base the run loaded (u306 TR-01):
+    /// what a publication's hold reads where a pass decides it.
+    held_root_identity: bool,
     /// Where every collection of the run is taken from (SPEC u291).
     root: &'a FolderRoot,
 }
@@ -2054,7 +2065,14 @@ async fn prepare_candidate(
                         &candidate.base_files,
                         &folder,
                         head,
-                    ) =>
+                    ) || candidate.publishing
+                        && publication_holds_root_identity(
+                            candidate.held_root_identity,
+                            candidate.base_commit.as_ref(),
+                            &candidate.base_files,
+                            &folder,
+                            head,
+                        ) =>
                 {
                     IdentityHold::Held(hash.clone())
                 }
@@ -2972,6 +2990,8 @@ async fn converge_from_resolution(
     };
     let written =
         retrieval_wrote_root_identity(&copy.root, &copy.owner, &copy.name, base_manifest.as_ref());
+    let held_identity =
+        held_root_identity(&copy.root, &copy.owner, &copy.name, base_manifest.as_ref());
     // u306 TR-01: a publication past the base holds it out alike where
     // neither side names it and it is the record a retrieval wrote.
     let hold = holds_root_identity(
@@ -2982,8 +3002,9 @@ async fn converge_from_resolution(
         &head,
     ) || mode == ConvergeMode::Publish
         && publication_holds_root_identity(
-            held_root_identity(&copy.root, &copy.owner, &copy.name, base_manifest.as_ref()),
-            &base,
+            held_identity,
+            base.commit.as_ref(),
+            &base.files,
             &folder,
             &head,
         );
@@ -3125,6 +3146,7 @@ async fn converge_from_resolution(
                 None => IdentityHold::Released,
             },
             written_root_identity: written,
+            held_root_identity: held_identity,
             root,
         },
         Some(folder),
@@ -3152,6 +3174,9 @@ async fn finish_preparation(
     let base_manifest = base_of(copy);
     let written =
         retrieval_wrote_root_identity(&copy.root, &copy.owner, &copy.name, base_manifest.as_ref());
+    // u306 CR4-1: the publication hold a pass decides reads it alike.
+    let held_identity =
+        held_root_identity(&copy.root, &copy.owner, &copy.name, base_manifest.as_ref());
     let base = base_from(base_manifest.as_ref());
     let base_files = match &standing.base_commit {
         Some(commit) if base.commit.as_ref() == Some(commit) => base.files,
@@ -3183,6 +3208,7 @@ async fn finish_preparation(
             force_resolution: true,
             hold_root_identity: IdentityHold::Undecided,
             written_root_identity: written,
+            held_root_identity: held_identity,
             root,
         },
         folder,
@@ -3773,6 +3799,7 @@ async fn guard_refused(
             force_resolution: true,
             hold_root_identity: IdentityHold::Released,
             written_root_identity: written,
+            held_root_identity: false,
             root,
         },
         None,
@@ -4119,6 +4146,7 @@ mod tests {
                 force_resolution: false,
                 hold_root_identity: IdentityHold::Released,
                 written_root_identity: false,
+                held_root_identity: false,
                 root: &FolderRoot::whole(&copy.root),
             },
             None,
@@ -4560,6 +4588,7 @@ mod tests {
                 force_resolution: false,
                 hold_root_identity: IdentityHold::Released,
                 written_root_identity: false,
+                held_root_identity: false,
                 root: &FolderRoot::whole(&holder.root),
             },
             None,
@@ -4657,6 +4686,7 @@ mod tests {
                             force_resolution: false,
                             hold_root_identity: IdentityHold::Released,
                             written_root_identity: false,
+                            held_root_identity: false,
                             root: &FolderRoot::of_scope(&folder.root, &scope, None),
                         },
                         None,

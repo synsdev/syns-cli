@@ -3930,6 +3930,59 @@ async fn sync_over_a_moved_head_holds_a_written_identity_file_out_of_the_local_p
     assert!(fake.push_bodies().is_empty());
 }
 
+// u306 CR4-1: finishing the half-written resolution such a publication
+// left holds the identity text out of its local paths alike.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn finishing_a_half_written_publication_holds_a_written_identity_file_out_of_the_local_paths()
+{
+    let e = env().await;
+    let (fake, folder, copy, _) =
+        identity_setup(&e, &[("a.md", "a\n")], IDENTITY, &[("c.md", Some("c\n"))]).await;
+    write_files(folder.path(), &[("b.md", "b\n")]);
+    let mut half_written = expect_resolution(publish(&fake, &copy, &e).await);
+    half_written.pending_writes = Some(BTreeMap::from([(
+        "c.md".to_string(),
+        Some(blob_sha1(b"c\n")),
+    )]));
+    std::fs::remove_file(folder.path().join("c.md")).unwrap();
+    copy.write_resolution(&half_written).unwrap();
+
+    let resolution = expect_resolution(publish(&fake, &copy, &e).await);
+
+    assert_eq!(resolution.local_paths, vec!["b.md".to_string()]);
+    assert!(
+        !resolution
+            .combined_paths
+            .contains(&".syns.yaml".to_string()),
+        "{resolution:?}"
+    );
+    assert_eq!(read(folder.path(), ".syns.yaml"), IDENTITY);
+    assert!(fake.push_bodies().is_empty());
+}
+
+// u306 CR4-2: a person's own root `.syns.yaml`, neither the base nor the
+// head naming it, is local work a publication past a moved head takes to
+// review rather than holding it out.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn sync_over_a_moved_head_beside_an_added_identity_file_both_lack_writes_a_resolution() {
+    let e = env().await;
+    let (fake, folder, copy, h1) = identity_setup(
+        &e,
+        &[("a.md", "a\n")],
+        IDENTITY_WITH_LOCAL_CHECK,
+        &[("c.md", Some("c\n"))],
+    )
+    .await;
+
+    let resolution = expect_resolution(publish(&fake, &copy, &e).await);
+
+    assert_eq!(resolution.local_paths, vec![".syns.yaml".to_string()]);
+    assert_eq!(fake.head().0, h1);
+    assert_eq!(read(folder.path(), ".syns.yaml"), IDENTITY_WITH_LOCAL_CHECK);
+}
+
 // ---- an interrupted preparation -------------------------------------------
 
 fn set_readonly(path: &Path, readonly: bool) {
