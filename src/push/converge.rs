@@ -2781,6 +2781,19 @@ pub(crate) fn lay_over_enclosing(
     }
 }
 
+/// A publication from a whole-repository copy with no resolution standing
+/// refuses a root identity file holding a marked block, before any request
+/// and before an outbox resumes, as it was refused before the root readers
+/// took that file by its local side (u308 round 2, ruled). A standing
+/// resolution is answered as it stands, and a folder copy's identity file
+/// is the folder form.
+fn refuse_unresolved_marked_identity(copy: &WorkingCopy) -> Result<(), CliError> {
+    if copy.folder.is_some() || copy.resolution()?.is_some() {
+        return Ok(());
+    }
+    refuse_marked_root_identity(&copy.root)
+}
+
 /// `converge` under the copy's state lock, held for the whole run.
 async fn converge_locked(
     client: &SynsClient,
@@ -2790,6 +2803,9 @@ async fn converge_locked(
     opts: SmartPushOptions,
 ) -> Result<SyncOutcome, CliError> {
     let _lock = copy.lock()?;
+    if mode == ConvergeMode::Publish {
+        refuse_unresolved_marked_identity(copy)?;
+    }
     let opts = with_run_budget(opts);
 
     // 1 — the run's staging, then the one collection the run hands on,
@@ -2904,12 +2920,6 @@ async fn converge_from_resolution(
             ConvergeMode::Retrieve { overwrite: true } => {}
             _ => return Ok(SyncOutcome::ResolutionRequired(standing.clone(), None)),
         }
-    }
-    // u308 round 2, ruled: a publication with no resolution standing refuses
-    // a root identity file holding a marked block, before any request, as
-    // it was refused before the root readers took it by its local side.
-    if mode == ConvergeMode::Publish && copy.folder.is_none() {
-        refuse_marked_root_identity(&copy.root)?;
     }
 
     // 5 — the one base read, held as its manifest for the written test
@@ -3773,6 +3783,7 @@ async fn continue_locked(
 ) -> Result<SyncOutcome, CliError> {
     // 1
     let _lock = copy.lock()?;
+    refuse_unresolved_marked_identity(copy)?;
     let opts = with_run_budget(opts);
     let staging = Staging::open(&opts.stores.write)?;
     let root = folder_root(client, Some(token), copy).await?;
