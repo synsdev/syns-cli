@@ -3430,6 +3430,77 @@ async fn a_publication_past_a_head_naming_no_identity_file_keeps_the_written_one
     assert!(fake.push_bodies().is_empty());
 }
 
+// u306 CR3-1: a publication at the base's commit beside the identity text
+// a retrieval wrote, the head naming no `.syns.yaml`, publishes as it did
+// before u306 rather than going on to the candidate.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_publication_at_the_base_commit_beside_a_written_identity_file_the_head_lacks_publishes()
+{
+    let e = env().await;
+    let fake = Fake::start().await;
+    let folder = tempfile::tempdir().unwrap();
+    let copy = e.copy(folder.path());
+    let h0 = fake.commit(&[("a.md", "a\n")]);
+    checkout(&fake, &copy, &h0);
+    write_files(folder.path(), &[(".syns.yaml", IDENTITY), ("a.md", "b\n")]);
+
+    let outcome = publish(&fake, &copy, &e).await;
+
+    assert!(
+        matches!(
+            outcome,
+            SyncOutcome::Synced {
+                published: Some(_),
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_ne!(fake.head().0, h0);
+    assert_eq!(fake.head().1["a.md"], "b\n");
+}
+
+// u306 CR3-2: a half-written preparation finished over `R` reads the
+// identity text as the record a retrieval wrote, under a retrieval and a
+// publication alike, so the head's `.syns.yaml` replaces it and no
+// resolution carries it.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn finishing_a_half_written_preparation_takes_the_head_identity_file_over_a_written_one() {
+    let e = env().await;
+    for mode in [
+        ConvergeMode::Retrieve { overwrite: false },
+        ConvergeMode::Publish,
+    ] {
+        let (fake, folder, copy, h1) = released_setup(&e, IDENTITY).await;
+        let mut half_written = dummy_resolution(&h1);
+        half_written.base_commit = Some(h1.clone());
+        half_written.pending_writes = Some(BTreeMap::from([(
+            "a.md".to_string(),
+            Some(blob_sha1(b"a\n")),
+        )]));
+        copy.write_resolution(&half_written).unwrap();
+
+        let outcome = converge(&fake.client(), Some(TOKEN), &copy, mode, e.opts())
+            .await
+            .unwrap();
+
+        let resolution = expect_resolution(outcome);
+        assert!(
+            !resolution.local_paths.contains(&".syns.yaml".to_string())
+                && resolution.collisions.iter().all(|(p, _)| p != ".syns.yaml"),
+            "{mode:?}: {resolution:?}"
+        );
+        assert_eq!(
+            read(folder.path(), ".syns.yaml"),
+            IDENTITY_WITH_CHECK,
+            "{mode:?}"
+        );
+        assert!(fake.push_bodies().is_empty(), "{mode:?}");
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn discard_restores_the_folder_before_the_resolution() {
