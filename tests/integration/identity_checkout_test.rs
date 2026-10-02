@@ -932,6 +932,12 @@ fn a_write_to_the_holder_inside_a_clean_identity_folder_lands_on_the_holder() {
     assert_eq!(pushes.len(), 1, "{:?}", d.targets());
     assert_eq!(pushed_paths(&pushes[0]), vec!["q3-plan/document.html"]);
     assert!(d.pushes(IDENTITY).is_empty());
+    // The write lands under the folder's holder path, so the identity
+    // lists it and the folder is left one version behind (CR2-1).
+    assert_eq!(
+        document(&out)["checkoutBehind"],
+        json!(d.folder().display().to_string())
+    );
 }
 
 // The ruling on UNP1-1: a `shared_as` spelling no repository name under
