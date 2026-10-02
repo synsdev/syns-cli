@@ -738,7 +738,9 @@ fn lay(
 /// records a base carries the placed paths. Inside a folder bound to its
 /// identity, the identity copy's base is laid, its commit advancing only
 /// where it stood at `stood_on`, the identity's newest listed version the
-/// placement was sent over. Otherwise the holder checkout's base is laid,
+/// placement was sent over, and the new folder's own copy, keyed on the
+/// identity, records its base at the placed commit (SPEC u307
+/// `record_bases` 1–2). Otherwise the holder checkout's base is laid,
 /// advancing only from the claimed parent; each enclosing folder copy's,
 /// advancing from the claimed parent or from its own commit where its
 /// folder stood unmoved from that commit up to the landed version; and
@@ -765,18 +767,24 @@ async fn record_bases(
     let in_holder = |path: &str| format!("{repository_path}/{path}");
 
     // 1 — inside a folder bound to its identity, the placed files laid
-    // over the identity folder's copy at the typed path, the placed folder
-    // recording no base of its own: it is a directory of that identity.
+    // over the identity folder's copy at the typed path.
     if let Some(scope) = counted.scope.as_ref().filter(|s| s.identity.is_some()) {
+        let place = place_under(folder_dir, &scope.dir);
         if let Some(copy) = WorkingCopy::open_existing_folder(cache, scope)? {
-            let place = place_under(folder_dir, &scope.dir);
             let files = from_folder
                 .iter()
                 .map(|(path, sha)| (format!("{place}/{path}"), sha.clone()))
                 .collect();
             lay(&copy, &files, stood_on, landed)?;
         }
-        return Ok(());
+        // SPEC u307 `record_bases` 2: the placed folder's own copy,
+        // keyed on the identity at its directory, records the placed
+        // commit, so a turn-on there is sent at it.
+        let copy = WorkingCopy::open_folder(cache, &scope.beneath(&place))?;
+        let _lock = copy.lock().map_err(|err| base_refusal(&copy, err))?;
+        return copy
+            .record_base(landed, from_folder.clone())
+            .map_err(|err| base_refusal(&copy, err));
     }
 
     // 2 — the holder checkout, advancing from the claimed parent alone.
@@ -811,7 +819,7 @@ async fn record_bases(
                         client,
                         Some(token),
                         &counted.holder,
-                        &enclosing.path,
+                        Some(&enclosing.path),
                         &own,
                         landed,
                     )

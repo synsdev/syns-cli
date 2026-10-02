@@ -82,28 +82,29 @@ fn changed_the_folder(entry: &VersionEntry, folder: &str) -> bool {
 /// `since` and before `landed` changing one (SPEC u304 Behaviour,
 /// `folder_unmoved_until` 1–4): false on every refusal and every answer
 /// leaving either unshown, and nothing written to either stream — the
-/// caller keeps a copy's commit on false and loses nothing else.
+/// caller keeps a copy's commit on false and loses nothing else. SPEC
+/// u307 `folder_unmoved_until` 1: with no `folder`, the page names no
+/// path and its every entry counts as one that changed what the copy
+/// covers — `repo_id`'s whole history, as an identity copy covers it.
 pub async fn folder_unmoved_until(
     client: &SynsClient,
     token: Option<&str>,
     repo_id: &str,
-    folder: &str,
+    folder: Option<&str>,
     since: &str,
     landed: &str,
 ) -> bool {
-    // 1 — the folder's two newest changes.
-    let Ok((page, _raw)) = client
-        .list_versions(repo_id, token, 2, 0, Some(folder))
-        .await
-    else {
+    // 1 — the folder's two newest changes, or the repository's.
+    let Ok((page, _raw)) = client.list_versions(repo_id, token, 2, 0, folder).await else {
         return false;
     };
     // 2 — a page not narrowed to the folder, or one whose newest change
     // is not the landed version.
-    if page
-        .data
-        .iter()
-        .any(|entry| !changed_the_folder(entry, folder))
+    if let Some(folder) = folder
+        && page
+            .data
+            .iter()
+            .any(|entry| !changed_the_folder(entry, folder))
     {
         return false;
     }
@@ -126,13 +127,13 @@ pub async fn folder_unmoved_until(
 }
 
 impl FolderCheck {
-    /// A read of the check refused: a `transient` refusal answers as a
-    /// folder that moved once the unread-check line is written, and any
-    /// other refusal ends the check on it.
-    fn unread(&self, err: CliError) -> Result<bool, CliError> {
+    /// A read of the check of `folder` refused: a `transient` refusal
+    /// answers as a folder that moved once the unread-check line is
+    /// written, and any other refusal ends the check on it.
+    fn unread(folder: &str, err: CliError) -> Result<bool, CliError> {
         match error_class(&err) {
             Some(ErrorClass::Transient) => {
-                eprintln!("{}", unread_check_line(&self.folder, &err));
+                eprintln!("{}", unread_check_line(folder, &err));
                 Ok(true)
             }
             _ => Err(err),
@@ -151,22 +152,57 @@ impl FolderCheck {
         if let Some(holder) = self.holder.clone() {
             return self.identity_moved(client, token, &holder).await;
         }
+        let folder = self.folder.clone();
+        let numbering = [self.repo_id.clone()];
+        self.moved_at(client, token, &folder, &numbering).await
+    }
+
+    /// Whether a version of the identity numbered after `since` changed a
+    /// path at or under `within`, a path counted from the identity folder
+    /// (SPEC u307 Behaviour, `FolderCheck::folder_moved_within` 1–3): u292's
+    /// steps over the identity's history at `within` alone, `since`
+    /// numbered through the identity and, where it answers `NOT_FOUND`,
+    /// through `holder`, so a version changing other identity paths alone
+    /// never answers true.
+    pub async fn folder_moved_within(
+        &mut self,
+        client: &SynsClient,
+        token: Option<&str>,
+        within: &str,
+    ) -> Result<bool, CliError> {
+        let numbering: Vec<String> = std::iter::once(self.repo_id.clone())
+            .chain(self.holder.clone())
+            .collect();
+        self.moved_at(client, token, within, &numbering).await
+    }
+
+    /// SPEC u292 Behaviour, `FolderCheck::folder_moved` 1–6, over
+    /// `repo_id`'s history at `folder`, the commit the work stands on
+    /// numbered through each of `numbering` in turn, a `NOT_FOUND` passed
+    /// over and one from every repository read as a folder that moved.
+    async fn moved_at(
+        &mut self,
+        client: &SynsClient,
+        token: Option<&str>,
+        folder: &str,
+        numbering: &[String],
+    ) -> Result<bool, CliError> {
         // 1 — the newest version that changed the folder.
         let page = match client
-            .list_versions(&self.repo_id, token, 1, 0, Some(&self.folder))
+            .list_versions(&self.repo_id, token, 1, 0, Some(folder))
             .await
         {
             Ok((page, _raw)) => page,
-            Err(err) => return self.unread(err),
+            Err(err) => return Self::unread(folder, err),
         };
         // 2 — a page the server did not narrow to the folder.
         if page
             .data
             .iter()
-            .any(|entry| !changed_the_folder(entry, &self.folder))
+            .any(|entry| !changed_the_folder(entry, folder))
         {
             return Err(CliError::FolderWriteUnsupported {
-                folder: self.folder.clone(),
+                folder: folder.to_string(),
             });
         }
         let newest = page.data.first().map(|entry| (entry.version, &entry.sha));
@@ -185,7 +221,7 @@ impl FolderCheck {
             None => {
                 let head = match client.list_versions(&self.repo_id, token, 1, 0, None).await {
                     Ok((head, _raw)) => head,
-                    Err(err) => return self.unread(err),
+                    Err(err) => return Self::unread(folder, err),
                 };
                 match head.data.first() {
                     Some(entry) if entry.version > SCAN_BOUND => Some(entry.version),
@@ -197,19 +233,33 @@ impl FolderCheck {
         // 5 — the number of the commit the work stands on, read once.
         let since_version = match self.since_version {
             Some(version) => version,
-            None => match client.get_version(&self.repo_id, token, &self.since).await {
-                Ok((entry, _raw)) => {
-                    self.since_version = Some(entry.version);
-                    entry.version
+            None => {
+                let mut numbered = None;
+                for repo_id in numbering {
+                    match client.get_version(repo_id, token, &self.since).await {
+                        Ok((entry, _raw)) => {
+                            numbered = Some(entry.version);
+                            break;
+                        }
+                        // A parent naming no commit of the repository
+                        // passes to the next, and reads as changed past
+                        // the last.
+                        Err(CliError::Api {
+                            status: Some(404),
+                            ref error,
+                            ..
+                        }) if error == "not_found" => continue,
+                        Err(err) => return Self::unread(folder, err),
+                    }
                 }
-                // A parent naming no commit of the holder reads as changed.
-                Err(CliError::Api {
-                    status: Some(404),
-                    ref error,
-                    ..
-                }) if error == "not_found" => return Ok(true),
-                Err(err) => return self.unread(err),
-            },
+                match numbered {
+                    Some(version) => {
+                        self.since_version = Some(version);
+                        version
+                    }
+                    None => return Ok(true),
+                }
+            }
         };
 
         // 6
@@ -232,7 +282,7 @@ impl FolderCheck {
         // 1 — the identity's newest version, naming no path.
         let page = match client.list_versions(&self.repo_id, token, 1, 0, None).await {
             Ok((page, _raw)) => page,
-            Err(err) => return self.unread(err),
+            Err(err) => return Self::unread(&self.folder, err),
         };
         // 4 — an identity listing no version: u292's steps 4 and 6 over a
         // head page that is this same empty page.
@@ -259,7 +309,7 @@ impl FolderCheck {
                             ref error,
                             ..
                         }) if error == "not_found" => continue,
-                        Err(err) => return self.unread(err),
+                        Err(err) => return Self::unread(&self.folder, err),
                     }
                 }
                 match numbered {
@@ -500,8 +550,9 @@ mod tests {
                 .mount(&server)
                 .await;
             let client = SynsClient::new(&server.uri()).unwrap();
-            answers
-                .push(folder_unmoved_until(&client, Some("t"), REPO, "budget", "h1", "h3").await);
+            answers.push(
+                folder_unmoved_until(&client, Some("t"), REPO, Some("budget"), "h1", "h3").await,
+            );
             if first_reads.is_none() {
                 first_reads = Some(single_version_reads(&server).await);
             }
@@ -540,8 +591,9 @@ mod tests {
                 .mount(&server)
                 .await;
             let client = SynsClient::new(&server.uri()).unwrap();
-            answers
-                .push(folder_unmoved_until(&client, Some("t"), REPO, "budget", "h1", "h3").await);
+            answers.push(
+                folder_unmoved_until(&client, Some("t"), REPO, Some("budget"), "h1", "h3").await,
+            );
         }
         assert_eq!(answers, [true, false]);
     }
@@ -616,6 +668,55 @@ mod tests {
 
     fn version_five() -> ResponseTemplate {
         ResponseTemplate::new(200).set_body_json(version(5, "h5", &["budget/document.html"]))
+    }
+
+    // SPEC u307 Tests,
+    // `a_check_within_a_folder_beneath_an_identity_reads_that_folders_history_alone`.
+    #[tokio::test]
+    async fn a_check_within_a_folder_beneath_an_identity_reads_that_folders_history_alone() {
+        let pages = [
+            version(3, "h3", &["appendix/x"]),
+            version(6, "h6", &["appendix/x"]),
+            version(6, "h6", &["notes.html"]),
+        ];
+        let mut answers = Vec::new();
+        let mut numbered = Vec::new();
+        for entry in pages {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api/v1/repos/alice/docs-q3-plan/versions"))
+                .and(query_param("path", "appendix"))
+                .and(query_param("limit", "1"))
+                .and(query_param("offset", "0"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(page(vec![entry])))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api/v1/repos/alice/docs-q3-plan/versions/h5"))
+                .respond_with(not_found())
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api/v1/repos/alice/docs/versions/h5"))
+                .respond_with(version_five())
+                .mount(&server)
+                .await;
+            let client = SynsClient::new(&server.uri()).unwrap();
+            let mut check = identity_check();
+            answers.push(
+                check
+                    .folder_moved_within(&client, Some("t"), "appendix")
+                    .await,
+            );
+            numbered.push(check.since_version);
+        }
+        assert!(matches!(answers[0], Ok(false)), "{:?}", answers[0]);
+        assert_eq!(numbered[0], Some(5));
+        assert!(matches!(answers[1], Ok(true)), "{:?}", answers[1]);
+        match &answers[2] {
+            Err(CliError::FolderWriteUnsupported { folder }) => assert_eq!(folder, "appendix"),
+            other => panic!("expected the unsupported-server refusal, got {other:?}"),
+        }
     }
 
     // SPEC u302 Tests, `a_carried_base_the_identity_does_not_list_is_numbered_through_the_holder`.

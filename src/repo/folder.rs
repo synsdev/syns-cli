@@ -67,6 +67,24 @@ impl FolderScope {
         }
     }
 
+    /// The scope of the folder at `place` under this scope's directory
+    /// (SPEC u307 Contract Surface, `FolderScope::beneath`): on a scope
+    /// bound to its identity, a folder beneath the identity folder whose
+    /// copy is keyed on the identity at its own directory, its path the
+    /// holder path `repository_path` answers for `place`, carrying no
+    /// checkout and this scope alone as the copy enclosing it.
+    pub fn beneath(&self, place: &str) -> FolderScope {
+        FolderScope {
+            dir: self.dir.join(place),
+            owner: self.owner.clone(),
+            name: self.name.clone(),
+            path: self.repository_path(place),
+            checkout: None,
+            enclosing: vec![self.clone()],
+            identity: self.identity.clone(),
+        }
+    }
+
     /// A path counted from the folder as the addressed repository carries
     /// it: itself through an identity, the holder's path otherwise (SPEC
     /// u302 Contract Surface, `FolderScope::request_path`).
@@ -872,6 +890,83 @@ mod tests {
         assert_eq!(s.request_path("a.md"), "q3-plan/a.md");
         assert_eq!(s.served_path("q3-plan/a.md").as_deref(), Some("a.md"));
         assert_eq!(s.served_path("other/a.md"), None);
+    }
+
+    // SPEC u307 Tests, `beneath_answers_the_scope_of_a_folder_under_an_identity_folder`.
+    #[test]
+    fn beneath_answers_the_scope_of_a_folder_under_an_identity_folder() {
+        let identity = FolderScope {
+            dir: PathBuf::from("/u/q3-plan"),
+            owner: "alice".into(),
+            name: "docs".into(),
+            path: "q3-plan".into(),
+            checkout: None,
+            enclosing: Vec::new(),
+            identity: Some("docs-q3-plan".into()),
+        };
+        let beneath = identity.beneath("appendix/sub");
+        assert_eq!(beneath.dir, PathBuf::from("/u/q3-plan/appendix/sub"));
+        assert_eq!(beneath.owner, "alice");
+        assert_eq!(beneath.name, "docs");
+        assert_eq!(beneath.path, "q3-plan/appendix/sub");
+        assert_eq!(beneath.identity.as_deref(), Some("docs-q3-plan"));
+        assert_eq!(beneath.checkout, None);
+        assert_eq!(beneath.enclosing, vec![identity]);
+    }
+
+    // SPEC u307 Tests,
+    // `a_folder_beneath_an_identity_reads_the_later_of_its_own_base_and_the_identity_copys`.
+    #[test]
+    fn a_folder_beneath_an_identity_reads_the_later_of_its_own_base_and_the_identity_copys() {
+        use crate::config::StoreRoots;
+        use crate::push::working_copy::{WorkingCopy, folder_base};
+        use std::collections::HashMap;
+
+        let cache = tempfile::tempdir().unwrap();
+        let stores = StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path());
+        let work = tempfile::tempdir().unwrap();
+        let d = fs::canonicalize(work.path()).unwrap();
+        fs::create_dir_all(d.join("appendix")).unwrap();
+        let identity = FolderScope {
+            dir: d.clone(),
+            owner: "alice".into(),
+            name: "docs".into(),
+            path: "q3-plan".into(),
+            checkout: None,
+            enclosing: Vec::new(),
+            identity: Some("docs-q3-plan".into()),
+        };
+        let files = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(p, s)| (p.to_string(), s.to_string()))
+                .collect()
+        };
+        let identity_copy = WorkingCopy::open(&stores, "alice", "docs-q3-plan", &d).unwrap();
+        let identity_files = files(&[("appendix/.syns.yaml", "s1"), ("document.html", "s2")]);
+        identity_copy
+            .record_laid_base("H4", identity_files.clone(), Some(5))
+            .unwrap();
+        WorkingCopy::open(&stores, "alice", "docs-q3-plan", &d.join("appendix"))
+            .unwrap()
+            .record_laid_base("H6", files(&[(".syns.yaml", "s1")]), Some(7))
+            .unwrap();
+        let read = || {
+            let base = folder_base(&stores, &identity.beneath("appendix")).expect("a base");
+            let paths: Vec<(String, String)> = base
+                .file_paths()
+                .map(|p| (p.to_string(), base.file_sha(p).unwrap().to_string()))
+                .collect();
+            (base.commit_sha().map(str::to_string), paths)
+        };
+        let alone = vec![(".syns.yaml".to_string(), "s1".to_string())];
+
+        assert_eq!(read(), (Some("H6".to_string()), alone.clone()));
+
+        identity_copy
+            .record_laid_base("H7", identity_files, Some(9))
+            .unwrap();
+        assert_eq!(read(), (Some("H7".to_string()), alone));
     }
 
     #[test]

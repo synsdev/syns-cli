@@ -145,6 +145,11 @@ pub struct WriteTarget {
     /// head being its identity's newest listed version (`D-119`). None
     /// everywhere else, where any changed file leaves `checkout` behind.
     pub checkout_path: Option<String>,
+    /// SPEC u307: the path, counted from the identity folder, of the
+    /// folder beneath it whose history alone the run's Folder Check reads
+    /// — set by a turn-on beneath an identity folder, and none from
+    /// `resolve_write_target` and on every other run.
+    pub check_within: Option<String>,
 }
 
 impl WriteTarget {
@@ -683,6 +688,7 @@ pub async fn resolve_write_target(
         folder,
         head,
         checkout_path,
+        check_within: None,
     })
 }
 
@@ -979,8 +985,17 @@ async fn send_inside_folder(
         if sends >= FOLDER_SEND_BOUND {
             return Err(conflict(&named));
         }
-        // 4
-        if check.folder_moved(client, Some(&target.token)).await? {
+        // 4 — SPEC u307 `send_inside_folder` 1: a turn-on beneath an
+        // identity folder reads that folder's history alone.
+        let moved = match target.check_within.as_deref() {
+            Some(within) => {
+                check
+                    .folder_moved_within(client, Some(&target.token), within)
+                    .await?
+            }
+            None => check.folder_moved(client, Some(&target.token)).await?,
+        };
+        if moved {
             return Err(conflict(&named));
         }
         // 5
@@ -1174,6 +1189,7 @@ mod tests {
             folder: None,
             head: None,
             checkout_path: None,
+            check_within: None,
         }
     }
 

@@ -187,13 +187,21 @@ pub async fn cmd_enable_checks(
         return Ok(());
     }
 
-    // 5 — the parent: the base the folder's files are read against.
+    // 5 — the parent: the base the folder's files are read against. SPEC
+    // u307 `cmd_enable_checks` 1–2: beneath an identity folder, the base
+    // the placed folder's own scope answers, the later of its own copy's
+    // and the identity copy's narrowed to it.
+    let turned_scope = if place.is_empty() {
+        scope.clone()
+    } else {
+        scope.beneath(&place)
+    };
     let cache = config.stores();
-    let parent = folder_base(cache, &scope)
+    let parent = folder_base(cache, &turned_scope)
         .and_then(|base| base.commit_sha().map(str::to_string))
         .filter(|sha| !sha.is_empty())
         .ok_or_else(|| CliError::Io {
-            message: checkout_guard_refusal(&scope.dir, &holder),
+            message: checkout_guard_refusal(&turned_scope.dir, &holder),
         })?;
 
     // 6 — the write target from the folder's directory.
@@ -203,7 +211,12 @@ pub async fn cmd_enable_checks(
         message: None,
         provenance: ProvenanceOptions::default(),
     };
-    let target = resolve_write_target(config, &scope.dir, &opts).await?;
+    let mut target = resolve_write_target(config, &scope.dir, &opts).await?;
+    // SPEC u307 `cmd_enable_checks` 3: the run's Folder Check reads the
+    // placed folder's history alone.
+    if !place.is_empty() {
+        target.check_within = Some(place.clone());
+    }
 
     // 7 — the one publication.
     let turned_on = enable_checks_text(&text, &waiting).map_err(invalid)?;
@@ -234,15 +247,17 @@ pub async fn cmd_enable_checks(
         )
     })?;
 
-    // 9 — every base standing at the parent laid at the landed commit.
+    // 9 — every base standing at the parent laid at the landed commit,
+    // the turned-on scope's own copy first (SPEC u307 `cmd_enable_checks`
+    // 4).
     let sha = blob_sha1(turned_on.as_bytes());
     let client = SynsClient::new(config.server_url())?;
     lay_turned_on(
         cache,
         &client,
         &target.token,
-        &scope,
-        &at,
+        &turned_scope,
+        SYNS_YAML,
         &sha,
         &parent,
         &claimed,
@@ -294,8 +309,11 @@ fn base_refusal(copy: &WorkingCopy, err: CliError) -> CliError {
 /// identity file at `sha` and keeping its recorded time — the holder
 /// checkout's commit advancing only from the claimed parent, an enclosing
 /// copy's from the claimed parent or from its own commit where its folder
-/// stood unmoved from that commit up to the landed version. One copy's
-/// lock is held at a time, none across a read, and no state is created.
+/// stood unmoved from that commit up to the landed version — an
+/// enclosing copy bound to its identity where the identity's whole
+/// history stood unmoved, no request reaching the holder (SPEC u307
+/// `lay_turned_on` 1). One copy's lock is held at a time, none across a
+/// read, and no state is created.
 #[allow(clippy::too_many_arguments)]
 async fn lay_turned_on(
     cache: &StoreRoots,
@@ -344,14 +362,20 @@ async fn lay_turned_on(
         let standing = copy
             .base()
             .and_then(|base| base.commit_sha().map(str::to_string));
+        // SPEC u307 `lay_turned_on` 1: an enclosing copy bound to its
+        // identity covers that identity's whole history.
+        let (address, covered) = match enclosing.identity {
+            Some(_) => (enclosing.address(), None),
+            None => (holder.clone(), Some(enclosing.path.as_str())),
+        };
         let advance_from = match standing {
             Some(own)
                 if own != claimed
                     && folder_unmoved_until(
                         client,
                         Some(token),
-                        &holder,
-                        &enclosing.path,
+                        &address,
+                        covered,
                         &own,
                         landed,
                     )

@@ -1423,6 +1423,196 @@ fn enable_checks_on_a_template_folder_inside_an_identity_checkout_goes_through_i
     assert!(d.pushes(HOLDER).is_empty());
 }
 
+/// `U/q3-plan/appendix/.syns.yaml` as SPEC u307 Tests' preamble writes
+/// it: the holder, the holder path, and a `template` mapping recording
+/// `bob/board-template` at version `9` with the check `make`.
+const APPENDIX: &str = "holder: alice/docs\npath: q3-plan/appendix\ntemplate:\n  repo: bob/board-template\n  version: 9\n  sha: '9999999999999999999999999999999999999999'\n  checks:\n  - make\n";
+
+/// `{T}`: the bytes the turn-on writes over `text`.
+fn turned_on(text: &str) -> String {
+    syns_cli::repo::syns_yaml::enable_checks_text(text, &["make".to_string()])
+        .expect("a folder form")
+}
+
+/// SPEC u307 Tests' setup beneath a placed folder: `document.html` and
+/// `appendix/.syns.yaml` written, the identity copy recording `H4` over
+/// both, and the identity's record at `H4`.
+fn placed_appendix() -> Deployment {
+    let d = Deployment::new();
+    write(&d.folder().join("document.html"), DOC);
+    write(&d.folder().join("appendix/.syns.yaml"), APPENDIX);
+    d.record_base(H4);
+    d.identity_record(H4);
+    d
+}
+
+/// The identity's newest listed version answering `newest` at
+/// `priority`, ahead of the default's.
+fn identity_newest_at(d: &Deployment, newest: Value, priority: u8) {
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path(format!("{IDENTITY}/versions")))
+            .and(query_param("limit", "1"))
+            .and(query_param_is_missing("path"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page(vec![newest], 1)))
+            .with_priority(priority),
+    );
+}
+
+/// The identity's version list at `path` `appendix` and `limit` `1`
+/// answering `newest` alone.
+fn appendix_history(d: &Deployment, newest: Value) {
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path(format!("{IDENTITY}/versions")))
+            .and(query_param("path", "appendix"))
+            .and(query_param("limit", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page(vec![newest], 1))),
+    );
+}
+
+/// The identity copy at `U/q3-plan`.
+fn identity_copy(d: &Deployment) -> WorkingCopy {
+    WorkingCopy::open_existing(&d.stores(), "alice", "docs-q3-plan", &d.folder())
+        .unwrap()
+        .expect("the identity copy")
+}
+
+// SPEC u307 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_turn_on_beneath_an_identity_folder_lands_past_a_version_changing_only_other_identity_paths() {
+    let d = placed_appendix();
+    identity_newest_at(&d, version(5, H5, &["notes.html"]), 1);
+    appendix_history(&d, version(4, H4, &["appendix/.syns.yaml"]));
+    d.mount(
+        Mock::given(method("PUT"))
+            .and(path(format!("{IDENTITY}/push")))
+            .and(wiremock::matchers::body_partial_json(
+                json!({"parentSha": H5}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "commitSha": H6, "version": 6, "filesChanged": 1, "created": false,
+            }))),
+    );
+
+    let out = d.run(&["--json", "enable-checks", "appendix"]);
+
+    assert_eq!(exit_of(&out), 0, "{}{}", stderr_of(&out), stdout_of(&out));
+    let pushes = d.pushes(IDENTITY);
+    assert_eq!(pushes.len(), 1, "{:?}", d.targets());
+    assert_eq!(pushes[0]["parentSha"], json!(H5));
+    assert_eq!(pushed_paths(&pushes[0]), vec!["appendix/.syns.yaml"]);
+    assert!(
+        d.targets()
+            .iter()
+            .any(|t| t.starts_with(&format!("GET {IDENTITY}/versions?"))
+                && t.contains("path=appendix")),
+        "{:?}",
+        d.targets()
+    );
+    let t = turned_on(APPENDIX);
+    assert_eq!(
+        std::fs::read_to_string(d.folder().join("appendix/.syns.yaml")).unwrap(),
+        t
+    );
+    let base = identity_copy(&d).base().unwrap();
+    assert_eq!(base.commit_sha(), Some(H4));
+    assert_eq!(
+        base.file_sha("appendix/.syns.yaml"),
+        Some(blob_sha1(t.as_bytes()).as_str())
+    );
+    assert_eq!(
+        base.file_sha("document.html"),
+        Some(blob_sha1(DOC.as_bytes()).as_str())
+    );
+}
+
+// SPEC u307 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_turn_on_beneath_an_identity_folder_past_a_holder_version_outside_it_advances_the_identity_copy()
+ {
+    let d = placed_appendix();
+    appendix_history(&d, version(4, H4, &["appendix/.syns.yaml"]));
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path(format!("{IDENTITY}/versions")))
+            .and(query_param("limit", "2"))
+            .and(query_param_is_missing("path"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page(
+                vec![
+                    version(7, H7, &["appendix/.syns.yaml"]),
+                    version(4, H4, &["document.html"]),
+                ],
+                2,
+            ))),
+    );
+    identity_push_past_h6(&d);
+
+    let out = d.run(&["--json", "enable-checks", "appendix"]);
+
+    assert_eq!(exit_of(&out), 0, "{}{}", stderr_of(&out), stdout_of(&out));
+    let pushes = d.pushes(IDENTITY);
+    assert_eq!(pushes.len(), 2, "{:?}", d.targets());
+    assert_eq!(pushes[1]["parentSha"], json!(H6));
+    let base = identity_copy(&d).base().unwrap();
+    assert_eq!(base.commit_sha(), Some(H7));
+    assert_eq!(
+        base.file_sha("appendix/.syns.yaml"),
+        Some(blob_sha1(turned_on(APPENDIX).as_bytes()).as_str())
+    );
+    let to_holder: Vec<String> = d
+        .requests()
+        .into_iter()
+        .filter(|r| {
+            let at = r.url.path();
+            at == HOLDER || at.starts_with(&format!("{HOLDER}/"))
+        })
+        .map(|r| format!("{} {}", r.method, r.url.path()))
+        .collect();
+    assert_eq!(to_holder, vec![format!("GET {HOLDER}/raw/.synsignore")]);
+}
+
+// SPEC u307 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_turn_on_beneath_an_identity_folder_past_a_version_changing_it_is_refused() {
+    let d = placed_appendix();
+    identity_newest_at(&d, version(5, H5, &["appendix/board.html"]), 1);
+    appendix_history(&d, version(5, H5, &["appendix/board.html"]));
+    d.serves(
+        "GET",
+        &format!("{IDENTITY}/versions/{H4}"),
+        ResponseTemplate::new(200).set_body_json(version(4, H4, &["document.html"])),
+    );
+    let base_before = identity_copy(&d).base().unwrap();
+
+    let out = d.run(&["--json", "enable-checks", "appendix"]);
+
+    assert_eq!(exit_of(&out), 7, "{}{}", stderr_of(&out), stdout_of(&out));
+    let refused = document(&out);
+    assert_eq!(refused["currentSha"], json!(H5));
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("conflict: the repository moved past"),
+        "{refused}"
+    );
+    assert!(d.pushes(IDENTITY).is_empty() && d.pushes(HOLDER).is_empty());
+    assert_eq!(
+        std::fs::read_to_string(d.folder().join("appendix/.syns.yaml")).unwrap(),
+        APPENDIX
+    );
+    let base_after = identity_copy(&d).base().unwrap();
+    assert_eq!(base_after.commit_sha(), base_before.commit_sha());
+    assert_eq!(
+        base_after.file_sha("appendix/.syns.yaml"),
+        base_before.file_sha("appendix/.syns.yaml")
+    );
+}
+
 // SPEC u302 Tests, the row of this name.
 #[test]
 #[serial]
@@ -1845,4 +2035,93 @@ fn a_placement_through_an_identity_whose_folder_check_is_refused_lays_its_files_
         .unwrap()
         .expect("the identity copy");
     assert_placed_at_h4(&d, &copy);
+}
+
+/// `bob/board-template` at version `9` serving `board.html` beside a root
+/// `.syns.yaml` declaring the check `make`, over `serve_template`'s
+/// answers.
+fn serve_template_with_check(d: &Deployment) {
+    const DECLARED: &str = "owner: bob\nname: board-template\nchecks: [make]\n";
+    serve_template(d);
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path(format!("{TEMPLATE}/tree")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "entries": [tree_entry(".syns.yaml", DECLARED), tree_entry("board.html", BOARD)],
+                "commitSha": T9, "truncated": false,
+            })))
+            .with_priority(1),
+    );
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path(format!("{TEMPLATE}/raw/.syns.yaml")))
+            .respond_with(raw(DECLARED))
+            .with_priority(1),
+    );
+}
+
+// SPEC u307 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_turn_on_right_after_a_placement_through_an_identity_past_a_collaborator_version_lands() {
+    let d = Deployment::new();
+    write(&d.folder().join("document.html"), DOC);
+    d.record_base(H4);
+    d.identity_record(H4);
+    serve_template_with_check(&d);
+    identity_newest_at(&d, version(5, H5, &["notes.html"]), 2);
+    for (claims, lands, number) in [(H5, H6, 6), (H6, H7, 7)] {
+        d.mount(
+            Mock::given(method("PUT"))
+                .and(path(format!("{IDENTITY}/push")))
+                .and(wiremock::matchers::body_partial_json(
+                    json!({"parentSha": claims}),
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "commitSha": lands, "version": number, "filesChanged": 2, "created": false,
+                }))),
+        );
+    }
+
+    let placed = d.run(&["--json", "place", "bob/board-template", "appendix"]);
+    assert_eq!(
+        exit_of(&placed),
+        0,
+        "{}{}",
+        stderr_of(&placed),
+        stdout_of(&placed)
+    );
+    identity_newest_at(
+        &d,
+        version(6, H6, &["appendix/.syns.yaml", "appendix/board.html"]),
+        1,
+    );
+    let written = std::fs::read_to_string(d.folder().join("appendix/.syns.yaml")).unwrap();
+
+    let out = d.run(&["--json", "enable-checks", "appendix"]);
+
+    assert_eq!(exit_of(&out), 0, "{}{}", stderr_of(&out), stdout_of(&out));
+    let pushes = d.pushes(IDENTITY);
+    assert_eq!(pushes.len(), 2, "{:?}", d.targets());
+    assert_eq!(pushes[1]["parentSha"], json!(H6));
+    assert_eq!(pushed_paths(&pushes[1]), vec!["appendix/.syns.yaml"]);
+    assert!(d.pushes(HOLDER).is_empty());
+    let t = blob_sha1(turned_on(&written).as_bytes());
+    let board = blob_sha1(BOARD.as_bytes());
+    let own = WorkingCopy::open_existing(
+        &d.stores(),
+        "alice",
+        "docs-q3-plan",
+        &d.folder().join("appendix"),
+    )
+    .unwrap()
+    .expect("the placed folder's own copy");
+    let base = own.base().unwrap();
+    assert_eq!(base.commit_sha(), Some(H7));
+    assert_eq!(base.file_sha(".syns.yaml"), Some(t.as_str()));
+    assert_eq!(base.file_sha("board.html"), Some(board.as_str()));
+    let base = identity_copy(&d).base().unwrap();
+    assert_eq!(base.commit_sha(), Some(H4));
+    assert_eq!(base.file_sha("appendix/.syns.yaml"), Some(t.as_str()));
+    assert_eq!(base.file_sha("appendix/board.html"), Some(board.as_str()));
 }
