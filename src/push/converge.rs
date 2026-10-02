@@ -1864,6 +1864,10 @@ struct Candidate<'a> {
     /// through `held_root_identity` over the base the run loaded (SPEC
     /// u306 `converge` 1), read once for the run.
     written_root_identity: bool,
+    /// The hash of the root identity file the caller held out of the
+    /// collection it hands in, before `hold_root_identity` dropped it
+    /// (u306 CR1-1); `None` where the caller held nothing.
+    held_root_identity_hash: Option<String>,
     /// Where every collection of the run is taken from (SPEC u291).
     root: &'a FolderRoot,
 }
@@ -2001,10 +2005,15 @@ async fn prepare_candidate(
             )
         });
         // SPEC u306 `converge` 5: the held file's hash, kept for the base
-        // a synced pass records.
+        // a synced pass records — the caller's where the collection it
+        // handed in is already held (u306 CR1-1).
         let mut held_hash: Option<String> = None;
         if holding {
-            held_hash = folder.hashes.get(ROOT_IDENTITY).cloned();
+            held_hash = folder
+                .hashes
+                .get(ROOT_IDENTITY)
+                .cloned()
+                .or_else(|| candidate.held_root_identity_hash.clone());
             hold_root_identity(&mut folder);
         }
         let excluded = excluded_on_disk(
@@ -3007,6 +3016,7 @@ async fn converge_from_resolution(
             force_resolution: false,
             hold_root_identity: Some(hold),
             written_root_identity: written,
+            held_root_identity_hash: held,
             root,
         },
         Some(folder),
@@ -3064,6 +3074,7 @@ async fn finish_preparation(
             force_resolution: true,
             hold_root_identity: None,
             written_root_identity: written,
+            held_root_identity_hash: None,
             root,
         },
         folder,
@@ -3649,6 +3660,7 @@ async fn guard_refused(
             force_resolution: true,
             hold_root_identity: Some(false),
             written_root_identity: false,
+            held_root_identity_hash: None,
             root,
         },
         None,
@@ -3994,6 +4006,7 @@ mod tests {
                 force_resolution: false,
                 hold_root_identity: Some(false),
                 written_root_identity: false,
+                held_root_identity_hash: None,
                 root: &FolderRoot::whole(&copy.root),
             },
             None,
@@ -4435,6 +4448,7 @@ mod tests {
                 force_resolution: false,
                 hold_root_identity: Some(false),
                 written_root_identity: false,
+                held_root_identity_hash: None,
                 root: &FolderRoot::whole(&holder.root),
             },
             None,
@@ -4532,6 +4546,7 @@ mod tests {
                             force_resolution: false,
                             hold_root_identity: Some(false),
                             written_root_identity: false,
+                            held_root_identity_hash: None,
                             root: &FolderRoot::of_scope(&folder.root, &scope, None),
                         },
                         None,

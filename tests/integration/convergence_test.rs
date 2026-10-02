@@ -3057,6 +3057,83 @@ async fn retrieval_at_the_base_commit_takes_the_head_identity_file_over_a_writte
     );
 }
 
+// u306 CR1-1, CR1-2: a retrieval keeping an edited identity file over a
+// head that also moves another path keeps the base's own entry, with and
+// without its overwrite option, so the next sync goes to review.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn retrieval_keeps_the_base_entry_for_an_edited_identity_file_when_the_head_moves_another_file()
+ {
+    let e = env().await;
+    for overwrite in [false, true] {
+        let (fake, folder, copy, _) = identity_setup(
+            &e,
+            &[("a.md", "a\n"), (".syns.yaml", IDENTITY)],
+            IDENTITY_WITH_LOCAL_CHECK,
+            &[
+                (".syns.yaml", Some(IDENTITY_WITH_CHECK)),
+                ("a.md", Some("b\n")),
+            ],
+        )
+        .await;
+
+        let outcome = retrieve(&fake, &copy, overwrite, &e).await;
+
+        assert!(
+            matches!(outcome, SyncOutcome::Synced { .. }),
+            "overwrite {overwrite}: {outcome:?}"
+        );
+        assert_eq!(read(folder.path(), "a.md"), "b\n", "overwrite {overwrite}");
+        assert_eq!(
+            read(folder.path(), ".syns.yaml"),
+            IDENTITY_WITH_LOCAL_CHECK,
+            "overwrite {overwrite}"
+        );
+        assert_eq!(
+            base_identity_entry(&copy),
+            Some(blob_sha1(IDENTITY.as_bytes())),
+            "overwrite {overwrite}"
+        );
+        let published = publish(&fake, &copy, &e).await;
+        assert!(
+            matches!(published, SyncOutcome::ResolutionRequired(..)),
+            "overwrite {overwrite}: {published:?}"
+        );
+        assert!(fake.push_bodies().is_empty(), "overwrite {overwrite}");
+    }
+}
+
+// u306 CR1-1: a second retrieval at the unmoved head, over a local edit
+// beside the kept identity file, keeps the base's own entry.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_second_retrieval_after_keeping_an_edited_identity_file_keeps_the_base_entry() {
+    let e = env().await;
+    let (fake, folder, copy, _) = identity_setup(
+        &e,
+        &[("a.md", "a\n"), (".syns.yaml", IDENTITY)],
+        IDENTITY_WITH_LOCAL_CHECK,
+        &[(".syns.yaml", Some(IDENTITY_WITH_CHECK))],
+    )
+    .await;
+    retrieve(&fake, &copy, false, &e).await;
+    write_files(folder.path(), &[("a.md", "a local\n")]);
+
+    let outcome = retrieve(&fake, &copy, false, &e).await;
+
+    assert!(matches!(outcome, SyncOutcome::Synced { .. }), "{outcome:?}");
+    assert_eq!(
+        base_identity_entry(&copy),
+        Some(blob_sha1(IDENTITY.as_bytes()))
+    );
+    let published = publish(&fake, &copy, &e).await;
+    assert!(
+        matches!(published, SyncOutcome::ResolutionRequired(..)),
+        "{published:?}"
+    );
+    assert!(fake.push_bodies().is_empty());
+}
+
 // SPEC u306 Tests, `pull_then_sync_over_a_head_gaining_an_identity_file_publishes_nothing`.
 #[tokio::test(flavor = "current_thread")]
 #[serial]
