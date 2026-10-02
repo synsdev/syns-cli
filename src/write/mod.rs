@@ -40,7 +40,7 @@ use crate::read::repository_argument;
 use crate::repo::folder::{FolderScope, lies_under, resolve_folder_scope};
 use crate::repo::identity::identity_head;
 use crate::repo::if_repo::resolve_full_or_skip;
-use crate::repo::syns_yaml::nearest_identity;
+use crate::repo::syns_yaml::{identity_text, nearest_identity};
 
 /// The options every write verb carries, spelt and bound identically on
 /// each (SPEC u271 Contract Surface, `WriteOptions`). `parent` holds a
@@ -326,7 +326,10 @@ fn agrees_with_base(
 }
 
 /// u271 `checkout_of` 2 and 3 over the checkout at `root`: answers `root`,
-/// or refuses naming it where the copy holds unpublished work.
+/// or refuses naming it where the copy holds unpublished work. SPEC u303:
+/// a root `.syns.yaml` holding exactly the identity text a retrieval
+/// writes, under a base naming none, is held out of the comparison as no
+/// local work (`held_root_identity`), and nothing else ever is.
 fn guard_root(config: &Config, root: &Path, repo_id: &str) -> Result<PathBuf, CliError> {
     let refuse = || CliError::Io {
         message: checkout_guard_refusal(root, repo_id),
@@ -364,10 +367,37 @@ fn guard_root(config: &Config, root: &Path, repo_id: &str) -> Result<PathBuf, Cl
         None,
         &HeldBytes::new(0),
     )?;
-    if !agrees_with_base(root, &guarded_hashes(&collected), base) {
+    let mut hashes = guarded_hashes(&collected);
+    if held_root_identity(root, owner, name, base.as_ref()) {
+        hashes.remove(SYNS_YAML);
+    }
+    if !agrees_with_base(root, &hashes, base) {
         return Err(refuse());
     }
     Ok(root.to_path_buf())
+}
+
+/// The root identity file's name, as a collection keys it at the root.
+const SYNS_YAML: &str = ".syns.yaml";
+
+/// SPEC u303 `guard_root` 3: whether the `.syns.yaml` standing directly
+/// at `root` is the identity record a retrieval wrote rather than local
+/// work — a base is recorded and names no `.syns.yaml`, and the file's
+/// bytes are `identity_text` of the bound owner and name, ASCII letter
+/// case aside. A file holding anything else, an unreadable one, one
+/// under a base naming it, and one beside no recorded base all stay in
+/// the comparison.
+fn held_root_identity(root: &Path, owner: &str, name: &str, base: Option<&Manifest>) -> bool {
+    let Some(base) = base else {
+        return false;
+    };
+    if base.file_sha(SYNS_YAML).is_some() {
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(root.join(SYNS_YAML)) else {
+        return false;
+    };
+    bytes.eq_ignore_ascii_case(identity_text(owner, name).as_bytes())
 }
 
 /// SPEC u291 `checkout_of` 2 and 3 inside the folder of the repository
@@ -1322,6 +1352,164 @@ mod tests {
             before,
             "a refused guard writes no state"
         );
+    }
+
+    // ---- u303: the root identity file a retrieval wrote ---------------
+
+    const NOTES_IDENTITY: &str = "owner: alice\nname: notes\n";
+    const NOTES_IDENTITY_WITH_CHECKS: &str = "owner: alice\nname: notes\nchecks:\n  - make test\n";
+
+    /// `W/.syns.yaml` reading `identity` beside `a.md`, the copy of
+    /// `alice/notes` at `W` recording a base naming `a.md` alone at its
+    /// hash, and `extra` beside it in that base.
+    fn seed_retrieved(config: &Config, root: &Path, identity: &str, extra: &[(&str, &str)]) {
+        std::fs::write(root.join(".syns.yaml"), identity).unwrap();
+        std::fs::write(root.join("a.md"), "keep one").unwrap();
+        let copy = WorkingCopy::open(config.stores(), "alice", "notes", root).unwrap();
+        let mut recorded = std::collections::HashMap::new();
+        recorded.insert("a.md".to_string(), blob_sha1(b"keep one"));
+        for (path, sha) in extra {
+            recorded.insert(path.to_string(), sha.to_string());
+        }
+        copy.record_base(HEAD_SHA, recorded).unwrap();
+    }
+
+    /// `checkout_of` driven to its answer for a run naming the repository
+    /// under `--repo`.
+    fn guard_named(
+        config: &Config,
+        cwd: &Path,
+        repo_id: &str,
+    ) -> Result<Option<PathBuf>, CliError> {
+        let client = SynsClient::new("https://syns.dev").unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(checkout_of(config, cwd, repo_id, true, &client, "t"))
+    }
+
+    fn canonical(path: &Path) -> PathBuf {
+        std::fs::canonicalize(path).unwrap()
+    }
+
+    // SPEC u303 Tests, `a_root_identity_file_the_base_lacks_is_held_out_of_the_guard`.
+    #[test]
+    #[serial]
+    fn a_root_identity_file_the_base_lacks_is_held_out_of_the_guard() {
+        let env = env_for("https://syns.dev");
+        let work = tempfile::tempdir().unwrap();
+        let w = canonical(work.path());
+        seed_retrieved(&env.config, &w, NOTES_IDENTITY, &[]);
+        let before = cache_entries(env.config.cache_dir());
+
+        let root = guard(&env.config, &w, "alice/notes").unwrap();
+        assert_eq!(root.map(|r| canonical(&r)), Some(w.clone()));
+
+        std::fs::write(w.join(".syns.yaml"), "owner: Alice\nname: Notes\n").unwrap();
+        let root = guard(&env.config, &w, "alice/notes").unwrap();
+        assert_eq!(root.map(|r| canonical(&r)), Some(w.clone()));
+
+        assert_eq!(
+            cache_entries(env.config.cache_dir()),
+            before,
+            "an admitted guard writes no state"
+        );
+    }
+
+    // SPEC u303 Tests, `an_identity_file_carrying_more_than_the_identity_text_is_refused`.
+    #[test]
+    #[serial]
+    fn an_identity_file_carrying_more_than_the_identity_text_is_refused() {
+        let env = env_for("https://syns.dev");
+        let work = tempfile::tempdir().unwrap();
+        let w = canonical(work.path());
+        seed_retrieved(&env.config, &w, NOTES_IDENTITY_WITH_CHECKS, &[]);
+
+        let err = guard(&env.config, &w, "alice/notes").unwrap_err();
+        assert_eq!(err.to_string(), checkout_guard_refusal(&w, "alice/notes"));
+        assert_eq!(err.exit_code(), 1);
+    }
+
+    // SPEC u303 Tests, `an_edit_beside_a_held_identity_file_is_refused`.
+    #[test]
+    #[serial]
+    fn an_edit_beside_a_held_identity_file_is_refused() {
+        let env = env_for("https://syns.dev");
+        let work = tempfile::tempdir().unwrap();
+        let w = canonical(work.path());
+        seed_retrieved(&env.config, &w, NOTES_IDENTITY, &[]);
+        std::fs::write(w.join("a.md"), "edited since").unwrap();
+
+        let err = guard(&env.config, &w, "alice/notes").unwrap_err();
+        assert_eq!(err.to_string(), checkout_guard_refusal(&w, "alice/notes"));
+        assert_eq!(err.exit_code(), 1);
+    }
+
+    // SPEC u303 Tests, `an_identity_file_the_base_names_at_other_bytes_is_refused`.
+    #[test]
+    #[serial]
+    fn an_identity_file_the_base_names_at_other_bytes_is_refused() {
+        let env = env_for("https://syns.dev");
+        let work = tempfile::tempdir().unwrap();
+        let w = canonical(work.path());
+        let recorded = blob_sha1(NOTES_IDENTITY_WITH_CHECKS.as_bytes());
+        seed_retrieved(
+            &env.config,
+            &w,
+            NOTES_IDENTITY,
+            &[(".syns.yaml", recorded.as_str())],
+        );
+
+        let err = guard(&env.config, &w, "alice/notes").unwrap_err();
+        assert_eq!(err.to_string(), checkout_guard_refusal(&w, "alice/notes"));
+        assert_eq!(err.exit_code(), 1);
+    }
+
+    // SPEC u303 Tests, `a_copy_recording_no_base_holding_its_identity_file_alone_is_refused`.
+    #[test]
+    #[serial]
+    fn a_copy_recording_no_base_holding_its_identity_file_alone_is_refused() {
+        let env = env_for("https://syns.dev");
+        let work = tempfile::tempdir().unwrap();
+        let w = canonical(work.path());
+        std::fs::write(w.join(".syns.yaml"), NOTES_IDENTITY).unwrap();
+        let before = cache_entries(env.config.cache_dir());
+
+        let err = guard(&env.config, &w, "alice/notes").unwrap_err();
+        assert_eq!(err.to_string(), checkout_guard_refusal(&w, "alice/notes"));
+        assert_eq!(err.exit_code(), 1);
+        assert_eq!(
+            cache_entries(env.config.cache_dir()),
+            before,
+            "a refused guard creates no copy state"
+        );
+    }
+
+    // SPEC u303 Tests, `the_holder_checkout_guarded_under_repo_holds_its_identity_file_out`.
+    #[test]
+    #[serial]
+    fn the_holder_checkout_guarded_under_repo_holds_its_identity_file_out() {
+        let env = env_for("https://syns.dev");
+        let work = tempfile::tempdir().unwrap();
+        let w = canonical(work.path());
+        let folder = w.join("clients").join("q3");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(w.join(".syns.yaml"), "owner: alice\nname: work\n").unwrap();
+        let folder_identity = "holder: alice/work\npath: clients/q3\n";
+        std::fs::write(folder.join(".syns.yaml"), folder_identity).unwrap();
+        std::fs::write(folder.join("a.md"), "keep one").unwrap();
+        let copy = WorkingCopy::open(env.config.stores(), "alice", "work", &w).unwrap();
+        let mut recorded = std::collections::HashMap::new();
+        recorded.insert(
+            "clients/q3/.syns.yaml".to_string(),
+            blob_sha1(folder_identity.as_bytes()),
+        );
+        recorded.insert("clients/q3/a.md".to_string(), blob_sha1(b"keep one"));
+        copy.record_base(HEAD_SHA, recorded).unwrap();
+
+        let root = guard_named(&env.config, &folder, "alice/work").unwrap();
+        assert_eq!(root.map(|r| canonical(&r)), Some(w));
     }
 
     /// Every path standing under the cache root.

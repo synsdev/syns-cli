@@ -476,10 +476,17 @@ fn local_side_of_collision(contents: &str) -> Option<String> {
     marked.then_some(local)
 }
 
+/// The root-form identity text of `owner/name` (SPEC u303 Contract
+/// Surface, `identity_text`): the one text `write_syns_yaml` writes, so
+/// the record a retrieval writes and the record the checkout guard holds
+/// out of its comparison are spelt by one function.
+pub fn identity_text(owner: &str, name: &str) -> String {
+    format!("owner: {owner}\nname: {name}\n")
+}
+
 pub fn write_syns_yaml(path: &Path, owner: &str, name: &str) -> Result<(), CliError> {
     let file_path = path.join(SYNS_YAML_FILENAME);
-    let content = format!("owner: {owner}\nname: {name}\n");
-    std::fs::write(&file_path, content).map_err(|err| CliError::Io {
+    std::fs::write(&file_path, identity_text(owner, name)).map_err(|err| CliError::Io {
         message: format!("could not write .syns.yaml: {err}"),
     })?;
     Ok(())
@@ -528,6 +535,21 @@ mod tests {
 
         let raw = fs::read_to_string(dir.path().join(".syns.yaml")).unwrap();
         assert_eq!(raw, "owner: alice\nname: my-project\n");
+    }
+
+    // SPEC u303 Contract Surface, `identity_text`: the text the guard
+    // holds out is the one a retrieval writes.
+    #[test]
+    fn identity_text_spells_the_bytes_a_retrieval_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        write_syns_yaml(dir.path(), "alice", "notes").unwrap();
+
+        let written = fs::read_to_string(dir.path().join(".syns.yaml")).unwrap();
+        assert_eq!(identity_text("alice", "notes"), written);
+        assert_eq!(
+            identity_text("alice", "notes"),
+            "owner: alice\nname: notes\n"
+        );
     }
 
     #[test]

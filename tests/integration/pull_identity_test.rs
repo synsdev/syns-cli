@@ -121,6 +121,85 @@ impl Env {
         });
     }
 
+    /// A stored credential in the config directory, as a write run reads
+    /// it (copied from `writes_test.rs`'s `Deployment::seed_credential`).
+    fn seed_credential(&self) {
+        fs::write(
+            self.config_dir.path().join("credentials.json"),
+            json!({"token": "test-token", "username": "alice"}).to_string(),
+        )
+        .unwrap();
+    }
+
+    /// The binary run from `cwd` with `stdin` on its standard input, no
+    /// provenance variable of the calling environment reaching it (copied
+    /// from `writes_test.rs`'s `Deployment::run_in`).
+    fn syns_with_stdin(&self, cwd: &Path, stdin: &[u8], args: &[&str]) -> std::process::Output {
+        let uri = self.server.uri();
+        let mut full = vec!["--server", uri.as_str()];
+        full.extend_from_slice(args);
+        AssertCommand::cargo_bin("syns")
+            .expect("syns binary")
+            .current_dir(cwd)
+            .env("SYNS_CONFIG_DIR", self.config_dir.path())
+            .env("SYNS_CACHE_DIR", self.cache_dir.path())
+            .env_remove("SYNS_URL")
+            .env_remove("SYNS_INTEGRATION")
+            .env_remove("SYNS_RUN")
+            .env_remove("SYNS_TRIGGER")
+            .env_remove("SYNS_TASK")
+            .args(&full)
+            .write_stdin(stdin.to_vec())
+            .output()
+            .expect("subprocess output")
+    }
+
+    /// The repository read of `alice/notes` naming head `6666…6666`, ahead
+    /// of the record every repository answers, and a push there answering
+    /// version `2` with one file changed (copied from `writes_test.rs`'s
+    /// `mount_repo` and `mount_push`).
+    fn mount_notes_push(&self) {
+        self.runtime.block_on(async {
+            Mock::given(method("GET"))
+                .and(path("/api/v1/repos/alice/notes"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "owner": "alice", "name": "notes", "description": null,
+                    "commitSha": PULLED_HEAD, "status": "active", "author": null,
+                    "tags": [], "visibility": "private", "forkedFrom": null,
+                    "forkCount": 0, "fileCount": 1, "role": "owner",
+                    "sharedFolder": false,
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "updatedAt": "2026-01-01T00:00:00Z",
+                })))
+                .with_priority(1)
+                .mount(&self.server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path("/api/v1/repos/alice/notes/push"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "commitSha": "7777777777777777777777777777777777777777",
+                    "version": 2, "filesChanged": 1, "created": false,
+                })))
+                .mount(&self.server)
+                .await;
+        });
+    }
+
+    /// Every push body the server received, in order (copied from
+    /// `writes_test.rs`'s `Deployment::pushes`).
+    fn pushes(&self) -> Vec<serde_json::Value> {
+        self.runtime.block_on(async {
+            self.server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.path().ends_with("/push"))
+                .map(|r| serde_json::from_slice(&r.body).expect("push body"))
+                .collect()
+        })
+    }
+
     fn cache_is_empty(&self) -> bool {
         fs::read_dir(self.cache_dir.path())
             .unwrap()
@@ -448,4 +527,116 @@ fn version_retrieval_counts_an_ignored_standing_identity_file_once() {
         fs::read_to_string(d.join(".syns.yaml")).unwrap(),
         LETTER_CASE_IDENTITY
     );
+}
+
+// ---- u303: writes from a fresh pull -----------------------------------
+
+/// The head `mount_notes` serves.
+const PULLED_HEAD: &str = "6666666666666666666666666666666666666666";
+
+/// The checkout-guard refusal naming `root`, as the diagnostic stream
+/// carries it.
+fn guard_refusal(root: &Path) -> String {
+    format!(
+        "error: the checkout at {} holds unpublished local changes for alice/notes; edit those files instead \u{2014} they publish at the end of the turn \u{2014} or publish them with syns sync, then write again\n",
+        root.display()
+    )
+}
+
+/// `mount_notes` with or without an identity file, the repository read
+/// and push of `alice/notes`, and a stored credential; `W/co` stands
+/// nowhere.
+fn fresh_pull_env(identity: bool) -> Env {
+    let env = Env::new();
+    env.mount_notes(identity);
+    env.mount_notes_push();
+    env.seed_credential();
+    env
+}
+
+// SPEC u303 Tests, `writes_from_a_fresh_pull_of_a_head_holding_no_identity_file_land`.
+#[test]
+#[serial]
+fn writes_from_a_fresh_pull_of_a_head_holding_no_identity_file_land() {
+    let env = fresh_pull_env(false);
+    let co = env.w.join("co");
+
+    let pull = env.syns_with_stdin(&env.w, b"", &["pull", "alice/notes", "co"]);
+    assert_eq!(pull.status.code(), Some(0), "{}", stderr(&pull));
+    let identity_bytes = fs::read(co.join(".syns.yaml")).unwrap();
+    assert_eq!(identity_bytes, b"owner: alice\nname: notes\n");
+
+    let rm = env.syns_with_stdin(&co, b"", &["rm", "a.md", "--parent", PULLED_HEAD]);
+    assert_eq!(rm.status.code(), Some(0), "{}", stderr(&rm));
+    let diagnostics = stderr(&rm);
+    let lines: Vec<&str> = diagnostics.lines().collect();
+    assert_eq!(
+        lines.last().copied(),
+        Some(
+            format!(
+                "the checkout at {} is now one version behind; syns sync converges it",
+                co.display()
+            )
+            .as_str()
+        ),
+        "{diagnostics}"
+    );
+    assert!(
+        lines.len() >= 2 && lines[lines.len() - 2].starts_with("wrote version 2, commit"),
+        "{diagnostics}"
+    );
+
+    let write = env.syns_with_stdin(
+        &co,
+        b"x",
+        &["--json", "write", "b.md", "--parent", PULLED_HEAD],
+    );
+    assert_eq!(write.status.code(), Some(0), "{}", stderr(&write));
+    let document: serde_json::Value = serde_json::from_str(stdout(&write).trim()).unwrap();
+    assert_eq!(document["checkoutBehind"], json!(co.display().to_string()));
+
+    let pushes = env.pushes();
+    assert_eq!(pushes.len(), 2, "each write sends one push");
+    for push in &pushes {
+        assert_eq!(push["parentSha"], json!(PULLED_HEAD));
+    }
+    assert_eq!(fs::read(co.join(".syns.yaml")).unwrap(), identity_bytes);
+    assert_eq!(fs::read(co.join("a.md")).unwrap(), b"a");
+}
+
+// SPEC u303 Tests, `a_fresh_pull_with_a_local_edit_still_refuses_a_write`.
+#[test]
+#[serial]
+fn a_fresh_pull_with_a_local_edit_still_refuses_a_write() {
+    let env = fresh_pull_env(false);
+    let co = env.w.join("co");
+
+    let pull = env.syns_with_stdin(&env.w, b"", &["pull", "alice/notes", "co"]);
+    assert_eq!(pull.status.code(), Some(0), "{}", stderr(&pull));
+    fs::write(co.join("a.md"), "b").unwrap();
+
+    let rm = env.syns_with_stdin(&co, b"", &["rm", "a.md", "--parent", PULLED_HEAD]);
+    assert_eq!(rm.status.code(), Some(1), "{}", stderr(&rm));
+    assert_eq!(stderr(&rm), guard_refusal(&co));
+    assert!(env.pushes().is_empty(), "no push request");
+}
+
+// SPEC u303 Tests, `an_edited_identity_file_a_pulled_head_carried_still_refuses_a_write`.
+#[test]
+#[serial]
+fn an_edited_identity_file_a_pulled_head_carried_still_refuses_a_write() {
+    let env = fresh_pull_env(true);
+    let co = env.w.join("co");
+
+    let pull = env.syns_with_stdin(&env.w, b"", &["pull", "alice/notes", "co"]);
+    assert_eq!(pull.status.code(), Some(0), "{}", stderr(&pull));
+    let mut identity = fs::read_to_string(co.join(".syns.yaml")).unwrap();
+    assert_eq!(identity, "owner: alice\nname: notes\n");
+    identity.push_str("checks:\n  - make test\n");
+    fs::write(co.join(".syns.yaml"), identity).unwrap();
+
+    let rm = env.syns_with_stdin(&co, b"", &["rm", "a.md", "--parent", PULLED_HEAD]);
+    assert_eq!(rm.status.code(), Some(1), "{}", stderr(&rm));
+    assert_eq!(stderr(&rm), guard_refusal(&co));
+    assert!(env.pushes().is_empty(), "no push request");
 }
