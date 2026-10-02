@@ -29,7 +29,8 @@ use crate::errors::{ApiErrorContext, CliError, IdentityRemedy, NotTextSurface};
 use crate::output::Output;
 use crate::push::collector::{CollectOptions, HeldBytes, MAX_FILE_BYTES, collect_files, is_text};
 use crate::push::converge::{
-    FolderRoot, collect_in_place, excluded_local_files, is_partial_write, read_holder_synsignore,
+    FolderRoot, check_holder, collect_in_place, excluded_local_files, identity_holder_synsignore,
+    is_partial_write, read_holder_synsignore,
 };
 use crate::push::folder_check::{FOLDER_SEND_BOUND, FolderCheck, named_head};
 use crate::push::hash::blob_sha1;
@@ -37,6 +38,7 @@ use crate::push::manifest::Manifest;
 use crate::push::working_copy::{WorkingCopy, folder_base};
 use crate::read::repository_argument;
 use crate::repo::folder::{FolderScope, resolve_folder_scope};
+use crate::repo::identity::identity_head;
 use crate::repo::if_repo::resolve_full_or_skip;
 use crate::repo::syns_yaml::nearest_identity;
 
@@ -147,7 +149,7 @@ impl WriteTarget {
         match &self.folder {
             None => Ok(typed.to_string()),
             Some(folder) => Ok(repository_argument(Some(folder), Some(typed))?
-                .unwrap_or_else(|| folder.path.clone())),
+                .unwrap_or_else(|| folder.request_path(""))),
         }
     }
 }
@@ -237,7 +239,9 @@ pub async fn checkout_of(
 ) -> Result<Option<PathBuf>, CliError> {
     // 1 — the folder the run stands in, where one stands.
     match resolve_folder_scope(cwd)? {
-        Some(scope) if !scope.holder().eq_ignore_ascii_case(repo_id) => Ok(None),
+        // SPEC u302 `checkout_of` 1: a folder bound to its identity stands
+        // for that identity.
+        Some(scope) if !scope.address().eq_ignore_ascii_case(repo_id) => Ok(None),
         Some(scope) if repo_named => match &scope.checkout {
             Some(checkout) => guard_root(config, checkout, repo_id).map(Some),
             None => guard_folder(config, &scope, repo_id, client, token)
@@ -371,6 +375,12 @@ async fn guard_folder(
     let base = folder_base(config.stores(), scope);
     let holder = match &scope.checkout {
         Some(_) => None,
+        // SPEC u302 `checkout_of` 1: the holder's file read through the
+        // holder, every refusal read as no file.
+        None if scope.identity.is_some() => {
+            let at = base.as_ref().and_then(|b| b.commit_sha().map(String::from));
+            identity_holder_synsignore(client, Some(token), scope, at.as_deref()).await
+        }
         None => {
             let at = base.as_ref().and_then(|b| b.commit_sha().map(String::from));
             read_holder_synsignore(client, Some(token), repo_id, at.as_deref()).await?
@@ -569,7 +579,7 @@ pub async fn resolve_write_target(
     let scope = resolve_folder_scope(cwd)?;
     let (repo_id, folder) = match (opts.repo.as_deref(), scope) {
         (Some(named), _) => (named.to_ascii_lowercase(), None),
-        (None, Some(scope)) => (scope.holder(), Some(scope)),
+        (None, Some(scope)) => (scope.address(), Some(scope)),
         (None, None) => {
             // `if_repo: false` refuses rather than skipping — these
             // verbs register no skip, a skipped write being a change its
@@ -609,6 +619,14 @@ pub async fn resolve_write_target(
         .await?
         .commit_sha
         .filter(|sha| !sha.is_empty());
+    // SPEC u302 `resolve_write_target` 1: through an identity, the head is
+    // its newest listed version, the record's `commitSha` unread.
+    let head = match folder.as_ref().filter(|scope| scope.identity.is_some()) {
+        Some(_) => identity_head(&client, Some(&token), &repo_id)
+            .await?
+            .map(|newest| newest.sha),
+        None => head,
+    };
 
     // 5 and 6 — pin the parent.
     let parent = resolve_parent(&client, &repo_id, &token, &opts.parent).await?;
@@ -886,6 +904,7 @@ async fn send_inside_folder(
         folder: folder.path.clone(),
         since: pinned.clone(),
         since_version: target.parent.version,
+        holder: check_holder(folder),
     };
     loop {
         // A head named in any other spelling than a full hash is sent
@@ -1893,6 +1912,7 @@ mod tests {
             path: "q3".to_string(),
             checkout: None,
             enclosing: Vec::new(),
+            identity: None,
         });
 
         commit_changeset(
@@ -2014,6 +2034,7 @@ mod tests {
             path: "q3".to_string(),
             checkout: None,
             enclosing: Vec::new(),
+            identity: None,
         });
 
         let (response, _raw, claimed) = publish_changeset(

@@ -55,12 +55,18 @@ pub fn named_head(err: &CliError) -> Option<&str> {
 /// `since` the full commit hash the run's work stands on, and
 /// `since_version` that commit's version number wherever the run already
 /// holds it — kept once read, so a check asked again reads it no more.
+///
+/// SPEC u302: `holder` is the holder's `OWNER/NAME` on a check asked
+/// through a shared folder's identity — `repo_id` that identity — through
+/// which a `since` the identity does not list is numbered; none on a check
+/// asked through a holder.
 #[derive(Debug, Clone)]
 pub struct FolderCheck {
     pub repo_id: String,
     pub folder: String,
     pub since: String,
     pub since_version: Option<u32>,
+    pub holder: Option<String>,
 }
 
 /// Whether `entry` changed a path equal to `folder` or lying under it.
@@ -94,6 +100,9 @@ impl FolderCheck {
         client: &SynsClient,
         token: Option<&str>,
     ) -> Result<bool, CliError> {
+        if let Some(holder) = self.holder.clone() {
+            return self.identity_moved(client, token, &holder).await;
+        }
         // 1 — the newest version that changed the folder.
         let page = match client
             .list_versions(&self.repo_id, token, 1, 0, Some(&self.folder))
@@ -161,6 +170,61 @@ impl FolderCheck {
             (None, Some(head)) => head.saturating_sub(since_version) > SCAN_BOUND,
             (None, None) => false,
         })
+    }
+
+    /// `folder_moved` through a shared folder's identity, whose every
+    /// listed version changed the folder (SPEC u302 Behaviour,
+    /// `FolderCheck::folder_moved` 1–4).
+    async fn identity_moved(
+        &mut self,
+        client: &SynsClient,
+        token: Option<&str>,
+        holder: &str,
+    ) -> Result<bool, CliError> {
+        // 1 — the identity's newest version, naming no path.
+        let page = match client.list_versions(&self.repo_id, token, 1, 0, None).await {
+            Ok((page, _raw)) => page,
+            Err(err) => return self.unread(err),
+        };
+        // 4 — an identity listing no version: u292's steps 4 and 6 over a
+        // head page that is this same empty page.
+        let Some(newest) = page.data.first() else {
+            return Ok(false);
+        };
+        // 2
+        if newest.sha == self.since {
+            return Ok(false);
+        }
+        // 3 — `since` numbered through the identity, then the holder.
+        let since_version = match self.since_version {
+            Some(version) => version,
+            None => {
+                let mut numbered = None;
+                for repo_id in [self.repo_id.clone(), holder.to_string()] {
+                    match client.get_version(&repo_id, token, &self.since).await {
+                        Ok((entry, _raw)) => {
+                            numbered = Some(entry.version);
+                            break;
+                        }
+                        Err(CliError::Api {
+                            status: Some(404),
+                            ref error,
+                            ..
+                        }) if error == "not_found" => continue,
+                        Err(err) => return self.unread(err),
+                    }
+                }
+                match numbered {
+                    Some(version) => {
+                        self.since_version = Some(version);
+                        version
+                    }
+                    None => return Ok(true),
+                }
+            }
+        };
+        // 4
+        Ok(newest.version > since_version)
     }
 }
 
@@ -237,6 +301,7 @@ mod tests {
             folder: FOLDER.to_string(),
             since: since.to_string(),
             since_version,
+            holder: None,
         }
     }
 
@@ -363,5 +428,94 @@ mod tests {
             }) => assert_eq!(error, "internal_error"),
             other => panic!("expected the server's refusal, got {other:?}"),
         }
+    }
+
+    /// A deployment answering the identity's version list at `limit` 1
+    /// with `newest`, and `EP-get-version` at `h5` with `through_identity`
+    /// at the identity and `through_holder` at the holder.
+    async fn identity_deployment(
+        newest: Option<(u32, &str)>,
+        through_identity: ResponseTemplate,
+        through_holder: ResponseTemplate,
+    ) -> MockServer {
+        let server = MockServer::start().await;
+        let entries = newest
+            .map(|(number, sha)| vec![version(number, sha, &["document.html"])])
+            .unwrap_or_default();
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/docs-q3-plan/versions"))
+            .and(query_param_is_missing("path"))
+            .and(query_param("limit", "1"))
+            .and(query_param("offset", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page(entries)))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/docs-q3-plan/versions/h5"))
+            .respond_with(through_identity)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/docs/versions/h5"))
+            .respond_with(through_holder)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn identity_check() -> FolderCheck {
+        FolderCheck {
+            repo_id: "alice/docs-q3-plan".to_string(),
+            folder: "q3-plan".to_string(),
+            since: "h5".to_string(),
+            since_version: None,
+            holder: Some("alice/docs".to_string()),
+        }
+    }
+
+    fn not_found() -> ResponseTemplate {
+        ResponseTemplate::new(404).set_body_json(serde_json::json!({"error": "not_found"}))
+    }
+
+    fn version_five() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(version(5, "h5", &["budget/document.html"]))
+    }
+
+    // SPEC u302 Tests, `a_carried_base_the_identity_does_not_list_is_numbered_through_the_holder`.
+    #[tokio::test]
+    async fn a_carried_base_the_identity_does_not_list_is_numbered_through_the_holder() {
+        let server = identity_deployment(Some((4, "h4")), not_found(), version_five()).await;
+        let mut check = identity_check();
+        assert!(!ask(&server, &mut check).await.unwrap());
+        assert_eq!(check.since_version, Some(5));
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.url.query_pairs().all(|(key, _)| key != "path")),
+            "a request named a path"
+        );
+    }
+
+    // SPEC u302 Behaviour, `FolderCheck::folder_moved` 1–4 through an
+    // identity: its newest version past `since` moved the folder, `since`
+    // itself or an empty list did not, and `since` numbered by neither
+    // reads as moved.
+    #[tokio::test]
+    async fn an_identity_check_answers_each_case() {
+        let ok_five = || ResponseTemplate::new(200).set_body_json(version(5, "h5", &["d"]));
+        let server = identity_deployment(Some((6, "h6")), ok_five(), not_found()).await;
+        assert!(ask(&server, &mut identity_check()).await.unwrap());
+
+        let server = identity_deployment(Some((5, "h5")), not_found(), not_found()).await;
+        assert!(!ask(&server, &mut identity_check()).await.unwrap());
+
+        let server = identity_deployment(None, not_found(), not_found()).await;
+        assert!(!ask(&server, &mut identity_check()).await.unwrap());
+
+        let server = identity_deployment(Some((6, "h6")), not_found(), not_found()).await;
+        assert!(ask(&server, &mut identity_check()).await.unwrap());
     }
 }

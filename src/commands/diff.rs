@@ -5,6 +5,7 @@ use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
 use crate::repo::folder::{FolderScope, current_dir, resolve_scoped_or_skip};
+use crate::repo::identity::identity_head;
 use console::style;
 
 fn style_status(status: &DiffStatus) -> console::StyledObject<&'static str> {
@@ -87,9 +88,17 @@ pub async fn cmd_diff(
         // Inside a folder with neither endpoint, the newest version that
         // changed the folder against the one numbered below it.
         (None, None, Some(folder)) => {
-            let page =
-                folder_history(&client, &repo_id, token.as_deref(), &folder.path, 1, 0).await?;
-            match page.data.first() {
+            // SPEC u302 `cmd_diff` 1: through an identity, its newest listed
+            // version against the one numbered below it.
+            let newest = match folder.identity {
+                Some(_) => identity_head(&client, token.as_deref(), &repo_id).await?,
+                None => folder_history(&client, &repo_id, token.as_deref(), &folder.path, 1, 0)
+                    .await?
+                    .data
+                    .into_iter()
+                    .next(),
+            };
+            match newest {
                 Some(newest) if newest.version > 1 => {
                     ((newest.version - 1).to_string(), newest.version.to_string())
                 }
@@ -132,8 +141,9 @@ pub async fn cmd_diff(
         .get_diff(&repo_id, token.as_deref(), &from_val, &to_val)
         .await?;
 
-    // 4 — inside a folder, the scoped diff entries alone.
-    if let Some(folder) = &folder {
+    // 4 — inside a folder, the scoped diff entries alone; through an
+    // identity every entry as served (SPEC u302 `cmd_diff` 1).
+    if let Some(folder) = folder.as_ref().filter(|f| f.identity.is_none()) {
         let scoped: Vec<serde_json::Value> = raw
             .get("files")
             .and_then(|f| f.as_array())

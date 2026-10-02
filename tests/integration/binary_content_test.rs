@@ -19,7 +19,7 @@ use syns_cli::push::hash::blob_sha1;
 use syns_cli::push::manifest::Manifest;
 use syns_cli::push::working_copy::{Resolution, WorkingCopy};
 use tempfile::TempDir;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{header, method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::convergence_test::Fake;
@@ -806,7 +806,25 @@ async fn chunker_packs_by_encoded_length() {
 
 const H1: &str = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
 
+/// The record every repository answers, marking no shared folder, which
+/// `syns pull OWNER/NAME` reads into a directory no identity file reaches
+/// (SPEC u302 `cmd_pull` 2).
+async fn mount_records(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v1/repos/[^/]+/[^/]+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "owner": "alice", "name": "repo", "description": null,
+            "commitSha": null, "status": "active", "author": null, "tags": [],
+            "visibility": "private", "forkedFrom": null, "forkCount": 0,
+            "fileCount": 0, "role": "owner", "sharedFolder": false,
+            "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+        })))
+        .mount(server)
+        .await;
+}
+
 async fn mount_tree(server: &MockServer, entries: Value) {
+    mount_records(server).await;
     Mock::given(method("GET"))
         .and(path("/api/v1/repos/alice/r/tree"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({

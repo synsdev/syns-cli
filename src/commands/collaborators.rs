@@ -131,7 +131,7 @@ pub async fn cmd_collaborators_role(
     // identity, and bind the repository (SPEC u300, `cmd_collaborators`
     // 1 and 2).
     let current_dir = current_dir()?;
-    admit_repository(&current_dir, "syns collaborators role", repo.as_deref())?;
+    let repo = admit_repository(&current_dir, "syns collaborators role", repo.as_deref())?.or(repo);
     let repo_id = match repo {
         Some(repo) => repo.to_ascii_lowercase(),
         None => match resolve_full_or_skip(None, &current_dir, if_repo, output)? {
@@ -195,21 +195,36 @@ fn bind_repo(
 /// names, letter case aside, the holder's owner joined by `/` to the
 /// identity the folder's own identity file records under `shared_as`
 /// (SPEC u300 Behaviour, `cmd_collaborators` 1).
+///
+/// SPEC u302 `cmd_collaborators` 1: inside a folder bound to its identity
+/// the noun addresses that identity where `repo` is absent or names it,
+/// answered as the repository to bind; every other `repo` there is
+/// refused as acting on the holder. None wherever the run binds `repo` or
+/// the working directory's identity as u300 binds it.
 fn admit_repository(
     cwd: &std::path::Path,
     command: &str,
     repo: Option<&str>,
-) -> Result<(), CliError> {
+) -> Result<Option<String>, CliError> {
     let Some(scope) = resolve_folder_scope(cwd)? else {
-        return Ok(());
+        return Ok(None);
     };
+    if scope.identity.is_some() {
+        let address = scope.address();
+        return match repo {
+            Some(repo) if !repo.eq_ignore_ascii_case(&address) => {
+                refuse_holder_change(cwd, command).map(|()| None)
+            }
+            _ => Ok(Some(address)),
+        };
+    }
     if let Some(repo) = repo
         && let Some(shared_as) = folder_shared_as(&scope.dir)?
         && repo.eq_ignore_ascii_case(&format!("{}/{shared_as}", scope.owner))
     {
-        return Ok(());
+        return Ok(None);
     }
-    refuse_holder_change(cwd, command)
+    refuse_holder_change(cwd, command).map(|()| None)
 }
 
 pub async fn cmd_collaborators(
@@ -231,9 +246,11 @@ pub async fn cmd_collaborators(
         Some(CollaboratorsAction::Role { .. }) => "syns collaborators role",
         Some(CollaboratorsAction::Remove { .. }) => "syns collaborators remove",
     };
-    if !matches!(action, Some(CollaboratorsAction::Role { .. })) {
-        admit_repository(&current_dir()?, command, repo.as_deref())?;
-    }
+    let repo = if matches!(action, Some(CollaboratorsAction::Role { .. })) {
+        repo
+    } else {
+        admit_repository(&current_dir()?, command, repo.as_deref())?.or(repo)
+    };
 
     match action {
         // The role change binds the repository itself (SPEC u272

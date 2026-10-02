@@ -6,6 +6,7 @@ use crate::output::Output;
 use crate::push::converge::{WorkingCopyState, working_copy_state};
 use crate::push::working_copy::WorkingCopy;
 use crate::repo::folder::{FolderScope, resolve_scoped_or_skip};
+use crate::repo::identity::identity_head;
 use crate::repo::root::push_scope;
 
 /// The machine-readable status document: the repository reply with the
@@ -47,7 +48,19 @@ pub async fn cmd_status(config: &Config, output: &Output, if_repo: bool) -> Resu
         .flatten();
     let client = SynsClient::new(config.server_url())?;
 
-    let response = client.get_repo(&repo_id, token.as_deref()).await?;
+    let mut response = client.get_repo(&repo_id, token.as_deref()).await?;
+    // SPEC u302 `cmd_status` 1: inside a folder bound to its identity, the
+    // identity's record at its newest listed version, `commitSha` as
+    // served where it lists none, with no holder, no path and no `Path`
+    // row.
+    let shown = folder.as_ref().filter(|scope| scope.identity.is_none());
+    if folder
+        .as_ref()
+        .is_some_and(|scope| scope.identity.is_some())
+        && let Some(newest) = identity_head(&client, token.as_deref(), &repo_id).await?
+    {
+        response.commit_sha = Some(newest.sha);
+    }
 
     // SPEC u256 `cmd_status` 2: the working copy's state, against a head
     // read in this same run — the folder copy's inside a folder (SPEC
@@ -62,14 +75,14 @@ pub async fn cmd_status(config: &Config, output: &Output, if_repo: bool) -> Resu
     let state = working_copy_state(&client, token.as_deref(), &copy).await?;
 
     if output.is_json() {
-        output.json(&status_document(&response, state, folder.as_ref())?);
+        output.json(&status_document(&response, state, shown)?);
     } else {
         let mut rows = vec![vec![
             "Repository".into(),
             format!("{}/{}", response.owner, response.name),
         ]];
         // SPEC u291 `cmd_status` 3: the recorded path after the holder.
-        if let Some(scope) = &folder {
+        if let Some(scope) = shown {
             rows.push(vec!["Path".into(), scope.path.clone()]);
         }
         rows.extend([

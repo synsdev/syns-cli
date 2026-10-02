@@ -16,6 +16,7 @@ use crate::config::Config;
 use crate::errors::{CliError, IdentityRemedy};
 use crate::output::Output;
 use crate::repo::folder::{FolderScope, current_dir, resolve_folder_scope, resolve_scoped_or_skip};
+use crate::repo::identity::identity_head;
 use crate::repo::if_repo::resolve_full_or_skip;
 
 /// The three options every read verb carries, spelt and bound
@@ -181,22 +182,52 @@ pub async fn resolve_read_target(
         .flatten();
     let client = SynsClient::new(config.server_url())?;
 
-    // 2 — the reference to resolve.
+    let no_commit = || CliError::Api {
+        status: Some(422),
+        error: "validation_error".to_string(),
+        context: None,
+    };
+
+    // 2 — the reference to resolve. SPEC u302 `resolve_read_target` 1:
+    // with no `--version`, a run addressing a shared folder's identity —
+    // inside a folder bound to it, or through `--repo` where the record
+    // marks one — pins the identity's newest listed version, reading no
+    // version after it.
     let reference = match opts.version.as_deref() {
         Some(value) => {
             refuse_reference_spelling(value)?;
             value.to_string()
         }
         None => {
-            let repo = client.get_repo(&repo_id, token.as_deref()).await?;
-            match repo.commit_sha {
+            let through_identity = match &folder {
+                Some(scope) => scope.identity.is_some(),
+                None => false,
+            };
+            let commit_sha = if through_identity {
+                None
+            } else {
+                let repo = client.get_repo(&repo_id, token.as_deref()).await?;
+                if repo.shared_folder {
+                    None
+                } else {
+                    Some(repo.commit_sha.ok_or_else(no_commit)?)
+                }
+            };
+            match commit_sha {
                 Some(sha) => sha,
                 None => {
-                    return Err(CliError::Api {
-                        status: Some(422),
-                        error: "validation_error".to_string(),
-                        context: None,
-                    });
+                    let newest = identity_head(&client, token.as_deref(), &repo_id)
+                        .await?
+                        .ok_or_else(no_commit)?;
+                    return Ok(Some(ReadTarget {
+                        repo_id,
+                        token,
+                        reference: ResolvedRef {
+                            version: newest.version,
+                            commit_sha: newest.sha,
+                        },
+                        folder,
+                    }));
                 }
             }
         }
@@ -259,7 +290,7 @@ pub fn bind_read_folder(opts: &ReadOptions) -> Result<Option<FolderScope>, CliEr
 /// where the run stands in none or the path lies outside it.
 pub fn counted_from(folder: Option<&FolderScope>, served: &str) -> String {
     folder
-        .and_then(|f| f.folder_path(served))
+        .and_then(|f| f.served_path(served))
         .unwrap_or_else(|| served.to_string())
 }
 
@@ -288,14 +319,16 @@ pub fn repository_argument(
     let Some(folder) = folder else {
         return Ok(typed.map(str::to_string));
     };
+    // SPEC u302: inside a folder bound to its identity, nothing typed
+    // names the identity's whole tree, and a typed path stands as typed.
     let Some(typed) = typed else {
-        return Ok(Some(folder.path.clone()));
+        return Ok(folder.identity.is_none().then(|| folder.path.clone()));
     };
     refuse_empty_path(typed)?;
     if typed.starts_with('/') || typed.split('/').any(|seg| seg == "." || seg == "..") {
         return Err(leaving_folder(typed, folder));
     }
-    Ok(Some(folder.repository_path(typed)))
+    Ok(Some(folder.request_path(typed)))
 }
 
 /// The two options the repository-scoped verbs this unit adds carry,
@@ -443,6 +476,7 @@ mod tests {
             path: "clients/q3".into(),
             checkout: None,
             enclosing: Vec::new(),
+            identity: None,
         }
     }
 
@@ -475,6 +509,28 @@ mod tests {
             );
             assert_eq!(err.exit_code(), 1);
         }
+    }
+
+    // SPEC u302 Behaviour, `resolve_read_target` 1: inside a folder bound
+    // to its identity nothing typed names the whole tree, a typed path
+    // stands as typed, and a served path is counted as served.
+    #[test]
+    fn paths_inside_an_identity_folder_stand_as_typed_and_served() {
+        let mut folder = q3();
+        folder.identity = Some("work-q3".into());
+        assert_eq!(repository_argument(Some(&folder), None).unwrap(), None);
+        assert_eq!(
+            repository_argument(Some(&folder), Some("notes/a.md"))
+                .unwrap()
+                .as_deref(),
+            Some("notes/a.md")
+        );
+        assert!(repository_argument(Some(&folder), Some("../x")).is_err());
+        assert_eq!(counted_from(Some(&folder), "notes/a.md"), "notes/a.md");
+        assert_eq!(
+            counted_from(Some(&q3()), "clients/q3/notes/a.md"),
+            "notes/a.md"
+        );
     }
 
     // SPEC u297 Tests, `repository_argument_refuses_an_empty_value_inside_a_folder_alone`.

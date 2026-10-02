@@ -100,7 +100,7 @@ pub async fn cmd_history_show(
 /// The changed paths lying under the folder, counted from it, in the
 /// order served.
 fn counted_paths(folder: &FolderScope, paths: &[String]) -> Vec<String> {
-    paths.iter().filter_map(|p| folder.folder_path(p)).collect()
+    paths.iter().filter_map(|p| folder.served_path(p)).collect()
 }
 
 /// The version block (SPEC u272 Behaviour, `cmd_history_show` 3): the
@@ -255,7 +255,9 @@ pub async fn cmd_history(
             .await?;
         if response.total > 0 {
             if output.is_json() {
-                if let Some(folder) = &folder {
+                // SPEC u302 `cmd_history` 1: through an identity every
+                // header stands as served.
+                if let Some(folder) = folder.as_ref().filter(|f| f.identity.is_none()) {
                     rebase_file_history(folder, &mut raw);
                 }
                 output.json(&raw);

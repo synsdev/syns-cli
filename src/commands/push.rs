@@ -16,13 +16,15 @@ use crate::push::collector::{
     CollectOptions, HELD_BYTES_BUDGET, HeldBytes, SkippedFile, write_skip_summary,
 };
 use crate::push::converge::{
-    ConvergeMode, FolderRoot, SyncOutcome, collect_in_place, converge, lay_over_enclosing,
-    read_folder_tree, read_holder_synsignore, resolution_elsewhere,
+    ConvergeMode, FolderRoot, SyncOutcome, check_holder, collect_in_place, converge,
+    identity_holder_synsignore, lay_over_enclosing, read_folder_tree, read_holder_synsignore,
+    read_identity_tree, resolution_elsewhere,
 };
 use crate::push::folder_check::{FOLDER_SEND_BOUND, FolderCheck, named_head};
 use crate::push::smart::{PushPipelineMeta, SmartPushOptions, smart_push};
 use crate::push::working_copy::{WorkingCopy, folder_base};
 use crate::repo::folder::{FolderScope, lies_under, place_under, resolve_folder_scope};
+use crate::repo::identity::identity_head;
 use crate::repo::if_repo::resolve_or_skip;
 use crate::repo::root::{push_scope, resolve_start_path};
 
@@ -315,6 +317,10 @@ async fn push_folder(
     start_path: &Path,
 ) -> Result<(), CliError> {
     let holder = scope.holder();
+    // SPEC u302 `cmd_push` 1: every request at the scope's address, the
+    // holder's root `.synsignore` alone read through the holder.
+    let address = scope.address();
+    let through_identity = scope.identity.is_some();
 
     // 2 — `--name` names a repository a folder cannot become.
     if args.name.is_some() {
@@ -368,14 +374,18 @@ async fn push_folder(
         held: Some(held.clone()),
         json_output: output.is_json(),
         renders_publication_summary: true,
-        folder: Some(scope.path.clone()),
+        folder: Some(if through_identity {
+            String::new()
+        } else {
+            scope.path.clone()
+        }),
         declined_parent: None,
     };
 
     // 6 — a bare publication converges the folder copy.
     if !args.force && args.path.is_none() {
         let converged = converge(&client, Some(&token), &copy, ConvergeMode::Publish, opts).await;
-        return render_bare(output, &holder, converged);
+        return render_bare(output, &address, converged);
     }
 
     // 5 — a forced or path-scoped publication, refused past a review
@@ -383,7 +393,7 @@ async fn push_folder(
     if let Some(resolution) = copy.resolution()? {
         return render_outcome(
             output,
-            Some(&holder),
+            Some(&address),
             SyncOutcome::ResolutionRequired(resolution, None),
             None,
         );
@@ -393,7 +403,7 @@ async fn push_folder(
     {
         return render_outcome(
             output,
-            Some(&holder),
+            Some(&address),
             SyncOutcome::ResolutionRequired(resolution, Some(dir)),
             None,
         );
@@ -423,6 +433,16 @@ async fn push_folder(
                 .collect::<HashMap<String, String>>(),
             base.commit_sha().map(String::from),
         ),
+        // SPEC u302 `cmd_push` 1: through an identity, its newest listed
+        // version the parent and its whole tree the reference.
+        None if through_identity => match identity_head(&client, Some(&token), &address).await? {
+            Some(newest) => {
+                let head =
+                    read_identity_tree(&client, Some(&token), &address, Some(&newest.sha)).await?;
+                (head.files.into_iter().collect(), Some(newest.sha))
+            }
+            None => (HashMap::new(), None),
+        },
         None => {
             let head = read_folder_tree(&client, Some(&token), &holder, &scope.path, None).await?;
             (head.files.into_iter().collect(), head.commit)
@@ -430,6 +450,9 @@ async fn push_folder(
     };
     let holder_bytes = match &scope.checkout {
         Some(_) => None,
+        None if through_identity => {
+            identity_holder_synsignore(&client, Some(&token), &scope, parent.as_deref()).await
+        }
         None => read_holder_synsignore(&client, Some(&token), &holder, parent.as_deref()).await?,
     };
     let root = FolderRoot::of_scope(&copy.root, &scope, holder_bytes);
@@ -453,7 +476,7 @@ async fn push_folder(
     // collected again, wherever no version after the parent it first
     // claimed changed the folder; at most `FOLDER_SEND_BOUND` sends.
     let resend = (!args.force).then(|| opts.clone());
-    let mut answer = smart_push(&client, &token, &holder, &copy.root, opts).await;
+    let mut answer = smart_push(&client, &token, &address, &copy.root, opts).await;
     let mut sends: u32 = 1;
     let mut check: Option<FolderCheck> = None;
     while let (Err(refused), Some(template), Some(since)) = (&answer, &resend, &parent) {
@@ -464,10 +487,11 @@ async fn push_folder(
             break;
         }
         let check = check.get_or_insert_with(|| FolderCheck {
-            repo_id: holder.clone(),
+            repo_id: address.clone(),
             folder: scope.path.clone(),
             since: since.clone(),
             since_version: None,
+            holder: check_holder(&scope),
         });
         if check.folder_moved(&client, Some(&token)).await? {
             break;
@@ -476,7 +500,7 @@ async fn push_folder(
         again.parent_sha = Some(named.to_string());
         again.collected = Some(collect()?);
         sends += 1;
-        answer = smart_push(&client, &token, &holder, &copy.root, again).await;
+        answer = smart_push(&client, &token, &address, &copy.root, again).await;
     }
     let (response, raw, meta) = answer?;
     // 4 — the publication laid over the base it stood on — the one
@@ -494,7 +518,7 @@ async fn push_folder(
             Some((meta.sent_parent.clone(), response.commit_sha.clone())),
         );
     }
-    format_response(output, &response, &raw, &holder, &meta);
+    format_response(output, &response, &raw, &address, &meta);
     Ok(())
 }
 

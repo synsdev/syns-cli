@@ -18,7 +18,10 @@ use crate::push::folder_check::named_head;
 use crate::push::hash::blob_sha1;
 use crate::push::working_copy::{WorkingCopy, holds_in_root_home};
 use crate::read::{refuse_reference_spelling, version_not_found_refusal};
-use crate::repo::folder::{FolderScope, current_dir, folder_checkout, resolve_folder_scope};
+use crate::repo::folder::{
+    FolderScope, current_dir, folder_checkout, place_under, resolve_folder_scope,
+};
+use crate::repo::identity::identity_head;
 use crate::repo::syns_yaml::{
     TemplateOrigin, declared_checks, folder_identity_text, nearest_identity,
 };
@@ -367,6 +370,14 @@ pub async fn cmd_place(
     let holder = counted.holder.clone();
     let repository_path = counted.repository_path(&path);
     let folder_dir = counted.dir.join(&path);
+    // SPEC u302 `cmd_place` 1: inside a folder bound to its identity, the
+    // placement's commit goes through the identity at the typed path
+    // counted from the folder, while the placed folder's identity file
+    // records the holder and the holder path.
+    let (address, request_path) = match &counted.scope {
+        Some(scope) if scope.identity.is_some() => (scope.address(), scope.request_path(&path)),
+        _ => (holder.clone(), repository_path.clone()),
+    };
 
     // 5 — the place check for the new folder.
     folder_checkout(&folder_dir, &holder, &repository_path)?;
@@ -380,18 +391,25 @@ pub async fn cmd_place(
         .ok_or(CliError::AuthRequired)?;
     let client = SynsClient::new(config.server_url())?;
 
-    // 8 — the holder's head.
-    let head = client
-        .get_repo(&holder, Some(&token))
-        .await?
-        .commit_sha
-        .filter(|sha| !sha.is_empty());
+    // 8 — the holder's head; through an identity, its newest listed
+    // version.
+    let head = if address == holder {
+        client
+            .get_repo(&holder, Some(&token))
+            .await?
+            .commit_sha
+            .filter(|sha| !sha.is_empty())
+    } else {
+        identity_head(&client, Some(&token), &address)
+            .await?
+            .map(|newest| newest.sha)
+    };
 
     // 9 — nothing the head holds at or above the folder's path.
     if let Some(head) = head.as_deref()
-        && let Some(held) = held_at(&client, &holder, &token, &repository_path, head).await?
+        && let Some(held) = held_at(&client, &address, &token, &request_path, head).await?
     {
-        return Err(occupied_at_head_refusal(&holder, &held, head));
+        return Err(occupied_at_head_refusal(&address, &held, head));
     }
 
     // 10 — the template, refused as missing where it cannot be read.
@@ -502,11 +520,11 @@ pub async fn cmd_place(
     let identity = folder_identity_text(&holder, &repository_path, &origin);
     let mut entries = Vec::with_capacity(placed.len() + 1);
     for file in &placed {
-        let at = format!("{repository_path}/{}", file.path);
+        let at = format!("{request_path}/{}", file.path);
         let content = classify_content(&at, file.bytes.clone(), None)?;
         entries.push(push_file_entry(at, content));
     }
-    let identity_at = format!("{repository_path}/{SYNS_YAML}");
+    let identity_at = format!("{request_path}/{SYNS_YAML}");
     let identity_content = classify_content(&identity_at, identity.clone().into_bytes(), None)?;
     entries.push(push_file_entry(identity_at, identity_content));
     let mut request = PushRequest {
@@ -526,7 +544,7 @@ pub async fn cmd_place(
         provenance: ProvenanceOptions::default().block(),
     };
     let body = serialised(&request)?;
-    let first = client.push_body(&holder, &token, body.clone()).await;
+    let first = client.push_body(&address, &token, body.clone()).await;
 
     // 16 — a moved head re-read, and the same body sent once more there.
     let (response, raw, claimed) = match first {
@@ -535,8 +553,8 @@ pub async fn cmd_place(
             let Some(moved) = named_head(&err).map(str::to_string) else {
                 return Err(err);
             };
-            if let Some(held) = held_at(&client, &holder, &token, &repository_path, &moved).await? {
-                return Err(occupied_at_head_refusal(&holder, &held, &moved));
+            if let Some(held) = held_at(&client, &address, &token, &request_path, &moved).await? {
+                return Err(occupied_at_head_refusal(&address, &held, &moved));
             }
             let again = match head {
                 Some(_) => with_parent_sha(body, &moved),
@@ -546,7 +564,7 @@ pub async fn cmd_place(
                     serialised(&request)?
                 }
             };
-            match client.push_body(&holder, &token, again).await {
+            match client.push_body(&address, &token, again).await {
                 Ok((response, raw)) => (response, raw, Some(moved)),
                 Err(err) => match named_head(&err) {
                     Some(current) => {
@@ -727,6 +745,24 @@ fn record_bases(
         .split_once('/')
         .unwrap_or((counted.holder.as_str(), ""));
     let in_holder = |path: &str| format!("{repository_path}/{path}");
+
+    // SPEC u302 `cmd_place` 1: inside a folder bound to its identity the
+    // placed files are laid over the identity folder's copy at the typed
+    // path, the placed folder recording no base of its own — it is a
+    // directory of that identity.
+    if let Some(scope) = counted.scope.as_ref().filter(|s| s.identity.is_some()) {
+        if let Some(copy) = WorkingCopy::open_existing_folder(cache, scope)? {
+            let place = place_under(folder_dir, &scope.dir);
+            lay_placed(
+                &copy,
+                from_folder,
+                |p| Some(format!("{place}/{p}")),
+                claimed,
+                landed,
+            )?;
+        }
+        return Ok(());
+    }
 
     if let Some(checkout) = &counted.checkout
         && let Some(copy) = WorkingCopy::open_existing(cache, owner, name, checkout)?

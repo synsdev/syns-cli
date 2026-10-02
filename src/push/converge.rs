@@ -43,6 +43,7 @@ use crate::push::working_copy::{
     holds_in_root_home,
 };
 use crate::repo::folder::{FolderScope, lies_under};
+use crate::repo::identity::identity_head;
 use crate::repo::syns_yaml::{IdentityForm, read_identity_form, read_required_checks};
 
 /// The last round a resolution stands at before attention is required:
@@ -344,6 +345,24 @@ fn repo_id(copy: &WorkingCopy) -> String {
     format!("{}/{}", copy.owner, copy.name)
 }
 
+/// The recorded path a folder copy's served paths are joined under: the
+/// holder's for a folder bound to its holder, none for a copy bound to a
+/// shared folder's identity, which serves them counted from the folder
+/// (SPEC u302 `converge` 1), and none for every other copy.
+fn served_under(copy: &WorkingCopy) -> Option<&str> {
+    copy.folder
+        .as_ref()
+        .filter(|scope| scope.identity.is_none())
+        .map(|scope| scope.path.as_str())
+}
+
+/// The holder a `FolderCheck` asked on `scope` numbers a `since` through:
+/// the holder on a scope bound to its identity, none otherwise (SPEC u302
+/// `converge` 3).
+pub(crate) fn check_holder(scope: &FolderScope) -> Option<String> {
+    scope.identity.as_ref().map(|_| scope.holder())
+}
+
 /// A served tree as a head, every path counted from `folder` where one
 /// stands and a path lying outside it left out.
 fn head_of(tree: &crate::client::TreeResponse, folder: Option<&str>) -> Head {
@@ -382,13 +401,26 @@ async fn read_tree(
     at: Option<&str>,
 ) -> Result<Head, CliError> {
     // SPEC u291 `converge` 1: a folder copy reads the holder's tree
-    // under its recorded path.
-    if let Some(scope) = &copy.folder {
-        return read_folder_tree(client, token, &repo_id(copy), &scope.path, at).await;
+    // under its recorded path; SPEC u302 `converge` 1: a copy bound to an
+    // identity reads the identity's whole tree, every path as served.
+    if let Some(path) = served_under(copy) {
+        return read_folder_tree(client, token, &repo_id(copy), path, at).await;
     }
     let (tree, _raw) = client
         .get_tree(&repo_id(copy), token, None, true, at)
         .await?;
+    Ok(head_of(&tree, None))
+}
+
+/// The whole tree of a shared folder's identity at `at` or the tip, every
+/// path as served (SPEC u302 `converge` 1, `cmd_push` 1).
+pub(crate) async fn read_identity_tree(
+    client: &SynsClient,
+    token: Option<&str>,
+    address: &str,
+    at: Option<&str>,
+) -> Result<Head, CliError> {
+    let (tree, _raw) = client.get_tree(address, token, None, true, at).await?;
     Ok(head_of(&tree, None))
 }
 
@@ -458,6 +490,22 @@ pub async fn read_holder_synsignore(
     }
 }
 
+/// The holder's root `.synsignore` at `at` or the tip, read through the
+/// holder for a folder bound to its identity, every refusal answering
+/// none (SPEC u302 Behaviour, `converge` 2): a reader the identity alone
+/// admits is answered by the holder as missing.
+pub(crate) async fn identity_holder_synsignore(
+    client: &SynsClient,
+    token: Option<&str>,
+    scope: &FolderScope,
+    at: Option<&str>,
+) -> Option<Vec<u8>> {
+    read_holder_synsignore(client, token, &scope.holder(), at)
+        .await
+        .ok()
+        .flatten()
+}
+
 fn is_empty_repository(err: &CliError) -> bool {
     matches!(err, CliError::Api { status: Some(422), error, .. } if error == "validation_error")
 }
@@ -483,6 +531,16 @@ async fn read_head(
     reading: HeadReading,
     has_base: bool,
 ) -> Result<Head, CliError> {
+    // SPEC u302 `converge` 1: a copy bound to an identity stands on the
+    // newest version the identity lists, its tree read at that hash; the
+    // tip's tree where it lists none.
+    if copy.folder.as_ref().is_some_and(|s| s.identity.is_some())
+        && let Some(newest) = identity_head(client, token, &repo_id(copy)).await?
+    {
+        let mut head = read_tree(client, token, copy, Some(&newest.sha)).await?;
+        head.commit = Some(newest.sha);
+        return Ok(head);
+    }
     match read_tree(client, token, copy, None).await {
         Ok(head) => Ok(head),
         Err(err)
@@ -813,6 +871,18 @@ pub(crate) async fn folder_root(
         return Ok(FolderRoot::of_scope(&copy.root, scope, None));
     }
     let based = folder_base(copy.stores(), scope).and_then(|b| b.commit_sha().map(String::from));
+    // SPEC u302 `converge` 2: through an identity, the holder's file at the
+    // base's commit or the identity's newest, read through the holder.
+    if scope.identity.is_some() {
+        let at = match based {
+            Some(commit) => Some(commit),
+            None => identity_head(client, token, &repo_id(copy))
+                .await?
+                .map(|newest| newest.sha),
+        };
+        let holder = identity_holder_synsignore(client, token, scope, at.as_deref()).await;
+        return Ok(FolderRoot::of_scope(&copy.root, scope, holder));
+    }
     let at = match based {
         Some(commit) => Some(commit),
         None => match read_folder_tree(client, token, &repo_id(copy), &scope.path, None).await {
@@ -1597,6 +1667,7 @@ fn folders_below(root: &Path, owner: &str, name: &str) -> Vec<FolderScope> {
                 path,
                 checkout: None,
                 enclosing: Vec::new(),
+                identity: None,
             });
         }
     }
@@ -1779,7 +1850,7 @@ async fn prepare_candidate(
     // SPEC u291 `converge` 4: the holder's review lock, taken once a pass
     // goes on to write a resolution and released once it is written.
     let mut review: Option<ReviewLock> = None;
-    let recorded = copy.folder.as_ref().map(|scope| scope.path.as_str());
+    let recorded = served_under(copy);
 
     // A preparation resumed over a resolution a killed or failed run left
     // half-written keeps that run's summaries, and counts a path already
@@ -2733,6 +2804,7 @@ async fn converge_from_resolution(
             folder: scope.path.clone(),
             since: base_commit.clone(),
             since_version: None,
+            holder: check_holder(scope),
         };
         if !check.folder_moved(client, Some(token)).await? {
             let at_head = (check, head_commit.clone(), head.files.clone());
@@ -2866,7 +2938,7 @@ async fn overwrite_with_head(
             client,
             token,
             &repo_id(copy),
-            copy.folder.as_ref().map(|scope| scope.path.as_str()),
+            served_under(copy),
             &head_commit,
             &wanted,
             &opts.held_bytes(),
@@ -3260,8 +3332,12 @@ async fn publish_reviewed(
             None => resolution.as_ref().map(|_| to_hash_map(&hashes)),
         };
         // SPEC u291 `converge` 5: a folder copy publishes under its
-        // recorded path, with no local record and no identity file.
-        push_opts.folder = copy.folder.as_ref().map(|scope| scope.path.clone());
+        // recorded path, with no local record and no identity file; SPEC
+        // u302 `converge` 3: through an identity under an empty one.
+        push_opts.folder = copy
+            .folder
+            .as_ref()
+            .map(|_| served_under(copy).unwrap_or_default().to_string());
         // The publication walks nothing: it publishes from this pass's
         // collection (SPEC u280 `converge` 1).
         push_opts.collected = Some(folder.into_collected());
@@ -3312,6 +3388,7 @@ async fn publish_reviewed(
                         folder: scope.path.clone(),
                         since: since.clone(),
                         since_version: None,
+                        holder: check_holder(scope),
                     });
                     if !check.folder_moved(client, Some(token)).await? {
                         copy.write_outbox(&Outbox {
@@ -3785,6 +3862,7 @@ mod tests {
             path: path.into(),
             checkout,
             enclosing: Vec::new(),
+            identity: None,
         }
     }
 

@@ -5,6 +5,7 @@ use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
 use crate::repo::folder::{FolderScope, current_dir, refuse_holder_change, resolve_scoped_or_skip};
+use crate::repo::identity::identity_head;
 use crate::repo::if_repo::resolve_full_or_skip;
 
 #[derive(clap::ValueEnum, Debug, Clone)]
@@ -278,7 +279,31 @@ pub async fn cmd_repo(
         .flatten();
 
     // 3 — the holder's record.
-    let response = client.get_repo(&repo_id, token.as_deref()).await?;
+    let mut response = client.get_repo(&repo_id, token.as_deref()).await?;
+
+    // SPEC u302 `cmd_repo` 1–2: inside a folder bound to its identity, the
+    // identity's record at its newest listed version — `commitSha` as
+    // served and `version` null where it lists none — with no holder and
+    // no path.
+    if folder
+        .as_ref()
+        .is_some_and(|scope| scope.identity.is_some())
+    {
+        let newest = identity_head(&client, token.as_deref(), &repo_id).await?;
+        let version = newest.map(|newest| {
+            response.commit_sha = Some(newest.sha);
+            newest.version
+        });
+        display_repo(
+            output,
+            &response,
+            Some(ReadAnswer {
+                folder: None,
+                version,
+            }),
+        );
+        return Ok(());
+    }
 
     // 4 — under `--json`, at a root and inside a folder alike, the number
     // of the version the head names: the newest row of the version list

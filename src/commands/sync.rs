@@ -26,6 +26,7 @@ use crate::push::reconcile::{CONFLICT_MARKERS, CollisionKind};
 use crate::push::smart::SmartPushOptions;
 use crate::push::working_copy::{Resolution, WorkingCopy};
 use crate::repo::folder::{FolderScope, resolve_scoped_or_skip};
+use crate::repo::identity::return_to_holder;
 use crate::repo::root::push_scope;
 use crate::repo::syns_yaml::write_syns_yaml_where_none_stands;
 
@@ -535,7 +536,7 @@ pub async fn cmd_sync(config: &Config, output: &Output, if_repo: bool) -> Result
         Ok(None) => return render_outcome(output, None, SyncOutcome::NoRepository, None),
         Err(err) => return render_error(output, None, err),
     };
-    let repo_id = format!("{owner}/{name}");
+    let mut repo_id = format!("{owner}/{name}");
 
     let run = async {
         // 2
@@ -545,20 +546,49 @@ pub async fn cmd_sync(config: &Config, output: &Output, if_repo: bool) -> Result
         // 4
         let client = SynsClient::new(config.server_url())?;
         ensure_copy_identity(&copy, &owner, &name)?;
-        converge(
+        let converged = converge(
             &client,
             Some(&token),
             &copy,
             ConvergeMode::Publish,
             convergence_options_for(config, output),
         )
-        .await
+        .await;
+        // SPEC u302 `cmd_sync` 2: an identity answering `NOT_FOUND` before
+        // anything is written returns the folder to its holder where the
+        // holder's file no longer names it, and the holder's copy converges.
+        match (converged, folder.as_ref()) {
+            (Err(err), Some(scope)) if scope.identity.is_some() && is_not_found(&err) => {
+                match return_to_holder(config.stores(), &client, Some(&token), scope).await? {
+                    Some(holder) => {
+                        repo_id = holder.holder();
+                        let copy = WorkingCopy::open_folder(config.stores(), &holder)?;
+                        converge(
+                            &client,
+                            Some(&token),
+                            &copy,
+                            ConvergeMode::Publish,
+                            convergence_options_for(config, output),
+                        )
+                        .await
+                    }
+                    None => Err(err),
+                }
+            }
+            (converged, _) => converged,
+        }
     };
 
-    match run.await {
+    let ran = run.await;
+    match ran {
         Ok(outcome) => render_outcome(output, Some(&repo_id), outcome, None),
         Err(err) => render_error(output, Some(&repo_id), err),
     }
+}
+
+/// Whether a refusal is `NOT_FOUND`.
+fn is_not_found(err: &CliError) -> bool {
+    matches!(err, CliError::Api { status: Some(404), error, .. } if error == "not_found")
 }
 
 // ---- syns resolution --------------------------------------------------

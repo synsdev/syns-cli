@@ -628,6 +628,36 @@ mod tests {
         assert_eq!(offered_share_name("alice/docs", "q3 plan"), None);
     }
 
+    // SPEC u302 Behaviour, `bind_share_target` 1: inside a folder bound to
+    // its identity, the holder its file names and the typed path joined
+    // under its recorded path, a typed `.` naming the folder itself.
+    #[test]
+    #[serial_test::serial]
+    fn bind_share_target_counts_from_the_holder_inside_an_identity_folder() {
+        let tree = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(tree.path()).unwrap().join("q3-plan");
+        std::fs::create_dir_all(dir.join("appendix")).unwrap();
+        std::fs::write(
+            dir.join(".syns.yaml"),
+            "holder: alice/docs\npath: q3-plan\nshared_as: docs-q3-plan\n",
+        )
+        .unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let appendix = bind_share_target("appendix", None);
+        let this = bind_share_target(".", None);
+        std::env::set_current_dir(std::env::temp_dir()).unwrap();
+        let appendix = appendix.unwrap();
+        assert_eq!(
+            (appendix.holder.as_str(), appendix.path.as_str()),
+            ("alice/docs", "q3-plan/appendix")
+        );
+        let this = this.unwrap();
+        assert_eq!(
+            (this.holder.as_str(), this.path.as_str()),
+            ("alice/docs", "q3-plan")
+        );
+    }
+
     fn identity(name: &str) -> Value {
         json!({
             "owner": "alice", "name": name, "description": null,

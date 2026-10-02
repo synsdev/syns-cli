@@ -516,28 +516,86 @@ impl WorkingCopy {
         &self.stores
     }
 
-    /// Open the state of the holder worked on at the folder's canonical
-    /// directory (SPEC u291, `WorkingCopy::open_folder`): a folder and its
-    /// holder's checkout never share a state directory.
+    /// Open the state of the repository the scope addresses worked on at
+    /// the folder's canonical directory (SPEC u291,
+    /// `WorkingCopy::open_folder`): a folder and its holder's checkout
+    /// never share a state directory. SPEC u302 `WorkingCopy::open_folder`
+    /// 1–2: a folder bound to its identity opens the identity's copy, the
+    /// base its holder's copy there recorded later carried to it.
     pub fn open_folder(stores: &StoreRoots, scope: &FolderScope) -> Result<WorkingCopy, CliError> {
-        let mut copy = Self::open(stores, &scope.owner, &scope.name, &scope.dir)?;
+        let (owner, name) = Self::addressed(scope);
+        let mut copy = Self::open(stores, &owner, &name, &scope.dir)?;
         copy.folder = Some(scope.clone());
+        if scope.identity.is_some() {
+            copy.carry_base(&scope.holder())?;
+        }
         Ok(copy)
     }
 
+    /// The owner and the name a scope's `address` joins.
+    fn addressed(scope: &FolderScope) -> (String, String) {
+        let name = scope.identity.as_ref().unwrap_or(&scope.name);
+        (scope.owner.clone(), name.clone())
+    }
+
     /// The folder copy where either home already holds its state, none
-    /// where neither does, creating nothing (SPEC u291,
-    /// `WorkingCopy::open_existing_folder`).
+    /// where neither does, creating nothing and carrying nothing (SPEC
+    /// u291, `WorkingCopy::open_existing_folder`; SPEC u302, keyed on the
+    /// scope's address).
     pub fn open_existing_folder(
         stores: &StoreRoots,
         scope: &FolderScope,
     ) -> Result<Option<WorkingCopy>, CliError> {
+        let (owner, name) = Self::addressed(scope);
         Ok(
-            Self::open_existing(stores, &scope.owner, &scope.name, &scope.dir)?.map(|mut copy| {
+            Self::open_existing(stores, &owner, &name, &scope.dir)?.map(|mut copy| {
                 copy.folder = Some(scope.clone());
                 copy
             }),
         )
+    }
+
+    /// Carry the base the copy of `from` (`OWNER/NAME`) at this copy's
+    /// canonical directory records to this copy where it was recorded
+    /// after this copy's own, or this copy records none — its commit,
+    /// per-file hashes and recorded time unchanged, the copy of `from`
+    /// left as it stood — answering whether it did (SPEC u302 Behaviour,
+    /// `WorkingCopy::carry_base` 1–3). A record carrying no time ranks
+    /// below every one that does.
+    pub fn carry_base(&self, from: &str) -> Result<bool, CliError> {
+        // 1 — this copy's base, under its lock.
+        let _lock = self.lock()?;
+        let own = self.base();
+
+        // 2 — the other copy's, in either home, creating no state.
+        let Some((owner, name)) = from.split_once('/') else {
+            return Ok(false);
+        };
+        let Some(other) = Self::open_existing(&self.stores, owner, name, &self.root)? else {
+            return Ok(false);
+        };
+        let Some(carried) = other.base() else {
+            return Ok(false);
+        };
+        if own.is_some_and(|own| own.recorded_at() >= carried.recorded_at()) {
+            return Ok(false);
+        }
+
+        // 3 — recorded as this copy's, unchanged.
+        let files = carried
+            .file_paths()
+            .filter_map(|path| {
+                carried
+                    .file_sha(path)
+                    .map(|sha| (path.to_string(), sha.to_string()))
+            })
+            .collect();
+        self.record_laid_base(
+            carried.commit_sha().unwrap_or_default(),
+            files,
+            carried.recorded_at(),
+        )?;
+        Ok(true)
     }
 
     /// The copy of `owner/name` at `root` where either of its homes
@@ -1231,6 +1289,15 @@ pub fn folder_base(stores: &StoreRoots, scope: &FolderScope) -> Option<Manifest>
     {
         standing.push(base);
     }
+    // SPEC u302 Contract Surface, `folder_base`: a folder bound to its
+    // identity reads its holder's copy at its directory beside its own.
+    if scope.identity.is_some()
+        && let Ok(Some(copy)) =
+            WorkingCopy::open_existing(stores, &scope.owner, &scope.name, &scope.dir)
+        && let Some(base) = copy.base()
+    {
+        standing.insert(0, base);
+    }
 
     // 2 — the greatest recorded time, the outermost root on a tie.
     let mut chosen: Option<Manifest> = None;
@@ -1596,6 +1663,7 @@ mod tests {
             path: "clients/vela/q3-board".into(),
             checkout,
             enclosing: Vec::new(),
+            identity: None,
         }
     }
 
@@ -1682,6 +1750,89 @@ mod tests {
 
         stamp(&holder, None);
         assert_eq!(answer(&scope), h0);
+    }
+
+    /// `U/q3-plan` bound to `alice/docs-q3-plan`, beside the cache.
+    fn identity_folder() -> (tempfile::TempDir, tempfile::TempDir, PathBuf, StoreRoots) {
+        let cache = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        let u = std::fs::canonicalize(tree.path()).unwrap();
+        std::fs::create_dir_all(u.join("q3-plan")).unwrap();
+        std::fs::write(
+            u.join("q3-plan/.syns.yaml"),
+            "holder: alice/docs\npath: q3-plan\nshared_as: docs-q3-plan\n",
+        )
+        .unwrap();
+        let stores = StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path());
+        (cache, tree, u, stores)
+    }
+
+    fn base_of(copy: &WorkingCopy) -> (String, Vec<(String, String)>, Option<u64>) {
+        let base = copy.base().expect("a base");
+        let mut files: Vec<(String, String)> = base
+            .file_paths()
+            .map(|p| (p.to_string(), base.file_sha(p).unwrap().to_string()))
+            .collect();
+        files.sort();
+        (
+            base.commit_sha().unwrap().to_string(),
+            files,
+            base.recorded_at(),
+        )
+    }
+
+    // SPEC u302 Tests, `the_base_recorded_under_the_holder_carries_to_the_identity`.
+    #[test]
+    fn the_base_recorded_under_the_holder_carries_to_the_identity() {
+        let (_cache, _tree, u, stores) = identity_folder();
+        let holder = WorkingCopy::open(&stores, "alice", "docs", &u.join("q3-plan")).unwrap();
+        holder
+            .record_base(
+                "h4",
+                HashMap::from([("document.html".to_string(), "b1".to_string())]),
+            )
+            .unwrap();
+        let recorded = base_of(&holder);
+        assert!(
+            WorkingCopy::open_existing(&stores, "alice", "docs-q3-plan", &u.join("q3-plan"))
+                .unwrap()
+                .is_none()
+        );
+
+        let scope = crate::repo::folder::resolve_folder_scope(&u.join("q3-plan"))
+            .unwrap()
+            .expect("a scope");
+        let copy = WorkingCopy::open_folder(&stores, &scope).unwrap();
+        assert_eq!(
+            (copy.owner.as_str(), copy.name.as_str()),
+            ("alice", "docs-q3-plan")
+        );
+        assert_eq!(base_of(&copy), recorded);
+        assert_eq!(base_of(&holder), recorded);
+        assert_ne!(copy.state_dir, holder.state_dir);
+    }
+
+    // SPEC u302 Tests, `carry_base_never_overwrites_a_later_base`.
+    #[test]
+    fn carry_base_never_overwrites_a_later_base() {
+        let (_cache, _tree, u, stores) = identity_folder();
+        let dir = u.join("q3-plan");
+        let holder = WorkingCopy::open(&stores, "alice", "docs", &dir).unwrap();
+        let identity = WorkingCopy::open(&stores, "alice", "docs-q3-plan", &dir).unwrap();
+        let files = HashMap::from([("document.html".to_string(), "b1".to_string())]);
+        holder.record_base("h4", files.clone()).unwrap();
+        identity.record_base("h7", files).unwrap();
+        stamp(&holder, Some(4));
+        stamp(&identity, Some(7));
+
+        assert!(!identity.carry_base("alice/docs").unwrap());
+        assert_eq!(base_of(&identity).0, "h7");
+        assert!(holder.carry_base("alice/docs-q3-plan").unwrap());
+        assert_eq!(base_of(&holder), base_of(&identity));
+        assert_eq!(base_of(&holder).2, Some(7));
+
+        stamp(&identity, None);
+        assert!(!holder.carry_base("alice/docs-q3-plan").unwrap());
     }
 
     // SPEC u291 Contract Surface, `WorkingCopy::open_folder`: a folder and

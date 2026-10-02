@@ -13,6 +13,7 @@ use crate::push::working_copy::{WorkingCopy, holds_in_root_home};
 use crate::repo::folder::{
     FolderScope, enclosing_folders, folder_checkout, lies_under, resolve_folder_scope,
 };
+use crate::repo::identity::{check_identity_marker, return_to_holder};
 use crate::repo::if_repo::resolve_full_or_skip;
 use crate::repo::root::resolve_start_path;
 use crate::repo::syns_yaml::{
@@ -170,6 +171,22 @@ pub fn folder_unmarked(holder: &str, path: &str, at: &str) -> String {
     )
 }
 
+/// Whether a refusal is `NOT_FOUND`.
+fn is_not_found(err: &CliError) -> bool {
+    matches!(err, CliError::Api { status: Some(404), error, .. } if error == "not_found")
+}
+
+/// The identity checkout refusal (SPEC u302 Contract Surface): a
+/// repository whose record marks a shared folder's identity, whose root at
+/// `at` holds no `.syns.yaml` naming it, `{owner}/{name}` lower-cased.
+pub fn identity_unmarked(owner: &str, name: &str, at: &str) -> String {
+    format!(
+        "{}/{} holds no .syns.yaml naming it as a shared folder at {at}; only a shared folder whose .syns.yaml names it is checked out from its name",
+        owner.to_ascii_lowercase(),
+        name.to_ascii_lowercase()
+    )
+}
+
 /// `--path` with any trailing `/` removed, refused unless it is an
 /// `INV-30` folder path (SPEC u291 `cmd_pull` 1).
 fn folder_argument(typed: &str) -> Result<String, CliError> {
@@ -238,13 +255,15 @@ pub async fn cmd_pull(
     // SPEC u291 `cmd_pull` 2–3: inside a folder the folder alone is
     // retrieved into the folder's directory, a positional naming another
     // repository than its holder refused before any request.
+    // SPEC u302 `cmd_pull` 1: inside a folder bound to its identity, the
+    // positional is compared against that identity, letter case aside.
     if let Some(scope) = resolve_folder_scope(&start_dir)? {
         if let Some((owner, name)) = &repository
-            && format!("{owner}/{name}") != scope.holder()
+            && !format!("{owner}/{name}").eq_ignore_ascii_case(&scope.address())
         {
             return Err(CliError::PathBelongsToAnotherRepository {
                 path: scope.dir.clone(),
-                standing: scope.holder(),
+                standing: scope.address(),
                 requested: format!("{owner}/{name}"),
             });
         }
@@ -296,6 +315,52 @@ pub async fn cmd_pull(
             standing: format!("{}/{}", standing.owner, standing.name),
             requested: format!("{owner}/{name}"),
         });
+    }
+
+    // SPEC u302 `cmd_pull` 2–4: a repository named with no identity file
+    // at or above the destination is told apart by its record before any
+    // directory is created, a shared folder's identity checked out under
+    // its folder's own `.syns.yaml`.
+    if bound && standing.is_none() {
+        let token = TokenStore::new(config.credentials_path())
+            .read()
+            .ok()
+            .flatten();
+        let client = SynsClient::new(config.server_url())?;
+        let record = client
+            .get_repo(&format!("{owner}/{name}"), token.as_deref())
+            .await?;
+        if record.shared_folder {
+            // 3 — the marker at the version asked or the tip.
+            let Some((holder, path)) =
+                check_identity_marker(&client, token.as_deref(), &owner, &name, version.as_deref())
+                    .await?
+            else {
+                return Err(CliError::Config {
+                    message: identity_unmarked(
+                        &owner,
+                        &name,
+                        version.as_deref().unwrap_or("the tip"),
+                    ),
+                });
+            };
+            // 4 — the destination, and the folder retrieved into it.
+            std::fs::create_dir_all(&start_dir).map_err(|e| CliError::Io {
+                message: format!("could not create target directory: {e}"),
+            })?;
+            let (holder_owner, holder_name) =
+                holder.split_once('/').unwrap_or((holder.as_str(), ""));
+            let scope = FolderScope {
+                dir: std::fs::canonicalize(&start_dir).unwrap_or(start_dir),
+                owner: holder_owner.to_ascii_lowercase(),
+                name: holder_name.to_ascii_lowercase(),
+                path,
+                checkout: None,
+                enclosing: Vec::new(),
+                identity: Some(name.to_ascii_lowercase()),
+            };
+            return pull_into_folder(config, output, scope, version, overwrite_local).await;
+        }
     }
 
     // `cmd_pull` 6: the retrieval's ONE write root. Every fetched path is
@@ -414,7 +479,7 @@ async fn pull_into_folder(
     version: Option<String>,
     overwrite_local: bool,
 ) -> Result<(), CliError> {
-    let repo_id = scope.holder();
+    let repo_id = scope.address();
     let token = TokenStore::new(config.credentials_path())
         .read()
         .ok()
@@ -422,8 +487,8 @@ async fn pull_into_folder(
     let client = SynsClient::new(config.server_url())?;
     let copy = WorkingCopy::open_folder(config.stores(), &scope)?;
 
-    if let Some(version) = version {
-        return pull_snapshot(
+    let retrieved = match version.as_deref() {
+        Some(version) => pull_snapshot(
             output,
             &client,
             token.as_deref(),
@@ -432,23 +497,48 @@ async fn pull_into_folder(
             &copy.root,
             &scope.owner,
             &scope.name,
-            &version,
+            version,
             config.cache_dir(),
             Some(&copy),
         )
-        .await;
-    }
-
-    let outcome = converge(
-        &client,
-        token.as_deref(),
-        &copy,
-        ConvergeMode::Retrieve {
-            overwrite: overwrite_local,
-        },
-        convergence_options_for(config, output),
-    )
-    .await?;
+        .await
+        .map(|()| None),
+        None => converge(
+            &client,
+            token.as_deref(),
+            &copy,
+            ConvergeMode::Retrieve {
+                overwrite: overwrite_local,
+            },
+            convergence_options_for(config, output),
+        )
+        .await
+        .map(Some),
+    };
+    // SPEC u302 `cmd_pull` 6: an identity answering `NOT_FOUND` before
+    // anything is written returns the folder to its holder where the
+    // holder's file no longer names it, and the folder is retrieved again
+    // through the holder.
+    let outcome = match retrieved {
+        Err(err) if scope.identity.is_some() && is_not_found(&err) => {
+            match return_to_holder(config.stores(), &client, token.as_deref(), &scope).await? {
+                Some(holder) => {
+                    return Box::pin(pull_into_folder(
+                        config,
+                        output,
+                        holder,
+                        version,
+                        overwrite_local,
+                    ))
+                    .await;
+                }
+                None => return Err(err),
+            }
+        }
+        Err(err) => return Err(err),
+        Ok(None) => return Ok(()),
+        Ok(Some(outcome)) => outcome,
+    };
     let (written, removed) = match outcome {
         SyncOutcome::Synced {
             written, removed, ..
@@ -561,6 +651,7 @@ async fn pull_folder_alone(
         path: path.to_string(),
         checkout,
         enclosing,
+        identity: None,
     };
     pull_into_folder(config, output, scope, version, overwrite_local).await
 }
@@ -589,8 +680,14 @@ async fn pull_snapshot(
     folder: Option<&WorkingCopy>,
 ) -> Result<(), CliError> {
     // SPEC u291 `cmd_pull` 3: inside a folder, the folder's tree at the
-    // version, every path counted from the folder.
-    let recorded = folder.and_then(|copy| copy.folder.as_ref().map(|s| s.path.clone()));
+    // version, every path counted from the folder; SPEC u302: through an
+    // identity, its whole tree, every path as served.
+    let recorded = folder.and_then(|copy| {
+        copy.folder
+            .as_ref()
+            .filter(|s| s.identity.is_none())
+            .map(|s| s.path.clone())
+    });
     let (commit_sha, server_files): (String, Vec<ServedFile>) = match &recorded {
         None => {
             let (tree_response, _raw) = client

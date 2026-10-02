@@ -263,6 +263,9 @@ impl FakeRepo {
             .and_then(|rest| rest.splitn(3, '/').nth(2))
             .unwrap_or("");
         match (req.method.as_str(), tail) {
+            // SPEC u302 `cmd_pull` 2: the record a retrieval naming its
+            // repository reads, marking no shared folder.
+            ("GET", "") => Some(self.record(route)),
             ("GET", "tree") => Some(self.tree(params.get("ref"))),
             ("GET", files) if files.starts_with("files/") => {
                 let path = urlencoding::decode(&files["files/".len()..])
@@ -296,6 +299,25 @@ impl FakeRepo {
             }
             _ => Some(Answer::json(404, error_body("not_found"))),
         }
+    }
+
+    /// The repository's record at `route`, its head the newest commit and
+    /// `sharedFolder` false.
+    fn record(&self, route: &str) -> Answer {
+        let mut pair = route.trim_start_matches("/api/v1/repos/").splitn(2, '/');
+        let (owner, name) = (pair.next().unwrap_or(""), pair.next().unwrap_or(""));
+        Answer::json(
+            200,
+            json!({
+                "owner": owner, "name": name, "description": null,
+                "commitSha": self.commits.last().map(|(sha, _)| sha.clone()),
+                "status": "active", "author": null, "tags": [],
+                "visibility": "private", "forkedFrom": null, "forkCount": 0,
+                "fileCount": 0, "role": "owner", "sharedFolder": false,
+                "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+            })
+            .to_string(),
+        )
     }
 
     fn find(&self, reference: Option<&String>) -> Option<&(String, BTreeMap<String, Vec<u8>>)> {

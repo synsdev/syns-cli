@@ -14,7 +14,7 @@ use crate::errors::CliError;
 use crate::output::Output;
 use crate::push::converge::check_server_path;
 use crate::repo::if_repo::resolve_full_or_skip;
-use crate::repo::syns_yaml::{IdentityForm, find_syns_yaml, read_identity_form};
+use crate::repo::syns_yaml::{IdentityForm, find_syns_yaml, folder_shared_as, read_identity_form};
 
 /// One scoped folder: `dir` is the absolute folder holding the identity
 /// file, `owner` and `name` the holder lower-cased, and `path` the
@@ -26,6 +26,11 @@ use crate::repo::syns_yaml::{IdentityForm, find_syns_yaml, read_identity_form};
 /// of the holder standing above it that `enclosing_folders` answers,
 /// nearest first, each carrying no checkout and no enclosing folder of
 /// its own.
+///
+/// SPEC u302: `identity` is the shared folder's identity name, lower-cased,
+/// on a scope bound to that identity, and none on every scope bound to its
+/// holder; `owner`, `name` and `path` name the holder and the recorded
+/// path under either binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FolderScope {
     pub dir: PathBuf,
@@ -34,6 +39,7 @@ pub struct FolderScope {
     pub path: String,
     pub checkout: Option<PathBuf>,
     pub enclosing: Vec<FolderScope>,
+    pub identity: Option<String>,
 }
 
 /// Whether `path` lies under the folder `folder`: it begins with the
@@ -47,6 +53,39 @@ impl FolderScope {
     /// The holder as `OWNER/NAME`, lower-cased.
     pub fn holder(&self) -> String {
         format!("{}/{}", self.owner, self.name)
+    }
+
+    /// The repository every request a run inside the folder sends
+    /// addresses — the holder's root `.synsignore` read and the share
+    /// routes aside (SPEC u302 Contract Surface, `FolderScope::address`):
+    /// the identity under the holder's owner where one is bound, the
+    /// holder otherwise.
+    pub fn address(&self) -> String {
+        match &self.identity {
+            Some(identity) => format!("{}/{identity}", self.owner),
+            None => self.holder(),
+        }
+    }
+
+    /// A path counted from the folder as the addressed repository carries
+    /// it: itself through an identity, the holder's path otherwise (SPEC
+    /// u302 Contract Surface, `FolderScope::request_path`).
+    pub fn request_path(&self, relative: &str) -> String {
+        match &self.identity {
+            Some(_) => relative.to_string(),
+            None => self.repository_path(relative),
+        }
+    }
+
+    /// A path the addressed repository serves, counted from the folder:
+    /// itself through an identity, none for an empty one; otherwise what
+    /// `folder_path` answers (SPEC u302 Contract Surface,
+    /// `FolderScope::served_path`).
+    pub fn served_path(&self, served: &str) -> Option<String> {
+        match &self.identity {
+            Some(_) => (!served.is_empty()).then(|| served.to_string()),
+            None => self.folder_path(served),
+        }
     }
 
     /// A path counted from the folder, as a path in the holder.
@@ -319,6 +358,7 @@ pub fn enclosing_folders(
             path: form_path,
             checkout: None,
             enclosing: Vec::new(),
+            identity: None,
         });
     }
     Ok(kept)
@@ -332,6 +372,12 @@ pub fn enclosing_folders(
 /// `folder_checkout`'s, whose answer the scope carries as `checkout`
 /// beside the folders `enclosing_folders` answers.
 pub fn resolve_folder_scope(start: &Path) -> Result<Option<FolderScope>, CliError> {
+    // SPEC u302 `resolve_folder_scope` 1 to 4 — a folder bound to its
+    // identity, every identity file beneath it read as content.
+    if let Some(scope) = identity_scope(start)? {
+        return Ok(Some(scope));
+    }
+
     // 1 — the nearest identity file, a marked one by its local side.
     let Some(file) = find_syns_yaml(start) else {
         return Ok(None);
@@ -365,6 +411,88 @@ pub fn resolve_folder_scope(start: &Path) -> Result<Option<FolderScope>, CliErro
         path,
         checkout,
         enclosing,
+        identity: None,
+    }))
+}
+
+/// How one identity file at or above a start reads (SPEC u302
+/// `resolve_folder_scope` 1): the root form, the folder form, or neither,
+/// a refused parse kept rather than raised.
+enum Standing {
+    Root,
+    Folder,
+    Neither,
+}
+
+/// Every identity file at or above `start` to the filesystem root,
+/// nearest first, beside the form it reads as.
+fn identity_files_from(start: &Path) -> Vec<(PathBuf, Standing)> {
+    let mut found = Vec::new();
+    let mut next = find_syns_yaml(start);
+    while let Some(file) = next {
+        let dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
+        let standing = match read_identity_form(&file) {
+            Ok(IdentityForm::Root { .. }) => Standing::Root,
+            Ok(IdentityForm::Folder { .. }) => Standing::Folder,
+            Err(_) => Standing::Neither,
+        };
+        next = dir.parent().and_then(find_syns_yaml);
+        found.push((dir, standing));
+    }
+    found
+}
+
+/// SPEC u302 `resolve_folder_scope` 2 to 4: the scope bound to the
+/// identity the outermost folder form at or above `start` names, where no
+/// root form and no file read as neither form stands above it; none
+/// wherever u290's and u291's steps answer the start.
+fn identity_scope(start: &Path) -> Result<Option<FolderScope>, CliError> {
+    // 2 — the outermost folder form, nothing but folder forms above it.
+    let files = identity_files_from(start);
+    let Some(outermost) = files
+        .iter()
+        .rposition(|(_, standing)| matches!(standing, Standing::Folder))
+    else {
+        return Ok(None);
+    };
+    if files[outermost + 1..]
+        .iter()
+        .any(|(_, standing)| !matches!(standing, Standing::Folder))
+    {
+        return Ok(None);
+    }
+    let dir = files[outermost].0.clone();
+    let Some(identity) = folder_shared_as(&dir)? else {
+        return Ok(None);
+    };
+
+    // 3 — that folder's holder and path, checked.
+    let IdentityForm::Folder { holder, path } = read_identity_form(&dir.join(".syns.yaml"))? else {
+        return Ok(None);
+    };
+    check_folder_form(&holder, &path)?;
+    let (owner, name) = holder
+        .split_once('/')
+        .expect("is_repository_shape admits one /");
+    let owner = owner.to_ascii_lowercase();
+    let identity = identity.to_ascii_lowercase();
+    if !is_repository_shape(&format!("{owner}/{identity}")) {
+        return Err(CliError::Io {
+            message: format!(
+                "invalid .syns.yaml: shared_as must name a repository under {owner} (got {identity})"
+            ),
+        });
+    }
+
+    // 4 — the scope bound to the identity.
+    Ok(Some(FolderScope {
+        dir,
+        owner,
+        name: name.to_ascii_lowercase(),
+        path,
+        checkout: None,
+        enclosing: Vec::new(),
+        identity: Some(identity),
     }))
 }
 
@@ -378,7 +506,10 @@ pub fn resolve_scoped_or_skip(
     output: &Output,
 ) -> Result<Option<(String, String, Option<FolderScope>)>, CliError> {
     if let Some(scope) = resolve_folder_scope(start)? {
-        return Ok(Some((scope.owner.clone(), scope.name.clone(), Some(scope))));
+        // SPEC u302 `resolve_scoped_or_skip` 1: the owner and the name the
+        // scope's address joins.
+        let name = scope.identity.clone().unwrap_or_else(|| scope.name.clone());
+        return Ok(Some((scope.owner.clone(), name, Some(scope))));
     }
     Ok(
         resolve_full_or_skip(None, start, if_repo, output)?
@@ -420,6 +551,7 @@ mod tests {
             path: path.into(),
             checkout: None,
             enclosing: Vec::new(),
+            identity: None,
         }
     }
 
@@ -627,6 +759,119 @@ mod tests {
             .expect("inner");
         let dirs: Vec<PathBuf> = scope.enclosing.iter().map(|f| f.dir.clone()).collect();
         assert_eq!(dirs, vec![v.join("q3")]);
+    }
+
+    const SHARED: &str = "holder: Alice/Docs\npath: q3-plan\nshared_as: Docs-Q3-Plan\n";
+
+    // SPEC u302 `resolve_folder_scope` 2–4: a folder form carrying
+    // `shared_as` with no identity file above it binds its identity,
+    // lower-cased, from anywhere beneath it.
+    #[test]
+    fn a_shared_folder_alone_binds_its_identity() {
+        let (_u, u) = forms(&[("q3-plan", SHARED)]);
+        fs::create_dir_all(u.join("q3-plan/sub")).unwrap();
+        let scope = resolve_folder_scope(&u.join("q3-plan/sub"))
+            .unwrap()
+            .expect("a scope");
+        assert_eq!(scope.identity.as_deref(), Some("docs-q3-plan"));
+        assert_eq!(scope.holder(), "alice/docs");
+        assert_eq!(scope.address(), "alice/docs-q3-plan");
+        assert_eq!(scope.path, "q3-plan");
+        assert_eq!(scope.dir, u.join("q3-plan"));
+        assert_eq!(scope.checkout, None);
+        assert!(scope.enclosing.is_empty());
+        let (owner, name, _) =
+            resolve_scoped_or_skip(&u.join("q3-plan/sub"), false, &Output::new(true))
+                .unwrap()
+                .expect("bound");
+        assert_eq!(format!("{owner}/{name}"), "alice/docs-q3-plan");
+    }
+
+    // `resolve_folder_scope` 2: a root form above and a folder form above
+    // carrying no `shared_as` each leave the folder bound to its holder,
+    // and a file read as neither form above leaves it to u290's steps.
+    #[test]
+    fn a_shared_folder_under_any_other_file_stays_bound_to_its_holder() {
+        let (_w, w) = forms(&[
+            ("", "owner: alice\nname: docs\n"),
+            (
+                "q3-plan",
+                "holder: alice/docs\npath: q3-plan\nshared_as: docs-q3-plan\n",
+            ),
+        ]);
+        let scope = resolve_folder_scope(&w.join("q3-plan"))
+            .unwrap()
+            .expect("w");
+        assert_eq!(scope.identity, None);
+        assert_eq!(scope.address(), "alice/docs");
+        assert_eq!(scope.checkout, Some(w.clone()));
+
+        let (_v, v) = forms(&[
+            ("q3-plan", "holder: alice/docs\npath: q3-plan\n"),
+            (
+                "q3-plan/appendix",
+                "holder: alice/docs\npath: q3-plan/appendix\nshared_as: docs-q3-plan-appendix\n",
+            ),
+        ]);
+        let scope = resolve_folder_scope(&v.join("q3-plan/appendix"))
+            .unwrap()
+            .expect("v");
+        assert_eq!(scope.identity, None);
+        assert_eq!(scope.path, "q3-plan/appendix");
+
+        // u290's steps answer a file read as neither form above with
+        // their malformed-file refusal, no identity bound.
+        let (_x, x) = forms(&[("", "not: [a, form\n"), ("q3-plan", SHARED)]);
+        match resolve_folder_scope(&x.join("q3-plan")) {
+            Err(CliError::Io { message }) => {
+                assert!(message.starts_with("invalid .syns.yaml: "), "{message}")
+            }
+            other => panic!("expected u290's refusal, got {other:?}"),
+        }
+    }
+
+    // `resolve_folder_scope` 2: under a folder bound to its identity, a
+    // nested folder form — `shared_as` included — a root form and a file
+    // read as neither form are content of that identity.
+    #[test]
+    fn identity_files_inside_an_identity_folder_read_as_content() {
+        let (_u, u) = forms(&[
+            ("q3-plan", SHARED),
+            (
+                "q3-plan/appendix",
+                "holder: alice/docs\npath: q3-plan/appendix\nshared_as: docs-q3-plan-appendix\n",
+            ),
+            ("q3-plan/notes", "owner: bob\nname: notes\n"),
+            ("q3-plan/broken", "not: [a, form\n"),
+        ]);
+        for place in ["q3-plan/appendix", "q3-plan/notes", "q3-plan/broken"] {
+            let scope = resolve_folder_scope(&u.join(place))
+                .unwrap()
+                .unwrap_or_else(|| panic!("{place}"));
+            assert_eq!(scope.address(), "alice/docs-q3-plan", "{place}");
+            assert_eq!(scope.dir, u.join("q3-plan"), "{place}");
+        }
+    }
+
+    // SPEC u302 Contract Surface, `FolderScope::request_path` and
+    // `FolderScope::served_path`: through an identity every path stands
+    // as counted from the folder, the holder mapping kept beside it.
+    #[test]
+    fn paths_through_an_identity_stand_as_counted_from_the_folder() {
+        let mut s = scope("q3-plan");
+        s.identity = Some("docs-q3-plan".into());
+        assert_eq!(s.address(), "alice/docs-q3-plan");
+        assert_eq!(s.holder(), "alice/work");
+        assert_eq!(s.request_path(""), "");
+        assert_eq!(s.request_path("a/b.md"), "a/b.md");
+        assert_eq!(s.served_path("a/b.md").as_deref(), Some("a/b.md"));
+        assert_eq!(s.served_path(""), None);
+        assert_eq!(s.repository_path("a/b.md"), "q3-plan/a/b.md");
+        let s = scope("q3-plan");
+        assert_eq!(s.address(), "alice/work");
+        assert_eq!(s.request_path("a.md"), "q3-plan/a.md");
+        assert_eq!(s.served_path("q3-plan/a.md").as_deref(), Some("a.md"));
+        assert_eq!(s.served_path("other/a.md"), None);
     }
 
     #[test]

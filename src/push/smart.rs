@@ -100,6 +100,10 @@ pub struct SmartPushOptions {
     /// request carries is this folder joined with the collected path, and
     /// the publication reads and writes no local record and writes no
     /// identity file; unset, every request stands as u255 and u280 give it.
+    ///
+    /// SPEC u302: an empty path is a publication from a folder bound to
+    /// its identity — every path carried as collected, and still no local
+    /// record and no identity file.
     pub folder: Option<String>,
     /// SPEC u291, `SmartPushOptions.declined_parent`: the parent a forced
     /// run held and claimed none of, answered as its meta's
@@ -251,10 +255,23 @@ fn base64_len(n: usize) -> usize {
 
 /// A collected path as a request carries it: joined under the scoped
 /// folder's recorded path where one stands (SPEC u291 `smart_push` 2).
+/// SPEC u302: an empty folder is a publication from a folder bound to
+/// its identity, whose paths ride as collected.
 fn wire_path<'a>(folder: Option<&str>, path: &'a str) -> Cow<'a, str> {
     match folder {
-        Some(folder) => Cow::Owned(format!("{folder}/{path}")),
-        None => Cow::Borrowed(path),
+        Some(folder) if !folder.is_empty() => Cow::Owned(format!("{folder}/{path}")),
+        _ => Cow::Borrowed(path),
+    }
+}
+
+/// A request path counted back from the scoped folder, none where it lies
+/// outside it; an empty or absent folder answers the path as carried.
+fn counted_back<'a>(folder: Option<&str>, path: &'a str) -> Option<&'a str> {
+    match folder {
+        Some(folder) if !folder.is_empty() => path
+            .strip_prefix(folder)
+            .and_then(|rest| rest.strip_prefix('/')),
+        _ => Some(path),
     }
 }
 
@@ -958,14 +975,7 @@ fn named_hash_only(
     hash_only
         .iter()
         .filter(|entry| missing.contains_key(&entry.path))
-        .filter_map(|entry| match folder {
-            Some(folder) => entry
-                .path
-                .strip_prefix(folder)
-                .and_then(|rest| rest.strip_prefix('/'))
-                .map(str::to_string),
-            None => Some(entry.path.clone()),
-        })
+        .filter_map(|entry| counted_back(folder, &entry.path).map(str::to_string))
         .collect()
 }
 
@@ -1276,9 +1286,10 @@ pub async fn smart_push(
     // is, so a caller lays them over a base counted the same way.
     let deleted_paths: Vec<String> = deletes
         .iter()
-        .map(|d| match folder.as_deref() {
-            Some(folder) => d.path[folder.len() + 1..].to_string(),
-            None => d.path.clone(),
+        .map(|d| {
+            counted_back(folder.as_deref(), &d.path)
+                .unwrap_or(&d.path)
+                .to_string()
         })
         .collect();
 
@@ -3367,6 +3378,77 @@ mod unclaimed_parent_tests {
         assert_eq!(meta.unclaimed_parent.as_deref(), Some("p"));
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1, "a folder run reads no tree");
+    }
+
+    /// SPEC u302 `converge` 3: an empty `folder` sends every path as
+    /// collected — a `MISSING_BLOBS` naming one answered with its content
+    /// and a deletion carried as the reference names it — and writes no
+    /// local record and no identity file.
+    #[tokio::test]
+    async fn an_identity_publication_carries_every_path_as_collected() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/repos/alice/notes/push"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "error": "missing_blobs",
+                "missing": {"a.md": blob_sha1(b"a")},
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        mount_push(&server).await;
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(folder.path().join("a.md"), "a").unwrap();
+        std::fs::write(folder.path().join("b.md"), "b two").unwrap();
+        let cache = tempfile::tempdir().unwrap();
+
+        let mut options = opts(cache.path(), false);
+        options.folder = Some(String::new());
+        options.parent_sha = Some(RECORDED.into());
+        options.reference = Some(HashMap::from([
+            ("a.md".to_string(), blob_sha1(b"a")),
+            ("b.md".to_string(), blob_sha1(b"b one")),
+            ("gone.md".to_string(), blob_sha1(b"g")),
+        ]));
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let (_response, _raw, meta) =
+            smart_push(&client, "t", "alice/notes", folder.path(), options)
+                .await
+                .unwrap();
+
+        let bodies: Vec<serde_json::Value> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.body_json().unwrap())
+            .collect();
+        assert_eq!(bodies.len(), 2);
+        for body in &bodies {
+            let mut sent: Vec<&str> = body["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| f["path"].as_str().unwrap())
+                .collect();
+            sent.sort();
+            assert_eq!(sent, vec!["a.md", "b.md"]);
+            assert_eq!(body["deletions"], serde_json::json!([{"path": "gone.md"}]));
+        }
+        let resent_a = bodies[1]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["path"] == "a.md")
+            .unwrap();
+        assert_eq!(resent_a["content"], serde_json::json!("a"));
+        assert_eq!(meta.deleted, vec!["gone.md".to_string()]);
+        assert!(!cache.path().join("alice").exists(), "a record was written");
+        assert!(
+            std::fs::read_dir(cache.path()).unwrap().next().is_none(),
+            "the cache holds state"
+        );
+        assert!(!folder.path().join(".syns.yaml").exists());
     }
 
     /// An unforced run claims the record's parent, so there is nothing
