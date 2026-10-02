@@ -4144,6 +4144,37 @@ async fn a_refused_sync_sending_only_a_written_identity_file_writes_no_resolutio
     );
 }
 
+// u306 CR5-1: a refused sync sending the identity text a retrieval wrote
+// beside other work keeps u256's forced resolution, though the head the
+// recomputation reads took that work alike, since the folder's difference
+// from the refused parent is not the identity text alone.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_refused_sync_sending_a_written_identity_file_beside_work_the_head_took_writes_a_resolution()
+ {
+    let e = env().await;
+    let fake = Fake::start().await;
+    let folder = tempfile::tempdir().unwrap();
+    let copy = e.copy(folder.path());
+    let h0 = fake.commit(&[("a.md", "a\n")]);
+    checkout(&fake, &copy, &h0);
+    write_files(folder.path(), &[(".syns.yaml", IDENTITY), ("b.md", "b\n")]);
+    fake.move_head_before_next_push(&[("b.md", Some("b\n"))]);
+
+    let resolution = expect_resolution(publish(&fake, &copy, &e).await);
+
+    assert!(resolution.local_paths.is_empty(), "{resolution:?}");
+    assert!(resolution.collisions.is_empty(), "{resolution:?}");
+    assert!(
+        !resolution
+            .combined_paths
+            .contains(&".syns.yaml".to_string()),
+        "{resolution:?}"
+    );
+    assert_ne!(fake.head().0, h0);
+    assert_eq!(read(folder.path(), ".syns.yaml"), IDENTITY);
+}
+
 // ---- an interrupted preparation -------------------------------------------
 
 fn set_readonly(path: &Path, readonly: bool) {

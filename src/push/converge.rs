@@ -1906,8 +1906,13 @@ struct Candidate<'a> {
     /// file out: the held record a retrieval wrote is no local work, so a
     /// recomputation finding no local path, no collision and no resolution
     /// standing records the head as the base and answers synced, nothing
-    /// published (SPEC u306 `converge` 5, under Q-01).
+    /// published (SPEC u306 `converge` 5, under Q-01) — and that only where
+    /// `sent_identity_alone` holds.
     force_resolution: bool,
+    /// Whether the refused send's tree differed from the refused parent in
+    /// the root identity file alone (`SAGA-cli-converge` step 6, u306
+    /// CR5-1): the one recomputation `force_resolution` yields to a hold.
+    sent_identity_alone: bool,
     /// Whether this run holds the root identity file out (u263), decided
     /// once and applied to every collection, and the held file's hash.
     hold_root_identity: IdentityHold,
@@ -2321,9 +2326,10 @@ async fn prepare_candidate(
         // over a path another copy standing over the same files holds a
         // resolution for.
         // SPEC u306 `converge` 5 under Q-01: a recomputation holding the
-        // root identity file out is forced to no resolution, so one finding
+        // root identity file out, after a send differing from its parent
+        // in that file alone, is forced to no resolution, so one finding
         // no local path, no collision and none standing records the head.
-        let forced = candidate.force_resolution && !holding;
+        let forced = candidate.force_resolution && !(holding && candidate.sent_identity_alone);
         let resolving = forced
             || resolution.is_some()
             || !collisions.is_empty()
@@ -3149,6 +3155,7 @@ async fn converge_from_resolution(
             publishing: mode == ConvergeMode::Publish,
             existing: None,
             force_resolution: false,
+            sent_identity_alone: false,
             hold_root_identity: match held {
                 Some(hash) => IdentityHold::Held(hash),
                 None => IdentityHold::Released,
@@ -3214,6 +3221,7 @@ async fn finish_preparation(
             publishing: mode == ConvergeMode::Publish,
             existing: Some(standing),
             force_resolution: true,
+            sent_identity_alone: false,
             hold_root_identity: IdentityHold::Undecided,
             written_root_identity: written,
             held_root_identity: held_identity,
@@ -3729,7 +3737,8 @@ async fn publish_reviewed(
                     }
                 }
                 return guard_refused(
-                    client, token, copy, &opts, staging, resolution, parent, reference, root,
+                    client, token, copy, &opts, staging, resolution, parent, reference, &hashes,
+                    root,
                 )
                 .await;
             }
@@ -3743,10 +3752,11 @@ async fn publish_reviewed(
 /// `publish_reviewed` 7 and 8: raise the round, wait its backoff, and
 /// prepare the candidate again over the newest head with the refused
 /// parent standing as the base — forced to a resolution but where the
-/// recomputation holds the root identity file a retrieval wrote out and
-/// finds no other local work, which answers synced carrying no
-/// publication, the head recorded as the base (SPEC u306 `converge` 5,
-/// under Q-01).
+/// refused send's tree `sent` differed from that parent in the root
+/// identity file alone and the recomputation holds that file out, which,
+/// finding no other local work, answers synced carrying no publication,
+/// the head recorded as the base (SPEC u306 `converge` 5, under Q-01,
+/// u306 CR5-1).
 #[allow(clippy::too_many_arguments)]
 async fn guard_refused(
     client: &SynsClient,
@@ -3757,8 +3767,10 @@ async fn guard_refused(
     resolution: Option<Resolution>,
     parent: Option<String>,
     reference: BTreeMap<String, String>,
+    sent: &BTreeMap<String, String>,
     root: &FolderRoot,
 ) -> Result<SyncOutcome, CliError> {
+    let sent_identity_alone = differing_paths(&reference, sent) == [ROOT_IDENTITY];
     let refused_round = resolution.as_ref().map(|r| r.round).unwrap_or(1).max(1);
     let raised = resolution.map(|mut standing| {
         standing.round += 1;
@@ -3816,6 +3828,7 @@ async fn guard_refused(
             publishing: true,
             existing,
             force_resolution: true,
+            sent_identity_alone,
             hold_root_identity: IdentityHold::Undecided,
             written_root_identity: written,
             held_root_identity: held_identity,
@@ -4163,6 +4176,7 @@ mod tests {
                 publishing: false,
                 existing: None,
                 force_resolution: false,
+                sent_identity_alone: false,
                 hold_root_identity: IdentityHold::Released,
                 written_root_identity: false,
                 held_root_identity: false,
@@ -4605,6 +4619,7 @@ mod tests {
                 publishing: false,
                 existing: None,
                 force_resolution: false,
+                sent_identity_alone: false,
                 hold_root_identity: IdentityHold::Released,
                 written_root_identity: false,
                 held_root_identity: false,
@@ -4703,6 +4718,7 @@ mod tests {
                             publishing: false,
                             existing: None,
                             force_resolution: false,
+                            sent_identity_alone: false,
                             hold_root_identity: IdentityHold::Released,
                             written_root_identity: false,
                             held_root_identity: false,
