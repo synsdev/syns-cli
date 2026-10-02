@@ -629,3 +629,50 @@ fn an_edited_identity_file_a_pulled_head_carried_still_refuses_a_write() {
     assert_eq!(stderr(&rm), guard_refusal(&co));
     assert!(env.pushes().is_empty(), "no push request");
 }
+
+// ---- u305: the state of a fresh pull --------------------------------------
+
+/// The `Working copy` row of a human `status` table, its value alone.
+fn working_copy_row(rendered: &str) -> String {
+    let row = rendered
+        .lines()
+        .find(|line| line.contains("Working copy"))
+        .unwrap_or_else(|| panic!("a Working copy row in {rendered}"));
+    row.replace("Working copy", "")
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_string()
+}
+
+// SPEC u305 Tests, `status_in_a_fresh_pull_of_a_head_holding_no_identity_file_reads_converged`.
+#[test]
+#[serial]
+fn status_in_a_fresh_pull_of_a_head_holding_no_identity_file_reads_converged() {
+    let env = fresh_pull_env(false);
+    let co = env.w.join("co");
+
+    let pull = env.syns_with_stdin(&env.w, b"", &["pull", "alice/notes", "co"]);
+    assert_eq!(pull.status.code(), Some(0), "{}", stderr(&pull));
+
+    let json_status = env.syns_with_stdin(&co, b"", &["--json", "status"]);
+    assert_eq!(
+        json_status.status.code(),
+        Some(0),
+        "{}",
+        stderr(&json_status)
+    );
+    let document: serde_json::Value = serde_json::from_str(stdout(&json_status).trim()).unwrap();
+    assert_eq!(document["workingCopyState"], "converged");
+
+    let human = env.syns_with_stdin(&co, b"", &["status"]);
+    assert_eq!(human.status.code(), Some(0), "{}", stderr(&human));
+    assert_eq!(working_copy_row(&stdout(&human)), "converged");
+
+    let mut identity = fs::read_to_string(co.join(".syns.yaml")).unwrap();
+    identity.push_str("checks:\n  - make test\n");
+    fs::write(co.join(".syns.yaml"), identity).unwrap();
+
+    let edited = env.syns_with_stdin(&co, b"", &["--json", "status"]);
+    assert_eq!(edited.status.code(), Some(0), "{}", stderr(&edited));
+    let document: serde_json::Value = serde_json::from_str(stdout(&edited).trim()).unwrap();
+    assert_eq!(document["workingCopyState"], "local_changes");
+}

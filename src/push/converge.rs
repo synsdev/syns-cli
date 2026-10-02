@@ -44,7 +44,9 @@ use crate::push::working_copy::{
 };
 use crate::repo::folder::{FolderScope, lies_under};
 use crate::repo::identity::identity_head;
-use crate::repo::syns_yaml::{IdentityForm, read_identity_form, read_required_checks};
+use crate::repo::syns_yaml::{
+    IdentityForm, held_root_identity, read_identity_form, read_required_checks,
+};
 
 /// The last round a resolution stands at before attention is required:
 /// the first candidate and three continuations (Q-03).
@@ -1147,7 +1149,14 @@ fn base_of(copy: &WorkingCopy) -> Option<Manifest> {
 }
 
 fn load_base(copy: &WorkingCopy) -> Base {
-    match base_of(copy) {
+    base_from(base_of(copy).as_ref())
+}
+
+/// The commit and path-to-hash map a recorded base holds, an empty `Base`
+/// where none is recorded — the one conversion `load_base` and
+/// `working_copy_state` read a base manifest through (SPEC u305).
+fn base_from(manifest: Option<&Manifest>) -> Base {
+    match manifest {
         Some(manifest) => Base {
             commit: manifest.commit_sha().map(String::from),
             files: manifest
@@ -3710,7 +3719,10 @@ pub fn discard_resolution(copy: &WorkingCopy) -> Result<(), CliError> {
 }
 
 /// Where the working copy stands, against a head read in this call. Its
-/// collection reads through the stat record and writes none back.
+/// collection reads through the stat record and writes none back. SPEC
+/// u305 `working_copy_state` 4: a root `.syns.yaml` `held_root_identity`
+/// holds against the base read here — the record a retrieval wrote —
+/// counts as no local work, dropped from the folder side alone.
 pub async fn working_copy_state(
     client: &SynsClient,
     token: Option<&str>,
@@ -3724,8 +3736,10 @@ pub async fn working_copy_state(
         return Ok(WorkingCopyState::ResolutionRequired);
     }
 
-    // 2
-    let base = load_base(copy);
+    // 2 — the one base read, held as its manifest for step 4 and as the
+    // `Base` the comparison reads.
+    let base_manifest = base_of(copy);
+    let base = base_from(base_manifest.as_ref());
     let head = read_head(
         client,
         token,
@@ -3748,7 +3762,7 @@ pub async fn working_copy_state(
         record.as_mut(),
         &HeldBytes::new(HELD_BYTES_BUDGET),
     )?;
-    let folder: BTreeMap<String, String> = collected
+    let mut folder: BTreeMap<String, String> = collected
         .files
         .iter()
         .filter(|(path, _)| !is_partial_write(path))
@@ -3760,6 +3774,17 @@ pub async fn working_copy_state(
     if folder == head_files {
         return Ok(WorkingCopyState::Converged);
     }
+
+    // 4 — the identity file a retrieval wrote leaves the folder side
+    // alone, the head's and the base's entries for the path kept.
+    if held_root_identity(&copy.root, &copy.owner, &copy.name, base_manifest.as_ref()) {
+        folder.remove(ROOT_IDENTITY);
+        if folder == head_files {
+            return Ok(WorkingCopyState::Converged);
+        }
+    }
+
+    // 5
     let local = folder != base_files;
     let remote = head.commit != base.commit || head_files != base_files;
     Ok(match (local, remote) {

@@ -4,6 +4,7 @@ use serde::Deserialize;
 
 use super::resolve::RepoIdentity;
 use crate::errors::CliError;
+use crate::push::manifest::Manifest;
 
 const SYNS_YAML_FILENAME: &str = ".syns.yaml";
 
@@ -482,6 +483,28 @@ fn local_side_of_collision(contents: &str) -> Option<String> {
 /// out of its comparison are spelt by one function.
 pub fn identity_text(owner: &str, name: &str) -> String {
     format!("owner: {owner}\nname: {name}\n")
+}
+
+/// Whether the `.syns.yaml` standing directly at `root` is the identity
+/// record a retrieval wrote rather than local work (SPEC u305 Contract
+/// Surface, `held_root_identity`, moved from u303's `guard_root` 3): a
+/// base is recorded and names no `.syns.yaml`, and the file's bytes are
+/// `identity_text` of the bound owner and name, ASCII letter case aside.
+/// A file holding anything else, an unreadable one, one under a base
+/// naming it, and one beside no recorded base all stay in the
+/// comparison — the checkout guard and the working-copy state hold one
+/// file out under this one test.
+pub fn held_root_identity(root: &Path, owner: &str, name: &str, base: Option<&Manifest>) -> bool {
+    let Some(base) = base else {
+        return false;
+    };
+    if base.file_sha(SYNS_YAML_FILENAME).is_some() {
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(root.join(SYNS_YAML_FILENAME)) else {
+        return false;
+    };
+    bytes.eq_ignore_ascii_case(identity_text(owner, name).as_bytes())
 }
 
 pub fn write_syns_yaml(path: &Path, owner: &str, name: &str) -> Result<(), CliError> {

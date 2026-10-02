@@ -40,7 +40,7 @@ use crate::read::repository_argument;
 use crate::repo::folder::{FolderScope, lies_under, resolve_folder_scope};
 use crate::repo::identity::identity_head;
 use crate::repo::if_repo::resolve_full_or_skip;
-use crate::repo::syns_yaml::{identity_text, nearest_identity};
+use crate::repo::syns_yaml::{held_root_identity, nearest_identity};
 
 /// The options every write verb carries, spelt and bound identically on
 /// each (SPEC u271 Contract Surface, `WriteOptions`). `parent` holds a
@@ -329,7 +329,9 @@ fn agrees_with_base(
 /// or refuses naming it where the copy holds unpublished work. SPEC u303:
 /// a root `.syns.yaml` holding exactly the identity text a retrieval
 /// writes, under a base naming none, is held out of the comparison as no
-/// local work (`held_root_identity`), and nothing else ever is.
+/// local work, and nothing else ever is — judged by `held_root_identity`
+/// alone, the one test the working-copy state also judges it by (SPEC
+/// u305 Contract Surface, `guard_root`).
 fn guard_root(config: &Config, root: &Path, repo_id: &str) -> Result<PathBuf, CliError> {
     let refuse = || CliError::Io {
         message: checkout_guard_refusal(root, repo_id),
@@ -379,26 +381,6 @@ fn guard_root(config: &Config, root: &Path, repo_id: &str) -> Result<PathBuf, Cl
 
 /// The root identity file's name, as a collection keys it at the root.
 const SYNS_YAML: &str = ".syns.yaml";
-
-/// SPEC u303 `guard_root` 3: whether the `.syns.yaml` standing directly
-/// at `root` is the identity record a retrieval wrote rather than local
-/// work — a base is recorded and names no `.syns.yaml`, and the file's
-/// bytes are `identity_text` of the bound owner and name, ASCII letter
-/// case aside. A file holding anything else, an unreadable one, one
-/// under a base naming it, and one beside no recorded base all stay in
-/// the comparison.
-fn held_root_identity(root: &Path, owner: &str, name: &str, base: Option<&Manifest>) -> bool {
-    let Some(base) = base else {
-        return false;
-    };
-    if base.file_sha(SYNS_YAML).is_some() {
-        return false;
-    }
-    let Ok(bytes) = std::fs::read(root.join(SYNS_YAML)) else {
-        return false;
-    };
-    bytes.eq_ignore_ascii_case(identity_text(owner, name).as_bytes())
-}
 
 /// SPEC u291 `checkout_of` 2 and 3 inside the folder of the repository
 /// bound: the folder copy's outbox and resolution, then the folder

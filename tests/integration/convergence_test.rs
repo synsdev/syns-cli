@@ -2585,6 +2585,106 @@ async fn status_ignores_a_partial_write_sibling() {
     assert_eq!(state, WorkingCopyState::RemoteChanges);
 }
 
+// ---- u305: the identity file a retrieval wrote, in the state --------------
+
+/// The working-copy state of the copy of `alice/proj` at `e.dir()`.
+async fn state_of(e: &Env) -> WorkingCopyState {
+    working_copy_state(&e.fake.client(), Some(TOKEN), &e.copy(&e.dir()))
+        .await
+        .unwrap()
+}
+
+/// A copy recording base `h0` holding `a.md` alone, the head standing
+/// there, and `.syns.yaml` written beside `a.md` reading `identity`.
+fn based_beside_identity(e: &Env, identity: &str) -> String {
+    let h0 = e.fake.commit(&[("a.md", "a0\n")]);
+    checkout(&e.fake, &e.copy(&e.dir()), &h0);
+    write_files(&e.dir(), &[(".syns.yaml", identity)]);
+    h0
+}
+
+// SPEC u305 Tests, `state_holds_out_an_identity_file_a_retrieval_wrote`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn state_holds_out_an_identity_file_a_retrieval_wrote() {
+    let e = env().await;
+    based_beside_identity(&e, IDENTITY);
+
+    assert_eq!(state_of(&e).await, WorkingCopyState::Converged);
+
+    write_files(&e.dir(), &[(".syns.yaml", "owner: Alice\nname: Proj\n")]);
+    assert_eq!(state_of(&e).await, WorkingCopyState::Converged);
+}
+
+// SPEC u305 Tests, `state_counts_an_edited_identity_file_the_base_lacks`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn state_counts_an_edited_identity_file_the_base_lacks() {
+    let e = env().await;
+    based_beside_identity(&e, IDENTITY_WITH_CHECK);
+
+    assert_eq!(state_of(&e).await, WorkingCopyState::LocalChanges);
+}
+
+// SPEC u305 Tests, `state_counts_an_edit_beside_a_held_identity_file`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn state_counts_an_edit_beside_a_held_identity_file() {
+    let e = env().await;
+    based_beside_identity(&e, IDENTITY);
+    write_files(&e.dir(), &[("a.md", "edited\n")]);
+
+    assert_eq!(state_of(&e).await, WorkingCopyState::LocalChanges);
+}
+
+// SPEC u305 Tests, `state_counts_an_identity_file_the_base_names_at_other_bytes`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn state_counts_an_identity_file_the_base_names_at_other_bytes() {
+    let e = env().await;
+    let h0 = e
+        .fake
+        .commit(&[("a.md", "a0\n"), (".syns.yaml", IDENTITY_WITH_CHECK)]);
+    checkout(&e.fake, &e.copy(&e.dir()), &h0);
+    write_files(&e.dir(), &[(".syns.yaml", IDENTITY)]);
+
+    assert_eq!(state_of(&e).await, WorkingCopyState::LocalChanges);
+}
+
+// SPEC u305 Tests, `state_with_no_recorded_base_holds_no_identity_file_out`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn state_with_no_recorded_base_holds_no_identity_file_out() {
+    let e = env().await;
+    e.fake.commit(&[("a.md", "a0\n")]);
+    write_files(&e.dir(), &[("a.md", "a0\n"), (".syns.yaml", IDENTITY)]);
+
+    assert_eq!(state_of(&e).await, WorkingCopyState::Diverged);
+}
+
+// SPEC u305 Tests, `state_reads_a_head_adding_the_written_identity_file_as_converged`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn state_reads_a_head_adding_the_written_identity_file_as_converged() {
+    let e = env().await;
+    based_beside_identity(&e, IDENTITY);
+    e.fake.commit(&[("a.md", "a0\n"), (".syns.yaml", IDENTITY)]);
+
+    assert_eq!(state_of(&e).await, WorkingCopyState::Converged);
+}
+
+// SPEC u305 Tests, `state_reads_a_head_adding_another_identity_file_as_remote_changes`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn state_reads_a_head_adding_another_identity_file_as_remote_changes() {
+    let e = env().await;
+    based_beside_identity(&e, IDENTITY);
+    e.fake
+        .commit(&[("a.md", "a0\n"), (".syns.yaml", IDENTITY_WITH_CHECK)]);
+
+    assert_eq!(state_of(&e).await, WorkingCopyState::RemoteChanges);
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn discard_restores_the_folder_before_the_resolution() {
