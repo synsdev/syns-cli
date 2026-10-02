@@ -26,7 +26,7 @@ use crate::push::working_copy::{WorkingCopy, folder_base};
 use crate::repo::folder::{FolderScope, lies_under, place_under, resolve_folder_scope};
 use crate::repo::identity::identity_head;
 use crate::repo::if_repo::resolve_or_skip;
-use crate::repo::root::{push_scope, resolve_start_path};
+use crate::repo::root::{push_scope, refuse_another_repository, resolve_start_path};
 use crate::repo::syns_yaml::refuse_marked_root_identity;
 
 /// The message a publication carries where the invocation names none.
@@ -159,16 +159,19 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
 
     let repo_id = format!("{owner}/{name}");
 
+    // SPEC u309 `cmd_push` 2 (issue 231): the identity file standing in
+    // the addressed directory itself naming another repository refuses
+    // the run — forced, path-scoped and bare alike — before any working
+    // copy, write or publication request, judged from the very arguments
+    // `push_scope` takes below.
+    let explicit = args.path.as_ref().map(|_| start_path.as_path());
+    refuse_another_repository(explicit, &start_path, &owner, &name)?;
+
     // The content root, and the scope inside it (SPEC u255 `cmd_push`
     // 3). Before u255 the publication took `start_path` itself as the
     // root, so a run from `repo/sub/` published `sub/` as though it
     // were the whole repository.
-    let scope = push_scope(
-        args.path.as_ref().map(|_| start_path.as_path()),
-        &start_path,
-        &owner,
-        &name,
-    )?;
+    let scope = push_scope(explicit, &start_path, &owner, &name)?;
 
     let status = args.status.clone().map(Into::into);
     let visibility = args.visibility.clone().map(Into::into);

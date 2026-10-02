@@ -2,7 +2,7 @@ use crate::auth::token::TokenStore;
 use crate::client::{EntryType, SynsClient};
 use crate::commands::sync::{convergence_options_for, render_outcome, render_transfer_lines};
 use crate::config::Config;
-use crate::errors::{CliError, IdentityRemedy};
+use crate::errors::{BelongsRemedy, CliError, IdentityRemedy};
 use crate::output::Output;
 use crate::push::collector::{HELD_BYTES_BUDGET, HeldBytes};
 use crate::push::converge::{
@@ -265,6 +265,7 @@ pub async fn cmd_pull(
                 path: scope.dir.clone(),
                 standing: scope.address(),
                 requested: format!("{owner}/{name}"),
+                remedy: BelongsRemedy::Pull,
             });
         }
         return pull_into_folder(config, output, scope, version, overwrite_local).await;
@@ -314,6 +315,7 @@ pub async fn cmd_pull(
             path: standing.dir.clone(),
             standing: format!("{}/{}", standing.owner, standing.name),
             requested: format!("{owner}/{name}"),
+            remedy: BelongsRemedy::Pull,
         });
     }
 
@@ -587,6 +589,7 @@ async fn pull_folder_alone(
                 path: standing_dir,
                 standing: named,
                 requested: holder,
+                remedy: BelongsRemedy::Pull,
             });
         }
         let ours = matches!(&form, IdentityForm::Folder { path: recorded, .. } if recorded == path);

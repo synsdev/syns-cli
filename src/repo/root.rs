@@ -11,8 +11,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::errors::CliError;
-use crate::repo::syns_yaml::find_repo_root_for;
+use crate::errors::{BelongsRemedy, CliError};
+use crate::repo::syns_yaml::{find_repo_root_for, nearest_identity};
 
 /// Where a publication's paths are taken relative to, and what part of
 /// the tree it is confined to (SPEC u255 § Contract Surface).
@@ -154,6 +154,44 @@ pub fn push_scope(
     owner: &str,
     name: &str,
 ) -> Result<ContentScope, CliError> {
+    // 1, 2 — the path the run addresses and the directory its walk
+    // starts at.
+    let (target, start) = addressed_directory(explicit, cwd)?;
+
+    // 3, 4 — the repository root, or the starting directory where the
+    // walk found no identity file naming this repository.
+    let root = match find_repo_root_for(&start, owner, name)? {
+        Some(root) => root,
+        None => {
+            return Ok(ContentScope {
+                root: start,
+                prefix: None,
+            });
+        }
+    };
+
+    // 5 — the addressed path's position under the root. A bare
+    // invocation carries no path argument and therefore no prefix,
+    // whichever descendant of the root it started in.
+    let prefix = match explicit {
+        None => None,
+        Some(_) => match target.strip_prefix(&root) {
+            Ok(rel) => to_forward_slash(rel).filter(|p| !p.is_empty()),
+            Err(_) => None,
+        },
+    };
+
+    Ok(ContentScope { root, prefix })
+}
+
+/// `push_scope`'s steps 1 and 2: the absolute form of the path a
+/// publication addresses — `explicit` where one was given, `cwd`
+/// otherwise — and the directory its walks start at, that path's
+/// parent where it names a file.
+fn addressed_directory(
+    explicit: Option<&Path>,
+    cwd: &Path,
+) -> Result<(PathBuf, PathBuf), CliError> {
     // 1 — absolute form of the path the run addresses.
     let target = absolutize(explicit.unwrap_or(cwd))?;
 
@@ -180,30 +218,42 @@ pub fn push_scope(
         });
     };
 
-    // 3, 4 — the repository root, or the starting directory where the
-    // walk found no identity file naming this repository.
-    let root = match find_repo_root_for(&start, owner, name)? {
-        Some(root) => root,
-        None => {
-            return Ok(ContentScope {
-                root: start,
-                prefix: None,
-            });
-        }
-    };
+    Ok((target, start))
+}
 
-    // 5 — the addressed path's position under the root. A bare
-    // invocation carries no path argument and therefore no prefix,
-    // whichever descendant of the root it started in.
-    let prefix = match explicit {
-        None => None,
-        Some(_) => match target.strip_prefix(&root) {
-            Ok(rel) => to_forward_slash(rel).filter(|p| !p.is_empty()),
-            Err(_) => None,
-        },
+/// Refuse a publication whose addressed directory holds an identity file
+/// naming a repository other than `owner/name` (SPEC u309 Contract
+/// Surface, issue 231).
+///
+/// The directory is the one `push_scope` starts its walk at for the same
+/// `explicit` and `cwd`. The nearest identity file is read by its local
+/// side where it carries collision markers. One standing above that
+/// directory decides nothing here: naming `owner/name` it roots the
+/// publication above, and naming another repository it leaves
+/// `push_scope` publishing the directory as its own root (SPEC u255).
+/// A file in the directory itself naming `owner/name`,
+/// ASCII letter case aside, passes; one naming another repository raises
+/// the ownership refusal under the publication's remedy, before any
+/// request, working copy or write.
+pub fn refuse_another_repository(
+    explicit: Option<&Path>,
+    cwd: &Path,
+    owner: &str,
+    name: &str,
+) -> Result<(), CliError> {
+    let (_target, start) = addressed_directory(explicit, cwd)?;
+    let Some(standing) = nearest_identity(&start)? else {
+        return Ok(());
     };
-
-    Ok(ContentScope { root, prefix })
+    if standing.dir != start || standing.names(owner, name) {
+        return Ok(());
+    }
+    Err(CliError::PathBelongsToAnotherRepository {
+        path: standing.dir,
+        standing: format!("{}/{}", standing.owner, standing.name),
+        requested: format!("{owner}/{name}").to_ascii_lowercase(),
+        remedy: BelongsRemedy::Push,
+    })
 }
 
 /// Resolve a retrieval's one write root (SPEC u255 § Behaviour,

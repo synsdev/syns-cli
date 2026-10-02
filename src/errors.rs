@@ -17,13 +17,18 @@ pub enum CliError {
     /// `syns pull OWNER/NAME [PATH]` where the identity file nearest the
     /// starting directory, at or above it, names another repository — a
     /// bare run, a path argument and a run from a sub-folder alike —
-    /// refused before any request (SPEC u263, issue 130). `path` is the
-    /// directory holding the identity file that decided, `standing` its
-    /// pair as spelt, `requested` the bound pair lower-cased.
+    /// refused before any request (SPEC u263, issue 130); and `syns push
+    /// [PATH]` resolving a repository other than the one the identity
+    /// file standing in its addressed directory names (SPEC u309, issue
+    /// 231). `path` is the directory holding the identity file that
+    /// decided, `standing` its pair as spelt, `requested` the pair the
+    /// run resolved lower-cased, and `remedy` which of the two commands'
+    /// moves the line offers.
     PathBelongsToAnotherRepository {
         path: std::path::PathBuf,
         standing: String,
         requested: String,
+        remedy: BelongsRemedy,
     },
     /// SPEC u290, the holder-acting refusal (`D-102`): a command that
     /// would change the holding repository, run inside a scoped folder,
@@ -208,6 +213,17 @@ pub enum IdentityRemedy {
     /// Every invocation taking `--repo` (SPEC u283): the option names
     /// the repository, or an identity file does.
     RepoOption,
+}
+
+/// Which command's move the ownership refusal offers (SPEC u309
+/// Contract Surface): every retrieval site carries `Pull`, and
+/// `refuse_another_repository` alone carries `Push`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BelongsRemedy {
+    /// `syns pull`: retrieve the repository into another directory.
+    Pull,
+    /// `syns push [PATH]`: publish the repository from another directory.
+    Push,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -434,12 +450,21 @@ impl std::fmt::Display for CliError {
                 path,
                 standing,
                 requested,
-            } => write!(
-                f,
-                "{} already belongs to {standing} \u{2014} pull {requested} into another directory, or remove {}",
-                path.display(),
-                path.join(".syns.yaml").display()
-            ),
+                remedy,
+            } => match remedy {
+                BelongsRemedy::Pull => write!(
+                    f,
+                    "{} already belongs to {standing} \u{2014} pull {requested} into another directory, or remove {}",
+                    path.display(),
+                    path.join(".syns.yaml").display()
+                ),
+                BelongsRemedy::Push => write!(
+                    f,
+                    "{} already belongs to {standing} \u{2014} push {requested} from another directory, or remove {}",
+                    path.display(),
+                    path.join(".syns.yaml").display()
+                ),
+            },
             CliError::HolderActing {
                 command,
                 holder,
@@ -966,18 +991,29 @@ mod tests {
         assert_eq!(doc["error"], serde_json::json!(err.to_string()));
     }
 
+    // SPEC u309 Tests, `path_belongs_line_names_the_refused_commands_move`:
+    // the retrieval's line word for word under `Pull`, the publication's
+    // under `Push`, exit `2` under both.
     #[test]
-    fn path_belongs_line_names_the_deciding_directory() {
-        let err = CliError::PathBelongsToAnotherRepository {
+    fn path_belongs_line_names_the_refused_commands_move() {
+        let refusal = |remedy| CliError::PathBelongsToAnotherRepository {
             path: std::path::PathBuf::from("/w/c"),
             standing: "bob/other".into(),
             requested: "alice/notes".into(),
+            remedy,
         };
+        let pull = refusal(BelongsRemedy::Pull);
         assert_eq!(
-            err.to_string(),
+            pull.to_string(),
             "/w/c already belongs to bob/other \u{2014} pull alice/notes into another directory, or remove /w/c/.syns.yaml"
         );
-        assert_eq!(err.exit_code(), 2);
+        assert_eq!(pull.exit_code(), 2);
+        let push = refusal(BelongsRemedy::Push);
+        assert_eq!(
+            push.to_string(),
+            "/w/c already belongs to bob/other \u{2014} push alice/notes from another directory, or remove /w/c/.syns.yaml"
+        );
+        assert_eq!(push.exit_code(), 2);
     }
 
     // SPEC u290 Contract Surface, the holder-acting refusal and the

@@ -20,9 +20,10 @@ use serial_test::serial;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use syns_cli::auth::token::TokenStore;
 use syns_cli::commands::pull::cmd_pull;
 use syns_cli::commands::push::{PushArgs, cmd_push};
-use syns_cli::errors::CliError;
+use syns_cli::errors::{BelongsRemedy, CliError};
 use syns_cli::push::hash::blob_sha1;
 use syns_cli::push::manifest::Manifest;
 use syns_cli::push::working_copy::WorkingCopy;
@@ -694,6 +695,7 @@ async fn pull_of_another_repository_below_an_identity_file_refuses() {
             path,
             standing,
             requested,
+            remedy: BelongsRemedy::Pull,
         }) => {
             assert_eq!(path, root);
             assert_eq!(standing, "alice/proj");
@@ -788,23 +790,24 @@ async fn allow_empty_still_carries_an_unscoped_publication_past_the_refusal() {
     );
 }
 
+// SPEC u309 Tests, the row of this name: inverting the u255-era case
+// that published another repository's tree from a folder whose own
+// identity file names `alice/proj`.
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn push_naming_another_repository_leaves_a_standing_identity_file_alone() {
     let ctx = setup().await;
     seed_credentials(&ctx, "test-token", "alice");
-    let root = seed_tree(&ctx);
+    let (folder, before) = seed_owned_folder(&ctx);
     mount_push_mocks(&ctx, "bob/other").await;
 
-    let mut args = push_args(Some(root.clone()));
+    let mut args = push_args(Some(folder.clone()));
     args.name = Some("bob/other".into());
-    cmd_push(&ctx.config, &ctx.output, &args).await.unwrap();
+    let result = cmd_push(&ctx.config, &ctx.output, &args).await;
 
-    let marker = fs::read_to_string(root.join(".syns.yaml")).unwrap();
-    assert_eq!(
-        marker, "owner: alice\nname: proj\n",
-        "the publication overwrote the identity file standing at its content root"
-    );
+    assert_refused_as_another_repository(&result, &folder, "alice/proj", "bob/other");
+    assert_no_request(&ctx).await;
+    assert_eq!(fs::read(folder.join(".syns.yaml")).unwrap(), before);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1044,5 +1047,283 @@ async fn pull_of_another_repository_where_an_identity_file_stands_refuses() {
     assert_eq!(
         fs::read_to_string(root.join(".syns.yaml")).unwrap(),
         standing
+    );
+}
+
+// ---- u309: a publication naming another repository than its folder's --
+
+/// SPEC u309 Tests' `F`, in its canonical form, and `I`, the bytes its
+/// identity file holds before the run.
+fn seed_owned_folder(ctx: &TestContext) -> (PathBuf, Vec<u8>) {
+    let folder = fs::canonicalize(ctx.project_dir.path()).unwrap();
+    let identity = b"owner: alice\nname: proj\n".to_vec();
+    fs::write(folder.join(".syns.yaml"), &identity).unwrap();
+    fs::write(folder.join("a.md"), "a\n").unwrap();
+    fs::create_dir_all(folder.join("sub")).unwrap();
+    fs::write(folder.join("sub/b.md"), "b\n").unwrap();
+    (folder, identity)
+}
+
+/// Every file under `dir`, relative to it, `/`-separated and sorted.
+fn files_under(dir: &Path) -> Vec<String> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(dir, &mut found);
+    let mut out: Vec<String> = found
+        .iter()
+        .map(|p| {
+            p.strip_prefix(dir)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+fn assert_refused_as_another_repository(
+    result: &Result<(), CliError>,
+    folder: &Path,
+    standing: &str,
+    requested: &str,
+) {
+    match result {
+        Err(CliError::PathBelongsToAnotherRepository {
+            path,
+            standing: s,
+            requested: r,
+            remedy,
+        }) => {
+            assert_eq!(path, folder);
+            assert_eq!(s, standing);
+            assert_eq!(r, requested);
+            assert_eq!(*remedy, BelongsRemedy::Push);
+        }
+        other => panic!("expected the publication's path-belongs refusal, got {other:?}"),
+    }
+}
+
+async fn assert_no_request(ctx: &TestContext) {
+    let requests = ctx.mock_server.received_requests().await.unwrap();
+    assert!(
+        requests.is_empty(),
+        "the refused publication sent {:?}",
+        requests
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.url.path()))
+            .collect::<Vec<_>>()
+    );
+}
+
+// SPEC u309 Tests, the row of this name: issue 231's reproduction.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn forced_push_naming_another_repository_refuses_before_any_request() {
+    let ctx = setup().await;
+    seed_credentials(&ctx, "test-token", "alice");
+    let (folder, before) = seed_owned_folder(&ctx);
+    mount_push_mocks(&ctx, "bob/other").await;
+
+    let result = {
+        let _cwd = CwdGuard::enter(&folder);
+        let mut args = push_args(None);
+        args.force = true;
+        args.name = Some("bob/other".into());
+        cmd_push(&ctx.config, &ctx.output, &args).await
+    };
+
+    assert_refused_as_another_repository(&result, &folder, "alice/proj", "bob/other");
+    assert_no_request(&ctx).await;
+    assert_eq!(fs::read(folder.join(".syns.yaml")).unwrap(), before);
+}
+
+// SPEC u309 Tests, the row of this name.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn push_scoped_to_a_file_beside_another_repositorys_identity_refuses() {
+    let ctx = setup().await;
+    seed_credentials(&ctx, "test-token", "alice");
+    let (folder, _before) = seed_owned_folder(&ctx);
+    mount_push_mocks(&ctx, "bob/other").await;
+
+    let mut args = push_args(Some(folder.join("a.md")));
+    args.name = Some("bob/other".into());
+    let result = cmd_push(&ctx.config, &ctx.output, &args).await;
+
+    assert_refused_as_another_repository(&result, &folder, "alice/proj", "bob/other");
+    assert_no_request(&ctx).await;
+}
+
+// SPEC u309 Tests, the row of this name.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn bare_push_naming_another_repository_refuses_and_converges_nothing() {
+    let ctx = setup().await;
+    seed_credentials(&ctx, "test-token", "alice");
+    let (folder, before) = seed_owned_folder(&ctx);
+    mount_push_mocks(&ctx, "bob/other").await;
+
+    let result = {
+        let _cwd = CwdGuard::enter(&folder);
+        let mut args = push_args(None);
+        args.name = Some("bob/other".into());
+        cmd_push(&ctx.config, &ctx.output, &args).await
+    };
+
+    assert_refused_as_another_repository(&result, &folder, "alice/proj", "bob/other");
+    assert_no_request(&ctx).await;
+    assert_eq!(files_under(&folder), [".syns.yaml", "a.md", "sub/b.md"]);
+    assert_eq!(fs::read(folder.join(".syns.yaml")).unwrap(), before);
+}
+
+// SPEC u309 Tests, the row of this name.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn bare_name_resolving_another_owner_refuses() {
+    let ctx = setup().await;
+    seed_credentials(&ctx, "test-token", "bob");
+    let (folder, _before) = seed_owned_folder(&ctx);
+    mount_push_mocks(&ctx, "bob/proj").await;
+
+    let result = {
+        let _cwd = CwdGuard::enter(&folder);
+        let mut args = push_args(None);
+        args.force = true;
+        args.name = Some("proj".into());
+        cmd_push(&ctx.config, &ctx.output, &args).await
+    };
+
+    assert_refused_as_another_repository(&result, &folder, "alice/proj", "bob/proj");
+    assert_no_request(&ctx).await;
+}
+
+// SPEC u309 Tests, the row of this name: the session read resolving the
+// owner is the one request preceding the refusal.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn bare_name_on_a_credential_storing_no_username_refuses_after_the_session_read() {
+    let ctx = setup().await;
+    TokenStore::new(ctx.config.credentials_path())
+        .write("test-token")
+        .unwrap();
+    let (folder, _before) = seed_owned_folder(&ctx);
+    Mock::given(method("GET"))
+        .and(path_matcher("/api/auth/get-session"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "user": {
+                "id": "user-id-bob",
+                "name": "Bob",
+                "username": "bob",
+                "email": "bob@example.com",
+                "emailVerified": true,
+                "image": null,
+                "createdAt": "2026-01-01T00:00:00.000Z",
+                "updatedAt": "2026-01-01T00:00:00.000Z"
+            },
+            "session": {
+                "id": "session-id-bob",
+                "userId": "user-id-bob",
+                "expiresAt": "2026-12-31T23:59:59.000Z"
+            }
+        })))
+        .mount(&ctx.mock_server)
+        .await;
+    mount_push_mocks(&ctx, "bob/proj").await;
+
+    let result = {
+        let _cwd = CwdGuard::enter(&folder);
+        let mut args = push_args(None);
+        args.force = true;
+        args.name = Some("proj".into());
+        cmd_push(&ctx.config, &ctx.output, &args).await
+    };
+
+    assert_refused_as_another_repository(&result, &folder, "alice/proj", "bob/proj");
+    let requests: Vec<String> = ctx
+        .mock_server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| format!("{} {}", r.method, r.url.path()))
+        .collect();
+    assert_eq!(requests, ["GET /api/auth/get-session"]);
+}
+
+// SPEC u309 Tests, the row of this name.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn push_beside_a_marked_identity_file_judges_its_local_side() {
+    let ctx = setup().await;
+    seed_credentials(&ctx, "test-token", "alice");
+    let (folder, _before) = seed_owned_folder(&ctx);
+    let marked = "<<<<<<< local\nowner: alice\nname: proj\n=======\nowner: bob\nname: other\n>>>>>>> remote\n";
+    fs::write(folder.join(".syns.yaml"), marked).unwrap();
+    mount_push_mocks(&ctx, "bob/other").await;
+
+    let mut args = push_args(Some(folder.clone()));
+    args.force = true;
+    args.name = Some("bob/other".into());
+    let result = cmd_push(&ctx.config, &ctx.output, &args).await;
+
+    assert_refused_as_another_repository(&result, &folder, "alice/proj", "bob/other");
+    assert_no_request(&ctx).await;
+    assert_eq!(
+        fs::read_to_string(folder.join(".syns.yaml")).unwrap(),
+        marked
+    );
+}
+
+// SPEC u309 Tests, the row of this name: `D-025`'s letter-case rule
+// keeps a folder whose identity file spells its repository otherwise
+// publishing as before.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn push_naming_the_folders_repository_in_another_case_publishes() {
+    let ctx = setup().await;
+    seed_credentials(&ctx, "test-token", "alice");
+    let (folder, _before) = seed_owned_folder(&ctx);
+    fs::write(folder.join(".syns.yaml"), "owner: Alice\nname: Proj\n").unwrap();
+    mount_push_mocks(&ctx, "alice/proj").await;
+
+    {
+        let _cwd = CwdGuard::enter(&folder);
+        let mut args = push_args(None);
+        args.force = true;
+        args.name = Some("alice/proj".into());
+        cmd_push(&ctx.config, &ctx.output, &args).await.unwrap();
+    }
+
+    let pushes: Vec<serde_json::Value> = ctx
+        .mock_server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method == reqwest::Method::PUT && r.url.path().ends_with("/push"))
+        .map(|r| {
+            assert_eq!(r.url.path(), "/api/v1/repos/alice/proj/push");
+            serde_json::from_slice(&r.body).unwrap()
+        })
+        .collect();
+    assert_eq!(pushes.len(), 1, "one publication request");
+    assert!(
+        body_paths(&pushes[0]).contains(&"a.md".to_string()),
+        "{:?}",
+        body_paths(&pushes[0])
+    );
+    assert_eq!(
+        fs::read_to_string(folder.join(".syns.yaml")).unwrap(),
+        "owner: Alice\nname: Proj\n"
     );
 }

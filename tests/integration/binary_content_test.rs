@@ -1465,3 +1465,30 @@ async fn convergence_on_windows_keeps_no_stat_record() {
     );
     assert!(!m.copy().state_dir.join("stat-record.json").exists());
 }
+
+// SPEC u309 Tests, the row of this name: issue 231's refusal as the
+// binary prints it, on the diagnostic stream and under `--json`.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn binary_push_naming_another_repository_prints_the_refusal() {
+    let server = MockServer::start().await;
+    let machine = Machine::new(&server.uri());
+    let m = std::fs::canonicalize(machine.dir()).unwrap();
+    write(&m, ".syns.yaml", identity());
+    write(&m, "a.md", b"a\n");
+    let line = format!(
+        "{} already belongs to alice/proj \u{2014} push alice/other from another directory, or remove {}",
+        m.display(),
+        m.join(".syns.yaml").display()
+    );
+
+    let forced = machine.run(&["push", "--force", "-n", "other"]).await;
+    assert_eq!(forced.status.code(), Some(2), "{}", stderr(&forced));
+    assert_eq!(stderr(&forced), format!("error: {line}\n"));
+
+    let json = machine.run(&["push", "-n", "other", "--json"]).await;
+    assert_eq!(json.status.code(), Some(2), "{}", stderr(&json));
+    assert_eq!(document(&json), json!({"error": line}));
+
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
