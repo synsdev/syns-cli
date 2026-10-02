@@ -37,7 +37,7 @@ use crate::push::hash::blob_sha1;
 use crate::push::manifest::Manifest;
 use crate::push::working_copy::{WorkingCopy, folder_base};
 use crate::read::repository_argument;
-use crate::repo::folder::{FolderScope, resolve_folder_scope};
+use crate::repo::folder::{FolderScope, lies_under, resolve_folder_scope};
 use crate::repo::identity::identity_head;
 use crate::repo::if_repo::resolve_full_or_skip;
 use crate::repo::syns_yaml::nearest_identity;
@@ -139,6 +139,12 @@ pub struct WriteTarget {
     /// SPEC u292: the head's commit the repository read answered at
     /// `resolve_write_target` 4, none where that answer named none.
     pub head: Option<String>,
+    /// The holder path of the folder `checkout` names, where that folder
+    /// is bound to its identity and `--repo` named its holder: only a
+    /// written path at or under it leaves the folder behind, the folder's
+    /// head being its identity's newest listed version (`D-119`). None
+    /// everywhere else, where any changed file leaves `checkout` behind.
+    pub checkout_path: Option<String>,
 }
 
 impl WriteTarget {
@@ -590,6 +596,18 @@ pub async fn resolve_write_target(
     // verbs admit, with no folder; no ladder, no mismatch check and no
     // skip runs beside it. Inside a folder the holder is bound.
     let scope = resolve_folder_scope(cwd)?;
+    // The ruling on u302 round 2's open question: a write naming the
+    // holder from inside a folder bound to its identity leaves that folder
+    // behind only through a path under its holder path.
+    let identity_folder_path = scope
+        .as_ref()
+        .filter(|scope| scope.identity.is_some())
+        .filter(|scope| {
+            opts.repo
+                .as_deref()
+                .is_some_and(|named| scope.holder().eq_ignore_ascii_case(named))
+        })
+        .map(|scope| scope.path.clone());
     let (repo_id, folder) = match (opts.repo.as_deref(), scope) {
         (Some(named), _) => (named.to_ascii_lowercase(), None),
         (None, Some(scope)) => (scope.address(), Some(scope)),
@@ -644,6 +662,7 @@ pub async fn resolve_write_target(
     // 5 and 6 — pin the parent.
     let parent = resolve_parent(&client, &repo_id, &token, &opts.parent).await?;
 
+    let checkout_path = checkout.as_ref().and(identity_folder_path);
     Ok(WriteTarget {
         repo_id,
         token,
@@ -651,6 +670,7 @@ pub async fn resolve_write_target(
         checkout,
         folder,
         head,
+        checkout_path,
     })
 }
 
@@ -746,15 +766,24 @@ fn fold_conflict(err: CliError, parent: &str) -> CliError {
 /// The checkout root a run leaves one version behind: `Some` only where
 /// the target carries one and the answer counted a changed file. A run
 /// that changed none leaves a clean folder unnamed, because the head it
-/// matches never moved.
+/// matches never moved. Where the target carries `checkout_path`, one of
+/// `written` — every file and deletion path the run sent — must also lie
+/// at or under it.
 pub fn checkout_left_behind<'a>(
     target: &'a WriteTarget,
     response: &PushResponse,
+    written: &[String],
 ) -> Option<&'a Path> {
     target
         .checkout
         .as_deref()
         .filter(|_| response.files_changed > 0)
+        .filter(|_| match target.checkout_path.as_deref() {
+            None => true,
+            Some(folder) => written
+                .iter()
+                .any(|path| path == folder || lies_under(path, folder)),
+        })
 }
 
 /// `commit_changeset` 4 in machine-readable mode: the served body with
@@ -765,10 +794,13 @@ pub fn with_checkout_behind(
     body: serde_json::Value,
     target: &WriteTarget,
     response: &PushResponse,
+    written: &[String],
 ) -> serde_json::Value {
     let mut body = body;
-    if let (Some(root), Some(map)) = (checkout_left_behind(target, response), body.as_object_mut())
-    {
+    if let (Some(root), Some(map)) = (
+        checkout_left_behind(target, response, written),
+        body.as_object_mut(),
+    ) {
         map.insert(
             "checkoutBehind".to_string(),
             serde_json::Value::from(root.display().to_string()),
@@ -779,12 +811,18 @@ pub fn with_checkout_behind(
 
 /// The run's one answer (`commit_changeset` 4 and 5): the served body
 /// under machine-readable mode, the write report otherwise.
-fn report(output: &Output, target: &WriteTarget, response: &PushResponse, raw: serde_json::Value) {
+fn report(
+    output: &Output,
+    target: &WriteTarget,
+    response: &PushResponse,
+    raw: serde_json::Value,
+    written: &[String],
+) {
     let changed = response.files_changed > 0;
-    let behind = checkout_left_behind(target, response);
+    let behind = checkout_left_behind(target, response, written);
 
     if output.is_json() {
-        output.json(&with_checkout_behind(raw, target, response));
+        output.json(&with_checkout_behind(raw, target, response, written));
         return;
     }
 
@@ -959,11 +997,22 @@ pub async fn commit_changeset(
     opts: &WriteOptions,
     default_message: &str,
 ) -> Result<(), CliError> {
+    // The paths the run sends, as typed: `checkout_path` stands only where
+    // `--repo` named the holder, so no folder maps them.
+    let written: Vec<String> = match target.checkout_path {
+        Some(_) => changeset
+            .files
+            .iter()
+            .map(|(path, _)| path.clone())
+            .chain(changeset.deletions.iter().cloned())
+            .collect(),
+        None => Vec::new(),
+    };
     let (response, raw, _claimed) =
         publish_changeset(config, target, changeset, opts, default_message).await?;
 
     // 4 and 5 — compose the run's one answer and render it.
-    report(output, target, &response, raw);
+    report(output, target, &response, raw, &written);
     Ok(())
 }
 
@@ -1112,6 +1161,7 @@ mod tests {
             checkout,
             folder: None,
             head: None,
+            checkout_path: None,
         }
     }
 
@@ -1737,24 +1787,77 @@ mod tests {
         let root = PathBuf::from("/w/notes");
         let target = target_at(Some(root.clone()));
         assert_eq!(
-            checkout_left_behind(&target, &response(1)),
+            checkout_left_behind(&target, &response(1), &[]),
             Some(root.as_path())
         );
-        assert_eq!(checkout_left_behind(&target, &response(0)), None);
-        assert_eq!(checkout_left_behind(&target_at(None), &response(1)), None);
+        assert_eq!(checkout_left_behind(&target, &response(0), &[]), None);
+        assert_eq!(
+            checkout_left_behind(&target_at(None), &response(1), &[]),
+            None
+        );
 
         let served = push_body(1, 8, MOVED_SHA);
-        let body = with_checkout_behind(served.clone(), &target, &response(1));
+        let body = with_checkout_behind(served.clone(), &target, &response(1), &[]);
         assert_eq!(body["checkoutBehind"], serde_json::json!("/w/notes"));
         assert_eq!(body["version"], serde_json::json!(8));
         assert_eq!(body["filesChanged"], serde_json::json!(1));
 
-        let unchanged = with_checkout_behind(served, &target, &response(0));
+        let unchanged = with_checkout_behind(served, &target, &response(0), &[]);
         assert!(unchanged.get("checkoutBehind").is_none());
         assert!(
-            with_checkout_behind(push_body(1, 8, MOVED_SHA), &target_at(None), &response(1))
-                .get("checkoutBehind")
-                .is_none()
+            with_checkout_behind(
+                push_body(1, 8, MOVED_SHA),
+                &target_at(None),
+                &response(1),
+                &[]
+            )
+            .get("checkoutBehind")
+            .is_none()
+        );
+    }
+
+    // The ruling on u302 round 2's open question: a folder bound to its
+    // identity, reached by a write naming its holder, is left behind only
+    // where a written path — a file or a deletion — lies at or under its
+    // holder path.
+    #[test]
+    fn an_identity_folder_is_left_behind_only_by_a_written_path_under_it() {
+        let root = PathBuf::from("/w/q3-plan");
+        let target = WriteTarget {
+            checkout_path: Some("q3-plan".to_string()),
+            ..target_at(Some(root.clone()))
+        };
+        let written = |paths: &[&str]| paths.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+
+        assert_eq!(
+            checkout_left_behind(&target, &response(1), &written(&["notes.md"])),
+            None
+        );
+        assert_eq!(
+            checkout_left_behind(&target, &response(1), &written(&["q3-planning/a.md"])),
+            None
+        );
+        assert_eq!(
+            checkout_left_behind(
+                &target,
+                &response(1),
+                &written(&["notes.md", "q3-plan/a.md"])
+            ),
+            Some(root.as_path())
+        );
+        assert_eq!(
+            checkout_left_behind(&target, &response(0), &written(&["q3-plan/a.md"])),
+            None
+        );
+        assert!(
+            with_checkout_behind(
+                push_body(1, 8, MOVED_SHA),
+                &target,
+                &response(1),
+                &written(&["notes.md"])
+            )
+            .get("checkoutBehind")
+            .is_none()
         );
     }
 

@@ -940,6 +940,70 @@ fn a_write_to_the_holder_inside_a_clean_identity_folder_lands_on_the_holder() {
     );
 }
 
+// The ruling on round 2's open question: a clean write to the holder
+// made from inside a folder bound to its identity names that folder as
+// left behind only where a written path lies under its holder path, the
+// folder's head being its identity's newest listed version (`D-119`),
+// which a holder commit outside the folder never moves.
+#[test]
+#[serial]
+fn a_write_to_the_holder_outside_a_clean_identity_folders_path_leaves_it_unnamed() {
+    let d = Deployment::new();
+    write(&d.folder().join("document.html"), DOC);
+    d.record_base(H4);
+    d.serves(
+        "GET",
+        HOLDER,
+        ResponseTemplate::new(200).set_body_json(record("alice", "docs", Some(H4), false)),
+    );
+    d.serves(
+        "PUT",
+        &format!("{HOLDER}/push"),
+        ResponseTemplate::new(200).set_body_json(json!({
+            "commitSha": H5, "version": 5, "filesChanged": 1, "created": false,
+        })),
+    );
+
+    let out = d.run_with(
+        &d.folder(),
+        &[
+            "--json",
+            "write",
+            "--repo",
+            "alice/docs",
+            "notes.md",
+            "--parent",
+            H4,
+        ],
+        "x",
+    );
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    let pushes = d.pushes(HOLDER);
+    assert_eq!(pushes.len(), 1, "{:?}", d.targets());
+    assert_eq!(pushed_paths(&pushes[0]), vec!["notes.md"]);
+    assert!(d.pushes(IDENTITY).is_empty());
+    assert_eq!(
+        document(&out).get("checkoutBehind"),
+        None,
+        "{}",
+        stdout_of(&out)
+    );
+
+    // Outside `--json`, the write report carries no left-behind line.
+    let out = d.run_with(
+        &d.folder(),
+        &["write", "--repo", "alice/docs", "notes.md", "--parent", H4],
+        "x",
+    );
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert!(
+        !stderr_of(&out).contains("one version behind"),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
 // The ruling on UNP1-1: a `shared_as` spelling no repository name under
 // the holder's owner stays refused, before any request.
 #[test]
