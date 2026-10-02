@@ -2685,6 +2685,424 @@ async fn state_reads_a_head_adding_another_identity_file_as_remote_changes() {
     assert_eq!(state_of(&e).await, WorkingCopyState::RemoteChanges);
 }
 
+// ---- u306: a retrieval over the root identity file it wrote or a local edit
+
+/// The identity file a local edit declares a check in.
+const IDENTITY_WITH_LOCAL_CHECK: &str = "owner: alice\nname: proj\nchecks:\n  - make local\n";
+
+/// The `.syns.yaml` entry the base of `copy` records.
+fn base_identity_entry(copy: &WorkingCopy) -> Option<String> {
+    copy.base()
+        .unwrap()
+        .file_sha(".syns.yaml")
+        .map(str::to_string)
+}
+
+/// A copy at a fresh folder against a fresh fake, its base `h0` holding
+/// `base` and the folder holding `h0`'s tree with `.syns.yaml` written
+/// over it reading `local`, the head `h1` laying `changes` over `h0`.
+async fn identity_setup(
+    e: &Env,
+    base: &[(&str, &str)],
+    local: &str,
+    changes: &[(&str, Option<&str>)],
+) -> (Fake, tempfile::TempDir, WorkingCopy, String) {
+    let fake = Fake::start().await;
+    let folder = tempfile::tempdir().unwrap();
+    let copy = e.copy(folder.path());
+    let h0 = fake.commit(base);
+    checkout(&fake, &copy, &h0);
+    write_files(folder.path(), &[(".syns.yaml", local)]);
+    let h1 = fake.commit_changes(changes);
+    (fake, folder, copy, h1)
+}
+
+async fn retrieve(fake: &Fake, copy: &WorkingCopy, overwrite: bool, e: &Env) -> SyncOutcome {
+    converge(
+        &fake.client(),
+        Some(TOKEN),
+        copy,
+        ConvergeMode::Retrieve { overwrite },
+        e.opts(),
+    )
+    .await
+    .unwrap()
+}
+
+async fn publish(fake: &Fake, copy: &WorkingCopy, e: &Env) -> SyncOutcome {
+    converge(
+        &fake.client(),
+        Some(TOKEN),
+        copy,
+        ConvergeMode::Publish,
+        e.opts(),
+    )
+    .await
+    .unwrap()
+}
+
+fn written_paths(outcome: &SyncOutcome) -> Vec<String> {
+    match outcome {
+        SyncOutcome::Synced { written, .. } => written.clone(),
+        other => panic!("expected Synced, got {other:?}"),
+    }
+}
+
+// SPEC u306 Tests, `retrieval_takes_a_head_identity_file_over_the_written_one`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn retrieval_takes_a_head_identity_file_over_the_written_one() {
+    let e = env().await;
+    for overwrite in [false, true] {
+        let (fake, folder, copy, h1) = identity_setup(
+            &e,
+            &[("a.md", "a\n")],
+            IDENTITY,
+            &[(".syns.yaml", Some(IDENTITY_WITH_CHECK))],
+        )
+        .await;
+
+        let outcome = retrieve(&fake, &copy, overwrite, &e).await;
+
+        assert!(
+            written_paths(&outcome).contains(&".syns.yaml".to_string()),
+            "overwrite {overwrite}: {outcome:?}"
+        );
+        assert_eq!(
+            read(folder.path(), ".syns.yaml"),
+            IDENTITY_WITH_CHECK,
+            "overwrite {overwrite}"
+        );
+        assert_eq!(
+            snapshot_bytes(&copy, &copy.local_snapshot().unwrap(), ".syns.yaml"),
+            Some(IDENTITY.as_bytes().to_vec()),
+            "overwrite {overwrite}"
+        );
+        assert_eq!(
+            copy.base().unwrap().commit_sha(),
+            Some(h1.as_str()),
+            "overwrite {overwrite}"
+        );
+        assert_eq!(
+            base_identity_entry(&copy),
+            Some(blob_sha1(IDENTITY_WITH_CHECK.as_bytes())),
+            "overwrite {overwrite}"
+        );
+        assert_eq!(
+            working_copy_state(&fake.client(), Some(TOKEN), &copy)
+                .await
+                .unwrap(),
+            WorkingCopyState::Converged,
+            "overwrite {overwrite}"
+        );
+    }
+}
+
+// SPEC u306 Tests, `retrieval_takes_a_head_identity_file_over_a_letter_case_written_one`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn retrieval_takes_a_head_identity_file_over_a_letter_case_written_one() {
+    let e = env().await;
+    let (fake, folder, copy, _) = identity_setup(
+        &e,
+        &[("a.md", "a\n")],
+        "owner: Alice\nname: Proj\n",
+        &[(".syns.yaml", Some(IDENTITY_WITH_CHECK))],
+    )
+    .await;
+
+    let outcome = retrieve(&fake, &copy, false, &e).await;
+
+    assert!(
+        written_paths(&outcome).contains(&".syns.yaml".to_string()),
+        "{outcome:?}"
+    );
+    assert_eq!(read(folder.path(), ".syns.yaml"), IDENTITY_WITH_CHECK);
+}
+
+// SPEC u306 Tests, `sync_after_taking_the_head_identity_file_publishes_nothing`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn sync_after_taking_the_head_identity_file_publishes_nothing() {
+    let e = env().await;
+    let (fake, _folder, copy, _) = identity_setup(
+        &e,
+        &[("a.md", "a\n")],
+        IDENTITY,
+        &[(".syns.yaml", Some(IDENTITY_WITH_CHECK))],
+    )
+    .await;
+    retrieve(&fake, &copy, false, &e).await;
+
+    let outcome = publish(&fake, &copy, &e).await;
+
+    assert!(matches!(outcome, SyncOutcome::NoChanges), "{outcome:?}");
+    assert!(fake.push_bodies().is_empty());
+    assert_eq!(fake.head().1[".syns.yaml"], IDENTITY_WITH_CHECK);
+}
+
+// SPEC u306 Tests, `retrieval_keeps_the_base_entry_for_an_edited_identity_file_the_head_edits`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn retrieval_keeps_the_base_entry_for_an_edited_identity_file_the_head_edits() {
+    let e = env().await;
+    for overwrite in [false, true] {
+        let (fake, folder, copy, h1) = identity_setup(
+            &e,
+            &[("a.md", "a\n"), (".syns.yaml", IDENTITY)],
+            IDENTITY_WITH_LOCAL_CHECK,
+            &[(".syns.yaml", Some(IDENTITY_WITH_CHECK))],
+        )
+        .await;
+
+        let outcome = retrieve(&fake, &copy, overwrite, &e).await;
+
+        assert!(
+            matches!(outcome, SyncOutcome::Synced { .. }),
+            "overwrite {overwrite}: {outcome:?}"
+        );
+        assert!(
+            copy.resolution().unwrap().is_none(),
+            "overwrite {overwrite}"
+        );
+        assert_eq!(
+            read(folder.path(), ".syns.yaml"),
+            IDENTITY_WITH_LOCAL_CHECK,
+            "overwrite {overwrite}"
+        );
+        assert_eq!(
+            copy.base().unwrap().commit_sha(),
+            Some(h1.as_str()),
+            "overwrite {overwrite}"
+        );
+        assert_eq!(
+            base_identity_entry(&copy),
+            Some(blob_sha1(IDENTITY.as_bytes())),
+            "overwrite {overwrite}"
+        );
+        assert_eq!(
+            working_copy_state(&fake.client(), Some(TOKEN), &copy)
+                .await
+                .unwrap(),
+            WorkingCopyState::Diverged,
+            "overwrite {overwrite}"
+        );
+    }
+}
+
+// SPEC u306 Tests, `retrieval_over_an_edited_identity_file_the_base_lacks_records_no_entry`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn retrieval_over_an_edited_identity_file_the_base_lacks_records_no_entry() {
+    let e = env().await;
+    let (fake, folder, copy, h1) = identity_setup(
+        &e,
+        &[("a.md", "a\n")],
+        IDENTITY_WITH_LOCAL_CHECK,
+        &[(".syns.yaml", Some(IDENTITY_WITH_CHECK))],
+    )
+    .await;
+
+    let outcome = retrieve(&fake, &copy, false, &e).await;
+
+    assert!(matches!(outcome, SyncOutcome::Synced { .. }), "{outcome:?}");
+    assert_eq!(read(folder.path(), ".syns.yaml"), IDENTITY_WITH_LOCAL_CHECK);
+    assert_eq!(copy.base().unwrap().commit_sha(), Some(h1.as_str()));
+    assert_eq!(base_identity_entry(&copy), None);
+    assert_eq!(
+        working_copy_state(&fake.client(), Some(TOKEN), &copy)
+            .await
+            .unwrap(),
+        WorkingCopyState::Diverged
+    );
+}
+
+// SPEC u306 Tests, `sync_after_keeping_an_edited_identity_file_writes_a_resolution`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn sync_after_keeping_an_edited_identity_file_writes_a_resolution() {
+    let e = env().await;
+    let (fake, _folder, copy, _) = identity_setup(
+        &e,
+        &[("a.md", "a\n"), (".syns.yaml", IDENTITY)],
+        IDENTITY_WITH_LOCAL_CHECK,
+        &[(".syns.yaml", Some(IDENTITY_WITH_CHECK))],
+    )
+    .await;
+    retrieve(&fake, &copy, false, &e).await;
+
+    let resolution = expect_resolution(publish(&fake, &copy, &e).await);
+
+    assert!(
+        resolution.collisions.iter().any(|(p, _)| p == ".syns.yaml"),
+        "{:?}",
+        resolution.collisions
+    );
+    assert!(fake.push_bodies().is_empty());
+    assert_eq!(fake.head().1[".syns.yaml"], IDENTITY_WITH_CHECK);
+}
+
+// SPEC u306 Tests, `retrieval_keeps_the_base_entry_for_an_edited_identity_file_the_head_removed`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn retrieval_keeps_the_base_entry_for_an_edited_identity_file_the_head_removed() {
+    let e = env().await;
+    let (fake, folder, copy, h1) = identity_setup(
+        &e,
+        &[("a.md", "a\n"), (".syns.yaml", IDENTITY)],
+        IDENTITY_WITH_LOCAL_CHECK,
+        &[(".syns.yaml", None)],
+    )
+    .await;
+
+    let outcome = retrieve(&fake, &copy, false, &e).await;
+
+    match &outcome {
+        SyncOutcome::Synced { removed, .. } => assert!(removed.is_empty(), "{outcome:?}"),
+        other => panic!("expected Synced, got {other:?}"),
+    }
+    assert_eq!(read(folder.path(), ".syns.yaml"), IDENTITY_WITH_LOCAL_CHECK);
+    assert_eq!(copy.base().unwrap().commit_sha(), Some(h1.as_str()));
+    assert_eq!(
+        base_identity_entry(&copy),
+        Some(blob_sha1(IDENTITY.as_bytes()))
+    );
+    assert_eq!(
+        working_copy_state(&fake.client(), Some(TOKEN), &copy)
+            .await
+            .unwrap(),
+        WorkingCopyState::Diverged
+    );
+}
+
+// SPEC u306 Tests, `sync_after_keeping_an_edited_identity_file_the_head_removed_writes_a_resolution`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn sync_after_keeping_an_edited_identity_file_the_head_removed_writes_a_resolution() {
+    let e = env().await;
+    let (fake, _folder, copy, _) = identity_setup(
+        &e,
+        &[("a.md", "a\n"), (".syns.yaml", IDENTITY)],
+        IDENTITY_WITH_LOCAL_CHECK,
+        &[(".syns.yaml", None)],
+    )
+    .await;
+    retrieve(&fake, &copy, false, &e).await;
+
+    let resolution = expect_resolution(publish(&fake, &copy, &e).await);
+
+    assert!(
+        resolution.collisions.iter().any(|(p, _)| p == ".syns.yaml"),
+        "{:?}",
+        resolution.collisions
+    );
+    assert!(fake.push_bodies().is_empty());
+    assert!(!fake.head().1.contains_key(".syns.yaml"));
+}
+
+// SPEC u306 Tests, `retrieval_with_no_recorded_base_records_the_head_identity_entry`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn retrieval_with_no_recorded_base_records_the_head_identity_entry() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let h0 = e
+        .fake
+        .commit(&[("a.md", "a\n"), (".syns.yaml", IDENTITY_WITH_CHECK)]);
+    write_files(
+        &dir,
+        &[("a.md", "a\n"), (".syns.yaml", IDENTITY_WITH_LOCAL_CHECK)],
+    );
+
+    let outcome = retrieve(&e.fake, &copy, false, &e).await;
+
+    assert!(matches!(outcome, SyncOutcome::Synced { .. }), "{outcome:?}");
+    assert_eq!(read(&dir, ".syns.yaml"), IDENTITY_WITH_LOCAL_CHECK);
+    assert_eq!(copy.base().unwrap().commit_sha(), Some(h0.as_str()));
+    assert_eq!(
+        base_identity_entry(&copy),
+        Some(blob_sha1(IDENTITY_WITH_CHECK.as_bytes()))
+    );
+}
+
+// SPEC u306 Tests, `retrieval_at_the_base_commit_takes_the_head_identity_file_over_a_written_one`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn retrieval_at_the_base_commit_takes_the_head_identity_file_over_a_written_one() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let h1 = e
+        .fake
+        .commit(&[("a.md", "a\n"), (".syns.yaml", IDENTITY_WITH_CHECK)]);
+    write_files(&dir, &[("a.md", "a\n"), (".syns.yaml", IDENTITY)]);
+    copy.record_base(
+        &h1,
+        HashMap::from([("a.md".to_string(), blob_sha1(b"a\n"))]),
+    )
+    .unwrap();
+
+    let outcome = retrieve(&e.fake, &copy, false, &e).await;
+
+    assert!(
+        written_paths(&outcome).contains(&".syns.yaml".to_string()),
+        "{outcome:?}"
+    );
+    assert_eq!(read(&dir, ".syns.yaml"), IDENTITY_WITH_CHECK);
+    assert_eq!(copy.base().unwrap().commit_sha(), Some(h1.as_str()));
+    assert_eq!(
+        base_identity_entry(&copy),
+        Some(blob_sha1(IDENTITY_WITH_CHECK.as_bytes()))
+    );
+}
+
+// SPEC u306 Tests, `pull_then_sync_over_a_head_gaining_an_identity_file_publishes_nothing`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn pull_then_sync_over_a_head_gaining_an_identity_file_publishes_nothing() {
+    let e = env().await;
+    let folder = tempfile::tempdir().unwrap();
+    let dir = std::fs::canonicalize(folder.path()).unwrap();
+    e.fake.commit(&[("a.md", "a\n")]);
+    let pull = || {
+        cmd_pull(
+            &e.config,
+            &e.output,
+            Some(("alice".into(), "proj".into())),
+            Some(dir.display().to_string()),
+            None,
+            false,
+            false,
+            None,
+        )
+    };
+
+    let first = pull().await;
+    assert!(first.is_ok(), "{first:?}");
+    assert_eq!(read(&dir, ".syns.yaml"), IDENTITY);
+    let h1 = e
+        .fake
+        .commit_changes(&[(".syns.yaml", Some(IDENTITY_WITH_CHECK))]);
+    let second = pull().await;
+    assert!(second.is_ok(), "{second:?}");
+    assert_eq!(read(&dir, ".syns.yaml"), IDENTITY_WITH_CHECK);
+    assert_eq!(
+        working_copy_state(&e.fake.client(), Some(TOKEN), &e.copy(&dir))
+            .await
+            .unwrap(),
+        WorkingCopyState::Converged
+    );
+    let synced = {
+        let _cwd = CwdGuard::enter(&dir);
+        cmd_sync(&e.config, &e.output, false).await
+    };
+
+    assert!(synced.is_ok(), "{synced:?}");
+    assert!(e.fake.push_bodies().is_empty());
+    assert_eq!(e.fake.head().0, h1);
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn discard_restores_the_folder_before_the_resolution() {

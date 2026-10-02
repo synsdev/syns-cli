@@ -1538,10 +1538,14 @@ const ROOT_IDENTITY: &str = ".syns.yaml";
 /// Whether a retrieval holds the root identity file out of every
 /// comparison, write and removal of its run (SPEC u263 `ConvergeMode`):
 /// only under `Retrieve`, only where the collected folder holds the file,
-/// and not where the folder holds it unedited against the base while the
-/// head carries other content — that head edit is taken like any other.
+/// and not where the head carries other content while the folder holds
+/// the file unedited against the base or `written` holds — the identity
+/// record a retrieval wrote, through `held_root_identity` (SPEC u306
+/// Contract Surface, `holds_root_identity`) — that head content is taken
+/// like any other.
 fn holds_root_identity(
     retrieving: bool,
+    written: bool,
     base_files: &BTreeMap<String, String>,
     folder: &Folder,
     head: &Head,
@@ -1549,12 +1553,12 @@ fn holds_root_identity(
     let Some(local) = folder.hashes.get(ROOT_IDENTITY) else {
         return false;
     };
-    let head_edited_an_unedited_file = base_files.get(ROOT_IDENTITY) == Some(local)
-        && head
-            .files
-            .get(ROOT_IDENTITY)
-            .is_some_and(|remote| remote != local);
-    retrieving && !head_edited_an_unedited_file
+    let head_differs = head
+        .files
+        .get(ROOT_IDENTITY)
+        .is_some_and(|remote| remote != local);
+    let unedited = base_files.get(ROOT_IDENTITY) == Some(local) || written;
+    retrieving && !(head_differs && unedited)
 }
 
 /// Drop the root identity file from a collected folder, so the exclusion
@@ -1562,6 +1566,33 @@ fn holds_root_identity(
 /// comparison leaves alone.
 fn hold_root_identity(folder: &mut Folder) {
     folder.remove(ROOT_IDENTITY);
+}
+
+/// The entries a convergence records as the base at the head's commit
+/// (SPEC u306 Contract Surface, `recorded_entries`): the head's, but where
+/// the run held out a root identity file hashing `held` over a base
+/// `prior` recorded before the run, and neither the head nor `prior`
+/// names the file at `held`, the path keeps `prior`'s entry, none where
+/// `prior` names none — so a locally edited identity file the head names
+/// otherwise reads as a difference the next publication takes to review.
+fn recorded_entries(
+    held: Option<&str>,
+    prior: Option<&BTreeMap<String, String>>,
+    head_files: &BTreeMap<String, String>,
+) -> HashMap<String, String> {
+    let mut entries = to_hash_map(head_files);
+    if let (Some(held), Some(prior)) = (held, prior) {
+        let names_held = |files: &BTreeMap<String, String>| {
+            files.get(ROOT_IDENTITY).map(String::as_str) == Some(held)
+        };
+        if !names_held(head_files) && !names_held(prior) {
+            match prior.get(ROOT_IDENTITY) {
+                Some(entry) => entries.insert(ROOT_IDENTITY.to_string(), entry.clone()),
+                None => entries.remove(ROOT_IDENTITY),
+            };
+        }
+    }
+    entries
 }
 
 fn without(
@@ -1829,6 +1860,10 @@ struct Candidate<'a> {
     /// once and applied to every collection; `None` leaves the first pass
     /// to decide it from its own collection.
     hold_root_identity: Option<bool>,
+    /// Whether the root identity file is the record a retrieval wrote,
+    /// through `held_root_identity` over the base the run loaded (SPEC
+    /// u306 `converge` 1), read once for the run.
+    written_root_identity: bool,
     /// Where every collection of the run is taken from (SPEC u291).
     root: &'a FolderRoot,
 }
@@ -1956,9 +1991,20 @@ async fn prepare_candidate(
             None => collect_folder(copy, opts, &forget, true, candidate.root)?,
         };
         forget.clear();
-        if *hold.get_or_insert_with(|| {
-            holds_root_identity(!candidate.publishing, &candidate.base_files, &folder, head)
-        }) {
+        let holding = *hold.get_or_insert_with(|| {
+            holds_root_identity(
+                !candidate.publishing,
+                candidate.written_root_identity,
+                &candidate.base_files,
+                &folder,
+                head,
+            )
+        });
+        // SPEC u306 `converge` 5: the held file's hash, kept for the base
+        // a synced pass records.
+        let mut held_hash: Option<String> = None;
+        if holding {
+            held_hash = folder.hashes.get(ROOT_IDENTITY).cloned();
             hold_root_identity(&mut folder);
         }
         let excluded = excluded_on_disk(
@@ -1966,8 +2012,20 @@ async fn prepare_candidate(
             &folder.hashes,
             candidate.base_files.keys().chain(head.files.keys()),
         );
+        // SPEC u306 `converge` 5: a retrieval over the identity record a
+        // retrieval wrote, not held, reads the base as naming it at the
+        // folder's hash, so the head's bytes replace it as a remote-only
+        // change; `candidate.base_files` stays whole for the base reads.
+        let mut compared_base = without(&candidate.base_files, &excluded);
+        if !holding
+            && !candidate.publishing
+            && candidate.written_root_identity
+            && let Some(local) = folder.hashes.get(ROOT_IDENTITY)
+        {
+            compared_base.insert(ROOT_IDENTITY.to_string(), local.clone());
+        }
         let mut rec = reconcile(
-            &without(&candidate.base_files, &excluded),
+            &compared_base,
             &folder.hashes,
             &without(&head.files, &excluded),
         );
@@ -2417,8 +2475,17 @@ async fn prepare_candidate(
                     Ok(Prepared::Resolution(resolution))
                 }
                 None => {
+                    // SPEC u306 `converge` 5: the base recorded is
+                    // `recorded_entries`'.
                     if let Some(commit) = &head.commit {
-                        copy.record_base(commit, to_hash_map(&head.files))?;
+                        let prior = candidate
+                            .base_commit
+                            .is_some()
+                            .then_some(&candidate.base_files);
+                        copy.record_base(
+                            commit,
+                            recorded_entries(held_hash.as_deref(), prior, &head.files),
+                        )?;
                     }
                     Ok(Prepared::Synced {
                         written: written.into_iter().collect(),
@@ -2781,8 +2848,10 @@ async fn converge_from_resolution(
         }
     }
 
-    // 5
-    let base = load_base(copy);
+    // 5 — the one base read, held as its manifest for the written test
+    // and as the `Base` every comparison reads.
+    let base_manifest = base_of(copy);
+    let base = base_from(base_manifest.as_ref());
     let head = read_head(
         client,
         token,
@@ -2798,19 +2867,31 @@ async fn converge_from_resolution(
     // 6 — a retrieval holding the root identity file out drops it from
     // the folder here, and the exclusion test then drops it from the base
     // and the head that steps 7 to 12 compare, write and remove from.
+    // SPEC u306 `converge` 1: decided once, over whether the file is the
+    // record a retrieval wrote, and the held file's hash kept for the base
+    // the run records.
     let mut folder = match folder {
         Some(folder) => folder,
         None => collect_folder(copy, &opts, &[], true, root)?,
     };
+    let written = held_root_identity(&copy.root, &copy.owner, &copy.name, base_manifest.as_ref());
     let hold = holds_root_identity(
         matches!(mode, ConvergeMode::Retrieve { .. }),
+        written,
         &base.files,
         &folder,
         &head,
     );
+    let mut held: Option<String> = None;
     if hold {
+        held = folder.hashes.get(ROOT_IDENTITY).cloned();
         hold_root_identity(&mut folder);
     }
+    let recorded = recorded_entries(
+        held.as_deref(),
+        base_manifest.as_ref().map(|_| &base.files),
+        &head.files,
+    );
     let excluded = excluded_on_disk(
         copy,
         &folder.hashes,
@@ -2818,7 +2899,7 @@ async fn converge_from_resolution(
     );
     let head_files = without(&head.files, &excluded);
 
-    // 7
+    // 7 — SPEC u306 `converge` 2: the base recorded is `recorded_entries`'.
     if mode == (ConvergeMode::Retrieve { overwrite: true })
         && (folder.hashes != head_files || resolution.is_some())
     {
@@ -2832,15 +2913,16 @@ async fn converge_from_resolution(
             folder,
             &excluded,
             resolution.is_some(),
+            recorded,
         )
         .await;
     }
 
-    // 8
+    // 8 — SPEC u306 `converge` 3: the base recorded is `recorded_entries`'.
     if folder.hashes == head_files {
         return match &head.commit {
             Some(commit) if base.commit.as_deref() != Some(commit.as_str()) => {
-                copy.record_base(commit, to_hash_map(&head.files))?;
+                copy.record_base(commit, recorded)?;
                 Ok(SyncOutcome::Synced {
                     written: Vec::new(),
                     removed: Vec::new(),
@@ -2851,8 +2933,11 @@ async fn converge_from_resolution(
         };
     }
 
-    // 9
-    if head.commit == base.commit {
+    // 9 — SPEC u306 `converge` 4: only where the base and the head name
+    // the root identity file alike; a base keeping its own entry for a
+    // held file the head names otherwise goes on to the candidate.
+    if head.commit == base.commit && base.files.get(ROOT_IDENTITY) == head.files.get(ROOT_IDENTITY)
+    {
         return match mode {
             ConvergeMode::Retrieve { .. } => Ok(SyncOutcome::NoChanges),
             ConvergeMode::Publish => {
@@ -2921,6 +3006,7 @@ async fn converge_from_resolution(
             existing: None,
             force_resolution: false,
             hold_root_identity: Some(hold),
+            written_root_identity: written,
             root,
         },
         Some(folder),
@@ -2945,7 +3031,9 @@ async fn finish_preparation(
     folder: Option<Folder>,
     root: &FolderRoot,
 ) -> Result<SyncOutcome, CliError> {
-    let base = load_base(copy);
+    let base_manifest = base_of(copy);
+    let written = held_root_identity(&copy.root, &copy.owner, &copy.name, base_manifest.as_ref());
+    let base = base_from(base_manifest.as_ref());
     let base_files = match &standing.base_commit {
         Some(commit) if base.commit.as_ref() == Some(commit) => base.files,
         Some(commit) => read_tree(client, token, copy, Some(commit)).await?.files,
@@ -2975,6 +3063,7 @@ async fn finish_preparation(
             existing: Some(standing),
             force_resolution: true,
             hold_root_identity: None,
+            written_root_identity: written,
             root,
         },
         folder,
@@ -2990,7 +3079,9 @@ async fn finish_preparation(
 }
 
 /// `converge` 7: make the folder hold the head, every rewritten or
-/// removed path snapshotted first and uncollected files left alone.
+/// removed path snapshotted first and uncollected files left alone, then
+/// record `recorded` as the base at the head's commit (SPEC u306
+/// `converge` 2).
 #[allow(clippy::too_many_arguments)]
 async fn overwrite_with_head(
     client: &SynsClient,
@@ -3002,6 +3093,7 @@ async fn overwrite_with_head(
     folder: Folder,
     excluded: &BTreeSet<String>,
     resolution_stands: bool,
+    recorded: HashMap<String, String>,
 ) -> Result<SyncOutcome, CliError> {
     check_server_paths(head.files.keys())?;
     let head_commit = head.commit.clone().unwrap_or_default();
@@ -3072,7 +3164,7 @@ async fn overwrite_with_head(
     }
 
     if let Some(commit) = &head.commit {
-        copy.record_base(commit, to_hash_map(&head.files))?;
+        copy.record_base(commit, recorded)?;
     }
     copy.remove_resolution()?;
 
@@ -3556,6 +3648,7 @@ async fn guard_refused(
             existing,
             force_resolution: true,
             hold_root_identity: Some(false),
+            written_root_identity: false,
             root,
         },
         None,
@@ -3900,6 +3993,7 @@ mod tests {
                 existing: None,
                 force_resolution: false,
                 hold_root_identity: Some(false),
+                written_root_identity: false,
                 root: &FolderRoot::whole(&copy.root),
             },
             None,
@@ -4340,6 +4434,7 @@ mod tests {
                 existing: None,
                 force_resolution: false,
                 hold_root_identity: Some(false),
+                written_root_identity: false,
                 root: &FolderRoot::whole(&holder.root),
             },
             None,
@@ -4436,6 +4531,7 @@ mod tests {
                             existing: None,
                             force_resolution: false,
                             hold_root_identity: Some(false),
+                            written_root_identity: false,
                             root: &FolderRoot::of_scope(&folder.root, &scope, None),
                         },
                         None,
