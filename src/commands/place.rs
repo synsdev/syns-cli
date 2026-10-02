@@ -32,7 +32,7 @@ const SYNS_YAML: &str = ".syns.yaml";
 pub fn path_refusal(typed: &str) -> CliError {
     CliError::Config {
         message: format!(
-            "the folder path must name a folder with no leading /, no empty segment, no ., .. or .git segment and no control byte (got {typed})"
+            "the folder path must name a folder with no leading /, no empty segment, no ., .., .git or .syns-state segment and no control byte (got {typed})"
         ),
     }
 }
@@ -182,13 +182,15 @@ pub fn enable_command(path: &str) -> String {
 
 /// A typed folder path, its trailing `/` removed, refused under the path
 /// refusal where it is empty, opens with `/`, holds an empty, `.`, `..`
-/// or `.git` segment, or holds a byte `INV-30` bars (SPEC u293 Contract
-/// Surface, `placement_path`).
+/// or `.git` segment, holds a byte `INV-30` bars (SPEC u293 Contract
+/// Surface, `placement_path`), or holds the in-root home's segment,
+/// letter case aside (SPEC u300, `placement_path`; issue 219).
 pub fn placement_path(typed: &str) -> Result<String, CliError> {
     let trimmed = typed.trim_end_matches('/');
     if trimmed.is_empty()
         || trimmed.starts_with('/')
         || trimmed.split('/').any(str::is_empty)
+        || holds_in_root_home(trimmed)
         || check_server_path(trimmed).is_err()
     {
         return Err(path_refusal(typed));
@@ -771,7 +773,7 @@ mod tests {
                 Err(err) => assert_eq!(
                     err.to_string(),
                     format!(
-                        "configuration error: the folder path must name a folder with no leading /, no empty segment, no ., .. or .git segment and no control byte (got {typed})"
+                        "configuration error: the folder path must name a folder with no leading /, no empty segment, no ., .., .git or .syns-state segment and no control byte (got {typed})"
                     )
                 ),
                 Ok(path) => panic!("{typed:?} was admitted as {path:?}"),
@@ -782,6 +784,28 @@ mod tests {
             enable_command("q3 #2's"),
             "syns enable-checks 'q3 #2'\\''s'"
         );
+    }
+
+    // SPEC u300 Tests, the row of this name.
+    #[test]
+    fn a_placement_path_holding_the_state_home_is_refused() {
+        for typed in [
+            ".syns-state/planted",
+            ".Syns-State/planted",
+            "a/.SYNS-STATE",
+            "a/.syns-state/",
+        ] {
+            match placement_path(typed) {
+                Err(err) => assert_eq!(
+                    err.to_string(),
+                    format!(
+                        "configuration error: the folder path must name a folder with no leading /, no empty segment, no ., .., .git or .syns-state segment and no control byte (got {typed})"
+                    )
+                ),
+                Ok(path) => panic!("{typed:?} was admitted as {path:?}"),
+            }
+        }
+        assert_eq!(placement_path("a/syns-state").unwrap(), "a/syns-state");
     }
 
     /// A working copy of `alice/work` at a directory of its own, its base

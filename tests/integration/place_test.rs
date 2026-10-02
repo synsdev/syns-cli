@@ -1694,3 +1694,26 @@ fn snapshot_and_placement_never_write_the_in_root_home() {
         "{carried:?}"
     );
 }
+
+// SPEC u300 Tests, the row of this name: issue 219's reproduction.
+#[test]
+#[serial]
+fn place_into_the_state_home_sends_nothing() {
+    let d = Deployment::fixture();
+    std::fs::write(d.w.join(".syns.yaml"), "owner: bartsoj\nname: work\n").expect("W identity");
+    std::fs::create_dir_all(d.w.join(".syns-state")).expect("in-root home");
+    let before = snapshot(&d.w);
+    let mark = d.mark();
+
+    let out = d.run_in(&d.w, &["place", "bartsoj/tmpl", ".Syns-State/planted"]);
+
+    assert_eq!(exit_of(&out), 1, "{}", stderr_of(&out));
+    assert_eq!(
+        stderr_of(&out).trim_end(),
+        "error: configuration error: the folder path must name a folder with no leading /, no empty segment, no ., .., .git or .syns-state segment and no control byte (got .Syns-State/planted)"
+    );
+    assert!(d.requests_since(mark).is_empty());
+    assert!(!d.w.join(".syns-state/planted").exists());
+    assert!(!d.w.join(".Syns-State/planted").exists());
+    assert_eq!(snapshot(&d.w), before);
+}
