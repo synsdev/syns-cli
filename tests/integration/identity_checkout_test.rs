@@ -1539,16 +1539,9 @@ const TEMPLATE: &str = "/api/v1/repos/bob/board-template";
 const T9: &str = "9999999999999999999999999999999999999999";
 const BOARD: &str = "<p>board</p>\n";
 
-// SPEC u302 Behaviour, `cmd_place` 1 (CR1-2): a placement inside a folder
-// bound to its identity is sent through the identity at the typed path,
-// its identity file recording the holder and the holder path, and laid
-// over the identity copy's base.
-#[test]
-#[serial]
-fn place_inside_an_identity_folder_goes_through_it() {
-    let d = Deployment::new();
-    write(&d.folder().join("document.html"), DOC);
-    d.record_base(H4);
+/// `bob/board-template` at version 9 holding `board.html` alone, and
+/// nothing at `appendix` in the identity at any reference.
+fn serve_template(d: &Deployment) {
     d.serves(
         "GET",
         TEMPLATE,
@@ -1579,6 +1572,19 @@ fn place_inside_an_identity_folder_goes_through_it() {
             ))
             .respond_with(refusal(404, "not_found")),
     );
+}
+
+// SPEC u302 Behaviour, `cmd_place` 1 (CR1-2): a placement inside a folder
+// bound to its identity is sent through the identity at the typed path,
+// its identity file recording the holder and the holder path, and laid
+// over the identity copy's base.
+#[test]
+#[serial]
+fn place_inside_an_identity_folder_goes_through_it() {
+    let d = Deployment::new();
+    write(&d.folder().join("document.html"), DOC);
+    d.record_base(H4);
+    serve_template(&d);
     d.serves(
         "PUT",
         &format!("{IDENTITY}/push"),
@@ -1622,4 +1628,157 @@ fn place_inside_an_identity_folder_goes_through_it() {
             .is_none(),
         "the placed folder recorded a base of its own"
     );
+}
+
+/// The identity's push answering `409` naming `H6` — a holder version
+/// outside the folder — where it claims `H4`, and landing `H7` as version
+/// `7` where it claims `H6`.
+fn identity_push_past_h6(d: &Deployment) {
+    d.mount(
+        Mock::given(method("PUT"))
+            .and(path(format!("{IDENTITY}/push")))
+            .and(wiremock::matchers::body_partial_json(
+                json!({"parentSha": H4}),
+            ))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "error": "conflict", "message": "Head mismatch", "currentSha": H6,
+            }))),
+    );
+    d.mount(
+        Mock::given(method("PUT"))
+            .and(path(format!("{IDENTITY}/push")))
+            .and(wiremock::matchers::body_partial_json(
+                json!({"parentSha": H6}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "commitSha": H7, "version": 7, "filesChanged": 2, "created": false,
+            }))),
+    );
+}
+
+// V1-13 of u302's VERIFICATION.md: a placement through the identity lands
+// past a holder version outside the folder, the identity's newest listed
+// version — the folder's base — never being the holder's head there; the
+// identity copy's base is laid at the landed commit all the same, so the
+// write right after it passes the checkout guard.
+#[test]
+#[serial]
+fn a_placement_through_an_identity_past_a_holder_version_outside_the_folder_leaves_it_clean() {
+    let d = Deployment::new();
+    write(&d.folder().join("document.html"), DOC);
+    d.record_base(H4);
+    serve_template(&d);
+    identity_push_past_h6(&d);
+
+    let out = d.run(&["--json", "place", "bob/board-template", "appendix"]);
+
+    assert_eq!(exit_of(&out), 0, "{}{}", stderr_of(&out), stdout_of(&out));
+    let pushes = d.pushes(IDENTITY);
+    assert_eq!(pushes.len(), 2, "{:?}", d.targets());
+    assert_eq!(pushes[0]["parentSha"], json!(H4));
+    assert_eq!(pushes[1]["parentSha"], json!(H6));
+    let copy = WorkingCopy::open_existing(&d.stores(), "alice", "docs-q3-plan", &d.folder())
+        .unwrap()
+        .expect("the identity copy");
+    let base = copy.base().unwrap();
+    assert_eq!(base.commit_sha(), Some(H7));
+    assert!(base.file_sha("appendix/.syns.yaml").is_some());
+    assert!(base.file_sha("appendix/board.html").is_some());
+
+    // The write right after, the identity now listing the placement.
+    d.identity_record(H7);
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path(format!("{IDENTITY}/versions")))
+            .and(query_param("limit", "1"))
+            .and(query_param_is_missing("path"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page(
+                vec![version(
+                    7,
+                    H7,
+                    &["appendix/.syns.yaml", "appendix/board.html"],
+                )],
+                1,
+            )))
+            .with_priority(1),
+    );
+    d.mount(
+        Mock::given(method("PUT"))
+            .and(path(format!("{IDENTITY}/push")))
+            .and(wiremock::matchers::body_partial_json(
+                json!({"parentSha": H7}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "commitSha": H8, "version": 8, "filesChanged": 1, "created": false,
+            }))),
+    );
+
+    let out = d.run_with(
+        &d.folder(),
+        &["--json", "write", "document.html", "--parent", H7],
+        "x",
+    );
+
+    assert_eq!(exit_of(&out), 0, "{}{}", stderr_of(&out), stdout_of(&out));
+    let pushes = d.pushes(IDENTITY);
+    assert_eq!(pushes.len(), 3, "{:?}", d.targets());
+    assert_eq!(pushes[2]["parentSha"], json!(H7));
+    assert_eq!(pushed_paths(&pushes[2]), vec!["document.html"]);
+}
+
+// V1-13 of u302's VERIFICATION.md: where a version after the one the
+// folder's base stands on changed the folder by the time the placement is
+// sent again, the placement still lands, and the identity copy's base is
+// left where it stood, so the folder's next sync retrieves that change.
+#[test]
+#[serial]
+fn a_placement_through_an_identity_past_a_moved_folder_leaves_its_base_standing() {
+    let d = Deployment::new();
+    write(&d.folder().join("document.html"), DOC);
+    d.record_base(H4);
+    serve_template(&d);
+    identity_push_past_h6(&d);
+    // The head the placement reads answers `H4`; the folder's check after
+    // the refusal reads `H5`, a version changing the folder.
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path(format!("{IDENTITY}/versions")))
+            .and(query_param("limit", "1"))
+            .and(query_param_is_missing("path"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(page(vec![version(4, H4, &["document.html"])], 1)),
+            )
+            .up_to_n_times(1)
+            .with_priority(1),
+    );
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path(format!("{IDENTITY}/versions")))
+            .and(query_param("limit", "1"))
+            .and(query_param_is_missing("path"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(page(vec![version(5, H5, &["document.html"])], 1)),
+            )
+            .with_priority(2),
+    );
+    d.serves(
+        "GET",
+        &format!("{IDENTITY}/versions/{H4}"),
+        ResponseTemplate::new(200).set_body_json(version(4, H4, &["document.html"])),
+    );
+
+    let out = d.run(&["--json", "place", "bob/board-template", "appendix"]);
+
+    assert_eq!(exit_of(&out), 0, "{}{}", stderr_of(&out), stdout_of(&out));
+    let pushes = d.pushes(IDENTITY);
+    assert_eq!(pushes.len(), 2, "{:?}", d.targets());
+    assert_eq!(pushes[1]["parentSha"], json!(H6));
+    let copy = WorkingCopy::open_existing(&d.stores(), "alice", "docs-q3-plan", &d.folder())
+        .unwrap()
+        .expect("the identity copy");
+    let base = copy.base().unwrap();
+    assert_eq!(base.commit_sha(), Some(H4));
+    assert!(base.file_sha("appendix/board.html").is_none());
 }

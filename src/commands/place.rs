@@ -14,7 +14,7 @@ use crate::config::Config;
 use crate::errors::{CliError, IdentityRemedy};
 use crate::output::Output;
 use crate::push::converge::check_server_path;
-use crate::push::folder_check::named_head;
+use crate::push::folder_check::{FolderCheck, named_head};
 use crate::push::hash::blob_sha1;
 use crate::push::working_copy::{WorkingCopy, holds_in_root_home};
 use crate::read::{refuse_reference_spelling, version_not_found_refusal};
@@ -547,6 +547,12 @@ pub async fn cmd_place(
     let first = client.push_body(&address, &token, body.clone()).await;
 
     // 16 — a moved head re-read, and the same body sent once more there.
+    // Through an identity, `stood_on` is the identity's newest listed
+    // version the placed files may be laid over: the head step 8 read,
+    // kept past a moved holder head only where no version after it changed
+    // the folder — that head is the holder's, so a holder version outside
+    // the folder moves it on every send the identity's newest is not.
+    let mut stood_on = head.clone();
     let (response, raw, claimed) = match first {
         Ok((response, raw)) => (response, raw, head.clone()),
         Err(err) => {
@@ -555,6 +561,27 @@ pub async fn cmd_place(
             };
             if let Some(held) = held_at(&client, &address, &token, &request_path, &moved).await? {
                 return Err(occupied_at_head_refusal(&address, &held, &moved));
+            }
+            if let (Some(scope), Some(since)) = (
+                counted.scope.as_ref().filter(|s| s.identity.is_some()),
+                head.as_deref(),
+            ) {
+                let mut check = FolderCheck {
+                    repo_id: address.clone(),
+                    folder: scope.path.clone(),
+                    since: since.to_string(),
+                    since_version: None,
+                    holder: Some(holder.clone()),
+                };
+                // A check that cannot be read lays nothing: the placement
+                // stands either way, and the folder's next sync converges it.
+                if check
+                    .folder_moved(&client, Some(&token))
+                    .await
+                    .unwrap_or(true)
+                {
+                    stood_on = None;
+                }
             }
             let again = match head {
                 Some(_) => with_parent_sha(body, &moved),
@@ -608,6 +635,7 @@ pub async fn cmd_place(
         &repository_path,
         &from_folder,
         claimed.as_deref(),
+        stood_on.as_deref(),
         &landed.sha,
     )?;
 
@@ -729,7 +757,11 @@ fn lay_placed(
 
 /// `cmd_place` 18: the holder checkout's base and each enclosing folder
 /// copy's laid where it stood at the claimed parent, then the new
-/// folder's own base recorded at the placed commit.
+/// folder's own base recorded at the placed commit. Inside a folder bound
+/// to its identity, the identity copy's base is laid where it stood at
+/// `stood_on`, the identity's newest listed version the placement was
+/// sent over, rather than at the holder head the landing send claimed.
+#[allow(clippy::too_many_arguments)]
 fn record_bases(
     config: &Config,
     counted: &Counted,
@@ -737,6 +769,7 @@ fn record_bases(
     repository_path: &str,
     from_folder: &HashMap<String, String>,
     claimed: Option<&str>,
+    stood_on: Option<&str>,
     landed: &str,
 ) -> Result<(), CliError> {
     let cache = config.stores();
@@ -757,7 +790,7 @@ fn record_bases(
                 &copy,
                 from_folder,
                 |p| Some(format!("{place}/{p}")),
-                claimed,
+                stood_on,
                 landed,
             )?;
         }
