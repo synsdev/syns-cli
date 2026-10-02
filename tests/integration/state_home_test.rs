@@ -162,6 +162,7 @@ fn superuser() -> bool {
 }
 
 /// Every path standing under `root`, `/`-joined from it, sorted.
+#[cfg(target_os = "macos")]
 fn entries_under(root: &Path) -> Vec<String> {
     fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
         for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
