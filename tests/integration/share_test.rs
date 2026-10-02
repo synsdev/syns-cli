@@ -154,7 +154,13 @@ impl Deployment {
     }
 
     fn command(&self, cwd: &Path, args: &[&str]) -> AssertCommand {
-        let mut command = AssertCommand::cargo_bin("syns").expect("syns binary");
+        AssertCommand::from_std(self.process(cwd, args))
+    }
+
+    /// The built binary with `args` in `cwd`, its standard streams left to
+    /// the caller.
+    fn process(&self, cwd: &Path, args: &[&str]) -> std::process::Command {
+        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("syns"));
         command
             .current_dir(cwd)
             .env("SYNS_CONFIG_DIR", self.home.path())
@@ -181,6 +187,49 @@ impl Deployment {
 
     fn run(&self, args: &[&str]) -> std::process::Output {
         self.run_in(&self.w.clone(), args)
+    }
+
+    /// `syns` with `args` in the working directory, standard input a
+    /// pseudo-terminal holding `typed`, the run bounded at a minute.
+    #[cfg(unix)]
+    fn run_on_a_terminal(&self, args: &[&str], typed: &str) -> std::process::Output {
+        use std::io::Write;
+        use std::os::fd::{FromRawFd, OwnedFd};
+
+        let (mut master, mut slave): (libc::c_int, libc::c_int) = (0, 0);
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(opened, 0, "openpty");
+        let mut master = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(master) });
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+        master.write_all(typed.as_bytes()).expect("typed input");
+
+        let child = self
+            .process(&self.w.clone(), args)
+            .stdin(std::process::Stdio::from(slave))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("run syns");
+        let pid = child.id() as libc::pid_t;
+        let (done, outcome) = std::sync::mpsc::channel();
+        std::thread::spawn(move || done.send(child.wait_with_output()));
+        let out = match outcome.recv_timeout(std::time::Duration::from_secs(60)) {
+            Ok(out) => out.expect("syns output"),
+            Err(_) => {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                panic!("syns {args:?} still waiting on the terminal after a minute");
+            }
+        };
+        drop(master);
+        out
     }
 }
 
@@ -682,6 +731,93 @@ fn share_lines_report_on_the_diagnostic_stream_and_name_the_identity() {
     assert_eq!(
         stderr_of(&out),
         "shared clients/vela/q3-board of alice/work as alice/work-q3-board\n"
+    );
+}
+
+// CR1-2: the name prompt through the built binary on a terminal — not
+// raised for a caller holding `write` on the holder, raised for `admin`,
+// and for `owner` raised again with no offer after a held name.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn the_name_prompt_on_a_terminal_asks_an_owner_or_an_admin_alone() {
+    let on_the_holder = |role: &str| {
+        let d = Deployment::new(Some("alice/docs"));
+        let mut holder = record("alice", "docs", false);
+        holder["role"] = json!(role);
+        d.mount(
+            Mock::given(method("GET"))
+                .and(path("/api/v1/repos/alice/docs"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(holder))
+                .with_priority(1),
+        );
+        d.serves(
+            "GET",
+            "/api/v1/repos/alice/docs/shares/q3-plan",
+            refusal(404, "not_found"),
+        );
+        d
+    };
+    let prompt = "name for q3-plan of alice/docs [docs-q3-plan]: ";
+
+    let write = on_the_holder("write");
+    write.serves(
+        "POST",
+        "/api/v1/repos/alice/docs/shares",
+        ResponseTemplate::new(201).set_body_json(record("alice", "docs-q3-plan", true)),
+    );
+    let out = write.run_on_a_terminal(&["share", "q3-plan"], "mine\n");
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert!(!stderr_of(&out).contains("name for"), "{}", stderr_of(&out));
+    assert_eq!(
+        write.bodies("/api/v1/repos/alice/docs/shares"),
+        vec![json!({"path": "q3-plan", "name": "docs-q3-plan"})]
+    );
+
+    let admin = on_the_holder("admin");
+    admin.serves(
+        "POST",
+        "/api/v1/repos/alice/docs/shares",
+        ResponseTemplate::new(201).set_body_json(record("alice", "mine", true)),
+    );
+    let out = admin.run_on_a_terminal(&["share", "q3-plan"], "mine\n");
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert!(stderr_of(&out).starts_with(prompt), "{}", stderr_of(&out));
+    assert_eq!(stdout_of(&out), "alice/mine\n");
+    assert_eq!(
+        admin.bodies("/api/v1/repos/alice/docs/shares"),
+        vec![json!({"path": "q3-plan", "name": "mine"})]
+    );
+
+    let owner = on_the_holder("owner");
+    owner.mount(
+        Mock::given(method("POST"))
+            .and(path("/api/v1/repos/alice/docs/shares"))
+            .respond_with(refusal(409, "conflict"))
+            .up_to_n_times(1)
+            .with_priority(1),
+    );
+    owner.serves(
+        "POST",
+        "/api/v1/repos/alice/docs/shares",
+        ResponseTemplate::new(201).set_body_json(record("alice", "second", true)),
+    );
+    let out = owner.run_on_a_terminal(&["share", "q3-plan"], "mine\nsecond\n");
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).starts_with(&format!(
+            "{prompt}alice/mine is already held; give another name\nname for q3-plan of alice/docs: "
+        )),
+        "{}",
+        stderr_of(&out)
+    );
+    assert_eq!(stdout_of(&out), "alice/second\n");
+    assert_eq!(
+        owner.bodies("/api/v1/repos/alice/docs/shares"),
+        vec![
+            json!({"path": "q3-plan", "name": "mine"}),
+            json!({"path": "q3-plan", "name": "second"}),
+        ]
     );
 }
 
