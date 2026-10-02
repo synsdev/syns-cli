@@ -3199,6 +3199,9 @@ async fn run_as_torn_writer() -> bool {
     let Ok(spec) = std::env::var(TORN_WRITER_ENV) else {
         return false;
     };
+    // This thread polls the run and so writes `c.md`; every other thread
+    // keeps `SIGXFSZ` blocked as `stop_writer_mid_write` started the child.
+    file_size_signal(libc::SIG_UNBLOCK);
     let spec: Value = serde_json::from_str(&spec).unwrap();
     let cache = PathBuf::from(spec["cache"].as_str().unwrap());
     let dir = PathBuf::from(spec["dir"].as_str().unwrap());
@@ -3328,9 +3331,15 @@ async fn stop_writer_mid_write(e: &Env, dir: &Path, test: &str, run: Value) {
         .env(TORN_WRITER_ENV, spec)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    // SAFETY: `setrlimit` is async-signal-safe and changes the child alone.
+    // SAFETY: `setrlimit` and `pthread_sigmask` are async-signal-safe and
+    // change the child alone.
     unsafe {
         writer.pre_exec(|| {
+            // The kernel hands the over-limit write's `SIGXFSZ` to the
+            // first thread not blocking it, which is not the writing thread
+            // unless every other blocks it; delivered elsewhere, the writer
+            // runs on past its failed write and removes the sibling.
+            file_size_signal(libc::SIG_BLOCK);
             let limit = libc::rlimit {
                 rlim_cur: TORN_WRITE_LIMIT as libc::rlim_t,
                 rlim_max: TORN_WRITE_LIMIT as libc::rlim_t,
@@ -3350,6 +3359,19 @@ async fn stop_writer_mid_write(e: &Env, dir: &Path, test: &str, run: Value) {
     );
     assert_eq!(read(dir, "c.md"), "base\n");
     assert_eq!(partial_writes(dir).len(), 1, "{:?}", partial_writes(dir));
+}
+
+/// Block or unblock `SIGXFSZ` on the calling thread, every thread it
+/// starts afterwards inheriting the mask.
+#[cfg(unix)]
+fn file_size_signal(how: libc::c_int) {
+    // SAFETY: the set is initialised by `sigemptyset` before it is read.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGXFSZ);
+        libc::pthread_sigmask(how, &set, std::ptr::null_mut());
+    }
 }
 
 /// The folder siblings a write interrupted part-way leaves behind.
