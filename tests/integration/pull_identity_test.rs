@@ -48,18 +48,7 @@ impl Env {
     }
 
     fn syns(&self, cwd: &Path, args: &[&str]) -> std::process::Output {
-        let uri = self.server.uri();
-        let mut full = vec!["--server", uri.as_str()];
-        full.extend_from_slice(args);
-        AssertCommand::cargo_bin("syns")
-            .expect("syns binary")
-            .current_dir(cwd)
-            .env("SYNS_CONFIG_DIR", self.config_dir.path())
-            .env("SYNS_CACHE_DIR", self.cache_dir.path())
-            .env_remove("SYNS_URL")
-            .args(&full)
-            .output()
-            .expect("subprocess output")
+        self.syns_with_stdin(cwd, b"", args)
     }
 
     fn request_paths(&self) -> Vec<String> {
