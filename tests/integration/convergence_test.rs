@@ -201,6 +201,12 @@ struct FakeRepo {
     /// Changes laid over the head as a fresh commit before the next
     /// publication is answered, so that publication meets a moved head.
     move_head_before_next_push: Option<Vec<(String, Option<Vec<u8>>)>>,
+    /// SPEC u318 Contract Surface, `FakeRepo::rewrite_on_push`: each
+    /// publication carrying this path is committed with these bytes there
+    /// in place of the ones it sent, its acknowledgment otherwise
+    /// unchanged — as the server rewrites a moved shared folder's
+    /// identity file.
+    rewrite_on_push: Option<(String, Vec<u8>)>,
     /// Refuse every publication as the server refuses a first push over a
     /// content store already holding commits: `CONFLICT` naming no head.
     identity_taken: bool,
@@ -474,6 +480,15 @@ impl FakeRepo {
         {
             files.remove(deletion["path"].as_str().unwrap());
         }
+        if let Some((path, bytes)) = &self.rewrite_on_push
+            && body["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["path"] == path.as_str())
+        {
+            files.insert(path.clone(), bytes.clone());
+        }
         let sha = self.add_commit(files);
         Answer::json(
             200,
@@ -632,6 +647,13 @@ impl Fake {
                 .map(|(p, c)| (p.to_string(), c.map(|c| c.as_bytes().to_vec())))
                 .collect(),
         );
+    }
+
+    /// Commit `text` at `path` in place of what each publication carrying
+    /// that path sent (SPEC u318 Contract Surface, `FakeRepo::rewrite_on_push`).
+    pub(crate) fn rewrite_on_push(&self, path: &str, text: &str) {
+        self.repo.lock().unwrap().rewrite_on_push =
+            Some((path.to_string(), text.as_bytes().to_vec()));
     }
 
     pub(crate) fn take_identity(&self) {
@@ -4173,6 +4195,304 @@ async fn a_refused_sync_sending_a_written_identity_file_beside_work_the_head_too
     );
     assert_ne!(fake.head().0, h0);
     assert_eq!(read(folder.path(), ".syns.yaml"), IDENTITY);
+}
+
+// ---- u318: a head at the base's commit naming a path otherwise ------------
+
+/// SPEC u318 Tests, `P`: the identity file a shared folder at `q3-plan`
+/// carries.
+const Q3_PLAN_IDENTITY: &str = "holder: alice/proj\npath: q3-plan\nshared_as: proj-q3-plan\n";
+/// SPEC u318 Tests, `R`: the identity file the server rewrote for the
+/// folder moved to `q3-review`.
+const Q3_REVIEW_IDENTITY: &str = "holder: alice/proj\npath: q3-review\nshared_as: proj-q3-plan\n";
+
+/// SPEC u318 Tests, `M`: the copy at `e.dir()` a publication of a move
+/// leaves — head `h2` holding `q3-review/.syns.yaml` at `R`, the base at
+/// `h2`'s commit naming it at `P`'s hash, the folder holding `P` — and
+/// answering `h2`.
+fn moved_publication(e: &Env) -> String {
+    let h2 = e.fake.commit(&[
+        ("q3-review/a.md", "a\n"),
+        ("q3-review/.syns.yaml", Q3_REVIEW_IDENTITY),
+    ]);
+    write_files(
+        &e.dir(),
+        &[
+            ("q3-review/a.md", "a\n"),
+            ("q3-review/.syns.yaml", Q3_PLAN_IDENTITY),
+        ],
+    );
+    e.copy(&e.dir())
+        .record_base(
+            &h2,
+            HashMap::from([
+                ("q3-review/a.md".to_string(), blob_sha1(b"a\n")),
+                (
+                    "q3-review/.syns.yaml".to_string(),
+                    blob_sha1(Q3_PLAN_IDENTITY.as_bytes()),
+                ),
+            ]),
+        )
+        .unwrap();
+    h2
+}
+
+/// The hash the copy's base records at `path`, none where it names none.
+fn base_sha(copy: &WorkingCopy, path: &str) -> Option<String> {
+    copy.base().unwrap().file_sha(path).map(str::to_string)
+}
+
+// SPEC u318 Tests, `sync_after_publishing_a_move_takes_the_rewritten_identity_file`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn sync_after_publishing_a_move_takes_the_rewritten_identity_file() {
+    let e = env().await;
+    let h2 = moved_publication(&e);
+    let copy = e.copy(&e.dir());
+
+    let first = publish(&e.fake, &copy, &e).await;
+
+    assert_eq!(
+        written_paths(&first),
+        vec!["q3-review/.syns.yaml".to_string()]
+    );
+    assert!(
+        matches!(
+            first,
+            SyncOutcome::Synced {
+                published: None,
+                ..
+            }
+        ),
+        "{first:?}"
+    );
+    assert!(e.fake.push_bodies().is_empty());
+    assert_eq!(read(&e.dir(), "q3-review/.syns.yaml"), Q3_REVIEW_IDENTITY);
+    assert_eq!(
+        snapshot_bytes(
+            &copy,
+            &copy.local_snapshot().unwrap(),
+            "q3-review/.syns.yaml"
+        ),
+        Some(Q3_PLAN_IDENTITY.as_bytes().to_vec())
+    );
+    assert_eq!(copy.base().unwrap().commit_sha(), Some(h2.as_str()));
+    assert_eq!(
+        base_sha(&copy, "q3-review/.syns.yaml"),
+        Some(blob_sha1(Q3_REVIEW_IDENTITY.as_bytes()))
+    );
+    assert_eq!(state_of(&e).await, WorkingCopyState::Converged);
+
+    let second = publish(&e.fake, &copy, &e).await;
+
+    assert!(matches!(second, SyncOutcome::NoChanges), "{second:?}");
+    assert!(e.fake.push_bodies().is_empty());
+}
+
+// SPEC u318 Tests, `retrieval_after_publishing_a_move_takes_the_rewritten_identity_file`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn retrieval_after_publishing_a_move_takes_the_rewritten_identity_file() {
+    let e = env().await;
+    let h2 = moved_publication(&e);
+    let copy = e.copy(&e.dir());
+
+    let first = retrieve(&e.fake, &copy, false, &e).await;
+
+    assert_eq!(
+        written_paths(&first),
+        vec!["q3-review/.syns.yaml".to_string()]
+    );
+    assert_eq!(read(&e.dir(), "q3-review/.syns.yaml"), Q3_REVIEW_IDENTITY);
+    assert_eq!(copy.base().unwrap().commit_sha(), Some(h2.as_str()));
+    assert_eq!(
+        base_sha(&copy, "q3-review/.syns.yaml"),
+        Some(blob_sha1(Q3_REVIEW_IDENTITY.as_bytes()))
+    );
+
+    let second = retrieve(&e.fake, &copy, false, &e).await;
+
+    assert!(matches!(second, SyncOutcome::NoChanges), "{second:?}");
+}
+
+// SPEC u318 Tests, `sync_after_publishing_a_move_beside_local_work_writes_a_resolution`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn sync_after_publishing_a_move_beside_local_work_writes_a_resolution() {
+    let e = env().await;
+    let h2 = moved_publication(&e);
+    write_files(&e.dir(), &[("b.md", "b\n")]);
+    let copy = e.copy(&e.dir());
+
+    let resolution = expect_resolution(publish(&e.fake, &copy, &e).await);
+
+    assert_eq!(resolution.local_paths, vec!["b.md".to_string()]);
+    assert!(resolution.collisions.is_empty(), "{resolution:?}");
+    assert!(e.fake.push_bodies().is_empty());
+    assert_eq!(read(&e.dir(), "q3-review/.syns.yaml"), Q3_REVIEW_IDENTITY);
+
+    let continued = continue_resolution(&e.fake.client(), TOKEN, &copy, e.opts())
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(
+            continued,
+            SyncOutcome::Synced {
+                published: Some(_),
+                ..
+            }
+        ),
+        "{continued:?}"
+    );
+    let bodies = e.fake.push_bodies();
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0]["parentSha"], h2.as_str());
+    let (head, files) = e.fake.head();
+    assert_ne!(head, h2);
+    assert_eq!(files["b.md"], "b\n");
+    assert_eq!(files["q3-review/.syns.yaml"], Q3_REVIEW_IDENTITY);
+}
+
+// SPEC u318 Tests, `a_move_acknowledged_at_rewritten_bytes_is_not_published_back`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_move_acknowledged_at_rewritten_bytes_is_not_published_back() {
+    let e = env().await;
+    let h1 = e.fake.commit(&[
+        ("q3-plan/a.md", "a\n"),
+        ("q3-plan/.syns.yaml", Q3_PLAN_IDENTITY),
+    ]);
+    let copy = e.copy(&e.dir());
+    checkout(&e.fake, &copy, &h1);
+    std::fs::rename(e.dir().join("q3-plan"), e.dir().join("q3-review")).unwrap();
+    e.fake
+        .rewrite_on_push("q3-review/.syns.yaml", Q3_REVIEW_IDENTITY);
+
+    let first = publish(&e.fake, &copy, &e).await;
+
+    assert!(
+        matches!(
+            first,
+            SyncOutcome::Synced {
+                published: Some(_),
+                ..
+            }
+        ),
+        "{first:?}"
+    );
+    assert_eq!(e.fake.head().1["q3-review/.syns.yaml"], Q3_REVIEW_IDENTITY);
+    assert_eq!(read(&e.dir(), "q3-review/.syns.yaml"), Q3_PLAN_IDENTITY);
+
+    let second = publish(&e.fake, &copy, &e).await;
+
+    assert_eq!(
+        written_paths(&second),
+        vec!["q3-review/.syns.yaml".to_string()]
+    );
+    assert!(
+        matches!(
+            second,
+            SyncOutcome::Synced {
+                published: None,
+                ..
+            }
+        ),
+        "{second:?}"
+    );
+    assert_eq!(read(&e.dir(), "q3-review/.syns.yaml"), Q3_REVIEW_IDENTITY);
+
+    let third = publish(&e.fake, &copy, &e).await;
+
+    assert!(matches!(third, SyncOutcome::NoChanges), "{third:?}");
+    assert_eq!(e.fake.push_bodies().len(), 1);
+    assert_eq!(e.fake.head().1["q3-review/.syns.yaml"], Q3_REVIEW_IDENTITY);
+}
+
+// SPEC u318 Tests, `sync_over_a_folder_already_holding_the_rewritten_identity_file_records_the_head`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn sync_over_a_folder_already_holding_the_rewritten_identity_file_records_the_head() {
+    let e = env().await;
+    let h2 = moved_publication(&e);
+    write_files(&e.dir(), &[("q3-review/.syns.yaml", Q3_REVIEW_IDENTITY)]);
+    let copy = e.copy(&e.dir());
+
+    let first = publish(&e.fake, &copy, &e).await;
+
+    assert!(matches!(first, SyncOutcome::NoChanges), "{first:?}");
+    assert!(e.fake.push_bodies().is_empty());
+    assert_eq!(copy.base().unwrap().commit_sha(), Some(h2.as_str()));
+    assert_eq!(
+        base_sha(&copy, "q3-review/.syns.yaml"),
+        Some(blob_sha1(Q3_REVIEW_IDENTITY.as_bytes()))
+    );
+
+    write_files(&e.dir(), &[("b.md", "b\n")]);
+    let second = publish(&e.fake, &copy, &e).await;
+
+    assert!(
+        matches!(
+            second,
+            SyncOutcome::Synced {
+                published: Some(_),
+                ..
+            }
+        ),
+        "{second:?}"
+    );
+    let bodies = e.fake.push_bodies();
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0]["parentSha"], h2.as_str());
+    assert!(copy.resolution().unwrap().is_none());
+}
+
+// SPEC u318 Tests, `a_head_at_the_base_commit_differing_only_in_an_excluded_path_publishes_at_once`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_head_at_the_base_commit_differing_only_in_an_excluded_path_publishes_at_once() {
+    let e = env().await;
+    let h1 = e.fake.commit(&[
+        ("a.md", "a\n"),
+        (".synsignore", "notes.md\n"),
+        ("notes.md", "n\n"),
+    ]);
+    write_files(
+        &e.dir(),
+        &[
+            ("a.md", "b\n"),
+            (".synsignore", "notes.md\n"),
+            ("notes.md", "n\n"),
+        ],
+    );
+    let copy = e.copy(&e.dir());
+    copy.record_base(
+        &h1,
+        HashMap::from([
+            ("a.md".to_string(), blob_sha1(b"a\n")),
+            (".synsignore".to_string(), blob_sha1(b"notes.md\n")),
+            ("notes.md".to_string(), blob_sha1(b"old\n")),
+        ]),
+    )
+    .unwrap();
+
+    let outcome = publish(&e.fake, &copy, &e).await;
+
+    assert!(
+        matches!(
+            outcome,
+            SyncOutcome::Synced {
+                published: Some(_),
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    let bodies = e.fake.push_bodies();
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0]["parentSha"], h1.as_str());
+    assert!(copy.resolution().unwrap().is_none());
+    assert_eq!(e.fake.head().1["a.md"], "b\n");
 }
 
 // ---- an interrupted preparation -------------------------------------------

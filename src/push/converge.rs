@@ -1653,6 +1653,20 @@ fn without(
         .collect()
 }
 
+/// Whether a head at the base's commit holds the base's tree (SPEC u318
+/// Contract Surface, `head_holds_base_tree`): every path outside
+/// `excluded` that either map names is named by both, at one hash. A head
+/// the server committed at other bytes than a publication sent — a moved
+/// shared folder's rewritten identity file — fails it, so its paths reach
+/// the folder as remote-only changes rather than being published back.
+fn head_holds_base_tree(
+    base_files: &BTreeMap<String, String>,
+    head_files: &BTreeMap<String, String>,
+    excluded: &BTreeSet<String>,
+) -> bool {
+    without(base_files, excluded) == without(head_files, excluded)
+}
+
 /// A folder path's prior content snapshotted as a content file of its
 /// own: a collected path through `copy_collected`, any other copied as it
 /// stands, none where no file stands (SPEC u280 `converge` 5). Answers the
@@ -3059,6 +3073,9 @@ async fn converge_from_resolution(
     }
 
     // 8 — SPEC u306 `converge` 3: the base recorded is `recorded_entries`'.
+    // SPEC u318 `converge` 1: a head at the base's commit naming a path
+    // otherwise than the base records `recorded_entries`' at that commit,
+    // so the next run compares against the head the folder already holds.
     if folder.hashes == head_files {
         return match &head.commit {
             Some(commit) if base.commit.as_deref() != Some(commit.as_str()) => {
@@ -3069,6 +3086,10 @@ async fn converge_from_resolution(
                     published: None,
                 })
             }
+            Some(commit) if !head_holds_base_tree(&base.files, &head.files, &excluded) => {
+                copy.record_base(commit, recorded)?;
+                Ok(SyncOutcome::NoChanges)
+            }
             _ => Ok(SyncOutcome::NoChanges),
         };
     }
@@ -3078,7 +3099,10 @@ async fn converge_from_resolution(
     // wrote stands while the head names that path at other bytes; a base
     // keeping its own entry for a held file the head names otherwise, and
     // a written file a released binary's base names at the head's bytes,
-    // go on to the candidate.
+    // go on to the candidate. SPEC u318 `converge` 2 and 3: and only where
+    // the head holds the base's tree, every other path included, so a
+    // head the server committed at other bytes than were sent goes on to
+    // the candidate, its paths taken as remote-only changes.
     let head_replaces_written = written
         && folder
             .hashes
@@ -3087,6 +3111,7 @@ async fn converge_from_resolution(
     if head.commit == base.commit
         && base.files.get(ROOT_IDENTITY) == head.files.get(ROOT_IDENTITY)
         && !head_replaces_written
+        && head_holds_base_tree(&base.files, &head.files, &excluded)
     {
         return match mode {
             ConvergeMode::Retrieve { .. } => Ok(SyncOutcome::NoChanges),
