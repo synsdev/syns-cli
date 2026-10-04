@@ -563,7 +563,9 @@ pub async fn cmd_mark_folder(
     let (marked, raw) =
         mark_with_names(&client, &token, &target, visibility.into(), name, ask).await?;
 
-    // 7 — the document, or the report.
+    // 7 — the document, or the report and the identity, the latter on
+    // the primary stream as a first share writes it (ruled on u329's
+    // round-1 open question).
     if output.is_json() {
         output.json(&document(
             &raw,
@@ -572,16 +574,16 @@ pub async fn cmd_mark_folder(
                 "path": target.path,
             }),
         ));
-    } else {
-        eprintln!(
-            "{} of {} is {} as {}/{}",
-            target.path,
-            target.holder,
-            visibility_text(&marked.visibility),
-            marked.owner,
-            marked.name
-        );
+        return Ok(());
     }
+    let identity = format!("{}/{}", marked.owner, marked.name);
+    eprintln!(
+        "{} of {} is {} as {identity}",
+        target.path,
+        target.holder,
+        visibility_text(&marked.visibility),
+    );
+    println!("{identity}");
     Ok(())
 }
 

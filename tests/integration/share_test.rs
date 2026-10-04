@@ -1159,6 +1159,9 @@ fn a_marking_sends_the_path_and_the_visibility_alone() {
         stderr_of(&out),
         "drafts of alice/handbook is private as alice/handbook-drafts\n"
     );
+    // Ruled on round 1's open question: the identity on the primary
+    // stream, as a first share writes it, so a script reads both alike.
+    assert_eq!(stdout_of(&out), "alice/handbook-drafts\n");
 }
 
 // SPEC u329 Tests, the row of this name.
