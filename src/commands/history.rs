@@ -1,14 +1,13 @@
-use crate::auth::token::TokenStore;
 use crate::client::{CommitProvenance, SynsClient, VersionEntry, VersionListResponse, undecodable};
 use crate::commands::repos::{LIMIT_MAX, LIMIT_MIN, refuse_limit_outside};
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
 use crate::read::{
-    RepoScopeArgs, refuse_reference_spelling, repository_argument, resolve_scoped_repo_scope,
-    version_not_found_refusal,
+    RepoScope, RepoScopeArgs, refuse_reference_spelling, repository_argument,
+    resolve_scoped_repo_scope, version_not_found_refusal,
 };
-use crate::repo::folder::{FolderScope, current_dir, lies_under, resolve_scoped_or_skip};
+use crate::repo::folder::{FolderScope, lies_under};
 
 /// A version row's provenance cell: the publisher and each asserted
 /// field under its label, where the commit recorded provenance and either
@@ -209,28 +208,30 @@ pub async fn folder_history(
 
 /// `syns history` (SPEC u290 Behaviour, `cmd_history`): the whole
 /// version list, a file's history, or a folder's, each at `--limit` and
-/// `--offset`.
+/// `--offset`, at the repository `--repo` names where it stands (SPEC
+/// u329).
 pub async fn cmd_history(
     config: &Config,
     output: &Output,
     file: Option<String>,
     limit: u32,
     offset: u32,
-    if_repo: bool,
+    scope: RepoScopeArgs,
 ) -> Result<(), CliError> {
     // 1 — the page bound, before any request.
     refuse_limit_outside(limit, LIMIT_MIN, LIMIT_MAX)?;
 
-    // 2 — the repository and the folder.
-    let Some((owner, name, folder)) = resolve_scoped_or_skip(&current_dir()?, if_repo, output)?
+    // 2 — the repository and the folder: `--repo` taken outright, binding
+    // no folder and reading no identity file, and otherwise the walk from
+    // the working directory (SPEC u329 `cmd_history` 1).
+    let Some(RepoScope {
+        repo_id,
+        token,
+        folder,
+    }) = resolve_scoped_repo_scope(config, output, &scope).await?
     else {
         return Ok(());
     };
-    let repo_id = format!("{owner}/{name}");
-    let token = TokenStore::new(config.credentials_path())
-        .read()
-        .ok()
-        .flatten();
     let client = SynsClient::new(config.server_url())?;
 
     // 3 — the path to answer; with none, the whole version list.
@@ -425,7 +426,7 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_history(&config, &output, None, 50, 0, false).await;
+        let result = cmd_history(&config, &output, None, 50, 0, RepoScopeArgs::default()).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
@@ -489,7 +490,7 @@ mod tests {
             Some("src/main.ts".to_string()),
             50,
             0,
-            false,
+            RepoScopeArgs::default(),
         )
         .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
@@ -526,7 +527,18 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_history(&config, &output, None, 50, 0, true).await;
+        let result = cmd_history(
+            &config,
+            &output,
+            None,
+            50,
+            0,
+            RepoScopeArgs {
+                repo: None,
+                if_repo: true,
+            },
+        )
+        .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
@@ -543,7 +555,18 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_history(&config, &output, None, 50, 0, true).await;
+        let result = cmd_history(
+            &config,
+            &output,
+            None,
+            50,
+            0,
+            RepoScopeArgs {
+                repo: None,
+                if_repo: true,
+            },
+        )
+        .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());

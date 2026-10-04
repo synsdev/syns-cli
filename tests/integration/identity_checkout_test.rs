@@ -2343,3 +2343,220 @@ fn a_default_comparison_through_an_identity_takes_its_two_newest_listed_versions
         d.targets()
     );
 }
+
+// ---- the history by `--repo`, and the refusal naming it (SPEC u329) ------
+
+const Q3_BOARD: &str = "/api/v1/repos/alice/clients-q3-board";
+
+/// The deployment with its stored credential removed.
+fn signed_out() -> Deployment {
+    let d = Deployment::new();
+    std::fs::remove_file(d.home.path().join("credentials.json")).expect("credential removed");
+    d
+}
+
+/// A fresh directory `U/<name>`, holding nothing.
+fn fresh(d: &Deployment, name: &str) -> PathBuf {
+    let dir = d.u.join(name);
+    std::fs::create_dir_all(&dir).expect("a fresh directory");
+    dir
+}
+
+/// Every request carrying an `Authorization` header.
+fn authorised(d: &Deployment) -> Vec<String> {
+    d.requests()
+        .into_iter()
+        .filter(|r| r.headers.contains_key("authorization"))
+        .map(|r| format!("{} {}", r.method, r.url.path()))
+        .collect()
+}
+
+/// `alice/clients-q3-board`'s version list naming no path answering
+/// versions `4` then `2`.
+fn q3_board_versions(d: &Deployment) {
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path(format!("{Q3_BOARD}/versions")))
+            .and(query_param_is_missing("path"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page(
+                vec![version(4, H4, &["board.md"]), version(2, H6, &["board.md"])],
+                50,
+            ))),
+    );
+}
+
+// SPEC u329 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_history_named_by_repo_is_read_there_from_inside_another_checkout() {
+    let d = signed_out();
+    let handbook = fresh(&d, "handbook");
+    write(
+        &handbook.join(".syns.yaml"),
+        "owner: alice\nname: handbook\n",
+    );
+    q3_board_versions(&d);
+    let history = json!({
+        "data": [{
+            "version": 4, "sha": H4, "blobSha": "b4", "message": "m",
+            "author": "alice", "createdAt": "2026-10-02T00:00:00Z",
+            "content": "board\n", "diff": null,
+        }],
+        "total": 1, "limit": 50, "offset": 0,
+    });
+    d.serves(
+        "GET",
+        &format!("{Q3_BOARD}/files/board.md/history"),
+        ResponseTemplate::new(200).set_body_json(history.clone()),
+    );
+    d.serves(
+        "GET",
+        &format!("{Q3_BOARD}/versions/4"),
+        ResponseTemplate::new(200).set_body_json(version(4, H4, &["board.md"])),
+    );
+
+    let list = d.run_in(&handbook, &["history", "--repo", "alice/clients-q3-board"]);
+    let file = d.run_in(
+        &handbook,
+        &[
+            "history",
+            "--repo",
+            "Alice/Clients-Q3-Board",
+            "--file",
+            "board.md",
+            "--json",
+        ],
+    );
+    let shown = d.run_in(
+        &handbook,
+        &["history", "--repo", "alice/clients-q3-board", "show", "4"],
+    );
+    let both = d.run_in(
+        &handbook,
+        &[
+            "history",
+            "--repo",
+            "alice/handbook",
+            "show",
+            "4",
+            "--repo",
+            "alice/clients-q3-board",
+        ],
+    );
+
+    for out in [&list, &file, &shown, &both] {
+        assert_eq!(exit_of(out), 0, "{}", stderr_of(out));
+    }
+    let targets = d.targets();
+    let lists: Vec<&String> = targets
+        .iter()
+        .filter(|t| t.starts_with(&format!("GET {Q3_BOARD}/versions?")))
+        .collect();
+    assert_eq!(lists.len(), 1, "{targets:?}");
+    assert!(
+        lists[0].contains("limit=50")
+            && lists[0].contains("offset=0")
+            && !lists[0].contains("path="),
+        "{}",
+        lists[0]
+    );
+    assert_eq!(
+        targets
+            .iter()
+            .filter(|t| t.starts_with(&format!("GET {Q3_BOARD}/files/board.md/history")))
+            .count(),
+        1,
+        "{targets:?}"
+    );
+    assert_eq!(
+        targets
+            .iter()
+            .filter(|t| *t == &format!("GET {Q3_BOARD}/versions/4"))
+            .count(),
+        2,
+        "{targets:?}"
+    );
+    assert!(
+        targets.iter().all(|t| !t.contains("alice/handbook")),
+        "{targets:?}"
+    );
+    assert!(authorised(&d).is_empty(), "{:?}", authorised(&d));
+    assert_eq!(document(&file), history);
+}
+
+// SPEC u329 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_history_outside_every_checkout_names_repo_which_skips_nothing() {
+    let d = signed_out();
+    let nowhere = fresh(&d, "nowhere");
+    q3_board_versions(&d);
+
+    let bare = d.run_in(&nowhere, &["history"]);
+
+    assert_eq!(exit_of(&bare), 2, "{}", stderr_of(&bare));
+    assert!(
+        stderr_of(&bare).contains("cannot determine repo identity \u{2014} pass --repo OWNER/NAME, or run inside a directory at or below one holding .syns.yaml"),
+        "{}",
+        stderr_of(&bare)
+    );
+    assert!(d.requests().is_empty(), "{:?}", d.targets());
+
+    let named = d.run_in(
+        &nowhere,
+        &["history", "--repo", "alice/clients-q3-board", "--if-repo"],
+    );
+
+    assert_eq!(exit_of(&named), 0, "{}", stderr_of(&named));
+    assert_eq!(
+        d.targets()
+            .iter()
+            .filter(|t| t.starts_with(&format!("GET {Q3_BOARD}/versions?")))
+            .count(),
+        1,
+        "{:?}",
+        d.targets()
+    );
+    assert_eq!(d.requests().len(), 1, "{:?}", d.targets());
+    assert!(
+        !stdout_of(&named).contains("skipped"),
+        "{}",
+        stdout_of(&named)
+    );
+}
+
+// SPEC u329 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_shared_folders_own_name_whose_identity_file_is_withheld_names_the_repo_reads() {
+    let d = signed_out();
+    let empty = fresh(&d, "empty");
+    let mut board = record("alice", "clients-q3-board", Some(H4), true);
+    board["visibility"] = json!("public");
+    board["heldIn"] = Value::Null;
+    board["role"] = Value::Null;
+    d.serves(
+        "GET",
+        Q3_BOARD,
+        ResponseTemplate::new(200).set_body_json(board),
+    );
+    d.serves(
+        "GET",
+        &format!("{Q3_BOARD}/raw/.syns.yaml"),
+        refusal(404, "not_found"),
+    );
+
+    let out = d.run_in(&empty, &["pull", "alice/clients-q3-board", "vela"]);
+
+    assert_eq!(exit_of(&out), 1, "{}", stderr_of(&out));
+    assert_eq!(
+        stderr_of(&out).trim_end(),
+        "error: configuration error: alice/clients-q3-board holds no .syns.yaml naming it as a shared folder at the tip; only a shared folder whose .syns.yaml names it is checked out from its name \u{2014} read it without a checkout with: syns ls --repo alice/clients-q3-board, syns history --repo alice/clients-q3-board"
+    );
+    assert!(!empty.join("vela").exists());
+    assert!(
+        d.targets().iter().all(|t| !t.contains("/tree")),
+        "{:?}",
+        d.targets()
+    );
+}

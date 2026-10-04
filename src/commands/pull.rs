@@ -178,12 +178,18 @@ fn is_not_found(err: &CliError) -> bool {
 
 /// The identity checkout refusal (SPEC u302 Contract Surface): a
 /// repository whose record marks a shared folder's identity, whose root at
-/// `at` holds no `.syns.yaml` naming it, `{owner}/{name}` lower-cased.
+/// `at` holds no `.syns.yaml` naming it — absent, or withheld from a
+/// reader the folder's visibility alone admits — `{owner}/{name}`
+/// lower-cased, then the `--repo` reads that reach it without a checkout
+/// (SPEC u329, Q-07).
 pub fn identity_unmarked(owner: &str, name: &str, at: &str) -> String {
-    format!(
-        "{}/{} holds no .syns.yaml naming it as a shared folder at {at}; only a shared folder whose .syns.yaml names it is checked out from its name",
+    let repo = format!(
+        "{}/{}",
         owner.to_ascii_lowercase(),
         name.to_ascii_lowercase()
+    );
+    format!(
+        "{repo} holds no .syns.yaml naming it as a shared folder at {at}; only a shared folder whose .syns.yaml names it is checked out from its name \u{2014} read it without a checkout with: syns ls --repo {repo}, syns history --repo {repo}"
     )
 }
 

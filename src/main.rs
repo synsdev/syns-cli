@@ -275,9 +275,8 @@ enum Commands {
         /// Number of versions to skip before the first one shown
         #[arg(long, default_value_t = 0)]
         offset: u32,
-        /// Silently skip (exit 0) when no Syns repo identity resolves
-        #[arg(long)]
-        if_repo: bool,
+        #[command(flatten)]
+        scope: RepoScopeArgs,
         #[command(subcommand)]
         action: Option<HistoryAction>,
     },
@@ -665,21 +664,23 @@ async fn run(
             file,
             limit,
             offset,
-            if_repo,
+            scope,
             action,
         } => match action {
             Some(HistoryAction::Show {
                 reference,
-                mut scope,
+                scope: mut own,
             }) => {
-                // `--if-repo` written ahead of the subcommand word is
-                // the noun's own, and the arm it routes to reads both
-                // (CR1-1), as `Commands::Collaborators` does below.
-                scope.if_repo = scope.if_repo || if_repo;
-                commands::history::cmd_history_show(config, output, reference, scope).await?
+                // `--if-repo` and `--repo` written ahead of the subcommand
+                // word are the noun's own, and the arm it routes to reads
+                // both (CR1-1), `show`'s own `--repo` taking the run where
+                // both stand (SPEC u329, the history command).
+                own.if_repo = own.if_repo || scope.if_repo;
+                own.repo = own.repo.or(scope.repo);
+                commands::history::cmd_history_show(config, output, reference, own).await?
             }
             None => {
-                commands::history::cmd_history(config, output, file, limit, offset, if_repo).await?
+                commands::history::cmd_history(config, output, file, limit, offset, scope).await?
             }
         },
         Commands::Diff { from, to, if_repo } => {
