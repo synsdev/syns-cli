@@ -3,14 +3,18 @@
 //! aiming the collaborator commands at that identity (SPEC u300 Tests);
 //! and marking a folder with a visibility of its own, naming it on the
 //! lookup, and keeping a marked folder's name across an unshare (SPEC
-//! u329 Tests).
+//! u329 Tests); and a marking under a private holder naming the folder's
+//! own name where its name is held, and warning where a public identity's
+//! name shows the holder's (SPEC u332 Tests).
 //!
 //! Every binary row of those tables stands here under the name the table
 //! gives it; `share_name_problem_weighs_the_repository_name_kind`,
 //! `offered_share_name_takes_the_last_segment_lower_cased`,
-//! `the_ask_takes_another_name_where_the_name_is_held` and
-//! `a_moved_head_under_the_share_asks_no_other_name` stand in the tests
-//! module of `src/commands/share.rs`. Each test drives one deployment of
+//! `the_ask_takes_another_name_where_the_name_is_held`,
+//! `a_moved_head_under_the_share_asks_no_other_name`,
+//! `offered_marking_name_keys_on_the_holder_visibility` and
+//! `carries_holder_name_matches_the_holder_name_and_a_dash_at_its_start`
+//! stand in the tests module of `src/commands/share.rs`. Each test drives one deployment of
 //! its own: a mock answering `EP-get-repo` for the holder with `role`
 //! `owner` and `sharedFolder` `false` where the row names no other
 //! answer, a config directory holding a credential for `alice`, a cache
@@ -1508,4 +1512,264 @@ fn an_unshare_whose_second_lookup_fails_claims_nothing() {
     let doc = document(&json_run);
     assert_eq!(doc["retired"], Value::Null);
     assert!(doc.as_object().expect("an object").contains_key("retired"));
+}
+
+// ---- a marking under a private holder (SPEC u332) -------------------------
+
+const CLIENTS_MARKING: &str = "/api/v1/repos/alice/clients/folder-visibility";
+const Q3_BOARD_LOOKUP: &str = "/api/v1/repos/alice/clients/shares/vela/q3-board";
+
+/// The tree at `folder` of `holder` holding `file`, at the wire's own
+/// `address`.
+fn serve_tree(d: &Deployment, address: &str, file: &str) {
+    d.serves(
+        "GET",
+        address,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "entries": [{
+                "name": file.rsplit('/').next().expect("a name"), "path": file,
+                "type": "file", "size": 6, "sha": null,
+            }],
+            "commitSha": "a".repeat(40),
+            "truncated": false,
+        })),
+    );
+}
+
+/// `P` of SPEC u332 Tests: the credential; `alice/clients` private with
+/// `role` `owner` and `sharedFolder` false, its tree at `vela/q3-board`
+/// holding `vela/q3-board/board.md`.
+fn private_holder_deployment() -> Deployment {
+    let d = Deployment::new(Some("alice/clients"));
+    serve_tree(
+        &d,
+        "/api/v1/repos/alice/clients/tree/vela/q3-board",
+        "vela/q3-board/board.md",
+    );
+    d
+}
+
+/// The marking at `address` answering `answer`, ahead of every answer
+/// at a higher `priority`.
+fn marking_at(d: &Deployment, address: &str, answer: ResponseTemplate, priority: u8) {
+    d.mount(
+        Mock::given(method("PUT"))
+            .and(path(address.to_string()))
+            .respond_with(answer)
+            .with_priority(priority),
+    );
+}
+
+/// A marking answer: `alice/NAME` at `visibility`, a shared folder.
+fn marked(name: &str, visibility: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(record_at("alice", name, true, visibility))
+}
+
+/// The lines of `out`'s diagnostic stream opening `warning:`.
+fn warnings(out: &std::process::Output) -> Vec<String> {
+    stderr_of(out)
+        .lines()
+        .filter(|line| line.starts_with("warning:"))
+        .map(str::to_string)
+        .collect()
+}
+
+const Q3_BOARD_WARNING: &str = "warning: alice/clients-q3-board is public, and its name shows anyone the name of the private repository alice/clients; to hide it, mark it private again with: syns share vela/q3-board --visibility private --repo alice/clients";
+
+// SPEC u332 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_held_name_under_a_private_holder_names_the_folders_own_name() {
+    let d = private_holder_deployment();
+    marking_at(&d, CLIENTS_MARKING, refusal(409, "conflict"), 5);
+    d.serves("GET", Q3_BOARD_LOOKUP, refusal(404, "not_found"));
+
+    let out = d.run(&[
+        "share",
+        "vela/q3-board",
+        "--visibility",
+        "public",
+        "--repo",
+        "alice/clients",
+    ]);
+
+    assert_eq!(exit_of(&out), 1, "{}", stderr_of(&out));
+    let err = stderr_of(&out);
+    assert!(err.contains("conflict"), "{err}");
+    assert_eq!(d.sent("PUT"), vec![CLIENTS_MARKING.to_string()]);
+    assert_eq!(
+        d.put_bodies(CLIENTS_MARKING),
+        vec![json!({"path": "vela/q3-board", "visibility": "public"})]
+    );
+    assert!(
+        err.contains("alice/q3-board is already held; give another name"),
+        "{err}"
+    );
+    assert!(!err.contains("clients-q3-board"), "{err}");
+}
+
+// SPEC u332 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_held_name_under_a_public_holder_names_the_holder_prefixed_name() {
+    let d = marking_deployment();
+    marking_first(&d, refusal(409, "conflict"), 1, 1);
+    d.serves("GET", DRAFTS_LOOKUP, refusal(404, "not_found"));
+
+    let out = d.run(&[
+        "share",
+        "drafts",
+        "--visibility",
+        "public",
+        "--repo",
+        "alice/handbook",
+    ]);
+
+    assert_eq!(exit_of(&out), 1, "{}", stderr_of(&out));
+    let err = stderr_of(&out);
+    assert!(err.contains("conflict"), "{err}");
+    assert!(
+        err.contains("alice/handbook-drafts is already held; give another name"),
+        "{err}"
+    );
+}
+
+// SPEC u332 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_public_marking_under_a_private_holder_whose_name_carries_the_holders_warns() {
+    let d = private_holder_deployment();
+    marking_at(&d, CLIENTS_MARKING, marked("clients-q3-board", "public"), 5);
+    let args = [
+        "share",
+        "vela/q3-board",
+        "--visibility",
+        "public",
+        "--repo",
+        "alice/clients",
+    ];
+
+    let human = d.run(&args);
+    let json_run = d.run(&[&args[..], &["--json"]].concat());
+    marking_at(&d, CLIENTS_MARKING, marked("clients-q3", "public"), 1);
+    let named = d.run(&[&args[..], &["--name", "clients-q3"]].concat());
+
+    for out in [&human, &json_run, &named] {
+        assert_eq!(exit_of(out), 0, "{}", stderr_of(out));
+    }
+    assert!(
+        stderr_of(&named).contains("warning: alice/clients-q3 is public"),
+        "{}",
+        stderr_of(&named)
+    );
+    assert_eq!(
+        stderr_of(&human),
+        format!(
+            "vela/q3-board of alice/clients is public as alice/clients-q3-board\n{Q3_BOARD_WARNING}\n"
+        )
+    );
+    assert_eq!(stdout_of(&human), "alice/clients-q3-board\n");
+    let mut expected = record_at("alice", "clients-q3-board", true, "public");
+    expected["holder"] = json!("alice/clients");
+    expected["path"] = json!("vela/q3-board");
+    assert_eq!(document(&json_run), expected);
+    assert_eq!(stderr_of(&json_run), format!("{Q3_BOARD_WARNING}\n"));
+}
+
+// SPEC u332 Tests, the row of this name.
+#[test]
+#[serial]
+fn the_warnings_remedy_quotes_a_spaced_path() {
+    let d = Deployment::new(Some("alice/docs"));
+    serve_tree(
+        &d,
+        "/api/v1/repos/alice/docs/tree/clients/q3%20plan",
+        "clients/q3 plan/plan.md",
+    );
+    marking_at(
+        &d,
+        "/api/v1/repos/alice/docs/folder-visibility",
+        marked("docs-q3-plan", "public"),
+        5,
+    );
+
+    let out = d.run(&[
+        "share",
+        "clients/q3 plan",
+        "--visibility",
+        "public",
+        "--repo",
+        "alice/docs",
+    ]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    let lines = warnings(&out);
+    assert_eq!(lines.len(), 1, "{}", stderr_of(&out));
+    assert!(
+        lines[0].ends_with("syns share 'clients/q3 plan' --visibility private --repo alice/docs"),
+        "{lines:?}"
+    );
+}
+
+// SPEC u332 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_marking_the_test_does_not_match_warns_of_nothing() {
+    let clients = [
+        "share",
+        "vela/q3-board",
+        "--visibility",
+        "public",
+        "--repo",
+        "alice/clients",
+    ];
+
+    let own_name = private_holder_deployment();
+    marking_at(&own_name, CLIENTS_MARKING, marked("q3-board", "public"), 5);
+    let own_name = own_name.run(&clients);
+
+    let private = private_holder_deployment();
+    marking_at(
+        &private,
+        CLIENTS_MARKING,
+        marked("clients-q3-board", "private"),
+        5,
+    );
+    let mut private_args = clients;
+    private_args[3] = "private";
+    let private = private.run(&private_args);
+
+    let public_holder = marking_deployment();
+    marking_first(&public_holder, marked("handbook-drafts", "public"), 1, 1);
+    let public_holder = public_holder.run(&[
+        "share",
+        "drafts",
+        "--visibility",
+        "public",
+        "--repo",
+        "alice/handbook",
+    ]);
+
+    for out in [&own_name, &private, &public_holder] {
+        assert_eq!(exit_of(out), 0, "{}", stderr_of(out));
+        assert!(warnings(out).is_empty(), "{}", stderr_of(out));
+    }
+}
+
+// SPEC u332 Tests, the row of this name.
+#[test]
+#[serial]
+fn the_share_name_help_names_a_markings_default_in_a_private_holder() {
+    let d = Deployment::new(None);
+
+    let out = d.run(&["share", "--help"]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert!(
+        stdout_of(&out).contains(
+            "offered as <holder name>-<folder name> where absent, and as <folder name> on a marking in a private holder"
+        ),
+        "{}",
+        stdout_of(&out)
+    );
 }

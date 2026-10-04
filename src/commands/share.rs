@@ -3,7 +3,9 @@
 //! named by its sharer, the identity a folder stands under read, and the
 //! sharing stopped (`D-110`, `D-115`, `D-116`, `D-118`, `D-119`); and
 //! `syns share PATH --visibility VISIBILITY` (SPEC u329): the folder
-//! marked with a visibility of its own through its holder (`D-122`).
+//! marked with a visibility of its own through its holder (`D-122`), its
+//! held name and its public name warning keyed on the holder's own
+//! visibility (SPEC u332, `D-123`).
 
 use std::io::{BufRead, IsTerminal, Write};
 
@@ -92,6 +94,31 @@ pub fn offered_share_name(holder: &str, path: &str) -> Option<String> {
     let last = path.rsplit('/').next().unwrap_or(path);
     let offer = format!("{holder_name}-{last}").to_lowercase();
     share_name_problem(&offer).is_none().then_some(offer)
+}
+
+/// The name a marking offers on its held line (SPEC u332,
+/// `offered_marking_name`): the name the server mints for a marking sent
+/// with no name — under a private holder the last segment of `path`
+/// lower-cased, and otherwise what `offered_share_name` answers (`D-123`);
+/// none where that fails `share_name_problem`.
+pub fn offered_marking_name(
+    holder: &str,
+    path: &str,
+    holder_visibility: &Visibility,
+) -> Option<String> {
+    if *holder_visibility != Visibility::Private {
+        return offered_share_name(holder, path);
+    }
+    let offer = path.rsplit('/').next().unwrap_or(path).to_lowercase();
+    share_name_problem(&offer).is_none().then_some(offer)
+}
+
+/// Whether `name` opens with the holder's name and `-`, letter case aside
+/// (SPEC u332, `carries_holder_name`).
+pub(crate) fn carries_holder_name(name: &str, holder: &str) -> bool {
+    let holder_name = holder.rsplit('/').next().unwrap_or(holder);
+    name.to_lowercase()
+        .starts_with(&format!("{}-", holder_name.to_lowercase()))
 }
 
 /// Whether a typed path names the folder the run stands in (SPEC u300
@@ -215,7 +242,8 @@ type AskAgain<'a> = &'a mut dyn FnMut() -> Option<String>;
 /// mints its identity under (SPEC u329 Behaviour, `cmd_mark_folder`
 /// 5–6): a `404` `not_found` is a server predating the route; a held
 /// name reads the lookup, sending the marking once more with no name
-/// where an identity stands, and otherwise writing the held line and
+/// where an identity stands, and otherwise writing the held line over the
+/// name sent, else over `offer` (SPEC u332, `cmd_mark_folder` 2), and
 /// asking `ask` for another name where it can.
 async fn mark_with_names(
     client: &SynsClient,
@@ -223,6 +251,7 @@ async fn mark_with_names(
     target: &ShareTarget,
     visibility: Visibility,
     name: Option<String>,
+    offer: Option<String>,
     mut ask: Option<AskAgain<'_>>,
 ) -> Result<(RepoResponse, Value), CliError> {
     let owner = target.holder.split('/').next().unwrap_or(&target.holder);
@@ -265,10 +294,7 @@ async fn mark_with_names(
 
         // 6 — the held line over the name sent, then another name where
         // one can be asked for.
-        let sent = name
-            .clone()
-            .or_else(|| offered_share_name(&target.holder, &target.path));
-        if let Some(sent) = sent {
+        if let Some(sent) = name.as_ref().or(offer.as_ref()) {
             eprintln!("{}", held_line(&format!("{owner}/{sent}")));
         }
         let Some(ask) = ask.as_mut() else {
@@ -560,8 +586,25 @@ pub async fn cmd_mark_folder(
     } else {
         None
     };
-    let (marked, raw) =
-        mark_with_names(&client, &token, &target, visibility.into(), name, ask).await?;
+    let public = matches!(visibility, CliVisibility::Public);
+    let offer = offered_marking_name(&target.holder, &target.path, &holder.visibility);
+    let (marked, raw) = mark_with_names(
+        &client,
+        &token,
+        &target,
+        visibility.into(),
+        name,
+        offer,
+        ask,
+    )
+    .await?;
+
+    // SPEC u332 `cmd_mark_folder` 4 — a public identity of a private
+    // holder whose name opens with the holder's (`D-123`).
+    let warning = (public
+        && holder.visibility == Visibility::Private
+        && carries_holder_name(&marked.name, &target.holder))
+    .then(|| public_name_warning(&marked, &target));
 
     // 7 — the document, or the report and the identity, the latter on
     // the primary stream as a first share writes it (ruled on u329's
@@ -574,17 +617,51 @@ pub async fn cmd_mark_folder(
                 "path": target.path,
             }),
         ));
-        return Ok(());
+    } else {
+        eprintln!(
+            "{} of {} is {} as {}/{}",
+            target.path,
+            target.holder,
+            visibility_text(&marked.visibility),
+            marked.owner,
+            marked.name,
+        );
     }
-    let identity = format!("{}/{}", marked.owner, marked.name);
-    eprintln!(
-        "{} of {} is {} as {identity}",
-        target.path,
-        target.holder,
-        visibility_text(&marked.visibility),
-    );
-    println!("{identity}");
+    if let Some(warning) = warning {
+        eprintln!("{warning}");
+    }
+    if !output.is_json() {
+        println!("{}/{}", marked.owner, marked.name);
+    }
     Ok(())
+}
+
+/// The public name warning (SPEC u332 Contract Surface): `marked` public
+/// under a private holder whose name its own shows, and the marking that
+/// hides it again.
+fn public_name_warning(marked: &RepoResponse, target: &ShareTarget) -> String {
+    format!(
+        "warning: {}/{} is public, and its name shows anyone the name of the private repository {holder}; to hide it, mark it private again with: syns share {} --visibility private --repo {holder}",
+        marked.owner,
+        marked.name,
+        shell_word(&target.path),
+        holder = target.holder,
+    )
+}
+
+/// `path` as one POSIX shell word: as given where it holds only ASCII
+/// letters, digits, `.`, `_`, `-` and `/`, and otherwise single-quoted
+/// with each `'` written `'\''`, as `enable_command` writes its own.
+fn shell_word(path: &str) -> String {
+    let plain = !path.is_empty()
+        && path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/'));
+    if plain {
+        path.to_string()
+    } else {
+        format!("'{}'", path.replace('\'', "'\\''"))
+    }
 }
 
 /// A served visibility in the lower-cased form `syns repo` writes it in.
@@ -820,6 +897,41 @@ mod tests {
         assert_eq!(offered_share_name("alice/docs", "q3 plan"), None);
     }
 
+    // SPEC u332 Tests, the row of this name.
+    #[test]
+    fn offered_marking_name_keys_on_the_holder_visibility() {
+        let offer = |holder, path, visibility| offered_marking_name(holder, path, &visibility);
+        assert_eq!(
+            offer("alice/clients", "vela/Q3-Board", Visibility::Private).as_deref(),
+            Some("q3-board")
+        );
+        assert_eq!(
+            offer("alice/clients", "vela/Q3-Board", Visibility::Public).as_deref(),
+            Some("clients-q3-board")
+        );
+        assert_eq!(
+            offer("alice/clients", "vela/Q3-Board", Visibility::Unknown).as_deref(),
+            Some("clients-q3-board")
+        );
+        assert_eq!(offer("alice/docs", "q3 plan", Visibility::Private), None);
+    }
+
+    // SPEC u332 Tests, the row of this name.
+    #[test]
+    fn carries_holder_name_matches_the_holder_name_and_a_dash_at_its_start() {
+        let carried: Vec<bool> = [
+            "clients-q3-board",
+            "Clients-Q3",
+            "q3-clients-board",
+            "clientsq3",
+            "clients",
+        ]
+        .into_iter()
+        .map(|name| carries_holder_name(name, "alice/Clients"))
+        .collect();
+        assert_eq!(carried, vec![true, true, false, false, false]);
+    }
+
     // SPEC u302 Behaviour, `bind_share_target` 1: inside a folder bound to
     // its identity, the holder its file names and the typed path joined
     // under its recorded path, a typed `.` naming the folder itself.
@@ -963,6 +1075,7 @@ mod tests {
             &target,
             Visibility::Private,
             Some("drafts-q3".into()),
+            None,
             Some(&mut ask),
         )
         .await
@@ -993,6 +1106,7 @@ mod tests {
             &target,
             Visibility::Private,
             Some("drafts-q3".into()),
+            None,
             Some(&mut none),
         )
         .await;

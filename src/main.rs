@@ -405,7 +405,7 @@ enum Commands {
         /// The folder, counted as syns place counts its own; . names the folder the run stands in
         #[arg(value_name = "PATH")]
         path: String,
-        /// The identity's name; offered as <holder name>-<folder name> where absent
+        /// The identity's name; offered as <holder name>-<folder name> where absent, and as <folder name> on a marking in a private holder
         #[arg(long, short = 'n')]
         name: Option<String>,
         /// The repository the folder stands in, as OWNER/NAME
