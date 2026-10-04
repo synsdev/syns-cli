@@ -229,6 +229,19 @@ pub struct ShareFolderRequest {
     pub name: String,
 }
 
+/// The folder visibility route's body (SPEC u329,
+/// `SetFolderVisibilityRequest`): the folder's holder path, the
+/// visibility it takes, and the name a first marking mints its identity
+/// under, left out where none was given.
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SetFolderVisibilityRequest {
+    pub path: String,
+    pub visibility: Visibility,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
 /// `EP-create-user-link`'s body.
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -1086,6 +1099,15 @@ async fn check_response(response: reqwest::Response) -> Result<reqwest::Response
                         .collect::<Option<std::collections::BTreeMap<String, String>>>()
                 })
                 .map(|missing| ApiErrorContext::MissingBlobs { missing }),
+            // SPEC u329 `check_response`: a validation refusal's served
+            // `message` crosses where it is a string, so a caller can tell
+            // one refusal from another.
+            (422, "validation_error", Some(body)) => body
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(|message| ApiErrorContext::Refusal {
+                    message: message.to_string(),
+                }),
             _ => None,
         };
         return Err(CliError::Api {
@@ -1972,6 +1994,29 @@ impl SynsClient {
             .post(&url)
             .bearer_auth(token)
             .send_json_bounded(&request)
+            .await?;
+        process_response_raw(response).await
+    }
+
+    /// Marks the folder at `request.path` of `holder` with a visibility of
+    /// its own (SPEC u329, `SynsClient::set_folder_visibility`): one
+    /// request to the folder visibility route, answering the identity the
+    /// folder stands under, typed and as served.
+    pub async fn set_folder_visibility(
+        &self,
+        holder: &str,
+        token: &str,
+        request: &SetFolderVisibilityRequest,
+    ) -> Result<(RepoResponse, serde_json::Value), CliError> {
+        let url = format!(
+            "{}/api/v1/repos/{}/folder-visibility",
+            self.base_url, holder
+        );
+        let response = self
+            .client
+            .put(&url)
+            .bearer_auth(token)
+            .send_json_bounded(request)
             .await?;
         process_response_raw(response).await
     }
@@ -2945,6 +2990,112 @@ mod tests {
             body,
             serde_json::json!({"path": "clients/q3 plan", "name": "docs-q3-plan"})
         );
+    }
+
+    // SPEC u329 Contract Surface, `SynsClient::set_folder_visibility` and
+    // `SetFolderVisibilityRequest`: one `PUT` whose body names the path
+    // and the visibility, `name` only where one was given.
+    #[tokio::test]
+    async fn a_marking_sends_the_path_and_the_visibility_and_a_name_only_where_given() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/repos/alice/handbook/folder-visibility"))
+            .and(header("authorization", "Bearer t"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(identity_body(Some(true))))
+            .mount(&mock_server)
+            .await;
+
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let (typed, raw) = client
+            .set_folder_visibility(
+                "alice/handbook",
+                "t",
+                &SetFolderVisibilityRequest {
+                    path: "drafts".into(),
+                    visibility: Visibility::Private,
+                    name: None,
+                },
+            )
+            .await
+            .unwrap();
+        client
+            .set_folder_visibility(
+                "alice/handbook",
+                "t",
+                &SetFolderVisibilityRequest {
+                    path: "drafts".into(),
+                    visibility: Visibility::Public,
+                    name: Some("handbook-drafts".into()),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(typed.shared_folder);
+        assert_eq!(raw["sharedFolder"], serde_json::json!(true));
+        let received = mock_server.received_requests().await.unwrap();
+        let bodies: Vec<serde_json::Value> = received
+            .iter()
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+        assert_eq!(
+            bodies,
+            vec![
+                serde_json::json!({"path": "drafts", "visibility": "private"}),
+                serde_json::json!({"path": "drafts", "visibility": "public", "name": "handbook-drafts"}),
+            ]
+        );
+    }
+
+    // SPEC u329 Contract Surface, `check_response`: a `422`
+    // `validation_error` keeps its served string `message`, and one
+    // carrying none keeps no context.
+    #[tokio::test]
+    async fn a_validation_refusal_keeps_its_served_message() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/repos/alice/a"))
+            .respond_with(ResponseTemplate::new(422).set_body_json(
+                serde_json::json!({"error": "validation_error", "message": "description is too long"}),
+            ))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/repos/alice/b"))
+            .respond_with(
+                ResponseTemplate::new(422)
+                    .set_body_json(serde_json::json!({"error": "validation_error"})),
+            )
+            .mount(&mock_server)
+            .await;
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let update = RepoUpdate {
+            description: None,
+            status: None,
+            visibility: Some(Visibility::Public),
+            author: None,
+            tags: None,
+        };
+
+        match client.update_repo("alice/a", "t", &update).await {
+            Err(CliError::Api {
+                status: Some(422),
+                error,
+                context: Some(ApiErrorContext::Refusal { message }),
+            }) => {
+                assert_eq!(error, "validation_error");
+                assert_eq!(message, "description is too long");
+            }
+            other => panic!("expected the refusal holding its message, got {other:?}"),
+        }
+        match client.update_repo("alice/b", "t", &update).await {
+            Err(CliError::Api {
+                status: Some(422),
+                context: None,
+                ..
+            }) => {}
+            other => panic!("expected the refusal holding no context, got {other:?}"),
+        }
     }
 
     // SPEC u300 Contract Surface, `SynsClient::get_share` and

@@ -415,8 +415,11 @@ enum Commands {
         /// Show the identity the folder stands shared under, sharing nothing
         #[arg(long, conflicts_with = "name")]
         show: bool,
+        /// Mark the folder with a visibility of its own, sharing it under an identity where it stands under none
+        #[arg(long, conflicts_with = "show")]
+        visibility: Option<CliVisibility>,
     },
-    /// Stop sharing a folder, retiring its identity and removing its collaborators
+    /// Stop sharing a folder, removing its collaborators and retiring its identity unless it carries a visibility of its own
     Unshare {
         /// The folder, counted as syns place counts its own; . names the folder the run stands in
         #[arg(value_name = "PATH")]
@@ -765,13 +768,15 @@ async fn run(
             name,
             repo,
             show,
-        } => {
-            if show {
-                commands::share::cmd_share_show(config, output, path, repo).await?
-            } else {
-                commands::share::cmd_share(config, output, path, name, repo).await?
+            visibility,
+        } => match (show, visibility) {
+            (true, _) => commands::share::cmd_share_show(config, output, path, repo).await?,
+            (false, Some(visibility)) => {
+                commands::share::cmd_mark_folder(config, output, path, visibility, name, repo)
+                    .await?
             }
-        }
+            (false, None) => commands::share::cmd_share(config, output, path, name, repo).await?,
+        },
         Commands::Unshare { path, repo, yes } => {
             commands::share::cmd_unshare(config, output, path, repo, yes).await?
         }

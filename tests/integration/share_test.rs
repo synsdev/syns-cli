@@ -1,8 +1,11 @@
 //! Binary-level behaviour of sharing a folder under an identity of its
 //! own, reading which identity it stands under, stopping the sharing, and
-//! aiming the collaborator commands at that identity (SPEC u300 Tests).
+//! aiming the collaborator commands at that identity (SPEC u300 Tests);
+//! and marking a folder with a visibility of its own, naming it on the
+//! lookup, and keeping a marked folder's name across an unshare (SPEC
+//! u329 Tests).
 //!
-//! Every binary row of that table stands here under the name the table
+//! Every binary row of those tables stands here under the name the table
 //! gives it; `share_name_problem_weighs_the_repository_name_kind`,
 //! `offered_share_name_takes_the_last_segment_lower_cased`,
 //! `the_ask_takes_another_name_where_the_name_is_held` and
@@ -45,6 +48,13 @@ fn record(owner: &str, name: &str, shared_folder: bool) -> Value {
         "fileCount": 0, "role": "owner", "sharedFolder": shared_folder,
         "createdAt": "2026-10-02T00:00:00Z", "updatedAt": "2026-10-02T00:00:00Z",
     })
+}
+
+/// `record` at `visibility`.
+fn record_at(owner: &str, name: &str, shared_folder: bool, visibility: &str) -> Value {
+    let mut body = record(owner, name, shared_folder);
+    body["visibility"] = json!(visibility);
+    body
 }
 
 fn refusal(status: u16, error: &str) -> ResponseTemplate {
@@ -121,6 +131,25 @@ impl Deployment {
         );
     }
 
+    /// The share lookup at `address` answering `before` once, then
+    /// `after` — the answer up to a removal ahead of the later one, both
+    /// ahead of every answer mounted earlier.
+    fn until_the_removal(&self, address: &str, before: ResponseTemplate, after: ResponseTemplate) {
+        self.mount(
+            Mock::given(method("GET"))
+                .and(path(address.to_string()))
+                .respond_with(before)
+                .up_to_n_times(1)
+                .with_priority(1),
+        );
+        self.mount(
+            Mock::given(method("GET"))
+                .and(path(address.to_string()))
+                .respond_with(after)
+                .with_priority(2),
+        );
+    }
+
     fn requests(&self) -> Vec<Request> {
         self.rt
             .block_on(self.server.received_requests())
@@ -141,6 +170,15 @@ impl Deployment {
         self.requests()
             .into_iter()
             .filter(|r| r.method.as_str() == "POST" && r.url.path() == address)
+            .map(|r| serde_json::from_slice(&r.body).expect("a JSON body"))
+            .collect()
+    }
+
+    /// The bodies of every `PUT` sent to `address`.
+    fn put_bodies(&self, address: &str) -> Vec<Value> {
+        self.requests()
+            .into_iter()
+            .filter(|r| r.method.as_str() == "PUT" && r.url.path() == address)
             .map(|r| serde_json::from_slice(&r.body).expect("a JSON body"))
             .collect()
     }
@@ -518,10 +556,10 @@ fn share_show_answers_the_identity_the_offer_or_a_refused_holder() {
 #[serial]
 fn unshare_retires_the_identity_once_confirmed() {
     let d = Deployment::new(Some("alice/docs"));
-    d.serves(
-        "GET",
+    d.until_the_removal(
         "/api/v1/repos/alice/docs/shares/q3-plan",
         ResponseTemplate::new(200).set_body_json(record("alice", "docs-q3-plan", true)),
+        refusal(404, "not_found"),
     );
     d.serves(
         "DELETE",
@@ -544,6 +582,7 @@ fn unshare_retires_the_identity_once_confirmed() {
             "path": "q3-plan",
             "owner": "alice",
             "name": "docs-q3-plan",
+            "retired": true,
         })
     );
 }
@@ -696,12 +735,17 @@ fn share_lines_report_on_the_diagnostic_stream_and_name_the_identity() {
     expect(
         &["share", "old", "--show"],
         "alice/docs-old\n",
-        "old of alice/docs is shared as alice/docs-old\n",
+        "old of alice/docs is shared as alice/docs-old (private)\n",
     );
     expect(
         &["share", "budget", "--show"],
         "",
         "budget of alice/docs is not shared; syns share offers the name docs-budget\n",
+    );
+    d.until_the_removal(
+        "/api/v1/repos/alice/docs/shares/old",
+        ResponseTemplate::new(200).set_body_json(record("alice", "docs-old", true)),
+        refusal(404, "not_found"),
     );
     expect(
         &["unshare", "old", "--yes"],
@@ -1033,4 +1077,432 @@ fn admin_on_an_identity_is_the_servers_refusal() {
         "{}",
         stdout_of(&out)
     );
+}
+
+// ---- a folder's own visibility (SPEC u329) -------------------------------
+
+const MARKING: &str = "/api/v1/repos/alice/handbook/folder-visibility";
+const DRAFTS_LOOKUP: &str = "/api/v1/repos/alice/handbook/shares/drafts";
+
+/// `M` of SPEC u329 Tests: the credential; `alice/handbook` public with
+/// `role` `owner` and `sharedFolder` false, its tree at `drafts` holding
+/// `drafts/plan.md`, and the marking answering `alice/handbook-drafts`
+/// at `private` with `sharedFolder` true.
+fn marking_deployment() -> Deployment {
+    let d = Deployment::new(Some("alice/handbook"));
+    d.serves(
+        "GET",
+        "/api/v1/repos/alice/handbook",
+        ResponseTemplate::new(200).set_body_json(record_at("alice", "handbook", false, "public")),
+    );
+    d.serves(
+        "GET",
+        "/api/v1/repos/alice/handbook/tree/drafts",
+        ResponseTemplate::new(200).set_body_json(json!({
+            "entries": [{
+                "name": "plan.md", "path": "drafts/plan.md", "type": "file",
+                "size": 6, "sha": null,
+            }],
+            "commitSha": "a".repeat(40),
+            "truncated": false,
+        })),
+    );
+    d.serves(
+        "PUT",
+        MARKING,
+        ResponseTemplate::new(200).set_body_json(record_at(
+            "alice",
+            "handbook-drafts",
+            true,
+            "private",
+        )),
+    );
+    d
+}
+
+/// The marking at `MARKING` answering `answer` the next `times` runs
+/// reach it, ahead of `M`'s answer.
+fn marking_first(d: &Deployment, answer: ResponseTemplate, times: u64, priority: u8) {
+    d.mount(
+        Mock::given(method("PUT"))
+            .and(path(MARKING))
+            .respond_with(answer)
+            .up_to_n_times(times)
+            .with_priority(priority),
+    );
+}
+
+const UNSUPPORTED_DRAFTS: &str = "folder_visibility_unsupported: the server does not support a folder's own visibility yet, so drafts of alice/handbook keeps the visibility it had";
+
+// SPEC u329 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_marking_sends_the_path_and_the_visibility_alone() {
+    let d = marking_deployment();
+
+    let out = d.run(&[
+        "share",
+        "drafts",
+        "--visibility",
+        "private",
+        "--repo",
+        "alice/handbook",
+    ]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(d.sent("PUT"), vec![MARKING.to_string()]);
+    assert_eq!(
+        d.put_bodies(MARKING),
+        vec![json!({"path": "drafts", "visibility": "private"})]
+    );
+    assert_eq!(
+        stderr_of(&out),
+        "drafts of alice/handbook is private as alice/handbook-drafts\n"
+    );
+}
+
+// SPEC u329 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_marking_under_json_answers_the_served_identity() {
+    let d = marking_deployment();
+
+    let out = d.run(&[
+        "share",
+        "drafts",
+        "--visibility",
+        "private",
+        "--repo",
+        "alice/handbook",
+        "--json",
+        "--name",
+        "handbook-drafts",
+    ]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(
+        d.put_bodies(MARKING),
+        vec![json!({"path": "drafts", "visibility": "private", "name": "handbook-drafts"})]
+    );
+    let mut expected = record_at("alice", "handbook-drafts", true, "private");
+    expected["holder"] = json!("alice/handbook");
+    expected["path"] = json!("drafts");
+    assert_eq!(document(&out), expected);
+}
+
+// SPEC u329 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_name_outside_the_kind_and_an_option_clash_send_nothing() {
+    let d = marking_deployment();
+
+    let bad = d.run(&[
+        "share",
+        "drafts",
+        "--visibility",
+        "public",
+        "--name",
+        "Bad",
+        "--repo",
+        "alice/handbook",
+    ]);
+    assert_eq!(exit_of(&bad), 1, "{}", stderr_of(&bad));
+    assert_eq!(
+        stderr_of(&bad).trim_end(),
+        format!("error: configuration error: {}", name_kind_line("Bad"))
+    );
+    for args in [
+        vec!["share", "drafts", "--visibility", "public", "--show"],
+        vec!["share", "drafts", "--visibility", "internal"],
+    ] {
+        let out = d.run(&args);
+        assert_eq!(exit_of(&out), 2, "{args:?}: {}", stderr_of(&out));
+    }
+    assert!(d.requests().is_empty(), "{:?}", d.requests());
+}
+
+// SPEC u329 Tests, the row of this name.
+#[test]
+#[serial]
+fn an_older_servers_marking_is_refused_plainly() {
+    let d = marking_deployment();
+    marking_first(
+        &d,
+        ResponseTemplate::new(404)
+            .set_body_json(json!({"error": "not_found", "message": "Not found"})),
+        1,
+        1,
+    );
+
+    let out = d.run(&[
+        "share",
+        "drafts",
+        "--visibility",
+        "public",
+        "--repo",
+        "alice/handbook",
+    ]);
+
+    assert_eq!(exit_of(&out), 1, "{}", stderr_of(&out));
+    assert_eq!(
+        stderr_of(&out).trim_end(),
+        format!("error: {UNSUPPORTED_DRAFTS}")
+    );
+}
+
+// SPEC u329 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_path_standing_nowhere_is_refused_before_any_marking() {
+    let d = marking_deployment();
+    d.serves(
+        "GET",
+        "/api/v1/repos/alice/handbook/tree/nowhere",
+        refusal(404, "not_found"),
+    );
+
+    let out = d.run(&[
+        "share",
+        "nowhere",
+        "--visibility",
+        "public",
+        "--repo",
+        "alice/handbook",
+    ]);
+
+    assert_eq!(exit_of(&out), 1, "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("not_found"), "{}", stderr_of(&out));
+    assert!(d.sent("PUT").is_empty());
+}
+
+// SPEC u329 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_held_name_on_a_first_marking_is_asked_of_no_one_who_cannot_answer() {
+    let d = marking_deployment();
+    let args = [
+        "share",
+        "drafts",
+        "--visibility",
+        "private",
+        "--name",
+        "drafts-q3",
+        "--repo",
+        "alice/handbook",
+    ];
+    marking_first(&d, refusal(409, "conflict"), 1, 1);
+    d.until_the_removal(
+        DRAFTS_LOOKUP,
+        refusal(404, "not_found"),
+        ResponseTemplate::new(200).set_body_json(record_at(
+            "alice",
+            "handbook-drafts",
+            true,
+            "private",
+        )),
+    );
+
+    let first = d.run(&args);
+
+    assert_eq!(exit_of(&first), 1, "{}", stderr_of(&first));
+    let err = stderr_of(&first);
+    assert!(err.contains("conflict"), "{err}");
+    assert!(
+        err.contains("alice/drafts-q3 is already held; give another name"),
+        "{err}"
+    );
+    assert_eq!(d.lookups().len(), 1);
+    assert_eq!(d.sent("PUT").len(), 1);
+
+    marking_first(&d, refusal(409, "conflict"), 1, 1);
+    let second = d.run(&args);
+
+    assert_eq!(exit_of(&second), 0, "{}", stderr_of(&second));
+    let bodies = d.put_bodies(MARKING);
+    assert_eq!(bodies.len(), 3, "{bodies:?}");
+    assert_eq!(bodies[1]["name"], "drafts-q3");
+    assert_eq!(
+        bodies[2],
+        json!({"path": "drafts", "visibility": "private"})
+    );
+}
+
+// SPEC u329 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_newer_servers_refusals_reach_as_served() {
+    let d = marking_deployment();
+    marking_first(&d, refusal(403, "forbidden"), 1, 1);
+    marking_first(&d, refusal(409, "conflict"), 1, 2);
+    d.serves("GET", DRAFTS_LOOKUP, refusal(404, "not_found"));
+    let args = [
+        "share",
+        "drafts",
+        "--visibility",
+        "public",
+        "--repo",
+        "alice/handbook",
+    ];
+
+    let forbidden = d.run(&args);
+    let conflict = d.run(&args);
+
+    assert_eq!(exit_of(&forbidden), 1, "{}", stderr_of(&forbidden));
+    assert!(stderr_of(&forbidden).contains("forbidden"));
+    assert_eq!(exit_of(&conflict), 1, "{}", stderr_of(&conflict));
+    assert!(stderr_of(&conflict).contains("conflict"));
+    for out in [&forbidden, &conflict] {
+        assert!(
+            !stderr_of(out).contains("folder_visibility_unsupported"),
+            "{}",
+            stderr_of(out)
+        );
+    }
+}
+
+// SPEC u329 Tests, the row of this name.
+#[test]
+#[serial]
+fn the_share_lookup_names_the_folders_visibility() {
+    let d = Deployment::new(Some("alice/clients"));
+    d.serves(
+        "GET",
+        "/api/v1/repos/alice/clients/shares/vela/q3-board",
+        ResponseTemplate::new(200).set_body_json(record_at(
+            "alice",
+            "clients-q3-board",
+            true,
+            "public",
+        )),
+    );
+
+    let out = d.run(&[
+        "share",
+        "vela/q3-board",
+        "--show",
+        "--repo",
+        "alice/clients",
+    ]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(
+        stderr_of(&out),
+        "vela/q3-board of alice/clients is shared as alice/clients-q3-board (public)\n"
+    );
+    assert_eq!(stdout_of(&out), "alice/clients-q3-board\n");
+}
+
+// SPEC u329 Tests, the row of this name.
+#[test]
+#[serial]
+fn an_unshare_keeping_a_marked_folders_name_says_so() {
+    let d = Deployment::new(Some("alice/handbook"));
+    d.serves(
+        "GET",
+        DRAFTS_LOOKUP,
+        ResponseTemplate::new(200).set_body_json(record("alice", "handbook-drafts", true)),
+    );
+    d.serves("DELETE", DRAFTS_LOOKUP, ResponseTemplate::new(204));
+    let args = ["unshare", "drafts", "--repo", "alice/handbook", "--yes"];
+
+    let human = d.run(&args);
+    let json_run = d.run(&[&args[..], &["--json"]].concat());
+
+    assert_eq!(exit_of(&human), 0, "{}", stderr_of(&human));
+    assert_eq!(
+        stderr_of(&human),
+        "stopped sharing drafts of alice/handbook: its collaborators removed, alice/handbook-drafts standing private by a visibility of its own\n"
+    );
+    assert_eq!(exit_of(&json_run), 0, "{}", stderr_of(&json_run));
+    assert_eq!(
+        document(&json_run),
+        json!({
+            "unshared": true,
+            "holder": "alice/handbook",
+            "path": "drafts",
+            "owner": "alice",
+            "name": "handbook-drafts",
+            "retired": false,
+        })
+    );
+    assert_eq!(d.sent("DELETE").len(), 2);
+    assert_eq!(
+        d.lookups().len(),
+        4,
+        "a lookup before and after each removal"
+    );
+}
+
+// SPEC u329 Tests, the row of this name.
+#[test]
+#[serial]
+fn an_unshare_retiring_a_folder_says_so_as_before() {
+    let d = Deployment::new(Some("alice/handbook"));
+    let guides = "/api/v1/repos/alice/handbook/shares/guides";
+    d.until_the_removal(
+        guides,
+        ResponseTemplate::new(200).set_body_json(record("alice", "handbook-guides", true)),
+        refusal(404, "not_found"),
+    );
+    d.serves("DELETE", guides, ResponseTemplate::new(204));
+
+    let out = d.run(&[
+        "unshare",
+        "guides",
+        "--repo",
+        "alice/handbook",
+        "--yes",
+        "--json",
+    ]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(
+        document(&out),
+        json!({
+            "unshared": true,
+            "holder": "alice/handbook",
+            "path": "guides",
+            "owner": "alice",
+            "name": "handbook-guides",
+            "retired": true,
+        })
+    );
+}
+
+// SPEC u329 Tests, the row of this name.
+#[test]
+#[serial]
+fn an_unshare_whose_second_lookup_fails_claims_nothing() {
+    let d = Deployment::new(Some("alice/handbook"));
+    let guides = "/api/v1/repos/alice/handbook/shares/guides";
+    d.serves("DELETE", guides, ResponseTemplate::new(204));
+    let args = ["unshare", "guides", "--repo", "alice/handbook", "--yes"];
+    let before_and_after = || {
+        d.until_the_removal(
+            guides,
+            ResponseTemplate::new(200).set_body_json(record("alice", "handbook-guides", true)),
+            refusal(500, "internal_error"),
+        )
+    };
+
+    before_and_after();
+    let human = d.run(&args);
+    before_and_after();
+    let json_run = d.run(&[&args[..], &["--json"]].concat());
+
+    assert_eq!(exit_of(&human), 0, "{}", stderr_of(&human));
+    let lines: Vec<String> = stderr_of(&human).lines().map(str::to_string).collect();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines[0].starts_with("could not tell whether alice/handbook-guides still stands:"),
+        "{lines:?}"
+    );
+    assert_eq!(
+        lines[1],
+        "stopped sharing guides of alice/handbook: the collaborators of alice/handbook-guides removed"
+    );
+    assert_eq!(exit_of(&json_run), 0, "{}", stderr_of(&json_run));
+    let doc = document(&json_run);
+    assert_eq!(doc["retired"], Value::Null);
+    assert!(doc.as_object().expect("an object").contains_key("retired"));
 }

@@ -1,10 +1,13 @@
 use crate::auth::token::TokenStore;
 use crate::client::{RepoResponse, RepoStatus, RepoUpdate, SynsClient, Visibility};
 use crate::commands::repos::ReposArgs;
+use crate::commands::share::{is_not_shared, visibility_text};
 use crate::config::Config;
-use crate::errors::CliError;
+use crate::errors::{ApiErrorContext, CliError};
 use crate::output::Output;
-use crate::repo::folder::{FolderScope, current_dir, refuse_holder_change, resolve_scoped_or_skip};
+use crate::repo::folder::{
+    FolderScope, current_dir, refuse_holder_change, resolve_folder_scope, resolve_scoped_or_skip,
+};
 use crate::repo::identity::identity_head;
 use crate::repo::if_repo::resolve_full_or_skip;
 
@@ -67,6 +70,12 @@ pub enum RepoAction {
 /// names the move for those and states that the other two reach the
 /// creation nowhere, rather than directing every caller to a position
 /// the argument tree rejects at exit `2` (CR2-1).
+/// The `message` every server predating the folder visibility route
+/// answers to a `visibility` sent through a shared folder's identity
+/// (SPEC u329 Contract Surface, `IDENTITY_VISIBILITY_REFUSAL`).
+pub const IDENTITY_VISIBILITY_REFUSAL: &str =
+    "visibility cannot be set through a shared folder; it is its holder's";
+
 pub const CREATE_TAKES_ITS_OWN_OPTIONS: &str = "--description and --visibility belong after create; --status and --tag change a standing repository and reach the create nowhere";
 
 /// Creates an empty repository under the caller (SPEC u272 Behaviour,
@@ -111,6 +120,32 @@ pub async fn cmd_repo_create(
 struct ReadAnswer<'a> {
     folder: Option<&'a FolderScope>,
     version: Option<u32>,
+    /// SPEC u329: inside a folder bound to its holder, the visibility of
+    /// the nearest identity at or above its recorded path, where one
+    /// answered.
+    folder_visibility: Option<Visibility>,
+}
+
+/// The visibility of the nearest identity at or above the folder's
+/// recorded path (SPEC u329 Behaviour, `cmd_repo` 1, Q-06): the share
+/// lookup at the path and then at each enclosing path nearest first,
+/// going on where no identity stands there and stopping at the first
+/// identity, and at any other refusal with none.
+async fn folder_visibility(
+    client: &SynsClient,
+    token: Option<&str>,
+    scope: &FolderScope,
+) -> Option<Visibility> {
+    let holder = scope.holder();
+    let mut path = scope.path.as_str();
+    loop {
+        match client.get_share(&holder, token, path).await {
+            Ok((identity, _)) => return Some(identity.visibility),
+            Err(err) if is_not_shared(&err) => {}
+            Err(_) => return None,
+        }
+        path = &path[..path.rfind('/')?];
+    }
 }
 
 fn display_repo(output: &Output, response: &RepoResponse, read: Option<ReadAnswer<'_>>) {
@@ -119,13 +154,23 @@ fn display_repo(output: &Output, response: &RepoResponse, read: Option<ReadAnswe
             // The read repository document: the record with the head's
             // number, and inside a folder the holder and the recorded
             // path, added.
-            Some(ReadAnswer { folder, version }) => {
+            Some(ReadAnswer {
+                folder,
+                version,
+                folder_visibility,
+            }) => {
                 let mut document = serde_json::to_value(response).unwrap_or_default();
                 if let Some(map) = document.as_object_mut() {
                     map.insert("version".to_string(), serde_json::Value::from(version));
                     if let Some(folder) = folder {
                         map.insert("holder".to_string(), folder.holder().into());
                         map.insert("path".to_string(), folder.path.clone().into());
+                    }
+                    if let Some(visibility) = folder_visibility {
+                        map.insert(
+                            "folderVisibility".to_string(),
+                            serde_json::to_value(visibility).unwrap_or_default(),
+                        );
                     }
                 }
                 output.json(&document);
@@ -161,6 +206,18 @@ fn display_repo(output: &Output, response: &RepoResponse, read: Option<ReadAnswe
                 "Visibility".into(),
                 format!("{:?}", response.visibility).to_lowercase(),
             ],
+        ]);
+        if let Some(ReadAnswer {
+            folder_visibility: Some(visibility),
+            ..
+        }) = &read
+        {
+            rows.push(vec![
+                "Folder visibility".into(),
+                visibility_text(visibility),
+            ]);
+        }
+        rows.extend([
             vec![
                 "Tags".into(),
                 if response.tags.is_empty() {
@@ -245,12 +302,35 @@ pub async fn cmd_repo(
         } else {
             "--tag"
         };
-        refuse_holder_change(&current_dir, &format!("syns repo {option}"))?;
-        let (owner, name) = match resolve_full_or_skip(None, &current_dir, if_repo, output)? {
-            Some(pair) => pair,
-            None => return Ok(()),
+        // SPEC u329 `cmd_repo` 2: `--visibility` given alone inside a
+        // folder addresses the folder's identity where it is bound to
+        // one, and names the share verb inside a folder bound to its
+        // holder; every other option or pairing acts on the holder.
+        let visibility_alone = description.is_none() && status.is_none() && tags.is_empty();
+        let through_identity = match (&visibility, visibility_alone) {
+            (Some(given), true) => match resolve_folder_scope(&current_dir)? {
+                Some(scope) if scope.identity.is_some() => Some(scope.address()),
+                Some(scope) => {
+                    return Err(CliError::FolderVisibilityRedirect {
+                        holder: scope.holder(),
+                        dir: scope.dir,
+                        visibility: visibility_text(&Visibility::from(given.clone())),
+                    });
+                }
+                None => None,
+            },
+            _ => None,
         };
-        let repo_id = format!("{owner}/{name}");
+        let repo_id = match through_identity {
+            Some(identity) => identity,
+            None => {
+                refuse_holder_change(&current_dir, &format!("syns repo {option}"))?;
+                match resolve_full_or_skip(None, &current_dir, if_repo, output)? {
+                    Some((owner, name)) => format!("{owner}/{name}"),
+                    None => return Ok(()),
+                }
+            }
+        };
         let client = SynsClient::new(config.server_url())?;
         let token = TokenStore::new(config.credentials_path())
             .read()?
@@ -262,7 +342,22 @@ pub async fn cmd_repo(
             author: None,
             tags: if tags.is_empty() { None } else { Some(tags) },
         };
-        let response = client.update_repo(&repo_id, &token, &update).await?;
+        // SPEC u329 `cmd_repo` 3: a server predating the folder visibility
+        // route refuses a `visibility` through an identity with this
+        // message alone, read as the route unsupported.
+        let response = match client.update_repo(&repo_id, &token, &update).await {
+            Err(CliError::Api {
+                status: Some(422),
+                error,
+                context: Some(ApiErrorContext::Refusal { message }),
+            }) if update.visibility.is_some()
+                && error == "validation_error"
+                && message == IDENTITY_VISIBILITY_REFUSAL =>
+            {
+                return Err(CliError::FolderVisibilityUnsupported { folder: repo_id });
+            }
+            answer => answer?,
+        };
         display_repo(output, &response, None);
         return Ok(());
     }
@@ -300,10 +395,18 @@ pub async fn cmd_repo(
             Some(ReadAnswer {
                 folder: None,
                 version,
+                folder_visibility: None,
             }),
         );
         return Ok(());
     }
+
+    // SPEC u329 `cmd_repo` 1 — inside a folder bound to its holder, the
+    // visibility of the nearest identity at or above its path.
+    let folder_visibility = match folder.as_ref() {
+        Some(scope) => folder_visibility(&client, token.as_deref(), scope).await,
+        None => None,
+    };
 
     // 4 — under `--json`, at a root and inside a folder alike, the number
     // of the version the head names: the newest row of the version list
@@ -334,6 +437,7 @@ pub async fn cmd_repo(
         Some(ReadAnswer {
             folder: folder.as_ref(),
             version,
+            folder_visibility,
         }),
     );
     Ok(())

@@ -16,6 +16,9 @@
 //! the identity's version list at `limit=1` with version `4` changing
 //! `document.html`, its tree and contents at `ref=4` and at the hash of
 //! version `4`, and the holder's raw `.synsignore` as `404` `not_found`.
+//! The rows of SPEC u329's Tests table reached through a folder bound to
+//! its identity stand here too, each over a folder of its own beside
+//! `U/q3-plan` under the names that table gives them.
 
 use assert_cmd::Command as AssertCommand;
 use serde_json::{Value, json};
@@ -384,6 +387,20 @@ fn a_folder_alone_carrying_shared_as_works_through_its_identity() {
                 ResponseTemplate::new(200)
                     .set_body_json(page(vec![version(4, H4, &["document.html"])], 50)),
             ),
+    );
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path(format!("{IDENTITY}/versions")))
+            .and(query_param("limit", "2"))
+            .and(query_param("offset", "0"))
+            .and(query_param_is_missing("path"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page(
+                vec![
+                    version(4, H4, &["document.html"]),
+                    version(3, H5, &["document.html"]),
+                ],
+                2,
+            ))),
     );
     d.mount(
         Mock::given(method("GET"))
@@ -1252,7 +1269,6 @@ fn bare_collaborators_inside_an_identity_folder_address_it() {
             "alice/docs",
         ],
         vec!["delete", "--if-repo"],
-        vec!["repo", "--visibility", "public"],
         vec!["fork", "bob/x"],
     ] {
         let out = d.run(&args);
@@ -2151,4 +2167,179 @@ fn a_turn_on_right_after_a_placement_through_an_identity_past_a_collaborator_ver
     assert_eq!(base.commit_sha(), Some(H4));
     assert_eq!(base.file_sha("appendix/.syns.yaml"), Some(t.as_str()));
     assert_eq!(base.file_sha("appendix/board.html"), Some(board.as_str()));
+}
+
+// ---- a folder's own visibility, and the default pair (SPEC u329) ---------
+
+const HANDBOOK_DRAFTS: &str = "/api/v1/repos/alice/handbook-drafts";
+
+/// `U/drafts` standing alone, bound to `alice/handbook-drafts`.
+fn drafts_alone(d: &Deployment) -> PathBuf {
+    let drafts = d.u.join("drafts");
+    write(
+        &drafts.join(".syns.yaml"),
+        "holder: alice/handbook\npath: drafts\nshared_as: handbook-drafts\n",
+    );
+    drafts
+}
+
+/// The updates sent, as `METHOD path`.
+fn updates(d: &Deployment) -> Vec<String> {
+    d.targets()
+        .into_iter()
+        .filter(|t| t.starts_with("PATCH "))
+        .collect()
+}
+
+const IDENTITY_VISIBILITY_REFUSAL: &str =
+    "visibility cannot be set through a shared folder; it is its holder's";
+
+// SPEC u329 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_visibility_inside_a_folder_bound_to_its_identity_updates_that_identity() {
+    let d = Deployment::new();
+    let drafts = drafts_alone(&d);
+    d.serves(
+        "PATCH",
+        HANDBOOK_DRAFTS,
+        ResponseTemplate::new(200).set_body_json(record("alice", "handbook-drafts", None, true)),
+    );
+
+    let alone = d.run_in(&drafts, &["repo", "--visibility", "private"]);
+
+    assert_eq!(exit_of(&alone), 0, "{}", stderr_of(&alone));
+    assert_eq!(updates(&d), vec![format!("PATCH {HANDBOOK_DRAFTS}")]);
+    let sent: Value = serde_json::from_slice(
+        &d.requests()
+            .into_iter()
+            .find(|r| r.method.as_str() == "PATCH")
+            .expect("an update")
+            .body,
+    )
+    .expect("a JSON body");
+    assert_eq!(sent["visibility"], json!("private"));
+
+    let before = d.requests().len();
+    let paired = d.run_in(
+        &drafts,
+        &["repo", "--visibility", "private", "--description", "x"],
+    );
+
+    assert_eq!(exit_of(&paired), 2, "{}", stderr_of(&paired));
+    assert!(
+        stderr_of(&paired).starts_with("error: holder root required: syns repo --description"),
+        "{}",
+        stderr_of(&paired)
+    );
+    assert_eq!(d.requests().len(), before, "{:?}", d.targets());
+}
+
+// SPEC u329 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_visibility_through_an_identity_on_an_older_server_is_refused_plainly() {
+    let d = Deployment::new();
+    let drafts = drafts_alone(&d);
+    d.serves(
+        "PATCH",
+        HANDBOOK_DRAFTS,
+        ResponseTemplate::new(422).set_body_json(
+            json!({"error": "validation_error", "message": IDENTITY_VISIBILITY_REFUSAL}),
+        ),
+    );
+
+    let out = d.run_in(&drafts, &["repo", "--visibility", "public"]);
+
+    assert_eq!(exit_of(&out), 1, "{}", stderr_of(&out));
+    assert_eq!(
+        stderr_of(&out).trim_end(),
+        "error: folder_visibility_unsupported: the server does not support a folder's own visibility yet, so alice/handbook-drafts keeps the visibility it had"
+    );
+}
+
+// SPEC u329 Tests, the row of this name.
+#[test]
+#[serial]
+fn another_validation_refusal_of_an_update_reaches_as_served() {
+    let d = Deployment::new();
+    let drafts = drafts_alone(&d);
+    d.serves(
+        "PATCH",
+        HANDBOOK_DRAFTS,
+        ResponseTemplate::new(422).set_body_json(
+            json!({"error": "validation_error", "message": "description is too long"}),
+        ),
+    );
+
+    let out = d.run_in(&drafts, &["repo", "--visibility", "public"]);
+
+    assert_eq!(exit_of(&out), 1, "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("validation_error"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert!(
+        !stderr_of(&out).contains("folder_visibility_unsupported"),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
+// SPEC u329 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_default_comparison_through_an_identity_takes_its_two_newest_listed_versions() {
+    let d = Deployment::new();
+    let board = d.u.join("q3-board");
+    write(
+        &board.join(".syns.yaml"),
+        "holder: alice/clients\npath: vela/q3-board\nshared_as: clients-q3-board\n",
+    );
+    let identity = "/api/v1/repos/alice/clients-q3-board";
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path(format!("{identity}/versions")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page(
+                vec![
+                    version(9, H8, &["board.json"]),
+                    version(6, H6, &["board.json"]),
+                ],
+                2,
+            ))),
+    );
+    d.serves(
+        "GET",
+        &format!("{identity}/diff"),
+        ResponseTemplate::new(200).set_body_json(json!({
+            "from": {"version": 6, "sha": H6}, "to": {"version": 9, "sha": H8},
+            "files": [],
+        })),
+    );
+
+    let out = d.run_in(&board, &["diff"]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    let diffs: Vec<String> = d
+        .targets()
+        .into_iter()
+        .filter(|t| t.contains("/diff"))
+        .collect();
+    assert_eq!(diffs.len(), 1, "{diffs:?}");
+    assert!(
+        diffs[0].starts_with(&format!("GET {identity}/diff?")),
+        "{}",
+        diffs[0]
+    );
+    assert!(
+        diffs[0].contains("from=6") && diffs[0].contains("to=9"),
+        "{}",
+        diffs[0]
+    );
+    assert!(
+        d.targets().iter().all(|t| !t.contains("=8")),
+        "{:?}",
+        d.targets()
+    );
 }

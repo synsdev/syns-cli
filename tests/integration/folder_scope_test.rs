@@ -8,7 +8,9 @@
 //! test drives one mock deployment of its own and runs the binary from a
 //! checkout `W` whose `.syns.yaml` names `alice/work`, holding the folder
 //! `W/clients/vela/q3-board` recording its own place and an empty `sub`
-//! under it, unless its setup says otherwise.
+//! under it, unless its setup says otherwise. The rows of SPEC u329's
+//! Tests table reached inside a folder bound to its holder, and at a
+//! root, stand here too under the names that table gives them.
 
 use assert_cmd::Command as AssertCommand;
 use serde_json::{Value, json};
@@ -41,6 +43,15 @@ struct Deployment {
 
 impl Deployment {
     fn new() -> Deployment {
+        let d = Deployment::holding("alice/work", &[]);
+        std::fs::create_dir_all(d.w.join(FOLDER).join("sub")).expect("folder");
+        std::fs::write(d.w.join(FOLDER).join(".syns.yaml"), FOLDER_YAML).expect("folder identity");
+        d
+    }
+
+    /// A deployment whose `W` is a checkout of `holder`, each of
+    /// `folders` a folder of it recording its own place.
+    fn holding(holder: &str, folders: &[&str]) -> Deployment {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -48,9 +59,20 @@ impl Deployment {
         let server = rt.block_on(MockServer::start());
         let work = tempfile::tempdir().expect("working dir");
         let w = std::fs::canonicalize(work.path()).expect("canonical W");
-        std::fs::write(w.join(".syns.yaml"), "owner: alice\nname: work\n").expect("W identity");
-        std::fs::create_dir_all(w.join(FOLDER).join("sub")).expect("folder");
-        std::fs::write(w.join(FOLDER).join(".syns.yaml"), FOLDER_YAML).expect("folder identity");
+        let (owner, name) = holder.split_once('/').expect("OWNER/NAME");
+        std::fs::write(
+            w.join(".syns.yaml"),
+            format!("owner: {owner}\nname: {name}\n"),
+        )
+        .expect("W identity");
+        for folder in folders {
+            std::fs::create_dir_all(w.join(folder).join("sub")).expect("folder");
+            std::fs::write(
+                w.join(folder).join(".syns.yaml"),
+                format!("holder: {holder}\npath: {folder}\n"),
+            )
+            .expect("folder identity");
+        }
         Deployment {
             rt,
             server,
@@ -61,15 +83,19 @@ impl Deployment {
         }
     }
 
-    /// The deployment with a stored credential.
-    fn with_credential() -> Deployment {
-        let d = Deployment::new();
+    /// `self` with a stored credential.
+    fn credentialed(self) -> Deployment {
         std::fs::write(
-            d.home.path().join("credentials.json"),
+            self.home.path().join("credentials.json"),
             json!({"token": "test-token", "username": "alice"}).to_string(),
         )
         .expect("credential");
-        d
+        self
+    }
+
+    /// The deployment with a stored credential.
+    fn with_credential() -> Deployment {
+        Deployment::new().credentialed()
     }
 
     fn folder(&self) -> PathBuf {
@@ -789,38 +815,6 @@ fn diff_inside_a_folder_over_versions_that_left_it_untouched_names_no_file() {
 
 #[test]
 #[serial]
-fn diff_inside_a_folder_defaults_to_the_newest_version_that_changed_it() {
-    let d = Deployment::new();
-    d.mount_versions(json!({
-        "data": [version_body(6, &"6".repeat(40), &[&format!("{FOLDER}/a.md")])],
-        "total": 4, "limit": 1, "offset": 0,
-    }));
-    d.mount(
-        Mock::given(method("GET"))
-            .and(path_matcher(format!("/api/v1/repos/{REPO}/diff")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "from": { "version": 5, "sha": "5".repeat(40) },
-                "to": { "version": 6, "sha": "6".repeat(40) },
-                "files": [],
-            }))),
-    );
-
-    let out = d.run_in(&d.folder(), b"", &["diff"]);
-
-    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
-    let lists = d.requests_to("/versions");
-    assert_eq!(lists.len(), 1);
-    assert_eq!(query_of(&lists[0], "path").as_deref(), Some(FOLDER));
-    assert_eq!(query_of(&lists[0], "limit").as_deref(), Some("1"));
-    assert_eq!(query_of(&lists[0], "offset").as_deref(), Some("0"));
-    let diffs = d.requests_to("/diff");
-    assert_eq!(diffs.len(), 1);
-    assert_eq!(query_of(&diffs[0], "from").as_deref(), Some("5"));
-    assert_eq!(query_of(&diffs[0], "to").as_deref(), Some("6"));
-}
-
-#[test]
-#[serial]
 fn history_show_inside_a_folder_names_only_its_paths() {
     let d = Deployment::new();
     d.mount(
@@ -1151,7 +1145,7 @@ fn commands_changing_the_holder_are_refused_inside_a_folder() {
     assert_eq!(
         stderr_of(&first).trim_end(),
         format!(
-            "error: holder root required: syns repo --visibility acts on the holding repository alice/work, not on the folder {} \u{2014} run it from the root of a checkout of alice/work",
+            "error: holder root required: syns repo --visibility acts on the holding repository alice/work, not on the folder {} \u{2014} set the folder's own visibility with: syns share . --visibility public",
             d.folder().display()
         )
     );
@@ -1457,4 +1451,208 @@ fn repo_inside_a_folder_numbers_the_head_when_the_list_has_moved_past_it() {
     let document = one_document(&out);
     assert_eq!(document["commitSha"], json!("h42"));
     assert_eq!(document["version"], json!(42));
+}
+
+// ---- a folder's own visibility, and the default pair (SPEC u329) ---------
+
+/// A `Repository` record of `alice/handbook` at `visibility`, no head.
+fn handbook(visibility: &str) -> Value {
+    json!({
+        "owner": "alice", "name": "handbook", "description": null,
+        "commitSha": null, "status": "active", "author": null, "tags": [],
+        "visibility": visibility, "forkedFrom": null, "forkCount": 0,
+        "fileCount": 3, "role": "owner",
+        "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+    })
+}
+
+fn diff_answer(from: u32, to: u32) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "from": { "version": from, "sha": format!("{from}").repeat(40) },
+        "to": { "version": to, "sha": format!("{to}").repeat(40) },
+        "files": [],
+    }))
+}
+
+// SPEC u329 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_visibility_inside_a_folder_bound_to_its_holder_names_the_share_verb() {
+    let d = Deployment::holding("alice/handbook", &["drafts"]).credentialed();
+    let sub = d.w.join("drafts").join("sub");
+
+    let alone = d.run_in(&sub, b"", &["repo", "--visibility", "private"]);
+    let paired = d.run_in(
+        &sub,
+        b"",
+        &["repo", "--visibility", "private", "--tag", "x"],
+    );
+
+    assert_eq!(exit_of(&alone), 2, "{}", stderr_of(&alone));
+    assert_eq!(
+        stderr_of(&alone).trim_end(),
+        format!(
+            "error: holder root required: syns repo --visibility acts on the holding repository alice/handbook, not on the folder {} \u{2014} set the folder's own visibility with: syns share . --visibility private",
+            d.w.join("drafts").display()
+        )
+    );
+    assert_eq!(exit_of(&paired), 2, "{}", stderr_of(&paired));
+    assert!(
+        stderr_of(&paired)
+            .trim_end()
+            .ends_with(" \u{2014} run it from the root of a checkout of alice/handbook"),
+        "{}",
+        stderr_of(&paired)
+    );
+    assert!(d.requests().is_empty(), "{:?}", d.requests());
+}
+
+// SPEC u329 Tests, the row of this name.
+#[test]
+#[serial]
+fn syns_repo_inside_a_holders_folder_names_the_folders_visibility() {
+    let d = Deployment::holding("alice/handbook", &["drafts/notes"]).credentialed();
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path_matcher("/api/v1/repos/alice/handbook"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(handbook("public"))),
+    );
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path_matcher(
+                "/api/v1/repos/alice/handbook/shares/drafts/notes",
+            ))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({"error": "not_found"}))),
+    );
+    let mut drafts = handbook("private");
+    drafts["name"] = json!("handbook-drafts");
+    drafts["sharedFolder"] = json!(true);
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path_matcher("/api/v1/repos/alice/handbook/shares/drafts"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(drafts)),
+    );
+    let notes = d.w.join("drafts/notes");
+
+    let rendered = d.run_in(&notes, b"", &["repo"]);
+    let json_run = d.run_in(&notes, b"", &["repo", "--json"]);
+
+    assert_eq!(exit_of(&rendered), 0, "{}", stderr_of(&rendered));
+    let text = stdout_of(&rendered);
+    let row = |label: &str| {
+        text.lines()
+            .position(|line| line.contains(label))
+            .unwrap_or_else(|| panic!("no {label} row: {text}"))
+    };
+    let visibility = row("Visibility");
+    let folder_visibility = row("Folder visibility");
+    assert!(
+        text.lines()
+            .nth(visibility)
+            .expect("row")
+            .contains("public"),
+        "{text}"
+    );
+    assert!(
+        text.lines()
+            .nth(folder_visibility)
+            .expect("row")
+            .contains("private"),
+        "{text}"
+    );
+    assert_eq!(folder_visibility, visibility + 1, "{text}");
+    assert_eq!(exit_of(&json_run), 0, "{}", stderr_of(&json_run));
+    let document = one_document(&json_run);
+    assert_eq!(document["visibility"], json!("public"));
+    assert_eq!(document["folderVisibility"], json!("private"));
+}
+
+// SPEC u329 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_default_comparison_at_a_root_steps_across_a_readers_gaps() {
+    let d = Deployment::holding("alice/handbook", &[]);
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path_matcher("/api/v1/repos/alice/handbook/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    version_body(7, &"7".repeat(40), &["a.md"]),
+                    version_body(4, &"4".repeat(40), &["a.md"]),
+                ],
+                "total": 2, "limit": 2, "offset": 0,
+            }))),
+    );
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path_matcher("/api/v1/repos/alice/handbook/diff"))
+            .respond_with(diff_answer(4, 7)),
+    );
+
+    let out = d.run_in(&d.w, b"", &["diff"]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    let diffs = d.requests_to("/diff");
+    assert_eq!(diffs.len(), 1);
+    assert_eq!(query_of(&diffs[0], "from").as_deref(), Some("4"));
+    assert_eq!(query_of(&diffs[0], "to").as_deref(), Some("7"));
+}
+
+// SPEC u329 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_default_comparison_inside_a_holders_folder_takes_the_folders_two_newest_versions() {
+    let d = Deployment::holding("alice/handbook", &["guides"]);
+    let changed = ["guides/a.md"];
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path_matcher("/api/v1/repos/alice/handbook/versions"))
+            .and(query_param("path", "guides"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    version_body(6, &"6".repeat(40), &changed),
+                    version_body(3, &"3".repeat(40), &changed),
+                ],
+                "total": 2, "limit": 2, "offset": 0,
+            })))
+            .up_to_n_times(1)
+            .with_priority(1),
+    );
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path_matcher("/api/v1/repos/alice/handbook/versions"))
+            .and(query_param("path", "guides"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [version_body(6, &"6".repeat(40), &changed)],
+                "total": 1, "limit": 2, "offset": 0,
+            }))),
+    );
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path_matcher("/api/v1/repos/alice/handbook/diff"))
+            .respond_with(diff_answer(3, 6)),
+    );
+    let guides = d.w.join("guides");
+
+    let pair = d.run_in(&guides, b"", &["diff"]);
+
+    assert_eq!(exit_of(&pair), 0, "{}", stderr_of(&pair));
+    let lists = d.requests_to("/versions");
+    assert_eq!(lists.len(), 1);
+    assert_eq!(query_of(&lists[0], "limit").as_deref(), Some("2"));
+    assert_eq!(query_of(&lists[0], "offset").as_deref(), Some("0"));
+    let diffs = d.requests_to("/diff");
+    assert_eq!(diffs.len(), 1);
+    assert_eq!(query_of(&diffs[0], "from").as_deref(), Some("3"));
+    assert_eq!(query_of(&diffs[0], "to").as_deref(), Some("6"));
+
+    let alone = d.run_in(&guides, b"", &["diff"]);
+
+    assert_eq!(exit_of(&alone), 1, "{}", stderr_of(&alone));
+    assert!(
+        stderr_of(&alone).starts_with("error: configuration error: "),
+        "{}",
+        stderr_of(&alone)
+    );
+    assert_eq!(d.requests_to("/diff").len(), 1, "no second diff request");
 }

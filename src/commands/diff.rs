@@ -1,11 +1,10 @@
 use crate::auth::token::TokenStore;
-use crate::client::{DiffStatus, SynsClient, undecodable};
+use crate::client::{DiffStatus, SynsClient, VersionListResponse, undecodable};
 use crate::commands::history::folder_history;
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
 use crate::repo::folder::{FolderScope, current_dir, resolve_scoped_or_skip};
-use crate::repo::identity::identity_head;
 use console::style;
 
 fn style_status(status: &DiffStatus) -> console::StyledObject<&'static str> {
@@ -63,6 +62,17 @@ fn scoped_entry(folder: &FolderScope, entry: &serde_json::Value) -> Option<serde
     Some(kept)
 }
 
+/// The default pair a list page answers (SPEC u329 Behaviour, `cmd_diff`
+/// 1): its second entry's number as `from` and its first's as `to`, both
+/// numbers the reader's list carries, so a gap in the list is stepped
+/// across rather than subtracted into; none under two entries.
+fn listed_pair(page: &VersionListResponse) -> Option<(String, String)> {
+    match page.data.as_slice() {
+        [newest, older, ..] => Some((older.version.to_string(), newest.version.to_string())),
+        _ => None,
+    }
+}
+
 pub async fn cmd_diff(
     config: &Config,
     output: &Output,
@@ -85,24 +95,25 @@ pub async fn cmd_diff(
     // 2 — the endpoints.
     let (from_val, to_val) = match (from, to, &folder) {
         (Some(f), Some(t), _) => (f, t),
-        // Inside a folder with neither endpoint, the newest version that
-        // changed the folder against the one numbered below it.
+        // SPEC u329 `cmd_diff` 2–3: inside a folder with neither endpoint,
+        // the two newest versions the scope's list carries — the
+        // identity's own list through an identity, the folder's history
+        // inside a folder bound to its holder.
         (None, None, Some(folder)) => {
-            // SPEC u302 `cmd_diff` 1: through an identity, its newest listed
-            // version against the one numbered below it.
-            let newest = match folder.identity {
-                Some(_) => identity_head(&client, token.as_deref(), &repo_id).await?,
-                None => folder_history(&client, &repo_id, token.as_deref(), &folder.path, 1, 0)
-                    .await?
-                    .data
-                    .into_iter()
-                    .next(),
-            };
-            match newest {
-                Some(newest) if newest.version > 1 => {
-                    ((newest.version - 1).to_string(), newest.version.to_string())
+            let page = match folder.identity {
+                Some(_) => {
+                    client
+                        .list_versions(&repo_id, token.as_deref(), 2, 0, None)
+                        .await?
+                        .0
                 }
-                _ => {
+                None => {
+                    folder_history(&client, &repo_id, token.as_deref(), &folder.path, 2, 0).await?
+                }
+            };
+            match listed_pair(&page) {
+                Some(pair) => pair,
+                None => {
                     return Err(CliError::Config {
                         message: format!(
                             "no version of {} changed {} beyond its first \u{2014} name --from and --to",
@@ -117,17 +128,11 @@ pub async fn cmd_diff(
             let (response, _raw) = client
                 .list_versions(&repo_id, token.as_deref(), 2, 0, None)
                 .await?;
-            if response.data.len() < 2 {
-                return Err(CliError::Api {
-                    status: None,
-                    error: "repository has fewer than 2 versions — cannot diff".to_string(),
-                    context: None,
-                });
-            }
-            (
-                response.data[1].version.to_string(),
-                response.data[0].version.to_string(),
-            )
+            listed_pair(&response).ok_or_else(|| CliError::Api {
+                status: None,
+                error: "repository has fewer than 2 versions — cannot diff".to_string(),
+                context: None,
+            })?
         }
         _ => {
             return Err(CliError::Config {

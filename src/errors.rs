@@ -40,6 +40,17 @@ pub enum CliError {
         holder: String,
         dir: std::path::PathBuf,
     },
+    /// SPEC u329, the folder visibility redirect (`D-122`): `syns repo
+    /// --visibility` given alone inside a folder bound to its holder,
+    /// refused before any request under the holder-acting refusal's code
+    /// in its place, naming the share verb that sets the folder's own
+    /// visibility. `holder` and `dir` as `HolderActing` carries them,
+    /// `visibility` the value given.
+    FolderVisibilityRedirect {
+        holder: String,
+        dir: std::path::PathBuf,
+        visibility: String,
+    },
     /// SPEC u290, the misplaced-folder refusal (`D-101`): a folder whose
     /// place under its holder's checkout at `checkout` differs from the
     /// path it records. SPEC u291: `back` is the absolute directory the
@@ -146,6 +157,16 @@ pub enum CliError {
     /// its document `error` alone, and never answered as a folder that
     /// moved. `folder` is the folder's recorded path.
     FolderWriteUnsupported {
+        folder: String,
+    },
+    /// SPEC u329, `CliError::FolderVisibilityUnsupported` (`D-122`): a
+    /// server predating the folder visibility route — a marking answered
+    /// `404` `not_found`, or a `visibility` sent through an identity
+    /// refused as only such a server refuses it. `FOLDER_VISIBILITY_UNSUPPORTED`
+    /// (`unregistered`) at exit `1`, nothing changed. `folder` is
+    /// `{path} of {holder}` on a marking and `{owner}/{name}` through
+    /// `syns repo`.
+    FolderVisibilityUnsupported {
         folder: String,
     },
     /// SPEC u271: `syns commit` over a changeset naming neither a file
@@ -256,6 +277,12 @@ pub enum ApiErrorContext {
     MissingBlobs {
         missing: std::collections::BTreeMap<String, String>,
     },
+    /// SPEC u329 `ApiErrorContext::Refusal`: the string `message` a `422`
+    /// `validation_error` served, kept so a caller can tell one refusal
+    /// from another. It renders as a refusal carrying no context renders.
+    Refusal {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,6 +298,7 @@ impl CliError {
             CliError::RepoIdentityUnknown { .. } => 2,
             CliError::PathBelongsToAnotherRepository { .. } => 2,
             CliError::HolderActing { .. } => 2,
+            CliError::FolderVisibilityRedirect { .. } => 2,
             CliError::FolderMoved { .. } => 2,
             CliError::FolderInAnotherCheckout { .. } => 2,
             CliError::ServerUnreachable { .. } => 3,
@@ -474,6 +502,15 @@ impl std::fmt::Display for CliError {
                 "holder root required: {command} acts on the holding repository {holder}, not on the folder {} \u{2014} run it from the root of a checkout of {holder}",
                 dir.display()
             ),
+            CliError::FolderVisibilityRedirect {
+                holder,
+                dir,
+                visibility,
+            } => write!(
+                f,
+                "holder root required: syns repo --visibility acts on the holding repository {holder}, not on the folder {} \u{2014} set the folder's own visibility with: syns share . --visibility {visibility}",
+                dir.display()
+            ),
             CliError::FolderMoved {
                 dir,
                 holder,
@@ -603,6 +640,10 @@ impl std::fmt::Display for CliError {
             CliError::FolderWriteUnsupported { folder } => write!(
                 f,
                 "folder_write_unsupported: the server does not support writes inside a folder yet, so {folder} cannot be written from inside it"
+            ),
+            CliError::FolderVisibilityUnsupported { folder } => write!(
+                f,
+                "folder_visibility_unsupported: the server does not support a folder's own visibility yet, so {folder} keeps the visibility it had"
             ),
             CliError::ChangesetEmpty => write!(
                 f,
@@ -1056,6 +1097,54 @@ mod tests {
             assert_eq!(err.exit_code(), 2);
             assert!(err.json_value().is_none());
         }
+    }
+
+    // SPEC u329 Contract Surface, the folder visibility redirect and
+    // `CliError::FolderVisibilityUnsupported`: each line whole, the
+    // redirect at exit `2` and the unsupported refusal at exit `1`, both
+    // under the generic error document.
+    #[test]
+    fn the_folder_visibility_refusals_render_their_lines_whole() {
+        let redirect = CliError::FolderVisibilityRedirect {
+            holder: "alice/handbook".into(),
+            dir: std::path::PathBuf::from("/w/drafts"),
+            visibility: "private".into(),
+        };
+        assert_eq!(
+            redirect.to_string(),
+            "holder root required: syns repo --visibility acts on the holding repository alice/handbook, not on the folder /w/drafts \u{2014} set the folder's own visibility with: syns share . --visibility private"
+        );
+        assert_eq!(redirect.exit_code(), 2);
+        assert!(redirect.json_value().is_none());
+        let unsupported = CliError::FolderVisibilityUnsupported {
+            folder: "drafts of alice/handbook".into(),
+        };
+        assert_eq!(
+            unsupported.to_string(),
+            "folder_visibility_unsupported: the server does not support a folder's own visibility yet, so drafts of alice/handbook keeps the visibility it had"
+        );
+        assert_eq!(unsupported.exit_code(), 1);
+        assert!(unsupported.json_value().is_none());
+    }
+
+    // SPEC u329 Contract Surface, `ApiErrorContext::Refusal`: a refusal
+    // holding its served message renders as one holding no context.
+    #[test]
+    fn a_kept_refusal_message_renders_as_a_refusal_with_no_context() {
+        let bare = CliError::Api {
+            status: Some(422),
+            error: "validation_error".into(),
+            context: None,
+        };
+        let kept = CliError::Api {
+            status: Some(422),
+            error: "validation_error".into(),
+            context: Some(ApiErrorContext::Refusal {
+                message: "description is too long".into(),
+            }),
+        };
+        assert_eq!(kept.to_string(), bare.to_string());
+        assert_eq!(kept.exit_code(), bare.exit_code());
     }
 
     #[test]

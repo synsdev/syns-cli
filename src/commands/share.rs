@@ -1,15 +1,20 @@
 //! `syns share PATH`, `syns share PATH --show` and `syns unshare PATH`
 //! (SPEC u300): a folder of a holder shared under an identity of its own
 //! named by its sharer, the identity a folder stands under read, and the
-//! sharing stopped (`D-110`, `D-115`, `D-116`, `D-118`, `D-119`).
+//! sharing stopped (`D-110`, `D-115`, `D-116`, `D-118`, `D-119`); and
+//! `syns share PATH --visibility VISIBILITY` (SPEC u329): the folder
+//! marked with a visibility of its own through its holder (`D-122`).
 
 use std::io::{BufRead, IsTerminal, Write};
 
 use serde_json::{Value, json};
 
 use crate::auth::token::TokenStore;
-use crate::client::{CollaboratorRole, RepoResponse, SynsClient};
+use crate::client::{
+    CollaboratorRole, RepoResponse, SetFolderVisibilityRequest, SynsClient, Visibility,
+};
 use crate::commands::place::{counted_from, placement_path};
+use crate::commands::repo::CliVisibility;
 use crate::config::Config;
 use crate::errors::{ApiErrorContext, CliError};
 use crate::output::Output;
@@ -132,7 +137,7 @@ fn held_line(held: &str) -> String {
 
 /// Whether `err` is the refusal a lookup answers where no identity of the
 /// folder stands.
-fn is_not_shared(err: &CliError) -> bool {
+pub(crate) fn is_not_shared(err: &CliError) -> bool {
     matches!(err, CliError::Api { status: Some(404), error, .. } if error == "not_found")
 }
 
@@ -197,6 +202,80 @@ pub(crate) async fn share_with_names(
         };
         match ask(&format!("{owner}/{name}")) {
             Some(another) => name = another,
+            None => return Err(held),
+        }
+    }
+}
+
+/// The name prompt `mark_with_names` asks again through, answering
+/// another name or none.
+type AskAgain<'a> = &'a mut dyn FnMut() -> Option<String>;
+
+/// Marks the target at `visibility`, `name` the name a first marking
+/// mints its identity under (SPEC u329 Behaviour, `cmd_mark_folder`
+/// 5–6): a `404` `not_found` is a server predating the route; a held
+/// name reads the lookup, sending the marking once more with no name
+/// where an identity stands, and otherwise writing the held line and
+/// asking `ask` for another name where it can.
+async fn mark_with_names(
+    client: &SynsClient,
+    token: &str,
+    target: &ShareTarget,
+    visibility: Visibility,
+    name: Option<String>,
+    mut ask: Option<AskAgain<'_>>,
+) -> Result<(RepoResponse, Value), CliError> {
+    let owner = target.holder.split('/').next().unwrap_or(&target.holder);
+    let marking = |name: Option<String>| SetFolderVisibilityRequest {
+        path: target.path.clone(),
+        visibility: visibility.clone(),
+        name,
+    };
+    let mut name = name;
+    loop {
+        // 5 — the marking.
+        let held = match client
+            .set_folder_visibility(&target.holder, token, &marking(name.clone()))
+            .await
+        {
+            Ok(marked) => return Ok(marked),
+            Err(err) if is_not_shared(&err) => {
+                return Err(CliError::FolderVisibilityUnsupported {
+                    folder: format!("{} of {}", target.path, target.holder),
+                });
+            }
+            Err(err) if is_held_name(&err) => err,
+            Err(err) => return Err(err),
+        };
+
+        // 6 — the lookup: an identity standing takes the marking with no
+        // name once more.
+        match client
+            .get_share(&target.holder, Some(token), &target.path)
+            .await
+        {
+            Ok(_) => {
+                return client
+                    .set_folder_visibility(&target.holder, token, &marking(None))
+                    .await;
+            }
+            Err(err) if is_not_shared(&err) => {}
+            Err(err) => return Err(err),
+        }
+
+        // 6 — the held line over the name sent, then another name where
+        // one can be asked for.
+        let sent = name
+            .clone()
+            .or_else(|| offered_share_name(&target.holder, &target.path));
+        if let Some(sent) = sent {
+            eprintln!("{}", held_line(&format!("{owner}/{sent}")));
+        }
+        let Some(ask) = ask.as_mut() else {
+            return Err(held);
+        };
+        match ask() {
+            Some(another) => name = Some(another),
             None => return Err(held),
         }
     }
@@ -436,6 +515,81 @@ pub async fn cmd_share(
     Ok(())
 }
 
+/// `syns share PATH --visibility VISIBILITY [--name NAME] [--repo
+/// OWNER/NAME]` (SPEC u329 Behaviour, `cmd_mark_folder`): the folder
+/// marked with a visibility of its own through its holder.
+pub async fn cmd_mark_folder(
+    config: &Config,
+    output: &Output,
+    path: String,
+    visibility: CliVisibility,
+    name: Option<String>,
+    repo: Option<String>,
+) -> Result<(), CliError> {
+    // 1 — a given name weighed, with no prompt to follow it; the target.
+    if let Some(line) = name.as_deref().and_then(share_name_problem) {
+        return Err(CliError::Config { message: line });
+    }
+    let target = bind_share_target(&path, repo.as_deref())?;
+
+    // 2 — the credential.
+    let token = TokenStore::new(config.credentials_path())
+        .read()?
+        .ok_or(CliError::AuthRequired)?;
+    let client = SynsClient::new(config.server_url())?;
+
+    // 3 — the holder, and the caller's role on it.
+    let holder = read_holder(&client, Some(&token), &target.holder).await?;
+
+    // 4 — the folder standing at the holder's head.
+    client
+        .get_tree(
+            &target.holder,
+            Some(&token),
+            Some(&target.path),
+            false,
+            None,
+        )
+        .await?;
+
+    // 5 and 6 — the marking, asking again on a held name.
+    let (path, holder_id) = (target.path.clone(), target.holder.clone());
+    let mut again = move || ask_name_here(&path, &holder_id, None);
+    let ask: Option<AskAgain<'_>> = if prompt_can_be_raised(output, holder.role.as_ref()) {
+        Some(&mut again)
+    } else {
+        None
+    };
+    let (marked, raw) =
+        mark_with_names(&client, &token, &target, visibility.into(), name, ask).await?;
+
+    // 7 — the document, or the report.
+    if output.is_json() {
+        output.json(&document(
+            &raw,
+            json!({
+                "holder": target.holder,
+                "path": target.path,
+            }),
+        ));
+    } else {
+        eprintln!(
+            "{} of {} is {} as {}/{}",
+            target.path,
+            target.holder,
+            visibility_text(&marked.visibility),
+            marked.owner,
+            marked.name
+        );
+    }
+    Ok(())
+}
+
+/// A served visibility in the lower-cased form `syns repo` writes it in.
+pub(crate) fn visibility_text(visibility: &Visibility) -> String {
+    format!("{visibility:?}").to_lowercase()
+}
+
 /// `syns share PATH --show [--repo OWNER/NAME]` (SPEC u300 Behaviour,
 /// `cmd_share_show`): the lookup alone, nothing sent that changes
 /// anything.
@@ -484,9 +638,13 @@ pub async fn cmd_share_show(
                     }),
                 ));
             } else {
+                // SPEC u329 `cmd_share_show` 1: the visibility the lookup
+                // served beside the identity.
                 eprintln!(
-                    "{} of {} is shared as {identity}",
-                    target.path, target.holder
+                    "{} of {} is shared as {identity} ({})",
+                    target.path,
+                    target.holder,
+                    visibility_text(&repo.visibility)
                 );
                 println!("{identity}");
             }
@@ -574,14 +732,46 @@ pub async fn cmd_unshare(
         .unshare_folder(&target.holder, &token, &target.path)
         .await?;
 
+    // SPEC u329 `cmd_unshare` 2 — the lookup once more: an identity
+    // standing kept its name by a visibility of its own, `NOT_FOUND`
+    // retired it, and any other refusal tells neither.
+    let after = client
+        .get_share(&target.holder, Some(&token), &target.path)
+        .await;
+    let retired = match &after {
+        Ok(_) => Some(false),
+        Err(err) if is_not_shared(err) => Some(true),
+        Err(_) => None,
+    };
+
     // 6 — the document, or the report.
+    let named = format!("{}/{}", identity.owner, identity.name);
     if output.is_json() {
-        output.json(&unshare_document(true));
-    } else {
-        eprintln!(
-            "stopped sharing {} of {}: {}/{} is retired and its collaborators removed",
-            target.path, target.holder, identity.owner, identity.name
-        );
+        let mut document = unshare_document(true);
+        document["retired"] = json!(retired);
+        output.json(&document);
+        return Ok(());
+    }
+    match after {
+        Ok((kept, _)) => eprintln!(
+            "stopped sharing {} of {}: its collaborators removed, {}/{} standing {} by a visibility of its own",
+            target.path,
+            target.holder,
+            kept.owner,
+            kept.name,
+            visibility_text(&kept.visibility)
+        ),
+        Err(err) if is_not_shared(&err) => eprintln!(
+            "stopped sharing {} of {}: {named} is retired and its collaborators removed",
+            target.path, target.holder
+        ),
+        Err(err) => {
+            eprintln!("could not tell whether {named} still stands: {err}");
+            eprintln!(
+                "stopped sharing {} of {}: the collaborators of {named} removed",
+                target.path, target.holder
+            );
+        }
     }
     Ok(())
 }
