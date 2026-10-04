@@ -1656,3 +1656,59 @@ fn a_default_comparison_inside_a_holders_folder_takes_the_folders_two_newest_ver
     );
     assert_eq!(d.requests_to("/diff").len(), 1, "no second diff request");
 }
+
+// CR1-2 (u329): a nearer lookup refused otherwise than `404` `not_found`
+// ends the walk, naming no visibility from further up.
+#[test]
+#[serial]
+fn a_refused_nearer_lookup_names_no_folder_visibility() {
+    let d = Deployment::holding("alice/handbook", &["drafts/notes"]).credentialed();
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path_matcher("/api/v1/repos/alice/handbook"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(handbook("public"))),
+    );
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path_matcher(
+                "/api/v1/repos/alice/handbook/shares/drafts/notes",
+            ))
+            .respond_with(
+                ResponseTemplate::new(500).set_body_json(json!({"error": "internal_error"})),
+            ),
+    );
+    let mut drafts = handbook("private");
+    drafts["name"] = json!("handbook-drafts");
+    drafts["sharedFolder"] = json!(true);
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path_matcher("/api/v1/repos/alice/handbook/shares/drafts"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(drafts)),
+    );
+    let notes = d.w.join("drafts/notes");
+
+    let rendered = d.run_in(&notes, b"", &["repo"]);
+    let json_run = d.run_in(&notes, b"", &["repo", "--json"]);
+
+    assert_eq!(exit_of(&rendered), 0, "{}", stderr_of(&rendered));
+    assert!(
+        !stdout_of(&rendered).contains("Folder visibility"),
+        "{}",
+        stdout_of(&rendered)
+    );
+    assert_eq!(exit_of(&json_run), 0, "{}", stderr_of(&json_run));
+    let document = one_document(&json_run);
+    assert!(
+        !document
+            .as_object()
+            .expect("an object")
+            .contains_key("folderVisibility"),
+        "{document}"
+    );
+    assert!(
+        d.requests()
+            .iter()
+            .all(|r| r.url.path() != "/api/v1/repos/alice/handbook/shares/drafts"),
+        "a lookup went past the refused one"
+    );
+}

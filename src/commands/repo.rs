@@ -70,13 +70,13 @@ pub enum RepoAction {
 /// names the move for those and states that the other two reach the
 /// creation nowhere, rather than directing every caller to a position
 /// the argument tree rejects at exit `2` (CR2-1).
+pub const CREATE_TAKES_ITS_OWN_OPTIONS: &str = "--description and --visibility belong after create; --status and --tag change a standing repository and reach the create nowhere";
+
 /// The `message` every server predating the folder visibility route
 /// answers to a `visibility` sent through a shared folder's identity
 /// (SPEC u329 Contract Surface, `IDENTITY_VISIBILITY_REFUSAL`).
 pub const IDENTITY_VISIBILITY_REFUSAL: &str =
     "visibility cannot be set through a shared folder; it is its holder's";
-
-pub const CREATE_TAKES_ITS_OWN_OPTIONS: &str = "--description and --visibility belong after create; --status and --tag change a standing repository and reach the create nowhere";
 
 /// Creates an empty repository under the caller (SPEC u272 Behaviour,
 /// `cmd_repo_create`).

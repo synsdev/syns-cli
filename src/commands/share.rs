@@ -917,6 +917,97 @@ mod tests {
         assert_eq!(names, vec![json!("docs-q3-plan"), json!("docs-q3-plan-2")]);
     }
 
+    // CR1-1 (u329): a held name on a first marking reads the lookup and
+    // marks again under the name the prompt answers; with no name back
+    // the held refusal stands and nothing is sent again.
+    #[tokio::test]
+    async fn a_marking_asks_another_name_where_the_name_is_held() {
+        let marking = "/api/v1/repos/alice/handbook/folder-visibility";
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path(marking))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({"error": "conflict"})))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(marking))
+            .respond_with(ResponseTemplate::new(200).set_body_json(identity("drafts-q4")))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/handbook/shares/drafts"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({"error": "not_found"})))
+            .mount(&server)
+            .await;
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let target = ShareTarget {
+            holder: "alice/handbook".into(),
+            path: "drafts".into(),
+        };
+        let names = |server_requests: Vec<wiremock::Request>| -> Vec<Value> {
+            server_requests
+                .into_iter()
+                .filter(|r| r.method.as_str() == "PUT")
+                .map(|r| serde_json::from_slice::<Value>(&r.body).unwrap()["name"].clone())
+                .collect()
+        };
+        let mut ask = || Some("drafts-q4".to_string());
+
+        let (marked, _) = mark_with_names(
+            &client,
+            "t",
+            &target,
+            Visibility::Private,
+            Some("drafts-q3".into()),
+            Some(&mut ask),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(marked.name, "drafts-q4");
+        assert_eq!(
+            names(server.received_requests().await.unwrap()),
+            vec![json!("drafts-q3"), json!("drafts-q4")]
+        );
+
+        server.reset().await;
+        Mock::given(method("PUT"))
+            .and(path(marking))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({"error": "conflict"})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/handbook/shares/drafts"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({"error": "not_found"})))
+            .mount(&server)
+            .await;
+        let mut none = || None;
+
+        let refused = mark_with_names(
+            &client,
+            "t",
+            &target,
+            Visibility::Private,
+            Some("drafts-q3".into()),
+            Some(&mut none),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                refused,
+                Err(CliError::Api {
+                    status: Some(409),
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(names(server.received_requests().await.unwrap()).len(), 1);
+    }
+
     // SPEC u300 Tests, the row of this name.
     #[tokio::test]
     async fn a_moved_head_under_the_share_asks_no_other_name() {
