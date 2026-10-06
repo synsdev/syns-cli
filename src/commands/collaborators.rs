@@ -3,13 +3,14 @@ use crate::client::{
     AddCollaboratorRequest, Collaborator, CollaboratorRole, SynsClient,
     UpdateCollaboratorRoleRequest, address_segment,
 };
-use crate::commands::pull::is_repository_shape;
 use crate::commands::repos::{LIMIT_MAX, LIMIT_MIN, refuse_limit_outside};
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
 use crate::prompts::{ConfirmOutcome, confirm_or_yes};
-use crate::repo::folder::{current_dir, refuse_holder_change, resolve_folder_scope};
+use crate::repo::folder::{
+    current_dir, refuse_holder_change, resolve_folder_scope, shared_as_address,
+};
 use crate::repo::if_repo::resolve_full_or_skip;
 use crate::repo::syns_yaml::folder_shared_as;
 use clap::Subcommand;
@@ -233,15 +234,7 @@ fn admit_repository(
             dir: scope.dir,
         });
     };
-    let address = format!("{}/{shared_as}", scope.owner).to_ascii_lowercase();
-    if !is_repository_shape(&address) {
-        return Err(CliError::Io {
-            message: format!(
-                "invalid .syns.yaml: shared_as must name a repository under {} (got {shared_as})",
-                scope.owner
-            ),
-        });
-    }
+    let address = shared_as_address(&scope.owner, &shared_as)?;
     match repo {
         Some(repo) if !repo.eq_ignore_ascii_case(&address) => {
             refuse_holder_change(cwd, command).map(|()| None)

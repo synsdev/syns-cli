@@ -493,14 +493,8 @@ fn identity_scope(start: &Path) -> Result<Option<FolderScope>, CliError> {
         .split_once('/')
         .expect("is_repository_shape admits one /");
     let owner = owner.to_ascii_lowercase();
+    shared_as_address(&owner, &identity)?;
     let identity = identity.to_ascii_lowercase();
-    if !is_repository_shape(&format!("{owner}/{identity}")) {
-        return Err(CliError::Io {
-            message: format!(
-                "invalid .syns.yaml: shared_as must name a repository under {owner} (got {identity})"
-            ),
-        });
-    }
 
     // 4 — the scope bound to the identity.
     Ok(Some(FolderScope {
@@ -556,10 +550,46 @@ pub fn current_dir() -> Result<PathBuf, CliError> {
     })
 }
 
+/// The repository a folder's `shared_as` names: the holder's owner joined
+/// by `/` to the name, lower-cased, refused as a malformed identity file
+/// where that is not the `OWNER/NAME` shape `D-025` fixes, the name written
+/// as recorded (SPEC u302 `resolve_folder_scope` 3, SPEC u333
+/// `admit_repository` 4).
+pub(crate) fn shared_as_address(owner: &str, shared_as: &str) -> Result<String, CliError> {
+    let address = format!("{owner}/{shared_as}").to_ascii_lowercase();
+    if !is_repository_shape(&address) {
+        return Err(CliError::Io {
+            message: format!(
+                "invalid .syns.yaml: shared_as must name a repository under {owner} (got {shared_as})"
+            ),
+        });
+    }
+    Ok(address)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    // CR1-3 of u333: one refusal for both bindings, the name as recorded.
+    #[test]
+    fn shared_as_address_joins_lower_cased_and_refuses_as_recorded() {
+        assert_eq!(
+            shared_as_address("alice", "Docs-Q3-Plan").unwrap(),
+            "alice/docs-q3-plan"
+        );
+        for recorded in ["Bad.Name!", "..", "a/b"] {
+            assert_eq!(
+                shared_as_address("alice", recorded)
+                    .unwrap_err()
+                    .to_string(),
+                format!(
+                    "invalid .syns.yaml: shared_as must name a repository under alice (got {recorded})"
+                )
+            );
+        }
+    }
 
     fn scope(path: &str) -> FolderScope {
         FolderScope {

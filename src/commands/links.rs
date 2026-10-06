@@ -308,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn the_add_and_remove_arms_carry_no_pre_request_check() {
+    fn the_add_arm_and_a_plain_removal_pass_the_pre_request_check() {
         assert!(
             check_action(&LinksAction::Add {
                 kind: LinkKind::Website,

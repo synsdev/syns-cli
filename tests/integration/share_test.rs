@@ -791,12 +791,14 @@ fn share_lines_report_on_the_diagnostic_stream_and_name_the_identity() {
     );
 }
 
-/// The diagnostic stream of `out` with every line opening `warning: `
+/// The diagnostic stream of `out` with every identity file warning line
 /// left aside.
 fn reports(out: &std::process::Output) -> String {
     stderr_of(out)
         .lines()
-        .filter(|line| !line.starts_with("warning: "))
+        .filter(|line| {
+            !(line.starts_with("warning: ") && line.ends_with("; syns sync takes it in"))
+        })
         .map(|line| format!("{line}\n"))
         .collect()
 }
@@ -2192,6 +2194,79 @@ fn an_edited_identity_file_is_left_and_named() {
     );
     assert!(
         stderr_of(&out).lines().any(|line| line == warning),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
+/// The identity file warning line for `W/q3-plan` naming
+/// `alice/docs-q3-plan`.
+fn q3_plan_warning(d: &Deployment) -> String {
+    format!(
+        "warning: {}/.syns.yaml was left as it stood and does not yet name alice/docs-q3-plan; syns sync takes it in",
+        d.w.join("q3-plan").display()
+    )
+}
+
+// CR1-1 of u333, `settle_identity_file` 2: a newest version whose file
+// names no identity is taken as no settling, the file left and named.
+#[test]
+#[serial]
+fn a_newest_version_naming_no_identity_leaves_the_file_and_warns() {
+    let d = w_deployment();
+    write(&d.w.join("q3-plan/.syns.yaml"), B0);
+    d.serves("GET", Q3_PLAN_LOOKUP, refusal(404, "not_found"));
+    d.serves(
+        "POST",
+        "/api/v1/repos/alice/docs/shares",
+        ResponseTemplate::new(201).set_body_json(record("alice", "docs-q3-plan", true)),
+    );
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path(Q3_PLAN_RAW))
+            .and(query_param("ref", "h2"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(B0.as_bytes()))
+            .with_priority(1),
+    );
+    serve_identity_file_versions(&d, ResponseTemplate::new(200).set_body_bytes(B0.as_bytes()));
+
+    let out = d.run(&["share", "q3-plan", "--name", "docs-q3-plan", "--json"]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(identity_file(&d), B0.as_bytes());
+    assert!(
+        stderr_of(&out)
+            .lines()
+            .any(|line| line == q3_plan_warning(&d)),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
+// CR1-1 of u333, `settle_identity_file` 4: a refusal other than
+// `NOT_FOUND` at the version before writes nothing over a folder whose
+// identity file stands absent.
+#[test]
+#[serial]
+fn a_refused_prior_version_writes_nothing() {
+    let d = w_deployment();
+    std::fs::remove_file(d.w.join("q3-plan/.syns.yaml")).expect("no identity file");
+    d.serves("GET", Q3_PLAN_LOOKUP, refusal(404, "not_found"));
+    d.serves(
+        "POST",
+        "/api/v1/repos/alice/docs/shares",
+        ResponseTemplate::new(201).set_body_json(record("alice", "docs-q3-plan", true)),
+    );
+    serve_identity_file_versions(&d, refusal(503, "unavailable"));
+
+    let out = d.run(&["share", "q3-plan", "--name", "docs-q3-plan", "--json"]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert!(!d.w.join("q3-plan/.syns.yaml").exists());
+    assert!(
+        stderr_of(&out)
+            .lines()
+            .any(|line| line == q3_plan_warning(&d)),
         "{}",
         stderr_of(&out)
     );

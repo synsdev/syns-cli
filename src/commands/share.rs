@@ -452,6 +452,15 @@ fn names_identity(bytes: &[u8], name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The bytes standing at `path`, none where no file stands there.
+fn read_standing(path: &std::path::Path) -> std::io::Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 /// Leaves the folder's `.syns.yaml` on disk as the holder's newest version
 /// changing that file holds it (SPEC u333 Behaviour, `settle_identity_file`,
 /// `D-118`): none exactly where the file on disk holds those bytes once it
@@ -495,10 +504,8 @@ pub(crate) async fn settle_identity_file(
 
     // 3 — the file on disk holding them already.
     let on_disk_path = dir.join(".syns.yaml");
-    let on_disk = match std::fs::read(&on_disk_path) {
-        Ok(bytes) => Some(bytes),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-        Err(_) => return warning(),
+    let Ok(on_disk) = read_standing(&on_disk_path) else {
+        return warning();
     };
     if on_disk.as_deref() == Some(served.as_slice()) {
         return None;
@@ -517,8 +524,9 @@ pub(crate) async fn settle_identity_file(
         },
     };
 
-    // 5 — the file replaced whole where it stands as that version held it.
-    if !dir.is_dir() || on_disk != prior {
+    // 5 — the file replaced whole where it stands as that version held it,
+    // read again so an edit saved during step 4's read is left standing.
+    if !dir.is_dir() || read_standing(&on_disk_path).ok() != Some(prior) {
         return warning();
     }
     match write_atomic(&on_disk_path, &served, |_| Ok(())) {
