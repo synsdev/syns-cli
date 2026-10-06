@@ -2273,6 +2273,49 @@ fn a_refused_prior_version_writes_nothing() {
     );
 }
 
+/// A raw read that saves `.1` over the file at `.0` before answering `200`
+/// with `B0`, standing in for an edit saved while that read is in flight.
+struct EditsThenAnswers(PathBuf, Vec<u8>);
+
+impl wiremock::Respond for EditsThenAnswers {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        std::fs::write(&self.0, &self.1).expect("the edit saved");
+        ResponseTemplate::new(200).set_body_bytes(B0.as_bytes())
+    }
+}
+
+// CR2-1 of u333, `settle_identity_file` 5: an edit saved while the version
+// before is read is left standing and named, the file read again just
+// before it would be replaced.
+#[test]
+#[serial]
+fn an_edit_saved_during_the_prior_read_is_left_and_named() {
+    let d = first_share_deployment();
+    let edited = format!("{B0}checks: [lint]\n");
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path(Q3_PLAN_RAW))
+            .and(query_param("ref", "h1"))
+            .respond_with(EditsThenAnswers(
+                d.w.join("q3-plan/.syns.yaml"),
+                edited.clone().into_bytes(),
+            ))
+            .with_priority(1),
+    );
+
+    let out = d.run(&["share", "q3-plan", "--name", "docs-q3-plan", "--json"]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(identity_file(&d), edited.as_bytes());
+    assert!(
+        stderr_of(&out)
+            .lines()
+            .any(|line| line == q3_plan_warning(&d)),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
 // SPEC u333 Tests, the row of this name.
 #[test]
 #[serial]
