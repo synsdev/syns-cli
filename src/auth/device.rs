@@ -128,9 +128,7 @@ impl DeviceAuthFlow {
         // 1. HTTPS enforcement
         if !server_url.starts_with("https://") && !crate::config::is_localhost_url(server_url) {
             return Err(CliError::Config {
-                message:
-                    "server URL must use HTTPS (except http://localhost for local development)"
-                        .into(),
+                message: crate::config::HTTPS_REQUIRED.into(),
             });
         }
 
@@ -247,7 +245,9 @@ mod tests {
     #[tokio::test]
     async fn https_enforcement_rejects_http() {
         let result = DeviceAuthFlow::run("http://example.com").await;
-        assert!(matches!(result, Err(CliError::Config { .. })));
+        assert!(
+            matches!(result, Err(CliError::Config { ref message }) if message == crate::config::HTTPS_REQUIRED)
+        );
     }
 
     #[tokio::test]

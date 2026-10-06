@@ -22,6 +22,7 @@ mod push_skipped_summary_test;
 mod push_strict_test;
 mod push_test;
 mod reads_test;
+mod refusal_lines_test;
 mod repo_root_test;
 mod share_test;
 mod state_home_test;

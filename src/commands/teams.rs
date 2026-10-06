@@ -172,6 +172,89 @@ fn weigh_repo_halves(owner: &str, name: &str) -> Result<(), CliError> {
     Ok(())
 }
 
+/// SPEC u334 `picker_selection`: the zero-based position of a trimmed
+/// ordinal from `1` to `count`, and otherwise `CONFIG_ERROR` carrying the
+/// invalid selection line.
+fn picker_selection(input: &str, count: usize) -> Result<usize, CliError> {
+    let input = input.trim();
+    match input.parse::<usize>() {
+        Ok(n) if (1..=count).contains(&n) => Ok(n - 1),
+        _ => Err(CliError::Config {
+            message: format!(
+                "invalid selection '{input}' \u{2014} type an ordinal from 1 to {count}"
+            ),
+        }),
+    }
+}
+
+/// SPEC u334 Contract Surface, the remove-repo forbidden move.
+fn remove_repo_forbidden_move(name: &str, repo: &str) -> String {
+    format!(
+        "only the owner of team '{name}' or an admin on it revokes its grants, whatever you hold on {repo}; see who with: syns teams members {name}"
+    )
+}
+
+/// SPEC u334 Contract Surface, the remove-repo not-found move.
+fn remove_repo_not_found_move(name: &str, repo: &str) -> String {
+    format!(
+        "team '{name}' holds no grant on {repo} that you can see, a revocation that already landed included; see what it holds with: syns teams repos {name}"
+    )
+}
+
+/// SPEC u334 Contract Surface, the invitation not-found move.
+fn invitation_not_found_move(id: &str) -> String {
+    format!(
+        "no invitation '{id}' is open to you; see the ones that are with: syns teams invitations"
+    )
+}
+
+/// SPEC u334 Contract Surface, the accept conflict move.
+fn accept_conflict_move(id: &str) -> String {
+    format!(
+        "invitation '{id}' is no longer pending, or you already belong to its team; see your teams with: syns teams, and your pending invitations with: syns teams invitations"
+    )
+}
+
+/// SPEC u334 Contract Surface, the decline conflict move.
+fn decline_conflict_move(id: &str) -> String {
+    format!(
+        "invitation '{id}' is no longer pending; see the ones that are with: syns teams invitations"
+    )
+}
+
+/// SPEC u334 Contract Surface, the accept forbidden move.
+fn accept_forbidden_move(id: &str) -> String {
+    format!(
+        "invitation '{id}' has expired or is addressed to another account; sign in as its invitee with: syns login, or ask the team for a new invitation"
+    )
+}
+
+/// SPEC u334 Contract Surface, the decline forbidden move.
+fn decline_forbidden_move(id: &str) -> String {
+    format!(
+        "invitation '{id}' is addressed to another account; sign in as its invitee with: syns login"
+    )
+}
+
+/// SPEC u334 Behaviour, `cmd_teams` 3: a refusal whose status and wire
+/// form `pick` names a move for carries it through
+/// `CliError::with_next_move`; every other refusal stands as it arrived
+/// (Q-01).
+fn with_move_for(err: CliError, pick: impl Fn(u16, &str) -> Option<String>) -> CliError {
+    let line = match &err {
+        CliError::Api {
+            status: Some(status),
+            error,
+            ..
+        } => pick(*status, error),
+        _ => None,
+    };
+    match line {
+        Some(line) => err.with_next_move(line),
+        None => err,
+    }
+}
+
 async fn resolve_team_id(
     client: &SynsClient,
     token: &str,
@@ -232,15 +315,8 @@ async fn resolve_team_id(
                 .map_err(|e| CliError::Io {
                     message: format!("could not read selection input: {e}"),
                 })?;
-            let selection: usize = input.trim().parse().map_err(|_| CliError::Config {
-                message: "invalid selection".to_string(),
-            })?;
-            if selection < 1 || selection > matches.len() {
-                return Err(CliError::Config {
-                    message: "invalid selection".to_string(),
-                });
-            }
-            Ok(matches.into_iter().nth(selection - 1).unwrap().id)
+            let selection = picker_selection(&input, matches.len())?;
+            Ok(matches.into_iter().nth(selection).unwrap().id)
         }
     }
 }
@@ -502,12 +578,32 @@ pub async fn cmd_teams(
         Some(TeamsAction::Accept { invitation_id }) => {
             // SPEC u333 `cmd_teams` 1 — the identifier weighed first.
             address_segment("INVITATION_ID", &invitation_id)?;
-            let (response, raw) = client.accept_invitation(&token, &invitation_id).await?;
+            let (response, raw) = client
+                .accept_invitation(&token, &invitation_id)
+                .await
+                .map_err(|e| {
+                    with_move_for(e, |status, error| match (status, error) {
+                        (403, "forbidden") => Some(accept_forbidden_move(&invitation_id)),
+                        (404, "not_found") => Some(invitation_not_found_move(&invitation_id)),
+                        (409, "conflict") => Some(accept_conflict_move(&invitation_id)),
+                        _ => None,
+                    })
+                })?;
             display_member(output, &response, &raw);
         }
         Some(TeamsAction::Decline { invitation_id }) => {
             address_segment("INVITATION_ID", &invitation_id)?;
-            client.decline_invitation(&token, &invitation_id).await?;
+            client
+                .decline_invitation(&token, &invitation_id)
+                .await
+                .map_err(|e| {
+                    with_move_for(e, |status, error| match (status, error) {
+                        (403, "forbidden") => Some(decline_forbidden_move(&invitation_id)),
+                        (404, "not_found") => Some(invitation_not_found_move(&invitation_id)),
+                        (409, "conflict") => Some(decline_conflict_move(&invitation_id)),
+                        _ => None,
+                    })
+                })?;
             if output.is_json() {
                 output.json(&json!({"declined": true, "invitationId": invitation_id}));
             } else {
@@ -608,7 +704,14 @@ pub async fn cmd_teams(
             }
             client
                 .remove_team_repo(&token, &team_id, repo_owner, repo_name)
-                .await?;
+                .await
+                .map_err(|e| {
+                    with_move_for(e, |status, error| match (status, error) {
+                        (403, "forbidden") => Some(remove_repo_forbidden_move(&name, &repo)),
+                        (404, "not_found") => Some(remove_repo_not_found_move(&name, &repo)),
+                        _ => None,
+                    })
+                })?;
             if output.is_json() {
                 output.json(&json!({"removed": true, "team": name, "repo": repo}));
             } else {
@@ -657,6 +760,21 @@ mod tests {
     use serial_test::serial;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // SPEC u334 Tests, `picker_selection_names_the_value_and_the_range`.
+    #[test]
+    fn picker_selection_names_the_value_and_the_range() {
+        for (input, shown) in [("3", "3"), ("", ""), (" x ", "x")] {
+            match picker_selection(input, 2) {
+                Err(CliError::Config { message }) => assert_eq!(
+                    message,
+                    format!("invalid selection '{shown}' \u{2014} type an ordinal from 1 to 2")
+                ),
+                other => panic!("{input:?} answered {other:?}"),
+            }
+        }
+        assert_eq!(picker_selection(" 2 ", 2).unwrap(), 1);
+    }
 
     #[tokio::test]
     async fn resolve_team_id_finds_team_by_name() {

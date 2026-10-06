@@ -293,6 +293,13 @@ pub enum ApiErrorContext {
     Refusal {
         message: String,
     },
+    /// SPEC u334 `ApiErrorContext::NextMove`: the move a caller makes
+    /// next, rendered after the bare `server error ({status}): {error}`
+    /// line and ` \u{2014} ` under any status (Q-01, appended rather than
+    /// replacing the line).
+    NextMove {
+        line: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -419,6 +426,24 @@ impl CliError {
         }
     }
 
+    /// SPEC u334 `CliError::with_next_move`: puts `NextMove` on an `Api`
+    /// refusal carrying a status; every other variant, and a network
+    /// error carrying none, passes through unchanged.
+    pub fn with_next_move(self, line: String) -> CliError {
+        match self {
+            CliError::Api {
+                status: Some(status),
+                error,
+                ..
+            } => CliError::Api {
+                status: Some(status),
+                error,
+                context: Some(ApiErrorContext::NextMove { line }),
+            },
+            other => other,
+        }
+    }
+
     pub fn with_cat_path_context(self, path: String) -> CliError {
         match self {
             CliError::Api { status, error, .. } => CliError::Api {
@@ -449,6 +474,11 @@ impl std::fmt::Display for CliError {
                 error,
                 context: Some(ApiErrorContext::CatPath { path }),
             } if error == "not_found" => write!(f, "file not found: {path}"),
+            CliError::Api {
+                status: Some(s),
+                error,
+                context: Some(ApiErrorContext::NextMove { line }),
+            } => write!(f, "server error ({s}): {error} \u{2014} {line}"),
             CliError::Api {
                 status: Some(s),
                 error,
@@ -1162,6 +1192,43 @@ mod tests {
         );
         assert_eq!(unsupported.exit_code(), 1);
         assert!(unsupported.json_value().is_none());
+    }
+
+    // SPEC u334 Contract Surface, `ApiErrorContext::NextMove`: the move
+    // stands after the bare line and ` \u{2014} `, the same string the
+    // JSON document's `error` carries.
+    #[test]
+    fn a_next_move_renders_after_the_wire_form() {
+        let moved = CliError::Api {
+            status: Some(409),
+            error: "conflict".into(),
+            context: None,
+        }
+        .with_next_move("invitation 'inv1' is no longer pending; see the ones that are with: syns teams invitations".into());
+        assert_eq!(
+            moved.to_string(),
+            "server error (409): conflict \u{2014} invitation 'inv1' is no longer pending; see the ones that are with: syns teams invitations"
+        );
+        assert!(moved.json_value().is_none());
+        assert_eq!(moved.exit_code(), 1);
+        let network = CliError::Api {
+            status: None,
+            error: "connection refused".into(),
+            context: None,
+        }
+        .with_next_move("x".into());
+        assert!(matches!(
+            network,
+            CliError::Api {
+                status: None,
+                context: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            CliError::AuthRequired.with_next_move("x".into()),
+            CliError::AuthRequired
+        ));
     }
 
     // SPEC u329 Contract Surface, `ApiErrorContext::Refusal`: a refusal

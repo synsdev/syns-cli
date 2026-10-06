@@ -201,9 +201,7 @@ impl Config {
             "http" if is_localhost(&parsed) => {}
             _ => {
                 return Err(CliError::Config {
-                    message:
-                        "server URL must use HTTPS (except http://localhost for local development)"
-                            .into(),
+                    message: HTTPS_REQUIRED.into(),
                 });
             }
         }
@@ -266,6 +264,10 @@ impl Config {
         &self.stores().write
     }
 }
+
+/// The one refusal every check of a server address answers off TLS and
+/// off the loopback host (SPEC u334 `HTTPS_REQUIRED`), under `CONFIG_ERROR`.
+pub const HTTPS_REQUIRED: &str = "server URL must use HTTPS, or http on the loopback host \u{2014} localhost, 127.0.0.1 or [::1] \u{2014} at any port";
 
 fn is_localhost(parsed: &Url) -> bool {
     matches!(
@@ -340,7 +342,19 @@ mod tests {
     fn config_rejects_http() {
         let result = Config::new(Some("http://example.com"));
         let err = result.unwrap_err();
-        assert!(matches!(err, CliError::Config { ref message } if message.contains("HTTPS")));
+        assert!(matches!(err, CliError::Config { ref message } if message == HTTPS_REQUIRED));
+        assert_eq!(
+            HTTPS_REQUIRED,
+            "server URL must use HTTPS, or http on the loopback host \u{2014} localhost, 127.0.0.1 or [::1] \u{2014} at any port"
+        );
+    }
+
+    #[test]
+    fn config_admits_every_loopback_form() {
+        let v4 = Config::new(Some("http://127.0.0.1:8080")).unwrap();
+        assert_eq!(v4.server_url(), "http://127.0.0.1:8080");
+        let v6 = Config::new(Some("http://[::1]:8080")).unwrap();
+        assert_eq!(v6.server_url(), "http://[::1]:8080");
     }
 
     #[test]

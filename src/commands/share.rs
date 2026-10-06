@@ -7,6 +7,7 @@
 //! held name and its public name warning keyed on the holder's own
 //! visibility (SPEC u332, `D-123`).
 
+use std::collections::HashMap;
 use std::io::{BufRead, IsTerminal, Write};
 
 use serde_json::{Value, json};
@@ -18,12 +19,19 @@ use crate::client::{
 use crate::commands::place::{counted_from, placement_path};
 use crate::commands::repo::CliVisibility;
 use crate::config::Config;
+use crate::config::StoreRoots;
 use crate::errors::{ApiErrorContext, CliError};
 use crate::output::Output;
 use crate::prompts::{ConfirmOutcome, confirm_or_yes};
-use crate::push::working_copy::write_atomic;
-use crate::repo::folder::{current_dir, resolve_folder_scope};
-use crate::repo::syns_yaml::{IdentityForm, identity_form_text};
+use crate::push::hash::blob_sha1;
+use crate::push::working_copy::{WorkingCopy, write_atomic};
+use crate::repo::folder::{FolderScope, current_dir, resolve_folder_scope};
+use crate::repo::syns_yaml::{
+    IdentityForm, find_syns_yaml, identity_form_text, read_identity_form,
+};
+
+/// The identity file's name, as every copy's base records it.
+const SYNS_YAML: &str = ".syns.yaml";
 
 /// The holder a share, its lookup and its removal address, and the
 /// folder's path from the holder's root (SPEC u300, `ShareTarget`).
@@ -432,25 +440,39 @@ fn identity_file_warning(dir: &std::path::Path, owner: &str, name: &str) -> Stri
     )
 }
 
-/// Whether `bytes` read as the folder form carrying `name` under
-/// `shared_as`, letter case aside, the key read as `folder_shared_as`
-/// reads it (SPEC u333 Behaviour, `settle_identity_file` 2).
-fn names_identity(bytes: &[u8], name: &str) -> bool {
+/// The unshare identity file warning line (SPEC u334 Contract Surface):
+/// the folder's `.syns.yaml` at `dir` left as it stood rather than as the
+/// holder's version retiring `owner/name` leaves it.
+fn unshare_identity_file_warning(dir: &std::path::Path, owner: &str, name: &str) -> String {
+    format!(
+        "warning: {}/.syns.yaml was left as it stood and not as the holder's version retiring {owner}/{name} leaves it; syns sync takes it in, stopping for a resolution where that file holds an edit not yet published",
+        dir.display()
+    )
+}
+
+/// Whether `bytes` read as the folder form a settling takes (SPEC u334
+/// Behaviour, `settle_identity_file` 2): carrying `name` under
+/// `shared_as`, letter case aside, where `shared`, and carrying no
+/// `shared_as` otherwise, the key read as `folder_shared_as` reads it.
+fn reads_as_settled(bytes: &[u8], name: &str, shared: bool) -> bool {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return false;
     };
     if !matches!(identity_form_text(text), Ok(IdentityForm::Folder { .. })) {
         return false;
     }
-    serde_yaml::from_str::<serde_yaml::Value>(text)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("shared_as")
-                .and_then(serde_yaml::Value::as_str)
-                .map(|shared_as| shared_as.eq_ignore_ascii_case(name))
-        })
-        .unwrap_or(false)
+    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(text) else {
+        return false;
+    };
+    match value.get("shared_as") {
+        None | Some(serde_yaml::Value::Null) => !shared,
+        Some(shared_as) => {
+            shared
+                && shared_as
+                    .as_str()
+                    .is_some_and(|shared_as| shared_as.eq_ignore_ascii_case(name))
+        }
+    }
 }
 
 /// The bytes standing at `path`, none where no file stands there.
@@ -462,23 +484,109 @@ fn read_standing(path: &std::path::Path) -> std::io::Result<Option<Vec<u8>>> {
     }
 }
 
+/// The scope `resolve_folder_scope` answers at `dir`, a refusal read as
+/// no scope (SPEC u334 Behaviour, `settle_identity_file` 5–6).
+fn scope_at(dir: &std::path::Path) -> Option<FolderScope> {
+    resolve_folder_scope(dir).ok().flatten()
+}
+
+/// Whether the base of the holder's copy at `scope`'s checkout, or of the
+/// folder's own copy, records `sha` for the folder's `.syns.yaml` (SPEC
+/// u334 Behaviour, `settle_identity_file` 5, Q-04).
+fn a_base_records(stores: &StoreRoots, scope: &FolderScope, file: &str, sha: &str) -> bool {
+    let records = |copy: Option<WorkingCopy>, at: &str| {
+        copy.and_then(|copy| copy.base())
+            .is_some_and(|base| base.file_sha(at) == Some(sha))
+    };
+    let checkout = scope.checkout.as_deref().and_then(|checkout| {
+        WorkingCopy::open_existing(stores, &scope.owner, &scope.name, checkout)
+            .ok()
+            .flatten()
+    });
+    records(checkout, file)
+        || records(
+            WorkingCopy::open_existing_folder(stores, scope)
+                .ok()
+                .flatten(),
+            SYNS_YAML,
+        )
+}
+
+/// The folder's `.syns.yaml` laid at `sha` over the base of every copy
+/// `scope` reaches — its own copy, the holder's copy at its checkout and
+/// each copy of its enclosing folders, each path counted from that copy's
+/// root — its commit moved only from `advance_from` to `landed`, every
+/// laying refusal leaving that copy's base as it stood (SPEC u334
+/// Behaviour, `settle_identity_file` 6). One copy's lock is held at a
+/// time, as `lay_turned_on` takes them.
+fn lay_identity_file(
+    stores: &StoreRoots,
+    scope: &FolderScope,
+    file: &str,
+    sha: &str,
+    advance_from: Option<&str>,
+    landed: &str,
+) {
+    let lay = |copy: Option<WorkingCopy>, at: String| {
+        if let Some(copy) = copy {
+            let files = HashMap::from([(at, sha.to_string())]);
+            let _ = copy.lay_files(&files, advance_from, landed);
+        }
+    };
+    lay(
+        WorkingCopy::open_existing_folder(stores, scope)
+            .ok()
+            .flatten(),
+        SYNS_YAML.to_string(),
+    );
+    if let Some(checkout) = &scope.checkout {
+        lay(
+            WorkingCopy::open_existing(stores, &scope.owner, &scope.name, checkout)
+                .ok()
+                .flatten(),
+            file.to_string(),
+        );
+    }
+    for enclosing in &scope.enclosing {
+        if let Some(at) = enclosing.folder_path(file) {
+            lay(
+                WorkingCopy::open_existing_folder(stores, enclosing)
+                    .ok()
+                    .flatten(),
+                at,
+            );
+        }
+    }
+}
+
 /// Leaves the folder's `.syns.yaml` on disk as the holder's newest version
-/// changing that file holds it (SPEC u333 Behaviour, `settle_identity_file`,
-/// `D-118`): none exactly where the file on disk holds those bytes once it
-/// returns, and the identity file warning line otherwise. It writes no
-/// other path and no working-copy state, and replaces the file only where
-/// it stands as the version before held it, an edit of it left standing
-/// (Q-03).
+/// changing that file holds it, and lays that version on the base of every
+/// copy addressing or enclosing the folder (SPEC u334 Behaviour,
+/// `settle_identity_file` 1–6, `D-118`): none exactly where the file on
+/// disk holds those bytes once it returns — naming `name` under
+/// `shared_as` where `shared`, carrying none otherwise — and otherwise the
+/// identity file warning line where `shared` and the unshare identity file
+/// warning line where not. It replaces the file only where it stands as
+/// the version before held it, or as a base of the checkout or the folder
+/// records it (Q-04), an edit of it left standing.
 pub(crate) async fn settle_identity_file(
+    stores: &StoreRoots,
     client: &SynsClient,
     token: &str,
     target: &ShareTarget,
     name: &str,
+    shared: bool,
 ) -> Option<String> {
     let dir = target.dir.as_deref()?;
     let owner = target.holder.split('/').next().unwrap_or(&target.holder);
-    let warning = || Some(identity_file_warning(dir, owner, name));
-    let file = format!("{}/.syns.yaml", target.path);
+    let warning = || {
+        Some(if shared {
+            identity_file_warning(dir, owner, name)
+        } else {
+            unshare_identity_file_warning(dir, owner, name)
+        })
+    };
+    let file = format!("{}/{SYNS_YAML}", target.path);
 
     // 1 — the newest version changing the file.
     let Ok((page, _)) = client
@@ -491,7 +599,7 @@ pub(crate) async fn settle_identity_file(
         return warning();
     };
 
-    // 2 — its bytes, kept only where they name the identity.
+    // 2 — its bytes, kept only where they read as the settled form.
     let Ok(served) = client
         .get_raw(&target.holder, Some(token), &file, Some(&entry.sha), None)
         .await
@@ -499,16 +607,30 @@ pub(crate) async fn settle_identity_file(
         return warning();
     };
     let served = served.bytes;
-    if !names_identity(&served, name) {
+    if !reads_as_settled(&served, name, shared) {
         return warning();
     }
+    let served_sha = blob_sha1(&served);
+    let lay = |scope: Option<FolderScope>| {
+        if let Some(scope) = scope {
+            lay_identity_file(
+                stores,
+                &scope,
+                &file,
+                &served_sha,
+                entry.parent_sha.as_deref(),
+                &entry.sha,
+            );
+        }
+    };
 
-    // 3 — the file on disk holding them already.
-    let on_disk_path = dir.join(".syns.yaml");
+    // 3 — the file on disk holding them already, laid on every base.
+    let on_disk_path = dir.join(SYNS_YAML);
     let Ok(on_disk) = read_standing(&on_disk_path) else {
         return warning();
     };
     if on_disk.as_deref() == Some(served.as_slice()) {
+        lay(scope_at(dir));
         return None;
     }
 
@@ -525,15 +647,33 @@ pub(crate) async fn settle_identity_file(
         },
     };
 
-    // 5 — the file replaced whole where it stands as that version held it,
-    // read again so an edit saved during step 4's read is left standing.
-    if !dir.is_dir() || read_standing(&on_disk_path).ok() != Some(prior) {
+    // 5 — the file replaced whole where, read again so an edit saved
+    // during step 4's read is left standing, it stands as that version
+    // held it or as a base of the checkout or the folder records it.
+    let before = scope_at(dir);
+    if !dir.is_dir() {
         return warning();
     }
-    match write_atomic(&on_disk_path, &served, |_| Ok(())) {
-        Ok(()) => None,
-        Err(_) => warning(),
+    let Ok(standing) = read_standing(&on_disk_path) else {
+        return warning();
+    };
+    let recorded = standing.as_deref().is_some_and(|bytes| {
+        let sha = blob_sha1(bytes);
+        before
+            .as_ref()
+            .is_some_and(|scope| a_base_records(stores, scope, &file, &sha))
+    });
+    if standing != prior && !recorded {
+        return warning();
     }
+    if write_atomic(&on_disk_path, &served, |_| Ok(())).is_err() {
+        return warning();
+    }
+
+    // 6 — laid on every base the scope reaches, as read before and after.
+    lay(before);
+    lay(scope_at(dir));
+    None
 }
 
 /// The holder's record, its `role` the caller's, refused where it is
@@ -630,7 +770,15 @@ pub async fn cmd_share(
 
     // SPEC u333 `cmd_share` 2 — the folder's identity file settled, created
     // or found standing (Q-02), a warning it answers written.
-    if let Some(warning) = settle_identity_file(&client, &token, &target, &outcome.repo.name).await
+    if let Some(warning) = settle_identity_file(
+        config.stores(),
+        &client,
+        &token,
+        &target,
+        &outcome.repo.name,
+        true,
+    )
+    .await
     {
         eprintln!("{warning}");
     }
@@ -731,7 +879,16 @@ pub async fn cmd_mark_folder(
 
     // SPEC u333 `cmd_mark_folder` 2 — the folder's identity file settled
     // as a share settles it, before anything is written.
-    if let Some(warning) = settle_identity_file(&client, &token, &target, &marked.name).await {
+    if let Some(warning) = settle_identity_file(
+        config.stores(),
+        &client,
+        &token,
+        &target,
+        &marked.name,
+        true,
+    )
+    .await
+    {
         eprintln!("{warning}");
     }
 
@@ -888,6 +1045,60 @@ pub async fn cmd_share_show(
     Ok(())
 }
 
+/// The checkout of `holder` (`OWNER/NAME`, lower-cased) the directory
+/// `start` stands in (SPEC u334 Behaviour, `cmd_unshare` 2): the nearest
+/// directory at or above it whose `.syns.yaml` names that holder in the
+/// root form, letter case aside, or else the `checkout` of the folder
+/// scope resolved at `start` whose holder it is; none on every refusal.
+fn holder_checkout_at(start: &std::path::Path, holder: &str) -> Option<std::path::PathBuf> {
+    let mut next = find_syns_yaml(start);
+    while let Some(file) = next {
+        let dir = file.parent()?.to_path_buf();
+        if let Ok(IdentityForm::Root { owner, name }) = read_identity_form(&file)
+            && format!("{owner}/{name}").eq_ignore_ascii_case(holder)
+        {
+            return Some(dir);
+        }
+        next = dir.parent().and_then(find_syns_yaml);
+    }
+    scope_at(start)
+        .filter(|scope| scope.holder() == holder)
+        .and_then(|scope| scope.checkout)
+}
+
+/// Where the folder scope at `dir` stands at `dir` itself bound to the
+/// identity `name` (letter case aside), the base that identity's copy at
+/// `dir` records carried to the holder's copy there, as
+/// `return_to_holder` carries it (SPEC u334 Behaviour, `cmd_unshare` 3);
+/// nothing done on any other scope, and a refusal of the scope or the
+/// carry answered.
+fn carry_identity_base(
+    stores: &StoreRoots,
+    dir: &std::path::Path,
+    name: &str,
+) -> Result<(), CliError> {
+    let Some(scope) = resolve_folder_scope(dir)? else {
+        return Ok(());
+    };
+    let same_dir = match (
+        std::fs::canonicalize(&scope.dir),
+        std::fs::canonicalize(dir),
+    ) {
+        (Ok(scoped), Ok(at)) => scoped == at,
+        _ => false,
+    };
+    let bound = scope
+        .identity
+        .as_deref()
+        .is_some_and(|identity| identity.eq_ignore_ascii_case(name));
+    if !same_dir || !bound {
+        return Ok(());
+    }
+    let copy = WorkingCopy::open(stores, &scope.owner, &scope.name, dir)?;
+    copy.carry_base(&scope.address())?;
+    Ok(())
+}
+
 /// `syns unshare PATH [--repo OWNER/NAME] [--yes]` (SPEC u300 Behaviour,
 /// `cmd_unshare`).
 pub async fn cmd_unshare(
@@ -897,8 +1108,15 @@ pub async fn cmd_unshare(
     repo: Option<String>,
     yes: bool,
 ) -> Result<(), CliError> {
-    // 1 — the target.
-    let target = bind_share_target(&path, repo.as_deref())?;
+    // 1 — the target; SPEC u334 `cmd_unshare` 2 — under `--repo`, the
+    // folder's directory in the checkout of that holder the run stands in.
+    let mut target = bind_share_target(&path, repo.as_deref())?;
+    if repo.is_some() {
+        target.dir = current_dir()
+            .ok()
+            .and_then(|cwd| holder_checkout_at(&cwd, &target.holder))
+            .map(|checkout| checkout.join(&target.path));
+    }
 
     // 2 — the credential.
     let token = TokenStore::new(config.credentials_path())
@@ -958,6 +1176,35 @@ pub async fn cmd_unshare(
         Err(err) if is_not_shared(err) => Some(true),
         Err(_) => None,
     };
+
+    // SPEC u334 `cmd_unshare` 3 and 4 — where the removal retired the
+    // identity, the base its copy at a folder bound to it records carried
+    // to the holder's copy there, then the folder's identity file settled
+    // (Q-03: nothing where the lookup could not be read).
+    if retired == Some(true)
+        && let Some(dir) = target.dir.as_deref()
+    {
+        let warning = match carry_identity_base(config.stores(), dir, &identity.name) {
+            Ok(()) => {
+                settle_identity_file(
+                    config.stores(),
+                    &client,
+                    &token,
+                    &target,
+                    &identity.name,
+                    false,
+                )
+                .await
+            }
+            Err(_) => {
+                let owner = target.holder.split('/').next().unwrap_or(&target.holder);
+                Some(unshare_identity_file_warning(dir, owner, &identity.name))
+            }
+        };
+        if let Some(warning) = warning {
+            eprintln!("{warning}");
+        }
+    }
 
     // 6 — the document, or the report.
     let named = format!("{}/{}", identity.owner, identity.name);

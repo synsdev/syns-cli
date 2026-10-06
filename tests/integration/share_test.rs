@@ -9,7 +9,12 @@
 //! command inside a folder addressing its identity or refused as not
 //! shared, and the folder's identity file settled by a share or a marking,
 //! found converged by the next sync, and where an edit was left standing
-//! stopping the next sync for its resolution (SPEC u333 Tests).
+//! stopping the next sync for its resolution (SPEC u333 Tests); and the
+//! folder's identity file settled by an unshare that retired its
+//! identity, the settled version laid on the base of every copy enclosing
+//! the folder so a later unshare or re-share elsewhere reaches the next
+//! sync with nothing published, and a folder checked out alone carrying
+//! its identity's base to the holder's copy (SPEC u334 Tests).
 //!
 //! Every binary row of those tables stands here under the name the table
 //! gives it; `share_name_problem_weighs_the_repository_name_kind`,
@@ -728,7 +733,9 @@ fn share_lines_report_on_the_diagnostic_stream_and_name_the_identity() {
     );
     // SPEC u333 `settle_identity_file` 5: none of these folders stands on
     // disk, so a share or a lookup finding one standing also writes the
-    // identity file warning line, which `reports` leaves aside.
+    // identity file warning line, and SPEC u334 `cmd_unshare` 4 an unshare
+    // retiring one the unshare identity file warning line, both of which
+    // `reports` leaves aside.
     let expect = |args: &[&str], stdout: &str, stderr: &str| {
         let out = d.run(args);
         assert_eq!(exit_of(&out), 0, "{args:?}: {}", stderr_of(&out));
@@ -792,8 +799,8 @@ fn share_lines_report_on_the_diagnostic_stream_and_name_the_identity() {
     );
 }
 
-/// The diagnostic stream of `out` with every identity file warning line
-/// left aside.
+/// The diagnostic stream of `out` with every identity file warning line,
+/// a share's and an unshare's, left aside.
 fn reports(out: &std::process::Output) -> String {
     stderr_of(out)
         .lines()
@@ -1801,6 +1808,9 @@ fn the_share_name_help_names_a_markings_default_in_a_private_holder() {
 const B0: &str = "holder: alice/docs\npath: q3-plan\n";
 /// `B1` of SPEC u333 Tests: the folder's identity file the share wrote.
 const B1: &str = "holder: alice/docs\npath: q3-plan\nshared_as: docs-q3-plan\n";
+/// `B2` of SPEC u334 Tests: the folder's identity file a re-share under
+/// `docs-plan` wrote.
+const B2: &str = "holder: alice/docs\npath: q3-plan\nshared_as: docs-plan\n";
 
 const IDENTITY_COLLABORATORS: &str = "/api/v1/repos/alice/docs-q3-plan/collaborators";
 const Q3_PLAN_LOOKUP: &str = "/api/v1/repos/alice/docs/shares/q3-plan";
@@ -2375,6 +2385,8 @@ fn a_marking_settles_the_folder_identity_file() {
 
 const SYNC_H1: &str = "1111111111111111111111111111111111111111";
 const SYNC_H2: &str = "2222222222222222222222222222222222222222";
+const SYNC_H3: &str = "3333333333333333333333333333333333333333";
+const SYNC_H4: &str = "4444444444444444444444444444444444444444";
 
 /// One commit of `alice/docs`: its version, its hash and its files.
 struct DocsCommit {
@@ -2722,4 +2734,624 @@ fn files_in(dir: &Path) -> Vec<(String, Vec<u8>)> {
     walk(dir, dir, &mut out);
     out.sort();
     out
+}
+
+// ---- the unshare's identity file, and the bases a settling lays (SPEC u334)
+
+/// The run's store roots over the deployment's cache, as the binary
+/// resolves them under `SYNS_CACHE_DIR`.
+fn stores_of(d: &Deployment) -> syns_cli::config::StoreRoots {
+    syns_cli::config::StoreRoots::resolve(Some(d.cache.path()), d.cache.path(), d.cache.path())
+}
+
+/// Each path of `files` beside the hash `blob_sha1` answers for its bytes.
+fn hashed(
+    files: &std::collections::BTreeMap<String, Vec<u8>>,
+) -> std::collections::HashMap<String, String> {
+    files
+        .iter()
+        .map(|(place, bytes)| (place.clone(), syns_cli::push::hash::blob_sha1(bytes)))
+        .collect()
+}
+
+/// The base the copy of `owner/name` at `root` records, read where it
+/// stands.
+fn base_of(
+    d: &Deployment,
+    owner: &str,
+    name: &str,
+    root: &Path,
+) -> syns_cli::push::manifest::Manifest {
+    syns_cli::push::working_copy::WorkingCopy::open_existing(&stores_of(d), owner, name, root)
+        .expect("open")
+        .expect("the copy")
+        .base()
+        .expect("a base")
+}
+
+/// The answers a responder gives in turn, the last standing once the rest
+/// are spent.
+struct InTurn(Vec<ResponseTemplate>, std::sync::atomic::AtomicUsize);
+
+impl InTurn {
+    fn new(answers: Vec<ResponseTemplate>) -> InTurn {
+        InTurn(answers, std::sync::atomic::AtomicUsize::new(0))
+    }
+}
+
+impl wiremock::Respond for InTurn {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        let turn = self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.0[turn.min(self.0.len() - 1)].clone()
+    }
+}
+
+/// One `EP-versions` page of `alice/docs` at `q3-plan/.syns.yaml` listing
+/// `version` at `sha` over `parent`.
+fn identity_file_version(version: u32, sha: &str, parent: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "data": [{
+            "version": version, "sha": sha, "parentSha": parent, "message": "m",
+            "messageBody": null, "author": "alice",
+            "createdAt": "2026-10-06T00:00:00Z",
+            "filesChanged": ["q3-plan/.syns.yaml"],
+        }],
+        "total": version, "limit": 1, "offset": 0,
+    }))
+}
+
+/// The raw `q3-plan/.syns.yaml` of `alice/docs` at `reference` answering
+/// `bytes`.
+fn serve_identity_file_at(d: &Deployment, reference: &str, bytes: &str) {
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path(Q3_PLAN_RAW))
+            .and(query_param("ref", reference.to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.as_bytes().to_vec())),
+    );
+}
+
+/// The unshare preamble of SPEC u334 Tests, copied from
+/// `serve_identity_file_versions`: `EP-versions` at `q3-plan/.syns.yaml`
+/// answering version `3`, `h3`, over `h2`; the raw file at `ref=h3`
+/// answering `B0` and at `ref=h2` `B1`; the first lookup at `q3-plan`
+/// answering `200` naming `alice/docs-q3-plan`, every later one `after`;
+/// and the removal `204`.
+fn serve_unshare(d: &Deployment, after: ResponseTemplate) {
+    d.until_the_removal(
+        Q3_PLAN_LOOKUP,
+        ResponseTemplate::new(200).set_body_json(record("alice", "docs-q3-plan", true)),
+        after,
+    );
+    d.serves("DELETE", Q3_PLAN_LOOKUP, ResponseTemplate::new(204));
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/docs/versions"))
+            .and(query_param("path", "q3-plan/.syns.yaml"))
+            .respond_with(identity_file_version(3, "h3", "h2")),
+    );
+    serve_identity_file_at(d, "h3", B0);
+    serve_identity_file_at(d, "h2", B1);
+}
+
+/// The unshare identity file warning line for the folder at `dir`
+/// retiring `alice/docs-q3-plan`.
+fn unshare_warning(dir: &Path) -> String {
+    format!(
+        "warning: {}/.syns.yaml was left as it stood and not as the holder's version retiring alice/docs-q3-plan leaves it; syns sync takes it in, stopping for a resolution where that file holds an edit not yet published",
+        dir.display()
+    )
+}
+
+/// Every versions or raw request sent, as `METHOD path`.
+fn settling_reads(d: &Deployment) -> Vec<String> {
+    request_lines(d)
+        .into_iter()
+        .filter(|line| line.contains("/versions") || line.contains("/raw/"))
+        .collect()
+}
+
+// SPEC u334 Tests, the row of this name.
+#[test]
+#[serial]
+fn an_unshare_leaves_the_folder_identity_file_as_the_holder_holds_it() {
+    let d = w_deployment();
+    serve_unshare(&d, refusal(404, "not_found"));
+    let folder = d.w.join("q3-plan");
+
+    let out = d.run_in(&folder, &["unshare", ".", "--yes", "--json"]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(document(&out)["retired"], true);
+    assert!(!stderr_of(&out).contains("warning:"), "{}", stderr_of(&out));
+    assert_eq!(identity_file(&d), B0.as_bytes());
+
+    let sent = d.requests().len();
+    let listing = d.run_in(&folder, &["collaborators"]);
+    assert_eq!(exit_of(&listing), 2, "{}", stderr_of(&listing));
+    assert_eq!(
+        stderr_of(&listing).trim_end(),
+        not_shared_line("syns collaborators", &folder)
+    );
+    assert_eq!(d.requests().len(), sent);
+}
+
+// SPEC u334 Tests, the row of this name.
+#[test]
+#[serial]
+fn an_unshare_leaves_an_edited_identity_file_and_names_it() {
+    let d = w_deployment();
+    let edited = format!("{B1}checks: [lint]\n");
+    write(&d.w.join("q3-plan/.syns.yaml"), &edited);
+    serve_unshare(&d, refusal(404, "not_found"));
+
+    let out = d.run(&["unshare", "q3-plan", "--yes", "--json"]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(document(&out)["retired"], true);
+    assert_eq!(identity_file(&d), edited.as_bytes());
+    assert!(
+        stderr_of(&out)
+            .lines()
+            .any(|line| line == unshare_warning(&d.w.join("q3-plan"))),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
+// SPEC u334 Tests, the row of this name.
+#[test]
+#[serial]
+fn an_unshare_answered_on_by_its_own_visibility_writes_no_file() {
+    let d = w_deployment();
+    serve_unshare(
+        &d,
+        ResponseTemplate::new(200).set_body_json(record("alice", "docs-q3-plan", true)),
+    );
+
+    let out = d.run(&["unshare", "q3-plan", "--yes", "--json"]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(document(&out)["retired"], false);
+    assert!(settling_reads(&d).is_empty(), "{:?}", settling_reads(&d));
+    assert_eq!(identity_file(&d), B1.as_bytes());
+}
+
+// SPEC u334 Tests, the row of this name.
+#[test]
+#[serial]
+fn an_unshare_naming_its_holder_inside_its_checkout_settles_the_file() {
+    let d = w_deployment();
+    serve_unshare(&d, refusal(404, "not_found"));
+
+    let out = d.run(&[
+        "unshare",
+        "q3-plan",
+        "--repo",
+        "alice/docs",
+        "--yes",
+        "--json",
+    ]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(identity_file(&d), B0.as_bytes());
+}
+
+// SPEC u334 Tests, the row of this name.
+#[test]
+#[serial]
+fn an_unshare_naming_its_holder_outside_any_checkout_of_it_writes_no_file() {
+    let d = w_deployment();
+    serve_unshare(&d, refusal(404, "not_found"));
+    let o = tempfile::tempdir().expect("O");
+    let o_dir = std::fs::canonicalize(o.path()).expect("canonical O");
+
+    let out = d.run_in(
+        &o_dir,
+        &[
+            "unshare",
+            "q3-plan",
+            "--repo",
+            "alice/docs",
+            "--yes",
+            "--json",
+        ],
+    );
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert!(settling_reads(&d).is_empty(), "{:?}", settling_reads(&d));
+    assert_eq!(identity_file(&d), B1.as_bytes());
+}
+
+// SPEC u334 Tests, the row of this name.
+#[test]
+#[serial]
+fn an_unshare_whose_second_lookup_is_unread_writes_no_file() {
+    let d = w_deployment();
+    serve_unshare(&d, refusal(500, "internal_error"));
+
+    let out = d.run(&["unshare", "q3-plan", "--yes", "--json"]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(document(&out)["retired"], Value::Null);
+    assert!(settling_reads(&d).is_empty(), "{:?}", settling_reads(&d));
+    assert_eq!(identity_file(&d), B1.as_bytes());
+}
+
+// SPEC u334 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_share_lays_its_identity_file_on_the_checkouts_base() {
+    let d = first_share_deployment();
+    let on_disk: std::collections::BTreeMap<String, Vec<u8>> = files_in(&d.w).into_iter().collect();
+    let copy =
+        syns_cli::push::working_copy::WorkingCopy::open(&stores_of(&d), "alice", "docs", &d.w)
+            .expect("the holder copy");
+    copy.record_base("h1", hashed(&on_disk)).expect("a base");
+
+    let out = d.run(&["share", "q3-plan", "--json"]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(identity_file(&d), B1.as_bytes());
+    let base = base_of(&d, "alice", "docs", &d.w);
+    assert_eq!(base.commit_sha(), Some("h2"));
+    let mut expected = on_disk.clone();
+    expected.insert("q3-plan/.syns.yaml".into(), B1.as_bytes().to_vec());
+    for (place, sha) in hashed(&expected) {
+        assert_eq!(base.file_sha(&place), Some(sha.as_str()), "{place}");
+    }
+    assert_eq!(base.file_paths().count(), expected.len());
+}
+
+/// `W` of SPEC u334 Tests after a share here and an unshare elsewhere:
+/// `W/q3-plan/.syns.yaml` holding `B1`, `W`'s copy recording base `h2`
+/// carrying it at `#B1`, and `DocsServer` at priority `6` holding `h2`,
+/// a head `h3` differing from it only by that file at `#B0`, and `more`
+/// after it.
+fn unshared_elsewhere_deployment(
+    more: Vec<(u32, &'static str, &'static str)>,
+) -> (Deployment, std::collections::BTreeMap<String, Vec<u8>>) {
+    let d = w_deployment();
+    let at_h2: std::collections::BTreeMap<String, Vec<u8>> = files_in(&d.w).into_iter().collect();
+    let with = |bytes: &str| {
+        let mut tree = at_h2.clone();
+        tree.insert("q3-plan/.syns.yaml".into(), bytes.as_bytes().to_vec());
+        tree
+    };
+    let mut commits = vec![
+        DocsCommit {
+            version: 2,
+            sha: SYNC_H2,
+            tree: at_h2.clone(),
+        },
+        DocsCommit {
+            version: 3,
+            sha: SYNC_H3,
+            tree: with(B0),
+        },
+    ];
+    for (version, sha, bytes) in more {
+        commits.push(DocsCommit {
+            version,
+            sha,
+            tree: with(bytes),
+        });
+    }
+    d.mount(
+        Mock::given(wiremock::matchers::any())
+            .respond_with(DocsServer(commits))
+            .with_priority(6),
+    );
+    syns_cli::push::working_copy::WorkingCopy::open(&stores_of(&d), "alice", "docs", &d.w)
+        .expect("the holder copy")
+        .record_base(SYNC_H2, hashed(&at_h2))
+        .expect("a base");
+    (d, at_h2)
+}
+
+// SPEC u334 Tests, the row of this name.
+#[test]
+#[serial]
+fn an_unshare_elsewhere_after_a_share_here_syncs_clean() {
+    let (d, _) = unshared_elsewhere_deployment(Vec::new());
+
+    let sync = d.run(&["--json", "sync"]);
+
+    assert_eq!(exit_of(&sync), 0, "{}", stderr_of(&sync));
+    assert!(
+        document(&sync).get("recoveryId").is_none(),
+        "{}",
+        stdout_of(&sync)
+    );
+    assert!(
+        !request_lines(&d).contains(&"PUT /api/v1/repos/alice/docs/push".to_string()),
+        "{:?}",
+        request_lines(&d)
+    );
+    assert_eq!(identity_file(&d), B0.as_bytes());
+
+    let folder = d.w.join("q3-plan");
+    let listing = d.run_in(&folder, &["collaborators"]);
+    assert_eq!(exit_of(&listing), 2, "{}", stderr_of(&listing));
+    assert_eq!(
+        stderr_of(&listing).trim_end(),
+        not_shared_line("syns collaborators", &folder)
+    );
+}
+
+/// A `200` collaborator listing holding one collaborator.
+fn listing() -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_string(format!(
+        r#"{{"data":[{COLLABORATOR}],"total":1,"limit":100,"offset":0}}"#
+    ))
+}
+
+// SPEC u334 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_reshare_after_an_unshare_elsewhere_records_the_new_name() {
+    let (d, _) = unshared_elsewhere_deployment(vec![(4, SYNC_H4, B2)]);
+    d.serves("GET", Q3_PLAN_LOOKUP, refusal(404, "not_found"));
+    d.serves(
+        "POST",
+        "/api/v1/repos/alice/docs/shares",
+        ResponseTemplate::new(201).set_body_json(record("alice", "docs-plan", true)),
+    );
+    d.serves(
+        "GET",
+        "/api/v1/repos/alice/docs-plan/collaborators",
+        listing(),
+    );
+    d.serves("GET", IDENTITY_COLLABORATORS, listing());
+
+    let share = d.run(&["share", "q3-plan", "--name", "docs-plan", "--json"]);
+
+    assert_eq!(exit_of(&share), 0, "{}", stderr_of(&share));
+    assert!(
+        !stderr_of(&share).contains("warning:"),
+        "{}",
+        stderr_of(&share)
+    );
+    assert_eq!(identity_file(&d), B2.as_bytes());
+    assert_eq!(
+        base_of(&d, "alice", "docs", &d.w).file_sha("q3-plan/.syns.yaml"),
+        Some(syns_cli::push::hash::blob_sha1(B2.as_bytes()).as_str())
+    );
+
+    let listed = d.run_in(&d.w.join("q3-plan"), &["--json", "collaborators"]);
+    assert_eq!(exit_of(&listed), 0, "{}", stderr_of(&listed));
+    assert_eq!(
+        d.sent("GET").last(),
+        Some(&"/api/v1/repos/alice/docs-plan/collaborators".to_string())
+    );
+
+    let sync = d.run(&["--json", "sync"]);
+    assert_eq!(exit_of(&sync), 0, "{}", stderr_of(&sync));
+    assert!(
+        document(&sync).get("recoveryId").is_none(),
+        "{}",
+        stdout_of(&sync)
+    );
+    assert!(
+        !request_lines(&d).contains(&"PUT /api/v1/repos/alice/docs/push".to_string()),
+        "{:?}",
+        request_lines(&d)
+    );
+    assert_eq!(identity_file(&d), B2.as_bytes());
+}
+
+// SPEC u334 Tests, the row of this name.
+#[test]
+#[serial]
+fn share_unshare_and_reshare_under_another_name_follow_the_current_identity() {
+    let d = w_deployment();
+    write(&d.w.join("q3-plan/.syns.yaml"), B0);
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path(Q3_PLAN_LOOKUP))
+            .respond_with(InTurn::new(vec![
+                refusal(404, "not_found"),
+                ResponseTemplate::new(200).set_body_json(record("alice", "docs-q3-plan", true)),
+                refusal(404, "not_found"),
+                refusal(404, "not_found"),
+            ])),
+    );
+    d.mount(
+        Mock::given(method("POST"))
+            .and(path("/api/v1/repos/alice/docs/shares"))
+            .respond_with(InTurn::new(vec![
+                ResponseTemplate::new(201).set_body_json(record("alice", "docs-q3-plan", true)),
+                ResponseTemplate::new(201).set_body_json(record("alice", "docs-plan", true)),
+            ])),
+    );
+    d.serves("DELETE", Q3_PLAN_LOOKUP, ResponseTemplate::new(204));
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/docs/versions"))
+            .and(query_param("path", "q3-plan/.syns.yaml"))
+            .respond_with(InTurn::new(vec![
+                identity_file_version(2, "h2", "h1"),
+                identity_file_version(3, "h3", "h2"),
+                identity_file_version(4, "h4", "h3"),
+            ])),
+    );
+    for (reference, bytes) in [("h1", B0), ("h2", B1), ("h3", B0), ("h4", B2)] {
+        serve_identity_file_at(&d, reference, bytes);
+    }
+    d.serves(
+        "GET",
+        "/api/v1/repos/alice/docs-plan/collaborators",
+        listing(),
+    );
+    d.serves("GET", IDENTITY_COLLABORATORS, listing());
+
+    for (args, settled) in [
+        (vec!["share", "q3-plan", "--json"], B1),
+        (vec!["unshare", "q3-plan", "--yes", "--json"], B0),
+        (
+            vec!["share", "q3-plan", "--name", "docs-plan", "--json"],
+            B2,
+        ),
+    ] {
+        let out = d.run(&args);
+        assert_eq!(exit_of(&out), 0, "{args:?}: {}", stderr_of(&out));
+        assert_eq!(
+            String::from_utf8_lossy(&identity_file(&d)),
+            settled,
+            "{args:?}: {}",
+            stderr_of(&out)
+        );
+    }
+
+    let listed = d.run_in(&d.w.join("q3-plan"), &["--json", "collaborators"]);
+    assert_eq!(exit_of(&listed), 0, "{}", stderr_of(&listed));
+    let listings: Vec<String> = d
+        .sent("GET")
+        .into_iter()
+        .filter(|p| p.ends_with("/collaborators"))
+        .collect();
+    assert_eq!(
+        listings,
+        vec!["/api/v1/repos/alice/docs-plan/collaborators"]
+    );
+}
+
+/// `F` of SPEC u334 Tests: the working directory of a deployment with no
+/// checkout above it, checked out alone through `alice/docs-q3-plan` —
+/// `F/.syns.yaml` holding `B1` and `F/doc.md` holding `doc`, the
+/// identity's copy at `F` recording base `h2` with `doc.md` at the hash
+/// of `line one\n` and `.syns.yaml` at `#B1`, the holder's copy there
+/// recording none — and `DocsServer` holding `h2`, and a head `h3`
+/// differing from it only by `q3-plan/.syns.yaml` at `#B0`; the unshare's
+/// lookups and removal as `serve_unshare` gives them, the second lookup
+/// answering `404`.
+fn checked_out_alone(doc: &str) -> Deployment {
+    let d = Deployment::new(None);
+    write(&d.w.join(".syns.yaml"), B1);
+    write(&d.w.join("doc.md"), doc);
+    let at_h2: std::collections::BTreeMap<String, Vec<u8>> = [
+        ("q3-plan/.syns.yaml".to_string(), B1.as_bytes().to_vec()),
+        ("q3-plan/doc.md".to_string(), b"line one\n".to_vec()),
+    ]
+    .into_iter()
+    .collect();
+    let mut at_h3 = at_h2.clone();
+    at_h3.insert("q3-plan/.syns.yaml".into(), B0.as_bytes().to_vec());
+    d.mount(
+        Mock::given(wiremock::matchers::any())
+            .respond_with(DocsServer(vec![
+                DocsCommit {
+                    version: 2,
+                    sha: SYNC_H2,
+                    tree: at_h2,
+                },
+                DocsCommit {
+                    version: 3,
+                    sha: SYNC_H3,
+                    tree: at_h3,
+                },
+            ]))
+            .with_priority(6),
+    );
+    d.until_the_removal(
+        Q3_PLAN_LOOKUP,
+        ResponseTemplate::new(200).set_body_json(record("alice", "docs-q3-plan", true)),
+        refusal(404, "not_found"),
+    );
+    d.serves("DELETE", Q3_PLAN_LOOKUP, ResponseTemplate::new(204));
+    syns_cli::push::working_copy::WorkingCopy::open(&stores_of(&d), "alice", "docs-q3-plan", &d.w)
+        .expect("the identity copy")
+        .record_base(
+            SYNC_H2,
+            [
+                (
+                    ".syns.yaml".to_string(),
+                    syns_cli::push::hash::blob_sha1(B1.as_bytes()),
+                ),
+                (
+                    "doc.md".to_string(),
+                    syns_cli::push::hash::blob_sha1(b"line one\n"),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .expect("a base");
+    d
+}
+
+// SPEC u334 Tests, the row of this name.
+#[test]
+#[serial]
+fn an_unshare_in_a_folder_checked_out_alone_carries_its_base() {
+    let d = checked_out_alone("line one\nline two\n");
+
+    let unshare = d.run(&["unshare", ".", "--yes", "--json"]);
+
+    assert_eq!(exit_of(&unshare), 0, "{}", stderr_of(&unshare));
+    assert_eq!(
+        std::fs::read(d.w.join(".syns.yaml")).expect("F/.syns.yaml"),
+        B0.as_bytes()
+    );
+    let base = base_of(&d, "alice", "docs", &d.w);
+    assert_eq!(base.commit_sha(), Some(SYNC_H3));
+    assert_eq!(
+        base.file_sha(".syns.yaml"),
+        Some(syns_cli::push::hash::blob_sha1(B0.as_bytes()).as_str())
+    );
+
+    // The base carried and laid at the head, the next sync takes `doc.md`
+    // as the one local path and publishes it over `h3` with no collision
+    // and no review stop; the deployment refuses the publication, which
+    // leaves the file as it stood.
+    let sync = d.run(&["--json", "sync"]);
+    let document = document(&sync);
+    assert!(document.get("resolution").is_none(), "{document}");
+    let pushes: Vec<Value> = d
+        .requests()
+        .into_iter()
+        .filter(|r| r.method.as_str() == "PUT" && r.url.path() == "/api/v1/repos/alice/docs/push")
+        .map(|r| serde_json::from_slice(&r.body).expect("a JSON body"))
+        .collect();
+    assert_eq!(pushes.len(), 1, "{document}");
+    assert_eq!(pushes[0]["parentSha"], SYNC_H3);
+    let carried: Vec<&str> = pushes[0]["files"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .filter(|file| file.get("content").is_some())
+        .map(|file| file["path"].as_str().expect("a path"))
+        .collect();
+    assert_eq!(carried, vec!["q3-plan/doc.md"], "{}", pushes[0]);
+    let doc = std::fs::read_to_string(d.w.join("doc.md")).expect("F/doc.md");
+    assert_eq!(doc, "line one\nline two\n");
+    assert!(!doc.lines().any(|line| line.starts_with("<<<<<<<")));
+}
+
+// SPEC u334 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_folder_checked_out_alone_and_unshared_with_no_edit_syncs_clean() {
+    let d = checked_out_alone("line one\n");
+
+    let unshare = d.run(&["unshare", ".", "--yes", "--json"]);
+    assert_eq!(exit_of(&unshare), 0, "{}", stderr_of(&unshare));
+
+    let sync = d.run(&["--json", "sync"]);
+
+    assert_eq!(exit_of(&sync), 0, "{}", stderr_of(&sync));
+    assert!(
+        document(&sync).get("recoveryId").is_none(),
+        "{}",
+        stdout_of(&sync)
+    );
+    assert!(
+        !request_lines(&d).iter().any(|line| line.ends_with("/push")),
+        "{:?}",
+        request_lines(&d)
+    );
+    assert_eq!(
+        base_of(&d, "alice", "docs", &d.w).commit_sha(),
+        Some(SYNC_H3)
+    );
 }

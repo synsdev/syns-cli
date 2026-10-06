@@ -1221,9 +1221,7 @@ impl SynsClient {
     pub fn new(server_url: &str) -> Result<SynsClient, CliError> {
         if !server_url.starts_with("https://") && !crate::config::is_localhost_url(server_url) {
             return Err(CliError::Config {
-                message:
-                    "HTTPS required for server URL (http://localhost permitted for development)"
-                        .to_string(),
+                message: crate::config::HTTPS_REQUIRED.to_string(),
             });
         }
 
@@ -2549,7 +2547,9 @@ mod tests {
     #[test]
     fn new_rejects_plain_http() {
         let err = SynsClient::new("http://example.com").unwrap_err();
-        assert!(matches!(err, CliError::Config { ref message } if message.contains("HTTPS")));
+        assert!(
+            matches!(err, CliError::Config { ref message } if message == crate::config::HTTPS_REQUIRED)
+        );
     }
 
     #[test]
