@@ -9,6 +9,7 @@ mod explore_test;
 mod folder_scope_test;
 mod folder_working_copy_test;
 mod history_file_test;
+mod identifier_segment_test;
 mod identity_checkout_test;
 mod if_repo_test;
 mod place_test;

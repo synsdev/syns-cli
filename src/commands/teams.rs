@@ -1,7 +1,7 @@
 use crate::auth::token::TokenStore;
 use crate::client::{
     ChangeRoleRequest, CollaboratorRole, CreateTeamRequest, InviteRequest, SynsClient,
-    TeamRepoAccessRequest, TeamRole, UpdateTeamRequest,
+    TeamRepoAccessRequest, TeamRole, UpdateTeamRequest, address_segment,
 };
 use crate::config::Config;
 use crate::errors::CliError;
@@ -162,6 +162,14 @@ fn parse_repo_string(repo: &str) -> Result<(&str, &str), CliError> {
             ),
         }),
     }
+}
+
+/// Each half of `OWNER/REPO` weighed as one address segment (SPEC u333
+/// Behaviour, `cmd_teams` 1).
+fn weigh_repo_halves(owner: &str, name: &str) -> Result<(), CliError> {
+    address_segment("OWNER/REPO", owner)?;
+    address_segment("OWNER/REPO", name)?;
+    Ok(())
 }
 
 async fn resolve_team_id(
@@ -492,10 +500,13 @@ pub async fn cmd_teams(
             }
         }
         Some(TeamsAction::Accept { invitation_id }) => {
+            // SPEC u333 `cmd_teams` 1 — the identifier weighed first.
+            address_segment("INVITATION_ID", &invitation_id)?;
             let (response, raw) = client.accept_invitation(&token, &invitation_id).await?;
             display_member(output, &response, &raw);
         }
         Some(TeamsAction::Decline { invitation_id }) => {
+            address_segment("INVITATION_ID", &invitation_id)?;
             client.decline_invitation(&token, &invitation_id).await?;
             if output.is_json() {
                 output.json(&json!({"declined": true, "invitationId": invitation_id}));
@@ -539,8 +550,11 @@ pub async fn cmd_teams(
         }
         Some(TeamsAction::AddRepo { name, repo, role }) => {
             let parsed_role = parse_repo_access_role(&role)?;
-            let team_id = resolve_team_id(&client, &token, &name, output).await?;
+            // SPEC u333 `cmd_teams` 1 — both halves weighed before the
+            // team is resolved.
             let (repo_owner, repo_name) = parse_repo_string(&repo)?;
+            weigh_repo_halves(repo_owner, repo_name)?;
+            let team_id = resolve_team_id(&client, &token, &name, output).await?;
             let request = TeamRepoAccessRequest { role: parsed_role };
             let (response, raw) = client
                 .add_team_repo(&token, &team_id, repo_owner, repo_name, &request)
@@ -576,6 +590,7 @@ pub async fn cmd_teams(
         }
         Some(TeamsAction::RemoveRepo { name, repo, yes }) => {
             let (repo_owner, repo_name) = parse_repo_string(&repo)?;
+            weigh_repo_halves(repo_owner, repo_name)?;
             let team_id = resolve_team_id(&client, &token, &name, output).await?;
             let prompt = format!(
                 "Remove repository access for '{}' from team '{}'? [y/N]: ",

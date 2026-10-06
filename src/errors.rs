@@ -51,6 +51,16 @@ pub enum CliError {
         dir: std::path::PathBuf,
         visibility: String,
     },
+    /// SPEC u333, the not-shared refusal (`D-124`, Q-01): a collaborator
+    /// command run inside a folder bound to its holder whose own identity
+    /// file records no `shared_as`, refused before any credential read or
+    /// request under the holder-acting refusal's code. `command`, `holder`
+    /// and `dir` as `HolderActing` carries them.
+    FolderNotShared {
+        command: String,
+        holder: String,
+        dir: std::path::PathBuf,
+    },
     /// SPEC u290, the misplaced-folder refusal (`D-101`): a folder whose
     /// place under its holder's checkout at `checkout` differs from the
     /// path it records. SPEC u291: `back` is the absolute directory the
@@ -299,6 +309,7 @@ impl CliError {
             CliError::PathBelongsToAnotherRepository { .. } => 2,
             CliError::HolderActing { .. } => 2,
             CliError::FolderVisibilityRedirect { .. } => 2,
+            CliError::FolderNotShared { .. } => 2,
             CliError::FolderMoved { .. } => 2,
             CliError::FolderInAnotherCheckout { .. } => 2,
             CliError::ServerUnreachable { .. } => 3,
@@ -500,6 +511,15 @@ impl std::fmt::Display for CliError {
             } => write!(
                 f,
                 "holder root required: {command} acts on the holding repository {holder}, not on the folder {} \u{2014} run it from the root of a checkout of {holder}",
+                dir.display()
+            ),
+            CliError::FolderNotShared {
+                command,
+                holder,
+                dir,
+            } => write!(
+                f,
+                "holder root required: {command} acts on a shared folder's own people, and the folder {} of {holder} is not shared \u{2014} share it with: syns share .",
                 dir.display()
             ),
             CliError::FolderVisibilityRedirect {
@@ -1097,6 +1117,23 @@ mod tests {
             assert_eq!(err.exit_code(), 2);
             assert!(err.json_value().is_none());
         }
+    }
+
+    // SPEC u333 Contract Surface, the not-shared refusal line (Q-01):
+    // the line whole, at exit `2`, under the generic error document.
+    #[test]
+    fn the_not_shared_refusal_renders_its_line_whole() {
+        let refusal = CliError::FolderNotShared {
+            command: "syns collaborators".into(),
+            holder: "alice/docs".into(),
+            dir: std::path::PathBuf::from("/w/budget"),
+        };
+        assert_eq!(
+            refusal.to_string(),
+            "holder root required: syns collaborators acts on a shared folder's own people, and the folder /w/budget of alice/docs is not shared \u{2014} share it with: syns share ."
+        );
+        assert_eq!(refusal.exit_code(), 2);
+        assert!(refusal.json_value().is_none());
     }
 
     // SPEC u329 Contract Surface, the folder visibility redirect and

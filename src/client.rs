@@ -772,6 +772,21 @@ fn share_url(base_url: &str, holder: &str, path: &str) -> String {
     )
 }
 
+/// One typed or served identifier as a single segment of an address
+/// (SPEC u333 Contract Surface, `address_segment`, issue 258): an empty,
+/// `.` or `..` value refused as `CONFIG_ERROR` before any request, since a
+/// URL parser folds a dot segment and its `%2e` spellings alike, and every
+/// other value answered with each byte outside the unreserved set
+/// percent-encoded, `/` and `%` among them.
+pub(crate) fn address_segment(label: &str, value: &str) -> Result<String, CliError> {
+    if matches!(value, "" | "." | "..") {
+        return Err(CliError::Config {
+            message: format!("{label} cannot be empty, . or .. (got '{value}')"),
+        });
+    }
+    Ok(urlencoding::encode(value).into_owned())
+}
+
 fn encode_path_segments(path: &str) -> String {
     path.split('/')
         .filter(|segment| !segment.is_empty())
@@ -1655,7 +1670,7 @@ impl SynsClient {
             "{}/api/v1/repos/{}/collaborators/{}",
             self.base_url,
             repo_id,
-            urlencoding::encode(user_id)
+            address_segment("USER_ID", user_id)?
         );
         let response = self
             .client
@@ -1684,7 +1699,7 @@ impl SynsClient {
             "{}/api/v1/repos/{}/collaborators/{}",
             self.base_url,
             repo_id,
-            urlencoding::encode(user_id)
+            address_segment("USER_ID", user_id)?
         );
         let response = self
             .client
@@ -1870,7 +1885,7 @@ impl SynsClient {
         let url = format!(
             "{}/api/v1/users/{}",
             self.base_url,
-            urlencoding::encode(username)
+            address_segment("USERNAME", username)?
         );
         let mut req = self.client.get(&url);
         if let Some(t) = token {
@@ -1910,7 +1925,7 @@ impl SynsClient {
                 sort_order,
             } => (
                 self.client
-                    .patch(format!("{}/{}", base, urlencoding::encode(id))),
+                    .patch(format!("{}/{}", base, address_segment("LINK_ID", id)?)),
                 json_body(&UpdateUserLinkRequest {
                     kind: kind.map(|k| k.as_wire_str().to_string()),
                     value: value.clone(),
@@ -1920,7 +1935,7 @@ impl SynsClient {
             ),
             LinksAction::Remove { id } => (
                 self.client
-                    .delete(format!("{}/{}", base, urlencoding::encode(id))),
+                    .delete(format!("{}/{}", base, address_segment("LINK_ID", id)?)),
                 None,
             ),
             LinksAction::Reorder { order } => (
@@ -2230,7 +2245,8 @@ impl SynsClient {
     ) -> Result<(TeamMemberResponse, serde_json::Value), CliError> {
         let url = format!(
             "{}/api/v1/teams/invitations/{}/accept",
-            self.base_url, invitation_id
+            self.base_url,
+            address_segment("INVITATION_ID", invitation_id)?
         );
         let response = self
             .client
@@ -2248,7 +2264,8 @@ impl SynsClient {
     ) -> Result<(), CliError> {
         let url = format!(
             "{}/api/v1/teams/invitations/{}/decline",
-            self.base_url, invitation_id
+            self.base_url,
+            address_segment("INVITATION_ID", invitation_id)?
         );
         let response = self
             .client
@@ -2271,7 +2288,10 @@ impl SynsClient {
     ) -> Result<(TeamRepoResponse, serde_json::Value), CliError> {
         let url = format!(
             "{}/api/v1/teams/{}/repos/{}/{}",
-            self.base_url, team_id, owner, name
+            self.base_url,
+            address_segment("team id", team_id)?,
+            address_segment("OWNER/REPO", owner)?,
+            address_segment("OWNER/REPO", name)?
         );
         let response = self
             .client
@@ -2291,7 +2311,10 @@ impl SynsClient {
     ) -> Result<(), CliError> {
         let url = format!(
             "{}/api/v1/teams/{}/repos/{}/{}",
-            self.base_url, team_id, owner, name
+            self.base_url,
+            address_segment("team id", team_id)?,
+            address_segment("OWNER/REPO", owner)?,
+            address_segment("OWNER/REPO", name)?
         );
         let response = self
             .client
@@ -2696,6 +2719,25 @@ mod tests {
             encode_path_segments("dir/sub dir/file #2.txt"),
             "dir/sub%20dir/file%20%232.txt"
         );
+    }
+
+    // SPEC u333 Tests, the row of this name.
+    #[test]
+    fn address_segment_refuses_dot_segments_and_encodes_the_rest() {
+        for value in ["", ".", ".."] {
+            match address_segment("USER_ID", value) {
+                Err(CliError::Config { message }) => assert_eq!(
+                    message,
+                    format!("USER_ID cannot be empty, . or .. (got '{value}')")
+                ),
+                other => panic!("{value:?}: expected the identifier refusal, got {other:?}"),
+            }
+        }
+        let answered: Vec<String> = ["...", "a/b", "%2e"]
+            .into_iter()
+            .map(|value| address_segment("USER_ID", value).expect("one segment"))
+            .collect();
+        assert_eq!(answered, vec!["...", "a%2Fb", "%252e"]);
     }
 
     #[test]

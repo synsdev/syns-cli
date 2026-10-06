@@ -5,7 +5,10 @@
 //! lookup, and keeping a marked folder's name across an unshare (SPEC
 //! u329 Tests); and a marking under a private holder naming the folder's
 //! own name where its name is held, and warning where a public identity's
-//! name shows the holder's (SPEC u332 Tests).
+//! name shows the holder's (SPEC u332 Tests); and a bare collaborator
+//! command inside a folder addressing its identity or refused as not
+//! shared, and the folder's identity file settled by a share or a marking
+//! and found converged by the next sync (SPEC u333 Tests).
 //!
 //! Every binary row of those tables stands here under the name the table
 //! gives it; `share_name_problem_weighs_the_repository_name_kind`,
@@ -14,7 +17,10 @@
 //! `a_moved_head_under_the_share_asks_no_other_name`,
 //! `offered_marking_name_keys_on_the_holder_visibility` and
 //! `carries_holder_name_matches_the_holder_name_and_a_dash_at_its_start`
-//! stand in the tests module of `src/commands/share.rs`. Each test drives one deployment of
+//! stand in the tests module of `src/commands/share.rs`,
+//! `address_segment_refuses_dot_segments_and_encodes_the_rest` in that of
+//! `src/client.rs`, and u333's identifier rows in
+//! `identifier_segment_test.rs`. Each test drives one deployment of
 //! its own: a mock answering `EP-get-repo` for the holder with `role`
 //! `owner` and `sharedFolder` `false` where the row names no other
 //! answer, a config directory holding a credential for `alice`, a cache
@@ -25,7 +31,7 @@ use assert_cmd::Command as AssertCommand;
 use serde_json::{Value, json};
 use serial_test::serial;
 use std::path::{Path, PathBuf};
-use wiremock::matchers::{method, path, path_regex};
+use wiremock::matchers::{method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 /// The name kind line `share_name_problem` writes for `name`.
@@ -719,11 +725,14 @@ fn share_lines_report_on_the_diagnostic_stream_and_name_the_identity() {
         "/api/v1/repos/alice/docs/shares/old",
         ResponseTemplate::new(204),
     );
+    // SPEC u333 `settle_identity_file` 5: none of these folders stands on
+    // disk, so a share or a lookup finding one standing also writes the
+    // identity file warning line, which `reports` leaves aside.
     let expect = |args: &[&str], stdout: &str, stderr: &str| {
         let out = d.run(args);
         assert_eq!(exit_of(&out), 0, "{args:?}: {}", stderr_of(&out));
         assert_eq!(stdout_of(&out), stdout, "{args:?}");
-        assert_eq!(stderr_of(&out), stderr, "{args:?}");
+        assert_eq!(reports(&out), stderr, "{args:?}");
     };
 
     expect(
@@ -777,9 +786,19 @@ fn share_lines_report_on_the_diagnostic_stream_and_name_the_identity() {
     assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
     assert_eq!(stdout_of(&out), "alice/work-q3-board\n");
     assert_eq!(
-        stderr_of(&out),
+        reports(&out),
         "shared clients/vela/q3-board of alice/work as alice/work-q3-board\n"
     );
+}
+
+/// The diagnostic stream of `out` with every line opening `warning: `
+/// left aside.
+fn reports(out: &std::process::Output) -> String {
+    stderr_of(out)
+        .lines()
+        .filter(|line| !line.starts_with("warning: "))
+        .map(|line| format!("{line}\n"))
+        .collect()
 }
 
 // CR1-2: the name prompt through the built binary on a terminal — not
@@ -969,7 +988,6 @@ fn collaborators_inside_a_folder_refuse_every_other_repository() {
     let add = ["collaborators", "add", "carol", "--role", "read"];
 
     for (folder, repo) in [
-        ("q3-plan", None),
         ("q3-plan", Some("alice/docs")),
         ("q3-plan", Some("alice/docs-budget")),
         ("budget", Some("alice/docs-budget")),
@@ -1772,4 +1790,749 @@ fn the_share_name_help_names_a_markings_default_in_a_private_holder() {
         "{}",
         stdout_of(&out)
     );
+}
+
+// ---- collaborators inside a shared folder, and its identity file (SPEC u333)
+
+/// `B0` of SPEC u333 Tests: the folder's identity file before the share.
+const B0: &str = "holder: alice/docs\npath: q3-plan\n";
+/// `B1` of SPEC u333 Tests: the folder's identity file the share wrote.
+const B1: &str = "holder: alice/docs\npath: q3-plan\nshared_as: docs-q3-plan\n";
+
+const IDENTITY_COLLABORATORS: &str = "/api/v1/repos/alice/docs-q3-plan/collaborators";
+const Q3_PLAN_LOOKUP: &str = "/api/v1/repos/alice/docs/shares/q3-plan";
+const Q3_PLAN_RAW: &str = "/api/v1/repos/alice/docs/raw/q3-plan/.syns.yaml";
+
+/// `W` of SPEC u333 Tests: a checkout of `alice/docs`, `W/q3-plan`'s
+/// identity file holding `B1` and `W/budget`'s recording no `shared_as`.
+fn w_deployment() -> Deployment {
+    let d = Deployment::new(Some("alice/docs"));
+    write(&d.w.join("q3-plan/.syns.yaml"), B1);
+    write(
+        &d.w.join("budget/.syns.yaml"),
+        "holder: alice/docs\npath: budget\n",
+    );
+    d
+}
+
+/// Each request as `METHOD path`.
+fn request_lines(d: &Deployment) -> Vec<String> {
+    d.requests()
+        .into_iter()
+        .map(|r| format!("{} {}", r.method, r.url.path()))
+        .collect()
+}
+
+/// The not-shared refusal line for the folder at `dir`.
+fn not_shared_line(command: &str, dir: &Path) -> String {
+    format!(
+        "error: holder root required: {command} acts on a shared folder's own people, and the folder {} of alice/docs is not shared \u{2014} share it with: syns share .",
+        dir.display()
+    )
+}
+
+// SPEC u333 Tests, the row of this name.
+#[test]
+#[serial]
+fn bare_collaborators_inside_a_shared_folder_address_its_identity() {
+    let d = w_deployment();
+    d.serves(
+        "GET",
+        IDENTITY_COLLABORATORS,
+        ResponseTemplate::new(200).set_body_string(format!(
+            r#"{{"data":[{COLLABORATOR}],"total":1,"limit":100,"offset":0}}"#
+        )),
+    );
+    d.serves("POST", IDENTITY_COLLABORATORS, ResponseTemplate::new(201));
+    d.serves(
+        "PATCH",
+        &format!("{IDENTITY_COLLABORATORS}/u-carol"),
+        ResponseTemplate::new(200).set_body_string(COLLABORATOR),
+    );
+    d.serves(
+        "DELETE",
+        &format!("{IDENTITY_COLLABORATORS}/u-carol"),
+        ResponseTemplate::new(204),
+    );
+    let folder = d.w.join("q3-plan");
+
+    for args in [
+        vec!["--json", "collaborators", "add", "carol", "--role", "read"],
+        vec!["--json", "collaborators"],
+        vec![
+            "--json",
+            "collaborators",
+            "role",
+            "u-carol",
+            "--role",
+            "write",
+        ],
+        vec!["--json", "collaborators", "remove", "u-carol", "--yes"],
+        vec![
+            "--json",
+            "collaborators",
+            "add",
+            "carol",
+            "--role",
+            "read",
+            "--repo",
+            "Alice/Docs-Q3-Plan",
+        ],
+    ] {
+        let out = d.run_in(&folder, &args);
+        assert_eq!(exit_of(&out), 0, "{args:?}: {}", stderr_of(&out));
+    }
+    let sent = request_lines(&d);
+    assert_eq!(sent.len(), 5, "{sent:?}");
+    for line in &sent {
+        let address = line.split_once(' ').expect("METHOD path").1;
+        assert!(address.starts_with(IDENTITY_COLLABORATORS), "{line}");
+        assert!(!address.starts_with("/api/v1/repos/alice/docs/"), "{line}");
+    }
+}
+
+// SPEC u333 Tests, the row of this name.
+#[test]
+#[serial]
+fn collaborators_at_the_holder_root_address_the_holder() {
+    let d = w_deployment();
+    d.serves(
+        "GET",
+        "/api/v1/repos/alice/docs/collaborators",
+        ResponseTemplate::new(200).set_body_string(format!(
+            r#"{{"data":[{COLLABORATOR}],"total":1,"limit":100,"offset":0}}"#
+        )),
+    );
+
+    let out = d.run(&["--json", "collaborators"]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(
+        request_lines(&d),
+        vec!["GET /api/v1/repos/alice/docs/collaborators".to_string()]
+    );
+}
+
+// SPEC u333 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_shared_folder_refuses_the_holder_and_every_other_repository() {
+    let d = w_deployment();
+    let folder = d.w.join("q3-plan");
+
+    for repo in ["alice/docs", "bob/other"] {
+        let out = d.run_in(
+            &folder,
+            &[
+                "collaborators",
+                "add",
+                "dave",
+                "--role",
+                "read",
+                "--repo",
+                repo,
+            ],
+        );
+        let stderr = stderr_of(&out);
+        assert_eq!(exit_of(&out), 2, "{repo}: {stderr}");
+        assert!(
+            stderr.starts_with("error: holder root required: "),
+            "{repo}: {stderr}"
+        );
+        assert!(stderr.contains("alice/docs"), "{repo}: {stderr}");
+        assert!(
+            stderr.contains("run it from the root of a checkout"),
+            "{repo}: {stderr}"
+        );
+    }
+    assert!(d.requests().is_empty());
+}
+
+// SPEC u333 Tests, the row of this name.
+#[test]
+#[serial]
+fn admin_on_the_folder_identity_is_the_servers_refusal() {
+    let d = w_deployment();
+    d.serves(
+        "POST",
+        IDENTITY_COLLABORATORS,
+        refusal(422, "validation_error"),
+    );
+
+    let out = d.run_in(
+        &d.w.join("q3-plan"),
+        &["--json", "collaborators", "add", "dave", "--role", "admin"],
+    );
+
+    assert_eq!(
+        d.bodies(IDENTITY_COLLABORATORS),
+        vec![json!({"username": "dave", "role": "admin"})]
+    );
+    assert_eq!(request_lines(&d).len(), 1);
+    assert_eq!(exit_of(&out), 1, "{}", stderr_of(&out));
+    assert!(
+        document(&out)["error"]
+            .as_str()
+            .expect("error")
+            .contains("validation_error"),
+        "{}",
+        stdout_of(&out)
+    );
+}
+
+// SPEC u333 Tests, the row of this name.
+#[test]
+#[serial]
+fn an_unshared_folder_refuses_every_collaborator_command_naming_the_share() {
+    let d = w_deployment();
+    write(
+        &d.w.join("plan/.syns.yaml"),
+        "holder: alice/docs\npath: plan\nshared_as: [x]\n",
+    );
+    let budget = d.w.join("budget");
+    let plan = d.w.join("plan");
+
+    for (cwd, args, command) in [
+        (&budget, vec!["collaborators"], "syns collaborators"),
+        (
+            &budget,
+            vec!["collaborators", "add", "carol", "--role", "read"],
+            "syns collaborators add",
+        ),
+        (
+            &budget,
+            vec!["collaborators", "role", "u1", "--role", "read"],
+            "syns collaborators role",
+        ),
+        (
+            &budget,
+            vec!["collaborators", "remove", "u1", "--yes"],
+            "syns collaborators remove",
+        ),
+        (
+            &budget,
+            vec![
+                "collaborators",
+                "add",
+                "carol",
+                "--role",
+                "read",
+                "--repo",
+                "alice/docs",
+            ],
+            "syns collaborators add",
+        ),
+        (
+            &budget,
+            vec!["collaborators", "--if-repo"],
+            "syns collaborators",
+        ),
+        (&plan, vec!["collaborators"], "syns collaborators"),
+    ] {
+        let out = d.run_in(cwd, &args);
+        let stderr = stderr_of(&out);
+        assert_eq!(exit_of(&out), 2, "{args:?}: {stderr}");
+        assert_eq!(stderr.trim_end(), not_shared_line(command, cwd), "{args:?}");
+        assert!(!stderr.contains("root of a checkout"), "{args:?}: {stderr}");
+    }
+    assert!(d.requests().is_empty());
+}
+
+// SPEC u333 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_shared_as_spelling_no_repository_name_is_a_malformed_identity_file() {
+    let d = w_deployment();
+    write(
+        &d.w.join("odd/.syns.yaml"),
+        "holder: alice/docs\npath: odd\nshared_as: ..\n",
+    );
+
+    let out = d.run_in(&d.w.join("odd"), &["collaborators"]);
+
+    assert_eq!(exit_of(&out), 1, "{}", stderr_of(&out));
+    assert_eq!(
+        stderr_of(&out).trim_end(),
+        "error: invalid .syns.yaml: shared_as must name a repository under alice (got ..)"
+    );
+    assert!(d.requests().is_empty());
+}
+
+/// `EP-versions` of `alice/docs` at `q3-plan/.syns.yaml` answering version
+/// `2`, `h2`, over `h1`; the raw file at `ref=h2` answering `B1` and at
+/// `ref=h1` answering `at_h1`.
+fn serve_identity_file_versions(d: &Deployment, at_h1: ResponseTemplate) {
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/docs/versions"))
+            .and(query_param("path", "q3-plan/.syns.yaml"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{
+                    "version": 2, "sha": "h2", "parentSha": "h1", "message": "share",
+                    "messageBody": null, "author": "alice",
+                    "createdAt": "2026-10-06T00:00:00Z",
+                    "filesChanged": ["q3-plan/.syns.yaml"],
+                }],
+                "total": 2, "limit": 1, "offset": 0,
+            }))),
+    );
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path(Q3_PLAN_RAW))
+            .and(query_param("ref", "h2"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(B1.as_bytes())),
+    );
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path(Q3_PLAN_RAW))
+            .and(query_param("ref", "h1"))
+            .respond_with(at_h1),
+    );
+}
+
+/// The deployment of `a_share_leaves_the_folder_identity_file_as_the_holder_holds_it`:
+/// `W/q3-plan/.syns.yaml` holding `B0`, the lookup `404`, the share `201`
+/// naming `alice/docs-q3-plan`, and the versions and raw reads.
+fn first_share_deployment() -> Deployment {
+    let d = w_deployment();
+    write(&d.w.join("q3-plan/.syns.yaml"), B0);
+    d.serves("GET", Q3_PLAN_LOOKUP, refusal(404, "not_found"));
+    d.serves(
+        "POST",
+        "/api/v1/repos/alice/docs/shares",
+        ResponseTemplate::new(201).set_body_json(record("alice", "docs-q3-plan", true)),
+    );
+    serve_identity_file_versions(&d, ResponseTemplate::new(200).set_body_bytes(B0.as_bytes()));
+    d
+}
+
+fn identity_file(d: &Deployment) -> Vec<u8> {
+    std::fs::read(d.w.join("q3-plan/.syns.yaml")).expect("the folder's identity file")
+}
+
+// SPEC u333 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_share_leaves_the_folder_identity_file_as_the_holder_holds_it() {
+    let d = first_share_deployment();
+    d.serves("POST", IDENTITY_COLLABORATORS, ResponseTemplate::new(201));
+
+    let share = d.run(&["share", "q3-plan", "--name", "docs-q3-plan", "--json"]);
+    assert_eq!(exit_of(&share), 0, "{}", stderr_of(&share));
+    assert_eq!(identity_file(&d), B1.as_bytes());
+
+    let add = d.run_in(
+        &d.w.join("q3-plan"),
+        &["--json", "collaborators", "add", "carol", "--role", "read"],
+    );
+    assert_eq!(exit_of(&add), 0, "{}", stderr_of(&add));
+    assert_eq!(
+        d.sent("POST").last(),
+        Some(&IDENTITY_COLLABORATORS.to_string())
+    );
+}
+
+// SPEC u333 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_share_writes_the_folder_identity_file_where_none_stood() {
+    let d = w_deployment();
+    std::fs::remove_file(d.w.join("q3-plan/.syns.yaml")).expect("no identity file");
+    d.serves("GET", Q3_PLAN_LOOKUP, refusal(404, "not_found"));
+    d.serves(
+        "POST",
+        "/api/v1/repos/alice/docs/shares",
+        ResponseTemplate::new(201).set_body_json(record("alice", "docs-q3-plan", true)),
+    );
+    serve_identity_file_versions(&d, refusal(404, "not_found"));
+
+    let out = d.run(&["share", "q3-plan", "--name", "docs-q3-plan", "--json"]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(identity_file(&d), B1.as_bytes());
+}
+
+// SPEC u333 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_share_found_standing_settles_the_file_too() {
+    let d = w_deployment();
+    write(&d.w.join("q3-plan/.syns.yaml"), B0);
+    d.serves(
+        "GET",
+        Q3_PLAN_LOOKUP,
+        ResponseTemplate::new(200).set_body_json(record("alice", "docs-q3-plan", true)),
+    );
+    serve_identity_file_versions(&d, ResponseTemplate::new(200).set_body_bytes(B0.as_bytes()));
+
+    let out = d.run(&["share", "q3-plan", "--json"]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert!(d.sent("POST").is_empty(), "{:?}", d.sent("POST"));
+    assert_eq!(document(&out)["created"], false);
+    assert_eq!(identity_file(&d), B1.as_bytes());
+}
+
+// SPEC u333 Tests, the row of this name.
+#[test]
+#[serial]
+fn an_edited_identity_file_is_left_and_named() {
+    let d = first_share_deployment();
+    let edited = format!("{B0}checks: [lint]\n");
+    write(&d.w.join("q3-plan/.syns.yaml"), &edited);
+
+    let out = d.run(&["share", "q3-plan", "--name", "docs-q3-plan", "--json"]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(document(&out)["created"], true);
+    assert_eq!(identity_file(&d), edited.as_bytes());
+    let warning = format!(
+        "warning: {}/.syns.yaml was left as it stood and does not yet name alice/docs-q3-plan; syns sync takes it in",
+        d.w.join("q3-plan").display()
+    );
+    assert!(
+        stderr_of(&out).lines().any(|line| line == warning),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
+// SPEC u333 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_share_naming_its_holder_by_the_repository_option_writes_no_file() {
+    let d = first_share_deployment();
+
+    let out = d.run(&[
+        "share",
+        "q3-plan",
+        "--repo",
+        "alice/docs",
+        "--name",
+        "docs-q3-plan",
+        "--json",
+    ]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    let sent = request_lines(&d);
+    assert!(
+        sent.iter()
+            .all(|line| !line.contains("/versions") && !line.contains("/raw/")),
+        "{sent:?}"
+    );
+    assert_eq!(identity_file(&d), B0.as_bytes());
+}
+
+// SPEC u333 Tests, the row of this name.
+#[test]
+#[serial]
+fn a_marking_settles_the_folder_identity_file() {
+    let d = w_deployment();
+    write(&d.w.join("q3-plan/.syns.yaml"), B0);
+    serve_tree(
+        &d,
+        "/api/v1/repos/alice/docs/tree/q3-plan",
+        "q3-plan/plan.md",
+    );
+    d.serves(
+        "PUT",
+        "/api/v1/repos/alice/docs/folder-visibility",
+        ResponseTemplate::new(200).set_body_json(record_at(
+            "alice",
+            "docs-q3-plan",
+            true,
+            "public",
+        )),
+    );
+    serve_identity_file_versions(&d, ResponseTemplate::new(200).set_body_bytes(B0.as_bytes()));
+
+    let out = d.run(&["share", "q3-plan", "--visibility", "public", "--json"]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(identity_file(&d), B1.as_bytes());
+}
+
+// ---- the next sync over a settled identity file (SPEC u333) ----------------
+
+const SYNC_H1: &str = "1111111111111111111111111111111111111111";
+const SYNC_H2: &str = "2222222222222222222222222222222222222222";
+
+/// One commit of `alice/docs`: its version, its hash and its files.
+struct DocsCommit {
+    version: u32,
+    sha: &'static str,
+    tree: std::collections::BTreeMap<String, Vec<u8>>,
+}
+
+/// A stateful responder for `alice/docs` alone, copied from
+/// `place_test`'s `Server`: its record, tree, raw and file reads and its
+/// version list served from `commits`, the last of them the head, and a
+/// push refused, so a sync reaching it fails.
+struct DocsServer(Vec<DocsCommit>);
+
+impl DocsServer {
+    fn at(&self, reference: Option<String>) -> Option<&DocsCommit> {
+        match reference {
+            None => self.0.last(),
+            Some(r) => self
+                .0
+                .iter()
+                .find(|c| c.sha == r || c.version.to_string() == r),
+        }
+    }
+
+    fn changed_at(&self, index: usize) -> Vec<String> {
+        let tree = &self.0[index].tree;
+        let empty = std::collections::BTreeMap::new();
+        let before = if index == 0 {
+            &empty
+        } else {
+            &self.0[index - 1].tree
+        };
+        tree.keys()
+            .chain(before.keys())
+            .filter(|p| tree.get(*p) != before.get(*p))
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    fn version_entry(&self, index: usize) -> Value {
+        let c = &self.0[index];
+        let parent = index.checked_sub(1).map(|i| self.0[i].sha);
+        json!({
+            "version": c.version, "sha": c.sha, "parentSha": parent,
+            "message": "m", "messageBody": null, "author": "alice",
+            "createdAt": "2026-10-06T00:00:00Z", "filesChanged": self.changed_at(index),
+        })
+    }
+}
+
+fn query_of(request: &Request, key: &str) -> Option<String> {
+    request
+        .url
+        .query_pairs()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.to_string())
+}
+
+impl wiremock::Respond for DocsServer {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let decoded = urlencoding::decode(request.url.path())
+            .map(|p| p.to_string())
+            .unwrap_or_else(|_| request.url.path().to_string());
+        let Some(rest) = decoded.strip_prefix("/api/v1/repos/alice/docs") else {
+            return refusal(404, "not_found");
+        };
+        let method = request.method.as_str();
+        let blob = syns_cli::push::hash::blob_sha1;
+        if rest.is_empty() && method == "GET" {
+            let head = self.0.last().expect("a head");
+            let mut body = record("alice", "docs", false);
+            body["commitSha"] = json!(head.sha);
+            body["fileCount"] = json!(head.tree.len());
+            return ResponseTemplate::new(200).set_body_json(body);
+        }
+        if method == "GET" && (rest == "/tree" || rest.starts_with("/tree/")) {
+            let Some(commit) = self.at(query_of(request, "ref")) else {
+                return refusal(404, "ref_not_found");
+            };
+            let under = rest.strip_prefix("/tree/").unwrap_or("");
+            let recursive = query_of(request, "recursive").as_deref() == Some("true");
+            let mut entries: std::collections::BTreeMap<String, Value> =
+                std::collections::BTreeMap::new();
+            for (place, bytes) in &commit.tree {
+                if !under.is_empty() && !place.starts_with(&format!("{under}/")) {
+                    continue;
+                }
+                let relative = if under.is_empty() {
+                    place.as_str()
+                } else {
+                    &place[under.len() + 1..]
+                };
+                if recursive || !relative.contains('/') {
+                    let name = place.rsplit('/').next().unwrap_or(place);
+                    entries.insert(
+                        place.clone(),
+                        json!({ "name": name, "path": place, "type": "file",
+                                "size": bytes.len(), "sha": blob(bytes) }),
+                    );
+                } else {
+                    let first = relative.split('/').next().unwrap_or(relative);
+                    let dir = if under.is_empty() {
+                        first.to_string()
+                    } else {
+                        format!("{under}/{first}")
+                    };
+                    entries.insert(
+                        dir.clone(),
+                        json!({ "name": first, "path": dir, "type": "dir", "size": null, "sha": null }),
+                    );
+                }
+            }
+            if !under.is_empty() && entries.is_empty() {
+                return refusal(404, "not_found");
+            }
+            return ResponseTemplate::new(200).set_body_json(json!({
+                "entries": entries.into_values().collect::<Vec<_>>(),
+                "commitSha": commit.sha,
+                "truncated": false,
+            }));
+        }
+        if (method == "GET" || method == "HEAD")
+            && let Some(file) = rest.strip_prefix("/raw/")
+        {
+            let Some(commit) = self.at(query_of(request, "ref")) else {
+                return refusal(404, "ref_not_found");
+            };
+            return match commit.tree.get(file) {
+                Some(bytes) => ResponseTemplate::new(200).set_body_bytes(bytes.clone()),
+                None => refusal(404, "not_found"),
+            };
+        }
+        if method == "GET"
+            && let Some(file) = rest.strip_prefix("/files/")
+        {
+            let Some(commit) = self.at(query_of(request, "ref")) else {
+                return refusal(404, "ref_not_found");
+            };
+            return match commit.tree.get(file) {
+                Some(bytes) => ResponseTemplate::new(200).set_body_json(json!({
+                    "content": String::from_utf8_lossy(bytes), "sha": blob(bytes),
+                    "size": bytes.len(),
+                })),
+                None => refusal(404, "not_found"),
+            };
+        }
+        if method == "GET" && rest == "/versions" {
+            let place = query_of(request, "path");
+            let limit: usize = query_of(request, "limit")
+                .and_then(|l| l.parse().ok())
+                .unwrap_or(20);
+            let offset: usize = query_of(request, "offset")
+                .and_then(|o| o.parse().ok())
+                .unwrap_or(0);
+            let listed: Vec<usize> = (0..self.0.len())
+                .rev()
+                .filter(|index| match &place {
+                    Some(place) => self
+                        .changed_at(*index)
+                        .iter()
+                        .any(|p| p == place || p.starts_with(&format!("{place}/"))),
+                    None => true,
+                })
+                .collect();
+            let data: Vec<Value> = listed
+                .iter()
+                .skip(offset)
+                .take(limit)
+                .map(|index| self.version_entry(*index))
+                .collect();
+            return ResponseTemplate::new(200).set_body_json(json!({
+                "data": data, "total": listed.len(), "limit": limit, "offset": offset,
+            }));
+        }
+        if method == "GET"
+            && let Some(reference) = rest.strip_prefix("/versions/")
+        {
+            return match self
+                .0
+                .iter()
+                .position(|c| c.sha == reference || c.version.to_string() == reference)
+            {
+                Some(index) => ResponseTemplate::new(200).set_body_json(self.version_entry(index)),
+                None => refusal(404, "not_found"),
+            };
+        }
+        refusal(404, "not_found")
+    }
+}
+
+// SPEC u333 Tests, the row of this name.
+#[test]
+#[serial]
+fn the_next_sync_finds_the_settled_file_converged() {
+    let d = w_deployment();
+    write(&d.w.join("q3-plan/.syns.yaml"), B0);
+    let on_disk: std::collections::BTreeMap<String, Vec<u8>> = files_in(&d.w).into_iter().collect();
+    let mut head = on_disk.clone();
+    head.insert("q3-plan/.syns.yaml".into(), B1.as_bytes().to_vec());
+    d.mount(
+        Mock::given(wiremock::matchers::any())
+            .respond_with(DocsServer(vec![
+                DocsCommit {
+                    version: 1,
+                    sha: SYNC_H1,
+                    tree: on_disk.clone(),
+                },
+                DocsCommit {
+                    version: 2,
+                    sha: SYNC_H2,
+                    tree: head,
+                },
+            ]))
+            .with_priority(1),
+    );
+    let stores =
+        syns_cli::config::StoreRoots::resolve(Some(d.cache.path()), d.cache.path(), d.cache.path());
+    let copy = syns_cli::push::working_copy::WorkingCopy::open(&stores, "alice", "docs", &d.w)
+        .expect("the holder copy");
+    copy.record_base(
+        SYNC_H1,
+        on_disk
+            .iter()
+            .map(|(place, bytes)| (place.clone(), syns_cli::push::hash::blob_sha1(bytes)))
+            .collect(),
+    )
+    .expect("a base");
+    write(&d.w.join("q3-plan/.syns.yaml"), B1);
+
+    let out = d.run(&["--json", "sync"]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert!(
+        document(&out).get("recoveryId").is_none(),
+        "{}",
+        stdout_of(&out)
+    );
+    let settled = std::fs::read(d.w.join("q3-plan/.syns.yaml")).expect("the identity file");
+    assert_eq!(settled, B1.as_bytes());
+    assert!(
+        !String::from_utf8_lossy(&settled)
+            .lines()
+            .any(|line| line.starts_with("<<<<<<<"))
+    );
+    let copy =
+        syns_cli::push::working_copy::WorkingCopy::open_existing(&stores, "alice", "docs", &d.w)
+            .expect("open")
+            .expect("the holder copy");
+    assert_eq!(copy.base().expect("a base").commit_sha(), Some(SYNC_H2));
+    assert!(
+        !request_lines(&d).contains(&"PUT /api/v1/repos/alice/docs/push".to_string()),
+        "{:?}",
+        request_lines(&d)
+    );
+}
+
+/// Every file under `dir`, by its place from `dir`.
+fn files_in(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                walk(root, &p, out);
+            } else {
+                let place = p.strip_prefix(root).expect("under root");
+                out.push((
+                    place.to_string_lossy().replace('\\', "/"),
+                    std::fs::read(&p).expect("read"),
+                ));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
 }

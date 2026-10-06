@@ -4,7 +4,7 @@
 //! caller's own handle they share with nothing else.
 
 use crate::auth::token::TokenStore;
-use crate::client::{SynsClient, UserProfile};
+use crate::client::{SynsClient, UserProfile, address_segment};
 use crate::commands::repos::{LIMIT_MIN, refuse_limit_outside};
 use crate::config::Config;
 use crate::errors::CliError;
@@ -83,9 +83,13 @@ pub async fn cmd_user(
     output: &Output,
     username: Option<String>,
 ) -> Result<(), CliError> {
-    // 1 and 2 — the positional as typed, or the caller's own handle.
+    // 1 and 2 — the positional as typed, weighed as one address segment
+    //     (SPEC u333 `cmd_user` 1), or the caller's own handle.
     let handle = match username {
-        Some(handle) => handle,
+        Some(handle) => {
+            address_segment("USERNAME", &handle)?;
+            handle
+        }
         None => resolve_self_handle(config).await?,
     };
 

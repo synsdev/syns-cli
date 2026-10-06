@@ -1,8 +1,9 @@
 use crate::auth::token::TokenStore;
 use crate::client::{
     AddCollaboratorRequest, Collaborator, CollaboratorRole, SynsClient,
-    UpdateCollaboratorRoleRequest,
+    UpdateCollaboratorRoleRequest, address_segment,
 };
+use crate::commands::pull::is_repository_shape;
 use crate::commands::repos::{LIMIT_MAX, LIMIT_MIN, refuse_limit_outside};
 use crate::config::Config;
 use crate::errors::CliError;
@@ -127,9 +128,13 @@ pub async fn cmd_collaborators_role(
     repo: Option<String>,
     if_repo: bool,
 ) -> Result<(), CliError> {
+    // SPEC u333 `cmd_collaborators_role` 1 — the identifier weighed
+    // before the folder's identity file and the credential.
+    address_segment("USER_ID", &user_id)?;
+
     // 1 — refuse inside a scoped folder unless `--repo` names its own
     // identity, and bind the repository (SPEC u300, `cmd_collaborators`
-    // 1 and 2).
+    // 1 and 2; SPEC u333 `cmd_collaborators_role` 2).
     let current_dir = current_dir()?;
     let repo = admit_repository(&current_dir, "syns collaborators role", repo.as_deref())?.or(repo);
     let repo_id = match repo {
@@ -190,17 +195,20 @@ fn bind_repo(
     Ok(Some((repo_id, SynsClient::new(config.server_url())?)))
 }
 
-/// Inside a scoped folder the noun acts on the holder, so it is refused
-/// through `refuse_holder_change` (SPEC u290, `D-102`) unless `repo`
-/// names, letter case aside, the holder's owner joined by `/` to the
-/// identity the folder's own identity file records under `shared_as`
-/// (SPEC u300 Behaviour, `cmd_collaborators` 1).
+/// The repository every arm of the noun addresses inside a scoped folder,
+/// lower-cased, decided from the folder's own identity file alone with no
+/// credential read and nothing sent (SPEC u333 Behaviour,
+/// `admit_repository`, `D-124`). None outside every scoped folder, where
+/// the run binds `repo` or the working directory's identity as u300 binds
+/// it.
 ///
 /// SPEC u302 `cmd_collaborators` 1: inside a folder bound to its identity
-/// the noun addresses that identity where `repo` is absent or names it,
-/// answered as the repository to bind; every other `repo` there is
-/// refused as acting on the holder. None wherever the run binds `repo` or
-/// the working directory's identity as u300 binds it.
+/// the noun addresses that identity where `repo` is absent or names it.
+/// Inside a folder bound to its holder it addresses the holder's owner
+/// joined by `/` to the name its identity file records under `shared_as`,
+/// where `repo` is absent or names that address; a folder recording none
+/// is refused as not shared whatever `repo` names (Q-01). Every other
+/// `repo` is refused through `refuse_holder_change` (SPEC u290, `D-102`).
 fn admit_repository(
     cwd: &std::path::Path,
     command: &str,
@@ -218,13 +226,28 @@ fn admit_repository(
             _ => Ok(Some(address)),
         };
     }
-    if let Some(repo) = repo
-        && let Some(shared_as) = folder_shared_as(&scope.dir)?
-        && repo.eq_ignore_ascii_case(&format!("{}/{shared_as}", scope.owner))
-    {
-        return Ok(None);
+    let Some(shared_as) = folder_shared_as(&scope.dir)? else {
+        return Err(CliError::FolderNotShared {
+            command: command.to_string(),
+            holder: scope.holder(),
+            dir: scope.dir,
+        });
+    };
+    let address = format!("{}/{shared_as}", scope.owner).to_ascii_lowercase();
+    if !is_repository_shape(&address) {
+        return Err(CliError::Io {
+            message: format!(
+                "invalid .syns.yaml: shared_as must name a repository under {} (got {shared_as})",
+                scope.owner
+            ),
+        });
     }
-    refuse_holder_change(cwd, command).map(|()| None)
+    match repo {
+        Some(repo) if !repo.eq_ignore_ascii_case(&address) => {
+            refuse_holder_change(cwd, command).map(|()| None)
+        }
+        _ => Ok(Some(address)),
+    }
 }
 
 pub async fn cmd_collaborators(
@@ -236,10 +259,17 @@ pub async fn cmd_collaborators(
     limit: u32,
     offset: u32,
 ) -> Result<(), CliError> {
-    // Inside a scoped folder the listing and every verb act on the
-    // holder, so each is refused before its identity, credential,
-    // confirmation and request (SPEC u290, `D-102`), unless `--repo`
-    // names the folder's own identity (SPEC u300).
+    // SPEC u333 `cmd_collaborators` 1 — the removal's identifier weighed
+    // before the folder's identity file, the credential and the
+    // confirmation.
+    if let Some(CollaboratorsAction::Remove { user_id, .. }) = &action {
+        address_segment("USER_ID", user_id)?;
+    }
+
+    // Inside a scoped folder the listing and every verb address the
+    // folder's identity, and are refused before their identity,
+    // credential, confirmation and request where it has none or `--repo`
+    // names another repository (SPEC u290, `D-102`; SPEC u333, `D-124`).
     let command = match &action {
         None => "syns collaborators",
         Some(CollaboratorsAction::Add { .. }) => "syns collaborators add",
@@ -409,7 +439,9 @@ mod tests {
     }
 
     // SPEC u290 Behaviour, `cmd_collaborators` 1 (`D-102`): the listing
-    // and every verb, the role change among them.
+    // and every verb, the role change among them; SPEC u333 Behaviour,
+    // `admit_repository` 3 (Q-01): a folder recording no `shared_as`
+    // refuses each as not shared.
     #[tokio::test]
     #[serial]
     async fn every_collaborators_route_inside_a_folder_is_refused_before_any_request() {
@@ -448,11 +480,11 @@ mod tests {
         let mut refused = Vec::new();
         for (action, expected) in routes {
             match cmd_collaborators(&config, &output, action, None, true, 20, 0).await {
-                Err(CliError::HolderActing { command, .. }) => {
+                Err(CliError::FolderNotShared { command, .. }) => {
                     assert_eq!(command, expected);
                     refused.push(command);
                 }
-                other => panic!("expected the holder-acting refusal, got {other:?}"),
+                other => panic!("expected the not-shared refusal, got {other:?}"),
             }
         }
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };

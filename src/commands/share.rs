@@ -21,7 +21,9 @@ use crate::config::Config;
 use crate::errors::{ApiErrorContext, CliError};
 use crate::output::Output;
 use crate::prompts::{ConfirmOutcome, confirm_or_yes};
+use crate::push::working_copy::write_atomic;
 use crate::repo::folder::{current_dir, resolve_folder_scope};
+use crate::repo::syns_yaml::{IdentityForm, identity_form_text};
 
 /// The holder a share, its lookup and its removal address, and the
 /// folder's path from the holder's root (SPEC u300, `ShareTarget`).
@@ -31,6 +33,9 @@ pub(crate) struct ShareTarget {
     pub holder: String,
     /// The folder's path from the holder's root.
     pub path: String,
+    /// The folder's directory on disk, none where `--repo` named the
+    /// holder (SPEC u333 Contract Surface, `ShareTarget.dir`).
+    pub dir: Option<std::path::PathBuf>,
 }
 
 /// What a share ended at (SPEC u300, `ShareOutcome`): the identity's
@@ -135,6 +140,7 @@ pub(crate) fn bind_share_target(typed: &str, repo: Option<&str>) -> Result<Share
         return Ok(ShareTarget {
             holder: repo.to_ascii_lowercase(),
             path: placement_path(typed)?,
+            dir: None,
         });
     }
 
@@ -147,6 +153,7 @@ pub(crate) fn bind_share_target(typed: &str, repo: Option<&str>) -> Result<Share
         return Ok(ShareTarget {
             holder: scope.holder(),
             path: scope.path.clone(),
+            dir: Some(scope.dir.clone()),
         });
     }
     let path = placement_path(typed)?;
@@ -154,6 +161,7 @@ pub(crate) fn bind_share_target(typed: &str, repo: Option<&str>) -> Result<Share
     Ok(ShareTarget {
         holder: counted.holder.clone(),
         path: counted.repository_path(&path),
+        dir: Some(counted.dir.join(&path)),
     })
 }
 
@@ -413,6 +421,112 @@ fn document(raw: &Value, extra: Value) -> Value {
     Value::Object(document)
 }
 
+/// The identity file warning line (SPEC u333 Contract Surface): the
+/// folder's `.syns.yaml` at `dir` left as it stood, not yet naming
+/// `owner/name`.
+fn identity_file_warning(dir: &std::path::Path, owner: &str, name: &str) -> String {
+    format!(
+        "warning: {}/.syns.yaml was left as it stood and does not yet name {owner}/{name}; syns sync takes it in",
+        dir.display()
+    )
+}
+
+/// Whether `bytes` read as the folder form carrying `name` under
+/// `shared_as`, letter case aside, the key read as `folder_shared_as`
+/// reads it (SPEC u333 Behaviour, `settle_identity_file` 2).
+fn names_identity(bytes: &[u8], name: &str) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    if !matches!(identity_form_text(text), Ok(IdentityForm::Folder { .. })) {
+        return false;
+    }
+    serde_yaml::from_str::<serde_yaml::Value>(text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("shared_as")
+                .and_then(serde_yaml::Value::as_str)
+                .map(|shared_as| shared_as.eq_ignore_ascii_case(name))
+        })
+        .unwrap_or(false)
+}
+
+/// Leaves the folder's `.syns.yaml` on disk as the holder's newest version
+/// changing that file holds it (SPEC u333 Behaviour, `settle_identity_file`,
+/// `D-118`): none exactly where the file on disk holds those bytes once it
+/// returns, and the identity file warning line otherwise. It writes no
+/// other path and no working-copy state, and replaces the file only where
+/// it stands as the version before held it, an edit of it left standing
+/// (Q-03).
+pub(crate) async fn settle_identity_file(
+    client: &SynsClient,
+    token: &str,
+    target: &ShareTarget,
+    name: &str,
+) -> Option<String> {
+    let dir = target.dir.as_deref()?;
+    let owner = target.holder.split('/').next().unwrap_or(&target.holder);
+    let warning = || Some(identity_file_warning(dir, owner, name));
+    let file = format!("{}/.syns.yaml", target.path);
+
+    // 1 — the newest version changing the file.
+    let Ok((page, _)) = client
+        .list_versions(&target.holder, Some(token), 1, 0, Some(&file))
+        .await
+    else {
+        return warning();
+    };
+    let Some(entry) = page.data.into_iter().next() else {
+        return warning();
+    };
+
+    // 2 — its bytes, kept only where they name the identity.
+    let Ok(served) = client
+        .get_raw(&target.holder, Some(token), &file, Some(&entry.sha), None)
+        .await
+    else {
+        return warning();
+    };
+    let served = served.bytes;
+    if !names_identity(&served, name) {
+        return warning();
+    }
+
+    // 3 — the file on disk holding them already.
+    let on_disk_path = dir.join(".syns.yaml");
+    let on_disk = match std::fs::read(&on_disk_path) {
+        Ok(bytes) => Some(bytes),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return warning(),
+    };
+    if on_disk.as_deref() == Some(served.as_slice()) {
+        return None;
+    }
+
+    // 4 — the bytes the version before held, none where it held no file.
+    let prior = match entry.parent_sha.as_deref() {
+        None => None,
+        Some(parent) => match client
+            .get_raw(&target.holder, Some(token), &file, Some(parent), None)
+            .await
+        {
+            Ok(raw) => Some(raw.bytes),
+            Err(err) if is_not_shared(&err) => None,
+            Err(_) => return warning(),
+        },
+    };
+
+    // 5 — the file replaced whole where it stands as that version held it.
+    if !dir.is_dir() || on_disk != prior {
+        return warning();
+    }
+    match write_atomic(&on_disk_path, &served, |_| Ok(())) {
+        Ok(()) => None,
+        Err(_) => warning(),
+    }
+}
+
 /// The holder's record, its `role` the caller's, refused where it is
 /// itself a shared folder's identity (SPEC u300 Behaviour, `cmd_share` 4,
 /// `cmd_share_show` 3).
@@ -504,6 +618,13 @@ pub async fn cmd_share(
         }
         Err(err) => return Err(err),
     };
+
+    // SPEC u333 `cmd_share` 2 — the folder's identity file settled, created
+    // or found standing (Q-02), a warning it answers written.
+    if let Some(warning) = settle_identity_file(&client, &token, &target, &outcome.repo.name).await
+    {
+        eprintln!("{warning}");
+    }
 
     // 8 — the document, or the report and the identity.
     let identity = format!("{}/{}", outcome.repo.owner, outcome.repo.name);
@@ -598,6 +719,12 @@ pub async fn cmd_mark_folder(
         ask,
     )
     .await?;
+
+    // SPEC u333 `cmd_mark_folder` 2 — the folder's identity file settled
+    // as a share settles it, before anything is written.
+    if let Some(warning) = settle_identity_file(&client, &token, &target, &marked.name).await {
+        eprintln!("{warning}");
+    }
 
     // SPEC u332 `cmd_mark_folder` 4 — a public identity of a private
     // holder whose name opens with the holder's (`D-123`).
@@ -955,11 +1082,16 @@ mod tests {
             (appendix.holder.as_str(), appendix.path.as_str()),
             ("alice/docs", "q3-plan/appendix")
         );
+        // SPEC u333 Behaviour, `bind_share_target` 2: the directory the
+        // path is counted from joined with it, and a typed `.` the
+        // folder's own.
+        assert_eq!(appendix.dir, Some(dir.join("appendix")));
         let this = this.unwrap();
         assert_eq!(
             (this.holder.as_str(), this.path.as_str()),
             ("alice/docs", "q3-plan")
         );
+        assert_eq!(this.dir, Some(dir.clone()));
     }
 
     fn identity(name: &str) -> Value {
@@ -976,6 +1108,7 @@ mod tests {
         ShareTarget {
             holder: "alice/docs".to_string(),
             path: "q3-plan".to_string(),
+            dir: None,
         }
     }
 
@@ -1059,6 +1192,7 @@ mod tests {
         let target = ShareTarget {
             holder: "alice/handbook".into(),
             path: "drafts".into(),
+            dir: None,
         };
         let names = |server_requests: Vec<wiremock::Request>| -> Vec<Value> {
             server_requests

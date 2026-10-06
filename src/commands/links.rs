@@ -3,7 +3,7 @@
 //! a second read to learn the new order.
 
 use crate::auth::token::TokenStore;
-use crate::client::SynsClient;
+use crate::client::{SynsClient, address_segment};
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
@@ -103,22 +103,24 @@ pub fn reorder_repeats_refusal(id: &str) -> String {
     format!("links reorder names '{id}' more than once — name every link identifier exactly once")
 }
 
-/// The arm's own pre-request checks (SPEC u272 Behaviour, `cmd_links` 2).
+/// The arm's own pre-request checks (SPEC u272 Behaviour, `cmd_links` 2),
+/// an update's and a removal's `LINK_ID` weighed as one address segment
+/// (SPEC u333 Behaviour, `check_action` 1).
 pub fn check_action(action: &LinksAction) -> Result<(), CliError> {
     match action {
         LinksAction::Update {
+            id,
             kind,
             value,
             label,
             sort_order,
-            ..
         } => {
             if kind.is_none() && value.is_none() && label.is_none() && sort_order.is_none() {
                 return Err(CliError::Config {
                     message: UPDATE_NAMES_NOTHING.to_string(),
                 });
             }
-            Ok(())
+            address_segment("LINK_ID", id).map(|_| ())
         }
         LinksAction::Reorder { order } => {
             let mut seen: Vec<&str> = Vec::with_capacity(order.len());
@@ -132,7 +134,8 @@ pub fn check_action(action: &LinksAction) -> Result<(), CliError> {
             }
             Ok(())
         }
-        LinksAction::Add { .. } | LinksAction::Remove { .. } => Ok(()),
+        LinksAction::Remove { id } => address_segment("LINK_ID", id).map(|_| ()),
+        LinksAction::Add { .. } => Ok(()),
     }
 }
 
@@ -278,6 +281,30 @@ mod tests {
             })
             .is_ok()
         );
+    }
+
+    // SPEC u333 Behaviour, `check_action` 1: an update's or a removal's
+    // `LINK_ID` empty, `.` or `..` is refused before any request.
+    #[test]
+    fn a_dot_segment_link_id_is_refused() {
+        let update = |id: &str| LinksAction::Update {
+            id: id.into(),
+            kind: None,
+            value: None,
+            label: Some("x".into()),
+            sort_order: None,
+        };
+        for id in ["", ".", ".."] {
+            for action in [update(id), LinksAction::Remove { id: id.into() }] {
+                let err = check_action(&action).unwrap_err();
+                assert_eq!(
+                    err.to_string(),
+                    format!("configuration error: LINK_ID cannot be empty, . or .. (got '{id}')")
+                );
+                assert_eq!(err.exit_code(), 1);
+            }
+        }
+        assert!(check_action(&update("x/y")).is_ok());
     }
 
     #[test]
