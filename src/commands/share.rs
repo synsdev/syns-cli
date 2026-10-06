@@ -423,10 +423,11 @@ fn document(raw: &Value, extra: Value) -> Value {
 
 /// The identity file warning line (SPEC u333 Contract Surface): the
 /// folder's `.syns.yaml` at `dir` left as it stood, not yet naming
-/// `owner/name`.
+/// `owner/name`, and the resolution the next sync stops for where that
+/// file holds an edit not yet published.
 fn identity_file_warning(dir: &std::path::Path, owner: &str, name: &str) -> String {
     format!(
-        "warning: {}/.syns.yaml was left as it stood and does not yet name {owner}/{name}; syns sync takes it in",
+        "warning: {}/.syns.yaml was left as it stood and does not yet name {owner}/{name}; syns sync takes it in, stopping for a resolution where that file holds an edit not yet published",
         dir.display()
     )
 }

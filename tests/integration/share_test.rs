@@ -7,8 +7,9 @@
 //! own name where its name is held, and warning where a public identity's
 //! name shows the holder's (SPEC u332 Tests); and a bare collaborator
 //! command inside a folder addressing its identity or refused as not
-//! shared, and the folder's identity file settled by a share or a marking
-//! and found converged by the next sync (SPEC u333 Tests).
+//! shared, and the folder's identity file settled by a share or a marking,
+//! found converged by the next sync, and where an edit was left standing
+//! stopping the next sync for its resolution (SPEC u333 Tests).
 //!
 //! Every binary row of those tables stands here under the name the table
 //! gives it; `share_name_problem_weighs_the_repository_name_kind`,
@@ -797,7 +798,7 @@ fn reports(out: &std::process::Output) -> String {
     stderr_of(out)
         .lines()
         .filter(|line| {
-            !(line.starts_with("warning: ") && line.ends_with("; syns sync takes it in"))
+            !(line.starts_with("warning: ") && line.ends_with("; syns sync takes it in, stopping for a resolution where that file holds an edit not yet published"))
         })
         .map(|line| format!("{line}\n"))
         .collect()
@@ -2189,7 +2190,7 @@ fn an_edited_identity_file_is_left_and_named() {
     assert_eq!(document(&out)["created"], true);
     assert_eq!(identity_file(&d), edited.as_bytes());
     let warning = format!(
-        "warning: {}/.syns.yaml was left as it stood and does not yet name alice/docs-q3-plan; syns sync takes it in",
+        "warning: {}/.syns.yaml was left as it stood and does not yet name alice/docs-q3-plan; syns sync takes it in, stopping for a resolution where that file holds an edit not yet published",
         d.w.join("q3-plan").display()
     );
     assert!(
@@ -2203,7 +2204,7 @@ fn an_edited_identity_file_is_left_and_named() {
 /// `alice/docs-q3-plan`.
 fn q3_plan_warning(d: &Deployment) -> String {
     format!(
-        "warning: {}/.syns.yaml was left as it stood and does not yet name alice/docs-q3-plan; syns sync takes it in",
+        "warning: {}/.syns.yaml was left as it stood and does not yet name alice/docs-q3-plan; syns sync takes it in, stopping for a resolution where that file holds an edit not yet published",
         d.w.join("q3-plan").display()
     )
 }
@@ -2583,6 +2584,74 @@ fn the_next_sync_finds_the_settled_file_converged() {
             .expect("open")
             .expect("the holder copy");
     assert_eq!(copy.base().expect("a base").commit_sha(), Some(SYNC_H2));
+    assert!(
+        !request_lines(&d).contains(&"PUT /api/v1/repos/alice/docs/push".to_string()),
+        "{:?}",
+        request_lines(&d)
+    );
+}
+
+// SPEC u333 Tests, the row of this name: the next sync over an identity
+// file a share left as it stood, holding an edit not yet published, stops
+// for the resolution the identity file warning line names.
+#[test]
+#[serial]
+fn the_next_sync_after_a_left_edit_stops_for_its_resolution() {
+    let d = w_deployment();
+    write(&d.w.join("q3-plan/.syns.yaml"), B0);
+    let on_disk: std::collections::BTreeMap<String, Vec<u8>> = files_in(&d.w).into_iter().collect();
+    let mut head = on_disk.clone();
+    head.insert("q3-plan/.syns.yaml".into(), B1.as_bytes().to_vec());
+    d.mount(
+        Mock::given(wiremock::matchers::any())
+            .respond_with(DocsServer(vec![
+                DocsCommit {
+                    version: 1,
+                    sha: SYNC_H1,
+                    tree: on_disk.clone(),
+                },
+                DocsCommit {
+                    version: 2,
+                    sha: SYNC_H2,
+                    tree: head,
+                },
+            ]))
+            .with_priority(1),
+    );
+    let stores =
+        syns_cli::config::StoreRoots::resolve(Some(d.cache.path()), d.cache.path(), d.cache.path());
+    let copy = syns_cli::push::working_copy::WorkingCopy::open(&stores, "alice", "docs", &d.w)
+        .expect("the holder copy");
+    copy.record_base(
+        SYNC_H1,
+        on_disk
+            .iter()
+            .map(|(place, bytes)| (place.clone(), syns_cli::push::hash::blob_sha1(bytes)))
+            .collect(),
+    )
+    .expect("a base");
+    write(
+        &d.w.join("q3-plan/.syns.yaml"),
+        &format!("# local note\n{B0}"),
+    );
+
+    let out = d.run(&["--json", "sync"]);
+
+    assert_eq!(exit_of(&out), 4, "{}", stderr_of(&out));
+    let document = document(&out);
+    assert_eq!(document["outcome"], "resolution_required", "{document}");
+    assert_eq!(
+        document["resolution"]["collisions"],
+        json!([{"path": "q3-plan/.syns.yaml", "kind": "modify_modify"}]),
+        "{document}"
+    );
+    let left = std::fs::read(d.w.join("q3-plan/.syns.yaml")).expect("the identity file");
+    assert_eq!(left, format!("# local note\n{B1}").as_bytes());
+    assert!(
+        !String::from_utf8_lossy(&left)
+            .lines()
+            .any(|line| line.starts_with("<<<<<<<"))
+    );
     assert!(
         !request_lines(&d).contains(&"PUT /api/v1/repos/alice/docs/push".to_string()),
         "{:?}",
