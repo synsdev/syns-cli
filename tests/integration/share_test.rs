@@ -3293,12 +3293,17 @@ fn an_unshare_in_a_folder_checked_out_alone_carries_its_base() {
         std::fs::read(d.w.join(".syns.yaml")).expect("F/.syns.yaml"),
         B0.as_bytes()
     );
-    let base = base_of(&d, "alice", "docs", &d.w);
-    assert_eq!(base.commit_sha(), Some(SYNC_H3));
-    assert_eq!(
-        base.file_sha(".syns.yaml"),
-        Some(syns_cli::push::hash::blob_sha1(B0.as_bytes()).as_str())
-    );
+    // CR1-3 of u334: the holder's copy the scope addresses once the file
+    // holds `B0`, and the identity's copy it addressed before, each laid.
+    for name in ["docs", "docs-q3-plan"] {
+        let base = base_of(&d, "alice", name, &d.w);
+        assert_eq!(base.commit_sha(), Some(SYNC_H3), "{name}");
+        assert_eq!(
+            base.file_sha(".syns.yaml"),
+            Some(syns_cli::push::hash::blob_sha1(B0.as_bytes()).as_str()),
+            "{name}"
+        );
+    }
 
     // The base carried and laid at the head, the next sync takes `doc.md`
     // as the one local path and publishes it over `h3` with no collision
@@ -3354,4 +3359,145 @@ fn a_folder_checked_out_alone_and_unshared_with_no_edit_syncs_clean() {
         base_of(&d, "alice", "docs", &d.w).commit_sha(),
         Some(SYNC_H3)
     );
+}
+
+// CR1-2 of u334, `cmd_unshare` 2: under `--repo`, a checkout of the
+// holder holding no directory at the folder's path leaves `dir` none.
+#[test]
+#[serial]
+fn an_unshare_naming_its_holder_where_the_folder_is_absent_writes_no_file() {
+    let d = w_deployment();
+    std::fs::remove_dir_all(d.w.join("q3-plan")).expect("no q3-plan");
+    serve_unshare(&d, refusal(404, "not_found"));
+
+    let out = d.run(&[
+        "unshare",
+        "q3-plan",
+        "--repo",
+        "alice/docs",
+        "--yes",
+        "--json",
+    ]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert!(settling_reads(&d).is_empty(), "{:?}", settling_reads(&d));
+    assert!(!stderr_of(&out).contains("warning:"), "{}", stderr_of(&out));
+    assert!(!d.w.join("q3-plan").exists());
+}
+
+/// The identity file a share of `q3-plan/appendix` under
+/// `docs-appendix` settles.
+const APPENDIX: &str = "holder: alice/docs\npath: q3-plan/appendix\nshared_as: docs-appendix\n";
+
+/// The identity file `q3-plan/appendix` holds before its share, where it
+/// holds one: the folder form naming no identity.
+const APPENDIX_BEFORE: &str = "holder: alice/docs\npath: q3-plan/appendix\n";
+
+/// `share q3-plan/appendix --json` from `W`, `W/q3-plan` holding `B0` and
+/// `plan.md`, its `alice/docs` copy recording base `h1` over them, and
+/// `W/q3-plan/appendix` holding `before` as its identity file, or none;
+/// the share settling `APPENDIX` at `h2` over `h1`. It answers the base
+/// the `W/q3-plan` copy records after the run.
+fn share_inside_an_enclosing_copy(before: Option<&str>) -> syns_cli::push::manifest::Manifest {
+    let d = w_deployment();
+    write(&d.w.join("q3-plan/.syns.yaml"), B0);
+    write(&d.w.join("q3-plan/plan.md"), "plan\n");
+    std::fs::create_dir_all(d.w.join("q3-plan/appendix")).expect("appendix");
+    let folder = d.w.join("q3-plan");
+    let at_h1: std::collections::BTreeMap<String, Vec<u8>> =
+        files_in(&folder).into_iter().collect();
+    syns_cli::push::working_copy::WorkingCopy::open(&stores_of(&d), "alice", "docs", &folder)
+        .expect("the folder copy")
+        .record_base("h1", hashed(&at_h1))
+        .expect("a base");
+    if let Some(before) = before {
+        write(&folder.join("appendix/.syns.yaml"), before);
+    }
+    let raw = "/api/v1/repos/alice/docs/raw/q3-plan/appendix/.syns.yaml";
+    d.serves(
+        "GET",
+        "/api/v1/repos/alice/docs/shares/q3-plan/appendix",
+        refusal(404, "not_found"),
+    );
+    d.serves(
+        "POST",
+        "/api/v1/repos/alice/docs/shares",
+        ResponseTemplate::new(201).set_body_json(record("alice", "docs-appendix", true)),
+    );
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/docs/versions"))
+            .and(query_param("path", "q3-plan/appendix/.syns.yaml"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{
+                    "version": 2, "sha": "h2", "parentSha": "h1", "message": "share",
+                    "messageBody": null, "author": "alice",
+                    "createdAt": "2026-10-06T00:00:00Z",
+                    "filesChanged": ["q3-plan/appendix/.syns.yaml"],
+                }],
+                "total": 2, "limit": 1, "offset": 0,
+            }))),
+    );
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path(raw))
+            .and(query_param("ref", "h2"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(APPENDIX.as_bytes())),
+    );
+    d.mount(
+        Mock::given(method("GET"))
+            .and(path(raw))
+            .and(query_param("ref", "h1"))
+            .respond_with(match before {
+                Some(before) => {
+                    ResponseTemplate::new(200).set_body_bytes(before.as_bytes().to_vec())
+                }
+                None => refusal(404, "not_found"),
+            }),
+    );
+
+    let out = d.run(&["share", "q3-plan/appendix", "--json"]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(
+        std::fs::read(folder.join("appendix/.syns.yaml")).expect("the appendix file"),
+        APPENDIX.as_bytes()
+    );
+    base_of(&d, "alice", "docs", &folder)
+}
+
+/// The `W/q3-plan` copy's base after a share of `q3-plan/appendix`
+/// settled: commit `h2`, `appendix/.syns.yaml` at the settled hash, and
+/// its own `.syns.yaml` and `plan.md` as recorded.
+fn assert_laid_inside(base: &syns_cli::push::manifest::Manifest) {
+    let hash = syns_cli::push::hash::blob_sha1;
+    assert_eq!(base.commit_sha(), Some("h2"));
+    assert_eq!(
+        base.file_sha("appendix/.syns.yaml"),
+        Some(hash(APPENDIX.as_bytes()).as_str())
+    );
+    assert_eq!(
+        base.file_sha(".syns.yaml"),
+        Some(hash(B0.as_bytes()).as_str())
+    );
+    assert_eq!(base.file_sha("plan.md"), Some(hash(b"plan\n").as_str()));
+}
+
+// CR1-1 of u334, `settle_identity_file` 6: a folder with no identity file
+// of its own resolves to the folder enclosing it, whose own copy takes the
+// settled file at the path counted from its root, its own `.syns.yaml`
+// left as recorded.
+#[test]
+#[serial]
+fn a_share_of_a_folder_with_no_identity_file_lays_it_inside_the_enclosing_copy() {
+    assert_laid_inside(&share_inside_an_enclosing_copy(None));
+}
+
+// CR1-3 of u334, `settle_identity_file` 6: a folder holding an identity
+// file of its own has the settled file laid on each copy of its enclosing
+// folders.
+#[test]
+#[serial]
+fn a_share_lays_its_identity_file_on_every_enclosing_copy() {
+    assert_laid_inside(&share_inside_an_enclosing_copy(Some(APPENDIX_BEFORE)));
 }

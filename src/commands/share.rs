@@ -490,26 +490,29 @@ fn scope_at(dir: &std::path::Path) -> Option<FolderScope> {
     resolve_folder_scope(dir).ok().flatten()
 }
 
-/// Whether the base of the holder's copy at `scope`'s checkout, or of the
-/// folder's own copy, records `sha` for the folder's `.syns.yaml` (SPEC
-/// u334 Behaviour, `settle_identity_file` 5, Q-04).
-fn a_base_records(stores: &StoreRoots, scope: &FolderScope, file: &str, sha: &str) -> bool {
-    let records = |copy: Option<WorkingCopy>, at: &str| {
+/// Every hash the base of the holder's copy at `scope`'s checkout, or of
+/// the scope's own copy, records for the folder's `.syns.yaml` at `file`
+/// in the holder, each path counted from that copy's root (SPEC u334
+/// Behaviour, `settle_identity_file` 5, Q-04).
+fn recorded_hashes(stores: &StoreRoots, scope: &FolderScope, file: &str) -> Vec<String> {
+    let recorded = |copy: Option<WorkingCopy>, at: &str| {
         copy.and_then(|copy| copy.base())
-            .is_some_and(|base| base.file_sha(at) == Some(sha))
+            .and_then(|base| base.file_sha(at).map(str::to_string))
     };
     let checkout = scope.checkout.as_deref().and_then(|checkout| {
         WorkingCopy::open_existing(stores, &scope.owner, &scope.name, checkout)
             .ok()
             .flatten()
     });
-    records(checkout, file)
-        || records(
+    let own = scope.folder_path(file).and_then(|at| {
+        recorded(
             WorkingCopy::open_existing_folder(stores, scope)
                 .ok()
                 .flatten(),
-            SYNS_YAML,
+            &at,
         )
+    });
+    recorded(checkout, file).into_iter().chain(own).collect()
 }
 
 /// The folder's `.syns.yaml` laid at `sha` over the base of every copy
@@ -533,12 +536,14 @@ fn lay_identity_file(
             let _ = copy.lay_files(&files, advance_from, landed);
         }
     };
-    lay(
-        WorkingCopy::open_existing_folder(stores, scope)
-            .ok()
-            .flatten(),
-        SYNS_YAML.to_string(),
-    );
+    if let Some(at) = scope.folder_path(file) {
+        lay(
+            WorkingCopy::open_existing_folder(stores, scope)
+                .ok()
+                .flatten(),
+            at,
+        );
+    }
     if let Some(checkout) = &scope.checkout {
         lay(
             WorkingCopy::open_existing(stores, &scope.owner, &scope.name, checkout)
@@ -649,21 +654,25 @@ pub(crate) async fn settle_identity_file(
 
     // 5 — the file replaced whole where, read again so an edit saved
     // during step 4's read is left standing, it stands as that version
-    // held it or as a base of the checkout or the folder records it.
+    // held it or as a base of the checkout or the folder records it; every
+    // scope and store read made ahead of that read, so none widens the
+    // window between it and the write.
     let before = scope_at(dir);
+    let recorded = before
+        .as_ref()
+        .map(|scope| recorded_hashes(stores, scope, &file))
+        .unwrap_or_default();
     if !dir.is_dir() {
         return warning();
     }
     let Ok(standing) = read_standing(&on_disk_path) else {
         return warning();
     };
-    let recorded = standing.as_deref().is_some_and(|bytes| {
-        let sha = blob_sha1(bytes);
-        before
-            .as_ref()
-            .is_some_and(|scope| a_base_records(stores, scope, &file, &sha))
-    });
-    if standing != prior && !recorded {
+    if standing != prior
+        && !standing
+            .as_deref()
+            .is_some_and(|bytes| recorded.contains(&blob_sha1(bytes)))
+    {
         return warning();
     }
     if write_atomic(&on_disk_path, &served, |_| Ok(())).is_err() {
@@ -1115,7 +1124,8 @@ pub async fn cmd_unshare(
         target.dir = current_dir()
             .ok()
             .and_then(|cwd| holder_checkout_at(&cwd, &target.holder))
-            .map(|checkout| checkout.join(&target.path));
+            .map(|checkout| checkout.join(&target.path))
+            .filter(|dir| dir.is_dir());
     }
 
     // 2 — the credential.
