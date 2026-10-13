@@ -72,6 +72,26 @@ pub(crate) const READ_CONCURRENCY: usize = 16;
 /// times the largest tree size among them (`unregistered`, `D-090`).
 pub(crate) const READ_BYTES_BOUND: u64 = 67_108_864;
 
+/// How many times a retrieval sends one raw read whose answer did not
+/// arrive whole before the walk gives up (issue 268).
+pub(crate) const READ_ATTEMPTS: u32 = 4;
+
+/// The pause before a raw read is sent again, doubled at each resend.
+const RESEND_PAUSE: Duration = if cfg!(test) {
+    Duration::from_millis(5)
+} else {
+    Duration::from_secs(1)
+};
+
+/// How long after its first send a raw read is still sent again: one
+/// request's ceiling, so a read that failed by outliving it — which the
+/// same file over the same link does again — is not (CR1-1).
+const RESEND_WITHIN: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    crate::client::REQUEST_CEILING
+};
+
 /// What a run is asked to do with the head.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConvergeMode {
@@ -574,9 +594,10 @@ fn reading_for(mode: ConvergeMode) -> HeadReading {
 /// only while the reads outstanding with it number at most
 /// `READ_CONCURRENCY` and their count times the largest size among them
 /// stays within `READ_BYTES_BOUND`, a `null` size counted as
-/// `MAX_FILE_BYTES`; a read with none outstanding always goes out. On
-/// the first refusal the rest are abandoned and every file staged here
-/// removed, nothing written.
+/// `MAX_FILE_BYTES`; a read with none outstanding always goes out. A
+/// read whose answer did not arrive whole is sent again in its own slot,
+/// up to `READ_ATTEMPTS` times. On the first refusal the rest are
+/// abandoned and every file staged here removed, nothing written.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn read_blobs(
     client: &SynsClient,
@@ -782,9 +803,10 @@ async fn read_one(
             // The answer is read into a buffer of the size its hold
             // counted, allocated before its first byte arrives (`D-094`).
             let capacity = usize::try_from(counted).unwrap_or(usize::MAX);
-            let raw = client
-                .get_raw(repo_id, token, path, Some(at), Some(capacity))
-                .await?;
+            let raw = resend_unreachable(|| {
+                client.get_raw(repo_id, token, path, Some(at), Some(capacity))
+            })
+            .await?;
             let actual = blob_sha1(&raw.bytes);
             if actual != hash {
                 return Err(crate::client::hash_mismatch(path, hash, &actual));
@@ -819,9 +841,15 @@ async fn read_one(
             Ok(Blob::Held(bytes, hold))
         }
         (None, Some(dest)) => {
-            let staged = client
-                .get_raw_staged(repo_id, token, path, Some(at), &dest)
-                .await?;
+            let staged = resend_unreachable(|| async {
+                // A resend stages its answer afresh, over whatever part
+                // of the last one arrived.
+                let _ = std::fs::remove_file(&dest);
+                client
+                    .get_raw_staged(repo_id, token, path, Some(at), &dest)
+                    .await
+            })
+            .await?;
             if staged.sha != hash {
                 return Err(crate::client::hash_mismatch(path, hash, &staged.sha));
             }
@@ -831,6 +859,31 @@ async fn read_one(
             message: format!("could not read {path}: no room was made for it"),
         }),
     }
+}
+
+/// `read` sent until it answers anything but `SERVER_UNREACHABLE`, at most
+/// `READ_ATTEMPTS` times and only while `RESEND_WITHIN` has not passed
+/// since its first send, pausing `RESEND_PAUSE` doubled at each resend: a
+/// raw read at a pinned commit, its answer checked against the tree's
+/// hash, writes the same bytes however often it is sent, so one answer
+/// that did not arrive costs one request rather than the walk (issue 268).
+async fn resend_unreachable<T, F, Fut>(mut read: F) -> Result<T, CliError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, CliError>>,
+{
+    let first_sent = std::time::Instant::now();
+    let mut pause = RESEND_PAUSE;
+    for _ in 1..READ_ATTEMPTS {
+        match read().await {
+            Err(CliError::ServerUnreachable { .. }) if first_sent.elapsed() < RESEND_WITHIN => {
+                tokio::time::sleep(pause).await;
+                pause *= 2;
+            }
+            answered => return answered,
+        }
+    }
+    read().await
 }
 
 // ---- the folder ------------------------------------------------------
@@ -4934,6 +4987,244 @@ mod tests {
                 assert_eq!(&*blob.load().unwrap(), path.as_bytes(), "{path}");
             }
         }
+    }
+
+    /// How a flaky listener fails a path's first reads.
+    #[derive(Clone, Copy)]
+    enum Fault {
+        /// The connection closes with no answer.
+        Dropped,
+        /// The head arrives, the body closes short of its length.
+        Short,
+        /// `404` with a refusal body, a refusal rather than a fault.
+        Missing,
+        /// The connection closes with no answer once `RESEND_WITHIN` has
+        /// passed, as a read outliving its ceiling ends.
+        Late,
+    }
+
+    /// A listener failing each path's first `failures` reads with
+    /// `fault` and answering the path's name after them, one connection
+    /// per read, counting every read each path took.
+    async fn flaky_listener(
+        failures: usize,
+        fault: Fault,
+    ) -> (String, Arc<std::sync::Mutex<HashMap<String, usize>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reads = Arc::new(std::sync::Mutex::new(HashMap::<String, usize>::new()));
+        let counted = reads.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let counted = counted.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let mut seen = Vec::new();
+                    while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => seen.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&seen).to_string();
+                    let target = head.split(' ').nth(1).unwrap_or("").to_string();
+                    let name = target
+                        .split('?')
+                        .next()
+                        .unwrap_or("")
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    let nth = {
+                        let mut reads = counted.lock().unwrap();
+                        let n = reads.entry(name.clone()).or_insert(0);
+                        *n += 1;
+                        *n
+                    };
+                    let response = if nth > failures {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{name}",
+                            name.len()
+                        )
+                    } else {
+                        match fault {
+                            Fault::Dropped => return,
+                            Fault::Late => {
+                                tokio::time::sleep(RESEND_WITHIN).await;
+                                return;
+                            }
+                            Fault::Short => format!(
+                                "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
+                                name.len() + 8,
+                                &name[..1]
+                            ),
+                            Fault::Missing => {
+                                let body = r#"{"error":"not_found","message":"File not found"}"#;
+                                format!(
+                                    "HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                                    body.len()
+                                )
+                            }
+                        }
+                    };
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{}", addr.port()), reads)
+    }
+
+    fn named_reads(count: usize) -> BTreeMap<String, (String, Option<u64>)> {
+        (0..count)
+            .map(|i| {
+                let path = format!("f{i:02}.md");
+                let hash = blob_sha1(path.as_bytes());
+                let size = path.len() as u64;
+                (path, (hash, Some(size)))
+            })
+            .collect()
+    }
+
+    // Issue 268: one answer that did not arrive among a walk's reads is
+    // sent again, held or staged, and the walk finishes with every answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_read_whose_answer_did_not_arrive_is_sent_again() {
+        for (fault, budget) in [
+            (Fault::Dropped, HELD_BYTES_BUDGET),
+            (Fault::Short, HELD_BYTES_BUDGET),
+            (Fault::Dropped, 0),
+            (Fault::Short, 0),
+        ] {
+            let (uri, reads) = flaky_listener(2, fault).await;
+            let client = SynsClient::new(&uri).unwrap();
+            let cache = tempfile::tempdir().unwrap();
+            let staging = Staging::open(cache.path()).unwrap();
+            let held = HeldBytes::new(budget);
+            let wanted = named_reads(20);
+
+            let answers = read_blobs(
+                &client, None, "alice/r", None, "h", &wanted, &held, &staging,
+            )
+            .await
+            .unwrap_or_else(|err| panic!("budget {budget}: {err}"));
+
+            assert_eq!(answers.len(), wanted.len());
+            for (path, blob) in &answers {
+                assert_eq!(&*blob.load().unwrap(), path.as_bytes(), "{path}");
+            }
+            let reads = reads.lock().unwrap();
+            assert!(reads.values().all(|n| *n == 3), "{reads:?}");
+        }
+    }
+
+    // Issue 268: a read whose answer never arrives whole ends the walk as
+    // `SERVER_UNREACHABLE` after `READ_ATTEMPTS` sends, each resend after a
+    // pause twice the last, every staged file removed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_read_never_answered_ends_the_walk_after_its_attempts() {
+        let (uri, reads) = flaky_listener(usize::MAX, Fault::Short).await;
+        let client = SynsClient::new(&uri).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let staging = Staging::open(cache.path()).unwrap();
+        let held = HeldBytes::new(0);
+        let wanted = named_reads(1);
+        let started = std::time::Instant::now();
+
+        let Err(err) = read_blobs(
+            &client, None, "alice/r", None, "h", &wanted, &held, &staging,
+        )
+        .await
+        else {
+            panic!("a read never answered was taken");
+        };
+
+        assert!(matches!(err, CliError::ServerUnreachable { .. }), "{err:?}");
+        assert_eq!(reads.lock().unwrap()["f00.md"], READ_ATTEMPTS as usize);
+        let paused: u32 = (0..READ_ATTEMPTS - 1).map(|n| 1 << n).sum();
+        assert!(
+            started.elapsed() >= RESEND_PAUSE * paused,
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(std::fs::read_dir(&staging.dir).unwrap().count(), 0);
+    }
+
+    // CR1-1: a read that failed once `RESEND_WITHIN` had passed since its
+    // first send — a read outliving its ceiling — is not sent again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_read_failing_past_its_ceiling_is_sent_once() {
+        let (uri, reads) = flaky_listener(usize::MAX, Fault::Late).await;
+        let client = SynsClient::new(&uri).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let staging = Staging::open(cache.path()).unwrap();
+        let held = HeldBytes::new(HELD_BYTES_BUDGET);
+
+        let Err(err) = read_blobs(
+            &client,
+            None,
+            "alice/r",
+            None,
+            "h",
+            &named_reads(1),
+            &held,
+            &staging,
+        )
+        .await
+        else {
+            panic!("a read never answered was taken");
+        };
+
+        assert!(matches!(err, CliError::ServerUnreachable { .. }), "{err:?}");
+        assert_eq!(reads.lock().unwrap()["f00.md"], 1);
+    }
+
+    // Issue 268: a refusal is no fault a resend clears — a `404` and an
+    // answer hashing to another blob each end the walk after one read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_read_is_sent_once() {
+        let (uri, reads) = flaky_listener(usize::MAX, Fault::Missing).await;
+        let client = SynsClient::new(&uri).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let staging = Staging::open(cache.path()).unwrap();
+        let held = HeldBytes::new(HELD_BYTES_BUDGET);
+        let Err(err) = read_blobs(
+            &client,
+            None,
+            "alice/r",
+            None,
+            "h",
+            &named_reads(1),
+            &held,
+            &staging,
+        )
+        .await
+        else {
+            panic!("a refused read was taken");
+        };
+        assert!(is_not_found(&err), "{err:?}");
+        assert_eq!(reads.lock().unwrap()["f00.md"], 1);
+
+        let (uri, reads) = flaky_listener(0, Fault::Dropped).await;
+        let client = SynsClient::new(&uri).unwrap();
+        let wanted = BTreeMap::from([("f00.md".to_string(), (blob_sha1(b"other bytes"), Some(6)))]);
+        let Err(err) = read_blobs(
+            &client, None, "alice/r", None, "h", &wanted, &held, &staging,
+        )
+        .await
+        else {
+            panic!("a mismatched answer was taken");
+        };
+        assert!(
+            err.to_string().contains("invalid response body: f00.md"),
+            "{err}"
+        );
+        assert_eq!(reads.lock().unwrap()["f00.md"], 1);
     }
 
     #[tokio::test]
