@@ -1123,6 +1123,17 @@ async fn check_response(response: reqwest::Response) -> Result<reqwest::Response
                 .map(|message| ApiErrorContext::Refusal {
                     message: message.to_string(),
                 }),
+            // Issue 199 (D-132): a `forbidden` keeps its served string
+            // `message` where it is not blank, so a ceiling reads apart
+            // from a missing grant.
+            (403, "forbidden", Some(body)) => body
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+                .map(|message| ApiErrorContext::Reason {
+                    message: message.to_string(),
+                }),
             _ => None,
         };
         return Err(CliError::Api {
@@ -3138,6 +3149,73 @@ mod tests {
             }) => {}
             other => panic!("expected the refusal holding no context, got {other:?}"),
         }
+    }
+
+    // Issue 199 (D-132): a `403` `forbidden` carries its served
+    // `message` after the wire form, so a ceiling (`Repository limit
+    // reached`) reads apart from a missing grant, in the line and in the
+    // `--json` document's one string; an answer whose `message` is
+    // absent, blank or not a string keeps the bare line.
+    #[tokio::test]
+    async fn a_forbidden_refusal_names_the_servers_reason() {
+        let mock_server = MockServer::start().await;
+        let limit =
+            serde_json::json!({"error": "forbidden", "message": "Repository limit reached"});
+        Mock::given(method("POST"))
+            .and(path("/api/v1/repos"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(limit.clone()))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/repos/alice/a/fork"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(limit))
+            .mount(&mock_server)
+            .await;
+        for (name, body) in [
+            ("b", serde_json::json!({"error": "forbidden"})),
+            (
+                "c",
+                serde_json::json!({"error": "forbidden", "message": "  "}),
+            ),
+            ("d", serde_json::json!({"error": "forbidden", "message": 7})),
+        ] {
+            Mock::given(method("POST"))
+                .and(path(format!("/api/v1/repos/alice/{name}/fork")))
+                .respond_with(ResponseTemplate::new(403).set_body_json(body))
+                .mount(&mock_server)
+                .await;
+        }
+        let client = SynsClient::new(&mock_server.uri()).unwrap();
+        let request = ForkRequest { name: None };
+
+        let created = client.create_repo("t", "x", None, None).await.unwrap_err();
+        assert_eq!(
+            created.to_string(),
+            "server error (403): forbidden \u{2014} Repository limit reached"
+        );
+        assert_eq!(created.exit_code(), 1);
+        let forked = client.fork("alice/a", "t", &request).await.unwrap_err();
+        assert_eq!(
+            forked.to_string(),
+            "server error (403): forbidden \u{2014} Repository limit reached"
+        );
+        for name in ["b", "c", "d"] {
+            let bare = client
+                .fork(&format!("alice/{name}"), "t", &request)
+                .await
+                .unwrap_err();
+            assert_eq!(bare.to_string(), "server error (403): forbidden", "{name}");
+        }
+        // A command's own next move (u334) still takes the reason's place.
+        let decorated = client
+            .fork("alice/a", "t", &request)
+            .await
+            .unwrap_err()
+            .with_next_move("ask the team's owner".into());
+        assert_eq!(
+            decorated.to_string(),
+            "server error (403): forbidden \u{2014} ask the team's owner"
+        );
     }
 
     // SPEC u300 Contract Surface, `SynsClient::get_share` and

@@ -300,6 +300,13 @@ pub enum ApiErrorContext {
     NextMove {
         line: String,
     },
+    /// Issue 199 (D-132): the non-blank string `message` a `403`
+    /// `forbidden` served, rendered after the wire form and ` \u{2014} `
+    /// so a ceiling `CTRL-per-owner-quota` holds reads apart from a
+    /// missing grant. A command's `NextMove` takes its place.
+    Reason {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -479,6 +486,11 @@ impl std::fmt::Display for CliError {
                 error,
                 context: Some(ApiErrorContext::NextMove { line }),
             } => write!(f, "server error ({s}): {error} \u{2014} {line}"),
+            CliError::Api {
+                status: Some(s),
+                error,
+                context: Some(ApiErrorContext::Reason { message }),
+            } => write!(f, "server error ({s}): {error} \u{2014} {message}"),
             CliError::Api {
                 status: Some(s),
                 error,
