@@ -2113,11 +2113,39 @@ mod tests {
         assert_eq!(err.exit_code(), 1);
     }
 
+    /// The provenance names cleared for one test and put back as they
+    /// were when it ends, even on a panic: `ProvenanceOptions::block`
+    /// falls back to the process environment, which an agent shell fills.
+    struct NoProvenanceEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl NoProvenanceEnv {
+        fn new() -> Self {
+            let names = ["SYNS_INTEGRATION", "SYNS_RUN", "SYNS_TRIGGER", "SYNS_TASK"];
+            let saved = names.map(|name| (name, std::env::var_os(name)));
+            for name in names {
+                unsafe { std::env::remove_var(name) };
+            }
+            NoProvenanceEnv(saved.into())
+        }
+    }
+
+    impl Drop for NoProvenanceEnv {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                if let Some(value) = value {
+                    unsafe { std::env::set_var(name, value) };
+                }
+            }
+        }
+    }
+
     // `commit_changeset` 1, 2 and 3: the caption, each content's derived
-    // hash, the pinned parent, and no author.
+    // hash, the pinned parent, and no author; no provenance given, in any
+    // shell.
     #[tokio::test]
     #[serial]
     async fn one_push_carries_the_pinned_parent_the_caption_and_derived_hashes() {
+        let _no_provenance = NoProvenanceEnv::new();
         let server = MockServer::start().await;
         Mock::given(method("PUT"))
             .and(path_matcher("/api/v1/repos/alice/notes/push"))
