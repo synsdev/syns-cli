@@ -46,7 +46,7 @@ use crate::repo::folder::{FolderScope, lies_under};
 use crate::repo::identity::identity_head;
 use crate::repo::syns_yaml::{
     IdentityForm, held_root_identity, identity_text, read_identity_form, read_required_checks,
-    refuse_marked_root_identity,
+    refuse_marked_root_identity, text_names_root_identity,
 };
 
 /// The last round a resolution stands at before attention is required:
@@ -1672,28 +1672,59 @@ fn recorded_entries(
     entries
 }
 
-/// Whether the root identity file of the copy at `root` is the record a
-/// retrieval wrote (SPEC u306 Contract Surface,
-/// `retrieval_wrote_root_identity`): a base is recorded, whatever it names
-/// for `.syns.yaml`, and the file holds `identity_text` of `owner` and
-/// `name`, ASCII letter case aside. A missing or unreadable file answers
-/// false. Unlike `held_root_identity`, which the working-copy state and
-/// the checkout guard keep, a base naming the file does not answer false,
-/// so a checkout whose base a released binary's retrieval left naming the
-/// head's file reads its identity text as written.
-fn retrieval_wrote_root_identity(
-    root: &Path,
-    owner: &str,
-    name: &str,
+/// Whether the root identity file of `copy` is the record a retrieval
+/// wrote (SPEC u306 Contract Surface, `retrieval_wrote_root_identity`;
+/// issue 270, D-155): a base is recorded, whatever it names for
+/// `.syns.yaml`; the file holds `identity_text` of the copy's owner and
+/// name, ASCII letter case aside; and where `head` names the file at
+/// other bytes than the local file's, the head's file read at its commit
+/// parses as an identity naming that owner and name, ASCII letter case
+/// aside. A missing or unreadable local file answers false, and so does
+/// a head file naming another repository, not parsing as the root form
+/// or missing at the head's commit: the local file is then the person's,
+/// a local edit a publication sends and a retrieval keeps. Unlike
+/// `held_root_identity`, which the working-copy state and the checkout
+/// guard keep, a base naming the file does not answer false, so a
+/// checkout whose base a released binary's retrieval left naming the
+/// head's file of this same repository reads its identity text as
+/// written. The head's file is read only where every other clause holds.
+async fn retrieval_wrote_root_identity(
+    client: &SynsClient,
+    token: Option<&str>,
+    copy: &WorkingCopy,
     base: Option<&Manifest>,
-) -> bool {
+    head: &Head,
+) -> Result<bool, CliError> {
     if base.is_none() {
-        return false;
+        return Ok(false);
     }
-    let Ok(bytes) = std::fs::read(root.join(ROOT_IDENTITY)) else {
-        return false;
+    let Ok(bytes) = std::fs::read(copy.root.join(ROOT_IDENTITY)) else {
+        return Ok(false);
     };
-    bytes.eq_ignore_ascii_case(identity_text(owner, name).as_bytes())
+    if !bytes.eq_ignore_ascii_case(identity_text(&copy.owner, &copy.name).as_bytes()) {
+        return Ok(false);
+    }
+    let (Some(remote), Some(at)) = (head.files.get(ROOT_IDENTITY), head.commit.as_deref()) else {
+        return Ok(true);
+    };
+    if *remote == blob_sha1(&bytes) {
+        return Ok(true);
+    }
+    let path = match served_under(copy) {
+        Some(folder) => format!("{folder}/{ROOT_IDENTITY}"),
+        None => ROOT_IDENTITY.to_string(),
+    };
+    // As content reads are: a brief outage is resent, not the run's end.
+    let repo = repo_id(copy);
+    match resend_unreachable(|| client.get_raw(&repo, token, &path, Some(at), None)).await {
+        Ok(raw) => Ok(text_names_root_identity(
+            &raw.bytes,
+            &copy.owner,
+            &copy.name,
+        )),
+        Err(err) if is_not_found(&err) => Ok(false),
+        Err(err) => Err(err),
+    }
 }
 
 fn without(
@@ -3070,7 +3101,7 @@ async fn converge_from_resolution(
         None => collect_folder(copy, &opts, &[], true, root)?,
     };
     let written =
-        retrieval_wrote_root_identity(&copy.root, &copy.owner, &copy.name, base_manifest.as_ref());
+        retrieval_wrote_root_identity(client, token, copy, base_manifest.as_ref(), &head).await?;
     let held_identity =
         held_root_identity(&copy.root, &copy.owner, &copy.name, base_manifest.as_ref());
     // u306 TR-01: a publication past the base holds it out alike where
@@ -3265,8 +3296,6 @@ async fn finish_preparation(
     root: &FolderRoot,
 ) -> Result<SyncOutcome, CliError> {
     let base_manifest = base_of(copy);
-    let written =
-        retrieval_wrote_root_identity(&copy.root, &copy.owner, &copy.name, base_manifest.as_ref());
     // u306 CR4-1: the publication hold a pass decides reads it alike.
     let held_identity =
         held_root_identity(&copy.root, &copy.owner, &copy.name, base_manifest.as_ref());
@@ -3284,6 +3313,9 @@ async fn finish_preparation(
     if head.truncated {
         return Ok(SyncOutcome::AttentionRequired(Some(standing)));
     }
+    // Issue 270, D-155: read over the head the preparation recorded.
+    let written =
+        retrieval_wrote_root_identity(client, token, copy, base_manifest.as_ref(), &head).await?;
     let past_bound = standing.round > ROUND_BOUND;
 
     let prepared = prepare_candidate(
@@ -3955,7 +3987,8 @@ async fn take_in_disjoint_move(
     }
 
     let written =
-        retrieval_wrote_root_identity(&copy.root, &copy.owner, &copy.name, base_manifest.as_ref());
+        retrieval_wrote_root_identity(client, Some(token), copy, base_manifest.as_ref(), &head)
+            .await?;
     let held_identity =
         held_root_identity(&copy.root, &copy.owner, &copy.name, base_manifest.as_ref());
     let mut existing = standing;
@@ -4048,8 +4081,6 @@ async fn guard_refused(
     // folder and the head read here, so the resolution it writes lists the
     // other local work alone.
     let base_manifest = base_of(copy);
-    let written =
-        retrieval_wrote_root_identity(&copy.root, &copy.owner, &copy.name, base_manifest.as_ref());
     let held_identity =
         held_root_identity(&copy.root, &copy.owner, &copy.name, base_manifest.as_ref());
     let head = read_head(
@@ -4063,6 +4094,9 @@ async fn guard_refused(
     if head.truncated {
         return Ok(SyncOutcome::AttentionRequired(raised));
     }
+    let written =
+        retrieval_wrote_root_identity(client, Some(token), copy, base_manifest.as_ref(), &head)
+            .await?;
 
     let existing = raised.map(|mut standing| {
         standing.reviewed_tree = None;

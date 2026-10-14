@@ -538,6 +538,21 @@ pub fn held_root_identity(root: &Path, owner: &str, name: &str, base: Option<&Ma
     bytes.eq_ignore_ascii_case(identity_text(owner, name).as_bytes())
 }
 
+/// Whether `bytes` read as the root form name `owner/name`, ASCII letter
+/// case aside as `held_root_identity` matches the identity text (issue
+/// 270, D-155): bytes that are not UTF-8, do not parse as the root form
+/// — not a mapping, the folder form, a missing or non-string `owner` or
+/// `name` — or name another repository answer false. Keys beside `owner`
+/// and `name`, such as `checks`, do not change the answer.
+pub fn text_names_root_identity(bytes: &[u8], owner: &str, name: &str) -> bool {
+    let Ok(contents) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    parse_root_text(contents).is_ok_and(|yaml| {
+        yaml.owner.eq_ignore_ascii_case(owner) && yaml.name.eq_ignore_ascii_case(name)
+    })
+}
+
 pub fn write_syns_yaml(path: &Path, owner: &str, name: &str) -> Result<(), CliError> {
     let file_path = path.join(SYNS_YAML_FILENAME);
     std::fs::write(&file_path, identity_text(owner, name)).map_err(|err| CliError::Io {
@@ -589,6 +604,38 @@ mod tests {
 
         let raw = fs::read_to_string(dir.path().join(".syns.yaml")).unwrap();
         assert_eq!(raw, "owner: alice\nname: my-project\n");
+    }
+
+    // Issue 270, D-155: a head file names the bound repository only where
+    // it parses as the root form naming that owner and name, case aside.
+    #[test]
+    fn text_names_root_identity_reads_the_root_form_alone() {
+        for named in [
+            "owner: alice\nname: notes\n",
+            "owner: Alice\nname: NOTES\nchecks:\n  - exit 0\n",
+            "owner: alice\r\nname: notes\r\n",
+        ] {
+            assert!(
+                text_names_root_identity(named.as_bytes(), "alice", "notes"),
+                "{named:?}"
+            );
+        }
+        for other in [
+            &b"owner: tmpl\nname: template\n"[..],
+            b"owner: alice\nname: other\n",
+            b"owner: [alice\n",
+            b"- alice\n- notes\n",
+            b"holder: alice/notes\npath: q\n",
+            b"owner: alice\nname: notes\nholder: alice/x\n",
+            b"owner: alice\nname: notes\xff\n",
+            b"",
+        ] {
+            assert!(
+                !text_names_root_identity(other, "alice", "notes"),
+                "{:?}",
+                String::from_utf8_lossy(other)
+            );
+        }
     }
 
     // SPEC u303 Contract Surface, `identity_text`: the text the guard

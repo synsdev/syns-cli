@@ -223,6 +223,9 @@ struct FakeRepo {
     /// A writer rewriting a folder file as a raw read of its path is
     /// answered.
     racing_writer: Option<RacingWriter>,
+    /// Issue 270 M2: the next raw read of this path is closed unanswered,
+    /// a brief outage the read is resent over.
+    drop_next_raw: Option<String>,
 }
 
 /// A writer landing in the folder while a run reads the head: each raw
@@ -298,6 +301,10 @@ impl FakeRepo {
                 let path = urlencoding::decode(&raw["raw/".len()..])
                     .unwrap()
                     .to_string();
+                if self.drop_next_raw.as_deref() == Some(path.as_str()) {
+                    self.drop_next_raw = None;
+                    return None;
+                }
                 if let Some(writer) = self.racing_writer.as_mut()
                     && writer.path == path
                     && (writer.every || writer.writes == 0)
@@ -649,6 +656,11 @@ impl Fake {
             .filter(|(method, _, _)| method == "PUT")
             .map(|(_, _, body)| serde_json::from_slice(body).unwrap())
             .collect()
+    }
+
+    /// Close the next raw read of `path` unanswered (issue 270 M2).
+    pub(crate) fn drop_next_raw(&self, path: &str) {
+        self.repo.lock().unwrap().drop_next_raw = Some(path.to_string());
     }
 
     pub(crate) fn drop_next_push(&self) {
@@ -6199,4 +6211,407 @@ async fn bare_pull_resuming_an_outbox_refuses_a_merge_marked_root_identity() {
 
     malformed_refusal(pulled);
     published_nothing(&e, &dir, &h0);
+}
+
+// ---- issue 270 (D-155): a root identity file corrected to name the copy's
+// own repository, where the head's file names another, is local work.
+
+/// A root identity file naming another repository: a fork's checkout
+/// whose retrieval took the template's file.
+const TEMPLATE_IDENTITY: &str = "owner: tmpl\nname: template\nchecks:\n  - exit 0\n";
+
+/// Head files that answer no identity naming the bound repository:
+/// another repository's, one naming the bound owner with another name,
+/// unparseable, not a mapping, the folder form, and not UTF-8.
+const FOREIGN_HEAD_FILES: [&[u8]; 6] = [
+    TEMPLATE_IDENTITY.as_bytes(),
+    b"owner: alice\nname: other\n",
+    b"owner: [alice\nname: proj\n",
+    b"- owner\n- alice\n",
+    b"holder: alice/proj\npath: q\n",
+    b"owner: alice\nname: proj\xff\n",
+];
+
+/// `e.fake`'s head `h1` holding `a.md` beside `.syns.yaml` reading
+/// `head_identity`, checked out at a fresh folder as its base, and
+/// `.syns.yaml` then corrected by hand to read `local`.
+fn corrected_checkout(e: &Env, head_identity: &[u8], local: &str) -> (PathBuf, String) {
+    let dir = std::fs::canonicalize(e.dir()).unwrap();
+    let h1 = e
+        .fake
+        .commit_bytes(&[("a.md", b"a\n"), (".syns.yaml", head_identity)]);
+    checkout(&e.fake, &e.copy(&dir), &h1);
+    write_files(&dir, &[(".syns.yaml", local)]);
+    (dir, h1)
+}
+
+// Issue 270 Expected row 1 (and row 4 for the head files that do not
+// parse): `syns push` publishes the corrected file, keeps it, and a
+// second push finds nothing to publish.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn push_publishes_an_identity_file_corrected_over_another_repositorys() {
+    for head_identity in FOREIGN_HEAD_FILES {
+        for local in [IDENTITY, "owner: Alice\nname: Proj\n"] {
+            let e = env().await;
+            let label = format!("{:?} -> {local:?}", String::from_utf8_lossy(head_identity));
+            let (dir, h1) = corrected_checkout(&e, head_identity, local);
+
+            let pushed = {
+                let _cwd = CwdGuard::enter(&dir);
+                cmd_push(&e.config, &e.output, &push_args(None)).await
+            };
+
+            assert!(pushed.is_ok(), "{label}: {pushed:?}");
+            assert_eq!(e.fake.push_bodies().len(), 1, "{label}");
+            let (published, tree) = e.fake.head();
+            assert_ne!(published, h1, "{label}");
+            assert_eq!(tree[".syns.yaml"], local, "{label}");
+            assert_eq!(tree["a.md"], "a\n", "{label}");
+            assert_eq!(read(&dir, ".syns.yaml"), local, "{label}");
+
+            let again = {
+                let _cwd = CwdGuard::enter(&dir);
+                cmd_push(&e.config, &e.output, &push_args(None)).await
+            };
+            assert!(again.is_ok(), "{label}: {again:?}");
+            assert_eq!(e.fake.push_bodies().len(), 1, "{label}");
+            assert_eq!(e.fake.head().0, published, "{label}");
+            assert_eq!(read(&dir, ".syns.yaml"), local, "{label}");
+        }
+    }
+}
+
+// Issue 270 Expected row 2: `syns pull` keeps the corrected file, status
+// reads it as local work, and `syns sync` publishes it.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn pull_keeps_and_sync_publishes_an_identity_file_corrected_over_another_repositorys() {
+    for head_identity in FOREIGN_HEAD_FILES {
+        let e = env().await;
+        let label = format!("{:?}", String::from_utf8_lossy(head_identity));
+        let (dir, h1) = corrected_checkout(&e, head_identity, IDENTITY);
+
+        let pulled = {
+            let _cwd = CwdGuard::enter(&dir);
+            cmd_pull(&e.config, &e.output, None, None, None, false, false, None).await
+        };
+        assert!(pulled.is_ok(), "{label}: {pulled:?}");
+        assert_eq!(read(&dir, ".syns.yaml"), IDENTITY, "{label}");
+        assert!(e.fake.push_bodies().is_empty(), "{label}");
+        assert_eq!(
+            working_copy_state(&e.fake.client(), Some(TOKEN), &e.copy(&dir))
+                .await
+                .unwrap(),
+            WorkingCopyState::LocalChanges,
+            "{label}"
+        );
+
+        let synced = {
+            let _cwd = CwdGuard::enter(&dir);
+            cmd_sync(&e.config, &e.output, false).await
+        };
+
+        assert!(synced.is_ok(), "{label}: {synced:?}");
+        assert_eq!(e.fake.push_bodies().len(), 1, "{label}");
+        let (published, tree) = e.fake.head();
+        assert_ne!(published, h1, "{label}");
+        assert_eq!(tree[".syns.yaml"], IDENTITY, "{label}");
+        assert_eq!(read(&dir, ".syns.yaml"), IDENTITY, "{label}");
+        assert_eq!(
+            working_copy_state(&e.fake.client(), Some(TOKEN), &e.copy(&dir))
+                .await
+                .unwrap(),
+            WorkingCopyState::Converged,
+            "{label}"
+        );
+    }
+}
+
+// Issue 270 rows 1-2 under the convergence itself: a retrieval of either
+// overwrite-free kind keeps the corrected file and records no base over
+// it; a publication sends it.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn converge_reads_an_identity_file_corrected_over_another_repositorys_as_local_work() {
+    let e = env().await;
+    for head_identity in FOREIGN_HEAD_FILES {
+        let label = format!("{:?}", String::from_utf8_lossy(head_identity));
+        let fake = Fake::start().await;
+        let folder = tempfile::tempdir().unwrap();
+        let copy = e.copy(folder.path());
+        let h1 = fake.commit_bytes(&[("a.md", b"a\n"), (".syns.yaml", head_identity)]);
+        checkout(&fake, &copy, &h1);
+        write_files(folder.path(), &[(".syns.yaml", IDENTITY)]);
+
+        let kept = retrieve(&fake, &copy, false, &e).await;
+        assert!(
+            !matches!(&kept, SyncOutcome::Synced { written, .. }
+                if written.contains(&".syns.yaml".to_string())),
+            "{label}: {kept:?}"
+        );
+        assert_eq!(read(folder.path(), ".syns.yaml"), IDENTITY, "{label}");
+        assert_eq!(
+            base_identity_entry(&copy),
+            Some(blob_sha1(head_identity)),
+            "{label}"
+        );
+
+        let outcome = publish(&fake, &copy, &e).await;
+
+        assert!(
+            matches!(
+                &outcome,
+                SyncOutcome::Synced {
+                    published: Some(_),
+                    ..
+                }
+            ),
+            "{label}: {outcome:?}"
+        );
+        assert_eq!(fake.head().1[".syns.yaml"], IDENTITY, "{label}");
+        assert_eq!(read(folder.path(), ".syns.yaml"), IDENTITY, "{label}");
+    }
+}
+
+// Issue 270 row 3 (u306 kept): the head's file naming the bound
+// repository with more keys still takes the bare identity text's place,
+// under either mode, publishing nothing; the corrected file of a
+// repository whose name starts with a digit is read alike.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn the_head_file_of_the_bound_repository_still_replaces_the_identity_text() {
+    let e = env().await;
+    for name in ["proj", "9proj"] {
+        for publishing in [false, true] {
+            let label = format!("{name}, publishing {publishing}");
+            let fake = Fake::start().await;
+            let folder = tempfile::tempdir().unwrap();
+            let copy = WorkingCopy::open(e.config.stores(), "alice", name, folder.path()).unwrap();
+            let rich = format!("owner: alice\nname: {name}\nchecks:\n  - exit 0\n");
+            let h1 = fake.commit(&[("a.md", "a\n"), (".syns.yaml", &rich)]);
+            checkout(&fake, &copy, &h1);
+            write_files(
+                folder.path(),
+                &[(".syns.yaml", &format!("owner: alice\nname: {name}\n"))],
+            );
+
+            let outcome = if publishing {
+                publish(&fake, &copy, &e).await
+            } else {
+                retrieve(&fake, &copy, false, &e).await
+            };
+
+            assert!(
+                written_paths(&outcome).contains(&".syns.yaml".to_string()),
+                "{label}: {outcome:?}"
+            );
+            assert!(fake.push_bodies().is_empty(), "{label}");
+            assert_eq!(read(folder.path(), ".syns.yaml"), rich, "{label}");
+        }
+    }
+}
+
+// Issue 270: finishing a half-written preparation reads the corrected
+// file as local work alike (`finish_preparation`'s read).
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn finishing_a_half_written_preparation_keeps_an_identity_file_corrected_over_another_repositorys()
+ {
+    let e = env().await;
+    for mode in [
+        ConvergeMode::Retrieve { overwrite: false },
+        ConvergeMode::Publish,
+    ] {
+        let fake = Fake::start().await;
+        let folder = tempfile::tempdir().unwrap();
+        let copy = e.copy(folder.path());
+        let h1 = fake.commit(&[("a.md", "a\n"), (".syns.yaml", TEMPLATE_IDENTITY)]);
+        checkout(&fake, &copy, &h1);
+        write_files(folder.path(), &[(".syns.yaml", IDENTITY)]);
+        let mut half_written = dummy_resolution(&h1);
+        half_written.base_commit = Some(h1.clone());
+        half_written.pending_writes = Some(BTreeMap::from([(
+            "a.md".to_string(),
+            Some(blob_sha1(b"a\n")),
+        )]));
+        copy.write_resolution(&half_written).unwrap();
+
+        let outcome = converge(&fake.client(), Some(TOKEN), &copy, mode, e.opts())
+            .await
+            .unwrap();
+
+        // A retrieval holds the person's file out of its comparison; a
+        // publication lists it as local work. Neither takes the head's.
+        let resolution = expect_resolution(outcome);
+        let identity = ".syns.yaml".to_string();
+        assert!(
+            !resolution.remote_paths.contains(&identity)
+                && resolution.collisions.iter().all(|(p, _)| *p != identity)
+                && (mode != ConvergeMode::Publish || resolution.local_paths.contains(&identity)),
+            "{mode:?}: {resolution:?}"
+        );
+        assert_eq!(read(folder.path(), ".syns.yaml"), IDENTITY, "{mode:?}");
+        assert!(fake.push_bodies().is_empty(), "{mode:?}");
+    }
+}
+
+// Issue 270: a publication the head's move refused recomputes over the
+// newest head reading the corrected file as local work (`guard_refused`'s
+// read), and never takes the other repository's file over it.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_refused_publication_keeps_an_identity_file_corrected_over_another_repositorys() {
+    let e = env().await;
+    let (dir, _h1) = corrected_checkout(&e, TEMPLATE_IDENTITY.as_bytes(), IDENTITY);
+    e.fake.move_head_before_next_push(&[("z.md", Some("z\n"))]);
+
+    let outcome = publish(&e.fake, &e.copy(&dir), &e).await;
+
+    assert_eq!(read(&dir, ".syns.yaml"), IDENTITY, "{outcome:?}");
+    match &outcome {
+        SyncOutcome::Synced {
+            published: Some(_), ..
+        } => assert_eq!(e.fake.head().1[".syns.yaml"], IDENTITY),
+        SyncOutcome::ResolutionRequired(resolution, _) => assert!(
+            resolution.local_paths.contains(&".syns.yaml".to_string()),
+            "{resolution:?}"
+        ),
+        other => panic!("expected a publication or a resolution, got {other:?}"),
+    }
+    let first = e.fake.push_bodies();
+    assert_eq!(
+        body_content(&first[0], ".syns.yaml"),
+        Some(IDENTITY),
+        "{first:?}"
+    );
+}
+
+// Issue 270 M2: the head-file read is resent over a brief outage, as
+// content reads are, rather than ending the run.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn the_head_identity_read_is_resent_over_a_dropped_answer() {
+    let e = env().await;
+    let (dir, h1) = corrected_checkout(&e, TEMPLATE_IDENTITY.as_bytes(), IDENTITY);
+    e.fake.drop_next_raw(".syns.yaml");
+
+    let pushed = {
+        let _cwd = CwdGuard::enter(&dir);
+        cmd_push(&e.config, &e.output, &push_args(None)).await
+    };
+
+    assert!(pushed.is_ok(), "{pushed:?}");
+    assert_eq!(e.fake.raw_reads(".syns.yaml", &h1), 2);
+    assert_eq!(e.fake.push_bodies().len(), 1);
+    assert_eq!(e.fake.head().1[".syns.yaml"], IDENTITY);
+    assert_eq!(read(&dir, ".syns.yaml"), IDENTITY);
+}
+
+// Issue 270 M1 (`take_in_disjoint_move`'s read): the person corrects the
+// identity file while a reviewed continue's send is out, and the head
+// moves on a path the review left alone. The take-in keeps the correction
+// as local work written since the review — it goes back for review rather
+// than being replaced by the other repository's file — and the next
+// continue publishes it.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_correction_while_a_disjoint_move_is_taken_in_stands_and_publishes() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let h0 = e.fake.commit(&[
+        ("a.md", "a\nb\nc\n"),
+        ("z.md", "z0\n"),
+        (".syns.yaml", TEMPLATE_IDENTITY),
+    ]);
+    checkout(&e.fake, &copy, &h0);
+    write_files(&dir, &[("a.md", "a\nL\nc\n")]);
+    e.fake.commit_changes(&[("a.md", Some("a\nR\nc\n"))]);
+    expect_resolution(publish(&e.fake, &copy, &e).await);
+    write_files(&dir, &[("a.md", "a\nL and R\nc\n")]);
+    e.fake.move_head_before_next_push(&[("z.md", Some("z2\n"))]);
+    e.fake
+        .write_on_next_push(dir.join(".syns.yaml"), IDENTITY.as_bytes());
+
+    let outcome = continue_resolution(&e.fake.client(), TOKEN, &copy, e.opts())
+        .await
+        .unwrap();
+
+    let identity = ".syns.yaml".to_string();
+    let fresh = expect_resolution(outcome);
+    assert!(fresh.local_paths.contains(&identity), "{fresh:?}");
+    assert!(!fresh.remote_paths.contains(&identity), "{fresh:?}");
+    assert!(fresh.reviewed_tree.is_none(), "{fresh:?}");
+    assert_eq!(read(&dir, ".syns.yaml"), IDENTITY);
+    assert_eq!(read(&dir, "z.md"), "z2\n");
+    assert_eq!(e.fake.push_bodies().len(), 1);
+
+    let again = continue_resolution(&e.fake.client(), TOKEN, &copy, e.opts())
+        .await
+        .unwrap();
+
+    let published = published_sha(again);
+    let (head, tree) = e.fake.head();
+    assert_eq!(head, published);
+    assert_eq!(tree[".syns.yaml"], IDENTITY);
+    assert_eq!(tree["a.md"], "a\nL and R\nc\n");
+    assert_eq!(tree["z.md"], "z2\n");
+    assert_eq!(read(&dir, ".syns.yaml"), IDENTITY);
+}
+
+// Issue 270 M3: the base names no `.syns.yaml` (a fresh retrieval wrote
+// the identity text), and the head later gains one naming another
+// repository. A retrieval keeps the local identity file, holding it out;
+// a publication finds an add/add collision on it, marks the file with
+// both sides and publishes nothing. Neither re-addresses the checkout.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_head_gaining_another_repositorys_identity_file_does_not_replace_the_written_one() {
+    let e = env().await;
+    let identity = ".syns.yaml".to_string();
+
+    let (fake, folder, copy, h1) = identity_setup(
+        &e,
+        &[("a.md", "a\n")],
+        IDENTITY,
+        &[(".syns.yaml", Some(TEMPLATE_IDENTITY))],
+    )
+    .await;
+    let kept = retrieve(&fake, &copy, false, &e).await;
+    assert!(!written_paths(&kept).contains(&identity), "{kept:?}");
+    assert_eq!(read(folder.path(), ".syns.yaml"), IDENTITY);
+    assert_eq!(copy.base().unwrap().commit_sha(), Some(h1.as_str()));
+    assert_eq!(base_identity_entry(&copy), None);
+
+    let (fake, folder, copy, h1) = identity_setup(
+        &e,
+        &[("a.md", "a\n")],
+        IDENTITY,
+        &[(".syns.yaml", Some(TEMPLATE_IDENTITY))],
+    )
+    .await;
+    let resolution = expect_resolution(publish(&fake, &copy, &e).await);
+    assert!(
+        names_collision(&resolution, ".syns.yaml", "add_add"),
+        "{resolution:?}"
+    );
+    assert!(fake.push_bodies().is_empty());
+    assert_eq!(fake.head().0, h1);
+    // The collision's markers stand in the file as for any add/add text
+    // collision; its local side still names the copy's repository, so the
+    // checkout resolves as before.
+    let marked = read(folder.path(), ".syns.yaml");
+    assert!(
+        marked.starts_with(&format!("<<<<<<< local\n{IDENTITY}"))
+            && marked.contains(TEMPLATE_IDENTITY),
+        "{marked:?}"
+    );
+    let resolved = syns_cli::repo::syns_yaml::read_syns_yaml(folder.path())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (resolved.owner.as_deref(), resolved.name.as_str()),
+        (Some("alice"), "proj")
+    );
 }
