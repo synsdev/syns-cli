@@ -27,11 +27,23 @@ use crate::read::{
 };
 
 /// The grep fan-out cap: the count of kept paths whose content is
-/// fetched, taken from the front of the ascending path order. A kept set
-/// larger than it leaves the answer marked `truncated` and the run at
-/// exit `0` — `D-080` puts the bound a run applies to itself outside the
-/// partial-answer refusal.
+/// fetched, taken from `--offset` in the ascending path order. A kept set
+/// standing past the window leaves the answer marked `truncated`, naming
+/// the window's end as `nextOffset`, and the run at exit `0` — `D-080`
+/// puts the bound a run applies to itself outside the partial-answer
+/// refusal, and `D-156` pages past it.
 pub const FAN_OUT_CAP: usize = 400;
+
+/// The `--offset` help, naming the cap from `FAN_OUT_CAP` so the two
+/// cannot drift apart.
+pub fn offset_help() -> String {
+    format!(
+        "Skip this many of the matching paths (the files --path and --glob keep), \
+         in ascending path order. One call searches at most {FAN_OUT_CAP} files; \
+         where more remain, the JSON answer's nextOffset names the offset to continue from, \
+         at the same --version"
+    )
+}
 
 /// The count of content requests outstanding at once, with nothing else
 /// pacing them.
@@ -71,6 +83,18 @@ pub struct GrepArgs {
     pub context: Option<u32>,
     pub output: GrepOutput,
     pub head_limit: Option<u32>,
+    /// The count of kept paths, in ascending path order, the window
+    /// starts past (`D-156`).
+    pub offset: u32,
+}
+
+/// The window `--offset` names over `kept` kept paths: its start and
+/// end, clamped to the kept count, and whether kept paths stand past its
+/// end (`D-156`).
+fn window(kept: usize, offset: u32) -> (usize, usize, bool) {
+    let start = usize::try_from(offset).unwrap_or(usize::MAX).min(kept);
+    let end = start.saturating_add(FAN_OUT_CAP).min(kept);
+    (start, end, kept > end)
 }
 
 /// One matched line, with the context lines that are not themselves
@@ -304,6 +328,25 @@ pub async fn cmd_grep(
     args: GrepArgs,
     opts: ReadOptions,
 ) -> Result<(), CliError> {
+    if let Some(document) = grep_document(config, output, pattern, args, opts).await?
+        && output.is_json()
+    {
+        output.json(&document);
+    }
+    Ok(())
+}
+
+/// The whole search but the writing of its one document: the render and
+/// the reference report outside `--json`, and the document answered —
+/// or `None` where `--if-repo` skipped the run. A partial answer stays
+/// the refusal carrying its document.
+pub async fn grep_document(
+    config: &Config,
+    output: &Output,
+    pattern: String,
+    args: GrepArgs,
+    opts: ReadOptions,
+) -> Result<Option<serde_json::Value>, CliError> {
     // 1 — refuse an option combination outside the registered set, build
     // the matcher and compile every `--glob`, all before any request.
     refuse_option_combination(&args)?;
@@ -324,7 +367,7 @@ pub async fn cmd_grep(
 
     // 2 — resolve the target.
     let Some(target) = resolve_read_target(config, output, &opts).await? else {
-        return Ok(());
+        return Ok(None);
     };
     let client = SynsClient::new(config.server_url())?;
 
@@ -372,8 +415,12 @@ pub async fn cmd_grep(
         .filter(|k| glob_admits(&rules, &k.shown))
         .collect();
     kept.sort_by(|a, b| a.shown.cmp(&b.shown));
-    let capped = kept.len() > FAN_OUT_CAP;
-    kept.truncate(FAN_OUT_CAP);
+    // The window `--offset` names, at most the fan-out cap wide
+    // (`D-156`): only its paths are fetched.
+    let total_kept = kept.len();
+    let (start, end, capped) = window(total_kept, args.offset);
+    kept.truncate(end);
+    kept.drain(..start);
 
     // 5 — fetch through the cache, searching each content as it lands
     // and closing the fan-out at the first content that carries the run
@@ -491,6 +538,11 @@ pub async fn cmd_grep(
     // `--head-limit` cuts the sorted pool to the limit.
     let limit = args.head_limit.map(|n| n as usize);
     let truncated = tree_truncated || capped;
+    // The next window starts at this one's end where kept paths stand
+    // past it and this one was searched whole: every path fetched and no
+    // row cut by `--head-limit`, so following it skips nothing (`D-156`).
+    let searched_whole = attempted == pool && limit.is_none_or(|l| carried <= l);
+    let next_offset = (capped && searched_whole).then_some(end);
 
     // 6 — write the render, or one document carrying the result.
     let mut document = serde_json::json!({
@@ -499,6 +551,7 @@ pub async fn cmd_grep(
         "pattern": pattern,
         "output": args.output.wire(),
         "truncated": truncated,
+        "nextOffset": next_offset,
         "skipped": skipped
             .iter()
             .map(|(path, reason)| serde_json::json!({ "path": path, "reason": reason }))
@@ -591,10 +644,19 @@ pub async fn cmd_grep(
     };
 
     if !output.is_json() {
-        // 7 — report the reference.
+        // 7 — report the reference, and where kept paths stand past the
+        // window, the offset and version the next call starts at (`D-156`).
         report_reference(output, &target.reference);
-    } else if refusal.is_none() {
-        output.json(&document);
+        if let Some(next) = next_offset {
+            // Pinned to the version this page read: a commit between
+            // pages would shift the kept list (D-156, verify F1).
+            eprintln!(
+                "this call took files {first} to {end} of the {total_kept} kept, in path order \
+                 (at most {FAN_OUT_CAP} a call); continue with --offset {next} --version {version}",
+                first = start + 1,
+                version = target.reference.version,
+            );
+        }
     }
 
     if let Some(refusal) = refusal {
@@ -605,7 +667,7 @@ pub async fn cmd_grep(
         });
     }
 
-    Ok(())
+    Ok(Some(document))
 }
 
 /// The content render: `{path}:{line}:{text}` where `--line-number`
@@ -695,6 +757,15 @@ mod tests {
         format!("fn one // {index}\n")
     }
 
+    /// The same, but matching `fn ` only below `matching`.
+    fn body_matching(index: usize, matching: usize) -> String {
+        if index < matching {
+            body_for(index)
+        } else {
+            format!("plain // {index}\n")
+        }
+    }
+
     struct FanOutEnv {
         server: MockServer,
         config: Config,
@@ -720,6 +791,13 @@ mod tests {
     }
 
     async fn fan_out_env(paths: usize) -> FanOutEnv {
+        fan_out_env_matching(paths, paths).await
+    }
+
+    /// A tree of `paths` files of which only the first `matching` hold a
+    /// match; every other content is answered after a delay, so the
+    /// matching ones land first and the fetches past them are in flight.
+    async fn fan_out_env_matching(paths: usize, matching: usize) -> FanOutEnv {
         let config_dir = tempfile::tempdir().unwrap();
         let cache_dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", config_dir.path()) };
@@ -751,7 +829,7 @@ mod tests {
 
         let entries: Vec<serde_json::Value> = (0..paths)
             .map(|index| {
-                let content = body_for(index);
+                let content = body_matching(index, matching);
                 serde_json::json!({
                     "name": format!("f{index:04}.ts"),
                     "path": format!("src/f{index:04}.ts"),
@@ -773,7 +851,7 @@ mod tests {
             .and(path_regex(
                 r"^/api/v1/repos/alice/notes/files/src/f\d+\.ts$",
             ))
-            .respond_with(|request: &Request| {
+            .respond_with(move |request: &Request| {
                 let path = request.url.path().to_string();
                 let stem = path.rsplit('/').next().unwrap_or_default().to_string();
                 let index: usize = stem
@@ -781,13 +859,18 @@ mod tests {
                     .trim_end_matches(".ts")
                     .parse()
                     .unwrap_or(0);
-                let content = body_for(index);
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                let content = body_matching(index, matching);
+                let answer = ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "path": format!("src/{stem}"),
                     "sha": blob_sha1(content.as_bytes()),
                     "content": content,
                     "size": content.len(),
-                }))
+                }));
+                if index < matching {
+                    answer
+                } else {
+                    answer.set_delay(std::time::Duration::from_millis(50))
+                }
             })
             .mount(&server)
             .await;
@@ -1087,5 +1170,238 @@ mod tests {
             file_calls >= 3,
             "every landed path is carried: {file_calls}"
         );
+    }
+
+    /// The paths a `files` document names, in its order.
+    fn files_of(document: &serde_json::Value) -> Vec<String> {
+        document["files"]
+            .as_array()
+            .expect("files")
+            .iter()
+            .map(|p| p.as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    // D-156, issue 260: `--offset` pages the kept paths in windows of
+    // the cap — offset 0 fetches the first 400 and names 400 as the next
+    // offset, offset 400 fetches the last 100 and names none, and
+    // following `nextOffset` from 0 visits every kept path exactly once.
+    #[tokio::test]
+    #[serial]
+    async fn following_next_offset_searches_every_kept_path_exactly_once() {
+        let env = fan_out_env(500).await;
+        let output = Output::new(true);
+
+        let first = grep_document(
+            &env.config,
+            &output,
+            "fn ".to_string(),
+            args(GrepOutput::Files),
+            named(),
+        )
+        .await;
+        let first_calls = env.file_calls().await;
+        let second = grep_document(
+            &env.config,
+            &output,
+            "fn ".to_string(),
+            GrepArgs {
+                offset: 400,
+                ..args(GrepOutput::Files)
+            },
+            named(),
+        )
+        .await;
+        let second_calls = env.file_calls().await - first_calls;
+        env.release();
+
+        let first = first.expect("offset 0 exits 0").expect("a document");
+        let second = second.expect("offset 400 exits 0").expect("a document");
+        assert_eq!(first_calls, FAN_OUT_CAP);
+        assert_eq!(first["nextOffset"], serde_json::json!(400));
+        assert_eq!(first["truncated"], serde_json::json!(true));
+        assert_eq!(second_calls, 100);
+        assert_eq!(second["nextOffset"], serde_json::Value::Null);
+        assert_eq!(second["truncated"], serde_json::json!(false));
+
+        let mut union = files_of(&first);
+        union.extend(files_of(&second));
+        let every: Vec<String> = (0..500).map(|i| format!("src/f{i:04}.ts")).collect();
+        assert_eq!(union, every, "each kept path once, in ascending order");
+    }
+
+    // D-156: an offset at or past the kept count answers no rows and no
+    // next offset, and fetches nothing.
+    #[tokio::test]
+    #[serial]
+    async fn an_offset_at_or_past_the_kept_count_answers_no_rows() {
+        let env = fan_out_env(500).await;
+        let output = Output::new(true);
+        let mut answers = Vec::new();
+        for offset in [500, 600, u32::MAX] {
+            answers.push(
+                grep_document(
+                    &env.config,
+                    &output,
+                    "fn ".to_string(),
+                    GrepArgs {
+                        offset,
+                        ..args(GrepOutput::Files)
+                    },
+                    named(),
+                )
+                .await,
+            );
+        }
+        let file_calls = env.file_calls().await;
+        env.release();
+
+        assert_eq!(file_calls, 0);
+        for answer in answers {
+            let document = answer.expect("exit 0").expect("a document");
+            assert!(files_of(&document).is_empty(), "{document}");
+            assert_eq!(document["nextOffset"], serde_json::Value::Null);
+            assert_eq!(document["truncated"], serde_json::json!(false));
+        }
+    }
+
+    // D-156: `--head-limit` closing the fan-out early answers
+    // `nextOffset: null`, so following it never skips a path inside a
+    // window — the rows equal to the limit tell the caller.
+    #[tokio::test]
+    #[serial]
+    async fn head_limit_closing_the_fan_out_answers_no_next_offset() {
+        let env = fan_out_env(500).await;
+        let output = Output::new(true);
+        let answer = grep_document(
+            &env.config,
+            &output,
+            "fn ".to_string(),
+            GrepArgs {
+                head_limit: Some(3),
+                ..args(GrepOutput::Content)
+            },
+            named(),
+        )
+        .await;
+        env.release();
+
+        let document = answer.expect("exit 0").expect("a document");
+        assert_eq!(document["matches"].as_array().map(Vec::len), Some(3));
+        let next = document.get("nextOffset").expect("the key stands");
+        assert_eq!(next, &serde_json::Value::Null);
+        assert_eq!(document["truncated"], serde_json::json!(true));
+    }
+
+    // D-156, "the window was searched whole": a `--head-limit` met only
+    // by the window's last path cuts no row, so the next window is named;
+    // one row fewer cuts a row and names none.
+    #[tokio::test]
+    #[serial]
+    async fn a_head_limit_cutting_no_row_still_names_the_next_window() {
+        let env = fan_out_env(500).await;
+        let output = Output::new(true);
+        let mut answers = Vec::new();
+        for limit in [400, 399] {
+            answers.push(
+                grep_document(
+                    &env.config,
+                    &output,
+                    "fn ".to_string(),
+                    GrepArgs {
+                        head_limit: Some(limit),
+                        ..args(GrepOutput::Files)
+                    },
+                    named(),
+                )
+                .await,
+            );
+        }
+        env.release();
+
+        let mut answers = answers.into_iter();
+        let met = answers
+            .next()
+            .unwrap()
+            .expect("exit 0")
+            .expect("a document");
+        assert_eq!(files_of(&met).len(), 400);
+        assert_eq!(met["nextOffset"], serde_json::json!(400));
+        let cut = answers
+            .next()
+            .unwrap()
+            .expect("exit 0")
+            .expect("a document");
+        assert_eq!(files_of(&cut).len(), 399);
+        assert_eq!(cut["nextOffset"], serde_json::Value::Null);
+    }
+
+    // D-156, "never skips a path inside a window": `--head-limit` met
+    // exactly by the first rows closes the fan-out while later window
+    // paths were never asked for, and the fetches still in flight land
+    // with no row — no row is cut, yet the window was not searched whole,
+    // so no next window is named.
+    #[tokio::test]
+    #[serial]
+    async fn a_head_limit_met_before_the_window_is_fetched_names_no_next_window() {
+        let env = fan_out_env_matching(500, 2).await;
+        let output = Output::new(true);
+        let answer = grep_document(
+            &env.config,
+            &output,
+            "fn ".to_string(),
+            GrepArgs {
+                head_limit: Some(2),
+                ..args(GrepOutput::Files)
+            },
+            named(),
+        )
+        .await;
+        let file_calls = env.file_calls().await;
+        env.release();
+
+        let document = answer.expect("exit 0").expect("a document");
+        assert_eq!(files_of(&document), vec!["src/f0000.ts", "src/f0001.ts"]);
+        assert!(
+            file_calls < FAN_OUT_CAP,
+            "the close left window paths unfetched: {file_calls} calls"
+        );
+        assert_eq!(document["nextOffset"], serde_json::Value::Null);
+        assert_eq!(document["truncated"], serde_json::json!(true));
+    }
+
+    // D-156: a kept set inside one window names no next offset.
+    #[tokio::test]
+    #[serial]
+    async fn a_kept_set_inside_one_window_answers_no_next_offset() {
+        let env = fan_out_env(12).await;
+        let output = Output::new(true);
+        let answer = grep_document(
+            &env.config,
+            &output,
+            "fn ".to_string(),
+            args(GrepOutput::Count),
+            named(),
+        )
+        .await;
+        env.release();
+
+        let document = answer.expect("exit 0").expect("a document");
+        assert_eq!(document["counts"].as_array().map(Vec::len), Some(12));
+        assert_eq!(document["nextOffset"], serde_json::Value::Null);
+        assert_eq!(document["truncated"], serde_json::json!(false));
+    }
+
+    // The window bounds over a kept count: `[start, end)` and whether
+    // kept paths stand past the window.
+    #[test]
+    fn the_window_is_clamped_to_the_kept_count() {
+        assert_eq!(window(500, 0), (0, 400, true));
+        assert_eq!(window(500, 400), (400, 500, false));
+        assert_eq!(window(500, 100), (100, 500, false));
+        assert_eq!(window(801, 400), (400, 800, true));
+        assert_eq!(window(500, 600), (500, 500, false));
+        assert_eq!(window(0, 0), (0, 0, false));
+        assert_eq!(window(10, u32::MAX), (10, 10, false));
     }
 }

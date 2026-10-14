@@ -988,6 +988,126 @@ fn head_limit_closes_the_fan_out_short_of_the_cap() {
     );
 }
 
+// D-156, issue 260: `--offset` continues past the fan-out cap, and
+// following `nextOffset` from 0 reaches every kept path exactly once.
+#[test]
+#[serial]
+fn grep_pages_its_fan_out_by_offset_through_next_offset() {
+    let d = Deployment::new();
+    mount_wide_tree(&d, 450);
+
+    let first = d.run(&["--json", "grep", "fn ", "--repo", REPO, "--output", "files"]);
+    assert_eq!(first.status.code(), Some(0), "{}", stderr_of(&first));
+    let first_body = document(&first);
+    assert_eq!(first_body["nextOffset"], json!(400));
+    assert_eq!(first_body["truncated"], json!(true));
+    assert_eq!(d.file_calls(), 400);
+
+    let second = d.run(&[
+        "--json", "grep", "fn ", "--repo", REPO, "--output", "files", "--offset", "400",
+    ]);
+    assert_eq!(second.status.code(), Some(0), "{}", stderr_of(&second));
+    let second_body = document(&second);
+    assert_eq!(second_body["nextOffset"], Value::Null);
+    assert_eq!(second_body["truncated"], json!(false));
+    assert_eq!(
+        d.file_calls(),
+        450,
+        "the second window fetched only its own 50"
+    );
+
+    let mut union: Vec<Value> = first_body["files"].as_array().expect("files").clone();
+    union.extend(
+        second_body["files"]
+            .as_array()
+            .expect("files")
+            .iter()
+            .cloned(),
+    );
+    let every: Vec<Value> = (0..450)
+        .map(|i| Value::from(format!("src/f{i:04}.ts")))
+        .collect();
+    assert_eq!(union, every);
+
+    let past = d.run(&["--json", "grep", "fn ", "--repo", REPO, "--offset", "600"]);
+    assert_eq!(past.status.code(), Some(0), "{}", stderr_of(&past));
+    let past_body = document(&past);
+    assert_eq!(past_body["matches"], json!([]));
+    assert_eq!(past_body["nextOffset"], Value::Null);
+    assert_eq!(
+        d.file_calls(),
+        450,
+        "an offset past the end fetches nothing"
+    );
+}
+
+// D-156: outside `--json` a capped run says on the diagnostic stream how
+// to continue, and the rows on stdout stay the rows alone.
+#[test]
+#[serial]
+fn a_capped_grep_names_the_offset_to_continue_from_on_stderr() {
+    let d = Deployment::new();
+    mount_wide_tree(&d, 450);
+
+    let capped = d.run(&["grep", "fn ", "--repo", REPO, "--output", "files"]);
+    assert_eq!(capped.status.code(), Some(0), "{}", stderr_of(&capped));
+    // D-156 (verify F1): the walk is pinned to the version this page
+    // read, so a commit between pages shifts no window.
+    assert!(
+        stderr_of(&capped).contains(&format!("--offset 400 --version {HEAD_VERSION}")),
+        "stderr: {}",
+        stderr_of(&capped)
+    );
+    assert_eq!(stdout_of(&capped).lines().count(), 400);
+    assert!(!stdout_of(&capped).contains("--offset"));
+
+    let last = d.run(&[
+        "grep", "fn ", "--repo", REPO, "--output", "files", "--offset", "400",
+    ]);
+    assert_eq!(last.status.code(), Some(0), "{}", stderr_of(&last));
+    assert!(
+        !stderr_of(&last).contains("--offset"),
+        "the last window names no continuation: {}",
+        stderr_of(&last)
+    );
+    assert_eq!(stdout_of(&last).lines().count(), 50);
+}
+
+// D-156: the cap stands where callers plan — `syns grep --help`.
+#[test]
+fn grep_help_states_the_fan_out_cap_and_the_offset() {
+    let d = Deployment::new();
+    let help = d.run(&["grep", "--help"]);
+    assert_eq!(help.status.code(), Some(0), "{}", stderr_of(&help));
+    let text = stdout_of(&help);
+    assert!(text.contains("--offset <NUM>"), "help: {text}");
+    let cap = syns_cli::commands::grep::FAN_OUT_CAP;
+    assert!(
+        text.contains(&format!("at most {cap} files")),
+        "help: {text}"
+    );
+    assert!(text.contains("matching paths"), "help: {text}");
+}
+
+// An `--offset` value no count spells is refused by the argument parser
+// at exit 2, before any request.
+#[test]
+#[serial]
+fn an_offset_that_is_no_count_is_refused_at_parse() {
+    let d = Deployment::new();
+    mount_wide_tree(&d, 3);
+    for value in ["", "-1", "abc", "1.5"] {
+        let output = d.run(&["grep", "fn ", "--repo", REPO, "--offset", value]);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "--offset {value:?}: {}",
+            stderr_of(&output)
+        );
+    }
+    assert!(d.requests().is_empty(), "nothing was sent");
+}
+
 #[test]
 #[serial]
 fn a_glob_value_without_a_separator_matches_at_every_depth() {

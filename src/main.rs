@@ -214,6 +214,8 @@ enum Commands {
         /// Carry at most this many rows
         #[arg(long, value_name = "NUM")]
         head_limit: Option<u32>,
+        #[arg(long, value_name = "NUM", default_value_t = 0, help = syns_cli::commands::grep::offset_help())]
+        offset: u32,
         #[command(flatten)]
         read: ReadOpts,
     },
@@ -623,6 +625,7 @@ async fn run(
             context,
             output: mode,
             head_limit,
+            offset,
             read,
         } => {
             let args = GrepArgs {
@@ -635,6 +638,7 @@ async fn run(
                 context,
                 output: mode,
                 head_limit,
+                offset,
             };
             commands::grep::cmd_grep(config, output, pattern, args, read.into()).await?
         }
