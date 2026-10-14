@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::errors::{ApiErrorContext, CliError};
 use crate::output::Output;
 use crate::repo::folder::refuse_holder_change;
-use crate::repo::syns_yaml::write_syns_yaml;
+use crate::repo::syns_yaml::repoint_root_identity;
 use console::style;
 
 fn validate_repo_id(repo: &str) -> Result<(), CliError> {
@@ -101,25 +101,23 @@ pub async fn cmd_fork(
         eprintln!("{}", style(format!("{} files", response.file_count)).dim());
     }
 
-    let cwd = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(_) => {
-            eprintln!("warning: could not determine current directory, .syns.yaml not updated");
-            return Ok(());
-        }
+    // The fork places no content, so it creates no identity: only an
+    // identity file standing in the working directory and naming the
+    // source is repointed to the copy (issue 162, `D-025`).
+    let (Some((source_owner, source_name)), Some(copy)) = (repo.split_once('/'), fork_identity)
+    else {
+        return Ok(());
     };
-
-    if let Some((fork_owner, fork_name)) = fork_identity {
-        if let Err(err) = write_syns_yaml(&cwd, fork_owner, fork_name) {
-            eprintln!("warning: could not update .syns.yaml: {err}");
-            return Ok(());
-        }
-        if !output.is_json() {
-            eprintln!(
-                "{}",
-                style(format!("Updated .syns.yaml → {}/{}", fork_owner, fork_name)).dim()
-            );
-        }
+    let Ok(cwd) = std::env::current_dir() else {
+        return Ok(());
+    };
+    match repoint_root_identity(&cwd, (source_owner, source_name), copy) {
+        Ok(true) if !output.is_json() => eprintln!(
+            "{}",
+            style(format!("Updated .syns.yaml → {}/{}", copy.0, copy.1)).dim()
+        ),
+        Ok(_) => {}
+        Err(err) => eprintln!("warning: could not update .syns.yaml: {err}"),
     }
 
     Ok(())
@@ -169,13 +167,106 @@ mod tests {
         let result = cmd_fork(&config, &output, "alice/my-project".into(), None).await;
         assert!(result.is_ok());
 
-        let yaml_path = dir.path().join(".syns.yaml");
-        assert!(yaml_path.exists());
-        let contents = std::fs::read_to_string(&yaml_path).unwrap();
-        assert!(contents.contains("owner: bob"));
-        assert!(contents.contains("name: my-project"));
+        // Issue 162: a directory bound to no repository stays unbound.
+        assert!(!dir.path().join(".syns.yaml").exists());
 
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+    }
+
+    /// Issue 162: run a successful `alice/my-project` → `bob/my-copy`
+    /// fork standing in `cwd`, `config_dir` holding the credential.
+    async fn fork_from(config_dir: &std::path::Path, cwd: &std::path::Path) {
+        TokenStore::new(config_dir.join("credentials.json"))
+            .write("test-token")
+            .unwrap();
+        std::env::set_current_dir(cwd).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", config_dir) };
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/repos/alice/my-project/fork"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "owner": "bob", "name": "my-copy", "description": null,
+                "commitSha": "abc123", "status": "active", "visibility": "public",
+                "tags": [], "fileCount": 5, "forkCount": 0,
+                "forkedFrom": { "owner": "alice", "name": "my-project" },
+                "createdAt": "2025-01-01T00:00:00Z", "updatedAt": "2025-01-01T00:00:00Z"
+            })))
+            .mount(&mock_server)
+            .await;
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        cmd_fork(
+            &config,
+            &Output::new(false),
+            "alice/my-project".into(),
+            None,
+        )
+        .await
+        .unwrap();
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn fork_from_an_unbound_directory_writes_no_identity() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::create_dir(cwd.path().join("sibling")).unwrap();
+        std::fs::write(cwd.path().join("sibling/note.md"), "note\n").unwrap();
+        fork_from(config_dir.path(), cwd.path()).await;
+        assert!(!cwd.path().join(".syns.yaml").exists());
+        assert!(!cwd.path().join("sibling/.syns.yaml").exists());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn fork_from_a_checkout_of_the_source_repoints_it_keeping_its_checks() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let file = cwd.path().join(".syns.yaml");
+        std::fs::write(
+            &file,
+            "owner: alice\nname: my-project\nchecks:\n  - exit 0\n",
+        )
+        .unwrap();
+        fork_from(config_dir.path(), cwd.path()).await;
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            crate::repo::syns_yaml::text_names_root_identity(text.as_bytes(), "bob", "my-copy"),
+            "{text}"
+        );
+        assert_eq!(
+            crate::repo::syns_yaml::declared_checks(&text).unwrap(),
+            vec!["exit 0"]
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn fork_beside_or_below_another_identity_leaves_every_file_standing() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let other_file = other.path().join(".syns.yaml");
+        std::fs::write(&other_file, "owner: carol\nname: other\n").unwrap();
+        fork_from(config_dir.path(), other.path()).await;
+        assert_eq!(
+            std::fs::read_to_string(&other_file).unwrap(),
+            "owner: carol\nname: other\n"
+        );
+
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source.path().join(".syns.yaml"),
+            "owner: alice\nname: my-project\n",
+        )
+        .unwrap();
+        let sub = source.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        fork_from(config_dir.path(), &sub).await;
+        assert!(!sub.join(".syns.yaml").exists());
+        assert_eq!(
+            std::fs::read_to_string(source.path().join(".syns.yaml")).unwrap(),
+            "owner: alice\nname: my-project\n"
+        );
     }
 
     #[tokio::test]

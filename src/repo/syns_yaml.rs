@@ -592,10 +592,121 @@ pub fn write_syns_yaml_where_none_stands(
     Ok(true)
 }
 
+/// Repoint the root-form identity file standing in `dir` itself from
+/// `from` to `to`, answering whether it wrote (issue 162, `D-025`): the
+/// local half of a fork, which places no content and so creates no
+/// identity. Only a file parsing as the root form as written and naming
+/// `from`, ASCII letter case aside, is rewritten, its `owner` and `name`
+/// replaced and every other key, such as `checks`, kept (issue 122); a
+/// file holding those two keys alone is written as `identity_text`, so
+/// the checkout guard still holds it out as a retrieval's record. No file
+/// in `dir`, and one that is not UTF-8, is the folder form, carries
+/// collision markers, parses as no form or names another repository, are
+/// left as they stand. A file above `dir` is never consulted.
+pub fn repoint_root_identity(
+    dir: &Path,
+    from: (&str, &str),
+    to: (&str, &str),
+) -> Result<bool, CliError> {
+    let file_path = dir.join(SYNS_YAML_FILENAME);
+    if !file_path.is_file() {
+        return Ok(false);
+    }
+    let bytes = std::fs::read(&file_path).map_err(|err| CliError::Io {
+        message: format!("could not read .syns.yaml: {err}"),
+    })?;
+    if !text_names_root_identity(&bytes, from.0, from.1) {
+        return Ok(false);
+    }
+    let contents = String::from_utf8_lossy(&bytes);
+    let Ok(serde_yaml::Value::Mapping(mut mapping)) =
+        serde_yaml::from_str::<serde_yaml::Value>(&contents)
+    else {
+        return Ok(false);
+    };
+    mapping.insert("owner".into(), to.0.into());
+    mapping.insert("name".into(), to.1.into());
+    let text = if mapping.len() == 2 {
+        identity_text(to.0, to.1)
+    } else {
+        serde_yaml::to_string(&mapping).map_err(invalid)?
+    };
+    std::fs::write(&file_path, text).map_err(|err| CliError::Io {
+        message: format!("could not write .syns.yaml: {err}"),
+    })?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    // Issue 162: a fork repoints only a root-form file in the directory
+    // itself naming the source, and creates none.
+    #[test]
+    fn repoint_writes_nothing_where_no_file_stands_in_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".syns.yaml"), "owner: alice\nname: notes\n").unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        assert!(!repoint_root_identity(&sub, ("alice", "notes"), ("bob", "notes")).unwrap());
+        assert!(!sub.join(".syns.yaml").exists());
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".syns.yaml")).unwrap(),
+            "owner: alice\nname: notes\n"
+        );
+    }
+
+    #[test]
+    fn repoint_rewrites_a_file_naming_the_source_keeping_its_other_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".syns.yaml");
+        fs::write(&file, "owner: Alice\nname: Notes\n").unwrap();
+        assert!(
+            repoint_root_identity(dir.path(), ("alice", "notes"), ("bob", "notes-copy")).unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            identity_text("bob", "notes-copy")
+        );
+
+        fs::write(
+            &file,
+            "owner: alice\nname: notes\nchecks:\n  - cargo test\n  - exit 0\n",
+        )
+        .unwrap();
+        assert!(repoint_root_identity(dir.path(), ("alice", "notes"), ("bob", "notes")).unwrap());
+        let text = fs::read_to_string(&file).unwrap();
+        assert!(
+            text_names_root_identity(text.as_bytes(), "bob", "notes"),
+            "{text}"
+        );
+        assert_eq!(
+            declared_checks(&text).unwrap(),
+            vec!["cargo test", "exit 0"]
+        );
+    }
+
+    #[test]
+    fn repoint_leaves_every_other_file_as_it_stands() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".syns.yaml");
+        let others: [&[u8]; 5] = [
+            b"owner: carol\nname: other\nchecks:\n  - exit 0\n",
+            b"holder: alice/notes\npath: sub\n",
+            b"<<<<<<< local\nowner: alice\nname: notes\n=======\nowner: bob\nname: notes\n>>>>>>> remote\n",
+            b"not: [an identity\n",
+            b"owner: alice\nname: \xff\n",
+        ];
+        for other in others {
+            fs::write(&file, other).unwrap();
+            assert!(
+                !repoint_root_identity(dir.path(), ("alice", "notes"), ("bob", "notes")).unwrap()
+            );
+            assert_eq!(fs::read(&file).unwrap(), other);
+        }
+    }
 
     #[test]
     fn write_creates_valid_yaml() {
