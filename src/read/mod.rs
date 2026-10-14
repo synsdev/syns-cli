@@ -304,20 +304,57 @@ fn leaving_folder(typed: &str, folder: &FolderScope) -> CliError {
     }
 }
 
+/// The refusal of a path climbing above the repository's root with no
+/// folder bound (issue 211, D-134).
+fn leaving_repository(typed: &str) -> CliError {
+    CliError::Config {
+        message: format!(
+            "{typed} names no path inside the repository; name one counted from its root"
+        ),
+    }
+}
+
+/// `typed`'s segments with `.` and empty ones dropped and each `..`
+/// taking off the segment before it, none where a `..` climbs above the
+/// start (issue 211, D-134).
+fn resolve_dot_segments(typed: &str) -> Option<Vec<&str>> {
+    let mut resolved = Vec::new();
+    for segment in typed.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                resolved.pop()?;
+            }
+            named => resolved.push(named),
+        }
+    }
+    Some(resolved)
+}
+
 /// A typed path argument as a path in the repository (SPEC u290
-/// Contract Surface, `repository_argument`): with no folder the typed
-/// value unchanged; inside a folder the folder's path where nothing was
-/// typed and the typed value joined under it otherwise, a value opening
-/// with `/` or holding a `.` or `..` segment refused before any request.
-/// Inside a folder a value `refuse_empty_path` refuses is refused with
-/// the empty-path refusal, so no typed value names the folder's own path
-/// (SPEC u297 Behaviour, `repository_argument` 3).
+/// Contract Surface, `repository_argument`; issue 211, D-134): `.` and
+/// `..` segments resolved lexically under every binding. With no folder
+/// a value holding no dot segment unchanged, one resolving to the root
+/// none, and one climbing above the root refused before any request;
+/// inside a folder the folder's path where nothing was typed or the value
+/// resolves to the folder itself, and the resolved value joined under it
+/// otherwise, a value opening with `/` or climbing out refused before any
+/// request. Inside a folder a value `refuse_empty_path` refuses is
+/// refused with the empty-path refusal (SPEC u297 Behaviour,
+/// `repository_argument` 3).
 pub fn repository_argument(
     folder: Option<&FolderScope>,
     typed: Option<&str>,
 ) -> Result<Option<String>, CliError> {
     let Some(folder) = folder else {
-        return Ok(typed.map(str::to_string));
+        let Some(typed) = typed else {
+            return Ok(None);
+        };
+        if !typed.split('/').any(|seg| seg == "." || seg == "..") {
+            return Ok(Some(typed.to_string()));
+        }
+        let resolved = resolve_dot_segments(typed).ok_or_else(|| leaving_repository(typed))?;
+        return Ok((!resolved.is_empty()).then(|| resolved.join("/")));
     };
     // SPEC u302: inside a folder bound to its identity, nothing typed
     // names the identity's whole tree, and a typed path stands as typed.
@@ -325,10 +362,14 @@ pub fn repository_argument(
         return Ok(folder.identity.is_none().then(|| folder.path.clone()));
     };
     refuse_empty_path(typed)?;
-    if typed.starts_with('/') || typed.split('/').any(|seg| seg == "." || seg == "..") {
+    if typed.starts_with('/') {
         return Err(leaving_folder(typed, folder));
     }
-    Ok(Some(folder.request_path(typed)))
+    let resolved = resolve_dot_segments(typed).ok_or_else(|| leaving_folder(typed, folder))?;
+    if resolved.is_empty() {
+        return Ok(folder.identity.is_none().then(|| folder.path.clone()));
+    }
+    Ok(Some(folder.request_path(&resolved.join("/"))))
 }
 
 /// The two options the repository-scoped verbs this unit adds carry,
@@ -485,8 +526,10 @@ mod tests {
     fn repository_argument_maps_a_typed_path_under_the_folder() {
         assert_eq!(repository_argument(None, None).unwrap(), None);
         assert_eq!(
-            repository_argument(None, Some("../x")).unwrap().as_deref(),
-            Some("../x")
+            repository_argument(None, Some("a/../x"))
+                .unwrap()
+                .as_deref(),
+            Some("x")
         );
         let folder = q3();
         assert_eq!(
@@ -499,12 +542,88 @@ mod tests {
                 .as_deref(),
             Some("clients/q3/notes/a.md")
         );
-        for typed in ["/x", "../x", "a/./b"] {
+        for typed in ["/x", "../x", "a/../../x", ".."] {
             let err = repository_argument(Some(&folder), Some(typed)).unwrap_err();
             assert_eq!(
                 err.to_string(),
                 format!(
                     "configuration error: {typed} names no path inside the folder /w/clients/q3; name one counted from it"
+                )
+            );
+            assert_eq!(err.exit_code(), 1);
+        }
+    }
+
+    // issue 211, D-134: inside a folder a dot segment resolves against
+    // it, `.` naming the folder itself as nothing typed does.
+    #[test]
+    fn repository_argument_resolves_dot_segments_inside_a_folder() {
+        let folder = q3();
+        for (typed, mapped) in [
+            ("./x.md", "clients/q3/x.md"),
+            ("sub/../x.md", "clients/q3/x.md"),
+            ("a/./b", "clients/q3/a/b"),
+            ("welcome/../notes", "clients/q3/notes"),
+            ("3/../x", "clients/q3/x"),
+            (".", "clients/q3"),
+            ("./", "clients/q3"),
+            ("a/..", "clients/q3"),
+        ] {
+            assert_eq!(
+                repository_argument(Some(&folder), Some(typed))
+                    .unwrap()
+                    .as_deref(),
+                Some(mapped),
+                "{typed}"
+            );
+        }
+        let mut identity = q3();
+        identity.identity = Some("work-q3".into());
+        assert_eq!(
+            repository_argument(Some(&identity), Some("sub/../x.md"))
+                .unwrap()
+                .as_deref(),
+            Some("x.md")
+        );
+        assert_eq!(
+            repository_argument(Some(&identity), Some(".")).unwrap(),
+            None
+        );
+    }
+
+    // issue 211, D-134: with no folder a path holding no dot segment
+    // stands as typed, one holding one is resolved, and one climbing above
+    // the repository's root is refused before any request.
+    #[test]
+    fn repository_argument_resolves_dot_segments_with_no_folder() {
+        for (typed, mapped) in [
+            ("x.md", Some("x.md")),
+            ("a//b/", Some("a//b/")),
+            ("./x.md", Some("x.md")),
+            ("a/./b", Some("a/b")),
+            ("/a/../b", Some("b")),
+            ("3/../x", Some("x")),
+            (".", None),
+            ("a/..", None),
+        ] {
+            assert_eq!(
+                repository_argument(None, Some(typed)).unwrap().as_deref(),
+                mapped,
+                "{typed}"
+            );
+        }
+        for typed in [
+            "..",
+            "../x",
+            "../versions/3",
+            "a/../../x",
+            "../../../bob/other/files/x",
+        ] {
+            let err = repository_argument(None, Some(typed)).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "configuration error: {typed} names no path inside the repository; name one counted from its root"
                 )
             );
             assert_eq!(err.exit_code(), 1);

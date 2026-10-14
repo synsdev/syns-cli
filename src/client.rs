@@ -765,11 +765,11 @@ struct AddCollaboratorErrorBody {
 }
 
 /// The share routes' address for the folder at `path` of `holder`.
-fn share_url(base_url: &str, holder: &str, path: &str) -> String {
-    format!(
+fn share_url(base_url: &str, holder: &str, path: &str) -> Result<String, CliError> {
+    Ok(format!(
         "{base_url}/api/v1/repos/{holder}/shares/{}",
-        encode_path_segments(path)
-    )
+        encode_path_segments(path)?
+    ))
 }
 
 /// One typed or served identifier as a single segment of an address
@@ -787,12 +787,23 @@ pub(crate) fn address_segment(label: &str, value: &str) -> Result<String, CliErr
     Ok(urlencoding::encode(value).into_owned())
 }
 
-fn encode_path_segments(path: &str) -> String {
-    path.split('/')
-        .filter(|segment| !segment.is_empty())
-        .map(|segment| urlencoding::encode(segment))
-        .collect::<Vec<_>>()
-        .join("/")
+/// A repository path as the segments of an address, each percent-encoded
+/// and empty ones dropped; a `.` or `..` segment refused as
+/// `CONFIG_ERROR` before any request, since the URL parser folds it and
+/// its `%2e` spellings into another route (issue 211, D-134; issue 258).
+fn encode_path_segments(path: &str) -> Result<String, CliError> {
+    let mut encoded = Vec::new();
+    for segment in path.split('/').filter(|segment| !segment.is_empty()) {
+        if matches!(segment, "." | "..") {
+            return Err(CliError::Config {
+                message: format!(
+                    "{path} holds a . or .. segment, which no repository path carries"
+                ),
+            });
+        }
+        encoded.push(urlencoding::encode(segment));
+    }
+    Ok(encoded.join("/"))
 }
 
 // --- The bounded transport (SPEC u280, `D-089`, `D-090`) ---
@@ -1350,7 +1361,7 @@ impl SynsClient {
                 "{}/api/v1/repos/{}/tree/{}",
                 self.base_url,
                 repo_id,
-                encode_path_segments(p)
+                encode_path_segments(p)?
             ),
             None => format!("{}/api/v1/repos/{}/tree", self.base_url, repo_id),
         };
@@ -1379,7 +1390,7 @@ impl SynsClient {
             "{}/api/v1/repos/{}/files/{}",
             self.base_url,
             repo_id,
-            encode_path_segments(path)
+            encode_path_segments(path)?
         );
         let mut req = self.client.get(&url);
         if let Some(r) = version_ref {
@@ -1401,12 +1412,12 @@ impl SynsClient {
         token: Option<&str>,
         path: &str,
         version_ref: Option<&str>,
-    ) -> reqwest::RequestBuilder {
+    ) -> Result<reqwest::RequestBuilder, CliError> {
         let url = format!(
             "{}/api/v1/repos/{}/raw/{}",
             self.base_url,
             repo_id,
-            encode_path_segments(path)
+            encode_path_segments(path)?
         );
         let mut req = self.client.request(method, &url);
         if let Some(r) = version_ref {
@@ -1415,7 +1426,7 @@ impl SynsClient {
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
-        req
+        Ok(req)
     }
 
     /// One `GET` of the raw entry (SPEC u280 `get_raw`, `D-088`): the
@@ -1434,7 +1445,7 @@ impl SynsClient {
         capacity: Option<usize>,
     ) -> Result<RawFile, CliError> {
         let response = self
-            .raw_request(reqwest::Method::GET, repo_id, token, path, version_ref)
+            .raw_request(reqwest::Method::GET, repo_id, token, path, version_ref)?
             .send_empty_bounded()
             .await?;
         let response = check_response(response).await?;
@@ -1469,7 +1480,7 @@ impl SynsClient {
                 token,
                 path,
                 Some(version_ref),
-            )
+            )?
             .send_empty_bounded()
             .await?;
         match check_response(response).await {
@@ -1492,7 +1503,7 @@ impl SynsClient {
         dest: &std::path::Path,
     ) -> Result<StagedRaw, CliError> {
         let response = self
-            .raw_request(reqwest::Method::GET, repo_id, token, path, version_ref)
+            .raw_request(reqwest::Method::GET, repo_id, token, path, version_ref)?
             .send_empty_bounded()
             .await?;
         let response = check_response(response).await?;
@@ -1528,7 +1539,7 @@ impl SynsClient {
             "{}/api/v1/repos/{}/versions/{}",
             self.base_url,
             repo_id,
-            encode_path_segments(reference)
+            encode_path_segments(reference)?
         );
         let mut req = self.client.get(&url);
         if let Some(t) = token {
@@ -1550,7 +1561,7 @@ impl SynsClient {
             "{}/api/v1/repos/{}/files/{}/history",
             self.base_url,
             repo_id,
-            encode_path_segments(path)
+            encode_path_segments(path)?
         );
         let mut req = self
             .client
@@ -1825,7 +1836,7 @@ impl SynsClient {
             "{}/api/v1/repos/{}/files/{}/revert",
             self.base_url,
             repo_id,
-            encode_path_segments(path)
+            encode_path_segments(path)?
         );
         let response = self
             .client
@@ -2054,7 +2065,7 @@ impl SynsClient {
         token: Option<&str>,
         path: &str,
     ) -> Result<(RepoResponse, serde_json::Value), CliError> {
-        let url = share_url(&self.base_url, holder, path);
+        let url = share_url(&self.base_url, holder, path)?;
         let mut req = self.client.get(&url);
         if let Some(t) = token {
             req = req.bearer_auth(t);
@@ -2072,7 +2083,7 @@ impl SynsClient {
         token: &str,
         path: &str,
     ) -> Result<(), CliError> {
-        let url = share_url(&self.base_url, holder, path);
+        let url = share_url(&self.base_url, holder, path)?;
         let response = self
             .client
             .delete(&url)
@@ -2724,10 +2735,13 @@ mod tests {
 
     #[test]
     fn encode_path_preserves_slashes() {
-        assert_eq!(encode_path_segments("src/main.rs"), "src/main.rs");
-        assert_eq!(encode_path_segments("src/my file.rs"), "src/my%20file.rs");
+        assert_eq!(encode_path_segments("src/main.rs").unwrap(), "src/main.rs");
         assert_eq!(
-            encode_path_segments("dir/sub dir/file #2.txt"),
+            encode_path_segments("src/my file.rs").unwrap(),
+            "src/my%20file.rs"
+        );
+        assert_eq!(
+            encode_path_segments("dir/sub dir/file #2.txt").unwrap(),
             "dir/sub%20dir/file%20%232.txt"
         );
     }
@@ -2753,9 +2767,21 @@ mod tests {
 
     #[test]
     fn encode_path_filters_empty_segments() {
-        assert_eq!(encode_path_segments("/src/main.rs"), "src/main.rs");
-        assert_eq!(encode_path_segments("src//main.rs"), "src/main.rs");
-        assert_eq!(encode_path_segments("src/main.rs/"), "src/main.rs");
+        assert_eq!(encode_path_segments("/src/main.rs").unwrap(), "src/main.rs");
+        assert_eq!(encode_path_segments("src//main.rs").unwrap(), "src/main.rs");
+        assert_eq!(encode_path_segments("src/main.rs/").unwrap(), "src/main.rs");
+    }
+
+    // issue 211, D-134: no path reaches an address the URL parser folds,
+    // its `%2e` spellings folding as `.` does (issue 258).
+    #[test]
+    fn encode_path_segments_refuses_a_dot_segment() {
+        for path in [".", "..", "../versions/3", "a/./b", "raw/../x"] {
+            let err = encode_path_segments(path).unwrap_err();
+            assert!(matches!(err, CliError::Config { .. }), "{path}: {err:?}");
+            assert_eq!(err.exit_code(), 1);
+        }
+        assert_eq!(encode_path_segments("a/.b/..c").unwrap(), "a/.b/..c");
     }
 
     #[test]

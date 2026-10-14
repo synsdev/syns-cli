@@ -154,11 +154,12 @@ pub struct WriteTarget {
 
 impl WriteTarget {
     /// A typed path as a path in the repository (SPEC u291 Contract
-    /// Surface, `WriteTarget::repository_path`): unchanged with no folder,
-    /// and inside one joined under it, a path leaving it refused.
+    /// Surface, `WriteTarget::repository_path`): with no folder unchanged
+    /// but for its `.` and `..` segments resolved (issue 211, D-134), and
+    /// inside one joined under it, a path leaving it refused.
     pub fn repository_path(&self, typed: &str) -> Result<String, CliError> {
         match &self.folder {
-            None => Ok(typed.to_string()),
+            None => Ok(repository_argument(None, Some(typed))?.unwrap_or_default()),
             Some(folder) => Ok(repository_argument(Some(folder), Some(typed))?
                 .unwrap_or_else(|| folder.request_path(""))),
         }
