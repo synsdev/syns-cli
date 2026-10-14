@@ -3,7 +3,7 @@ use crate::client::{RevertFileRequest, SynsClient};
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
-use crate::read::repository_argument;
+use crate::read::file_argument;
 use crate::repo::folder::resolve_scoped_or_skip;
 
 pub async fn cmd_revert(
@@ -24,7 +24,7 @@ pub async fn cmd_revert(
         Some(bound) => bound,
         None => return Ok(()),
     };
-    let mapped = repository_argument(folder.as_ref(), Some(&path))?.unwrap_or_else(|| path.clone());
+    let mapped = file_argument(folder.as_ref(), &path)?;
     let repo_id = format!("{owner}/{name}");
     let token = TokenStore::new(config.credentials_path())
         .read()?

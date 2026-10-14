@@ -372,6 +372,31 @@ pub fn repository_argument(
     Ok(Some(folder.request_path(&resolved.join("/"))))
 }
 
+/// A typed path a file verb acts on (`syns revert`, the write verbs) as
+/// a path in the repository: `repository_argument`'s mapping, a value
+/// whose dot segments resolve to the folder itself or the repository's
+/// root refused before any request, since no file stands there (issue
+/// 211, D-134; SPEC u297).
+pub fn file_argument(folder: Option<&FolderScope>, typed: &str) -> Result<String, CliError> {
+    let has_dot_segment = typed.split('/').any(|seg| seg == "." || seg == "..");
+    if has_dot_segment && resolve_dot_segments(typed).is_some_and(|resolved| resolved.is_empty()) {
+        return Err(CliError::Config {
+            message: match folder {
+                Some(folder) => format!(
+                    "{typed} names the folder {} itself; name a file counted from it",
+                    folder.dir.display()
+                ),
+                None => format!("{typed} names the repository's root; name a file counted from it"),
+            },
+        });
+    }
+    Ok(match folder {
+        Some(folder) => repository_argument(Some(folder), Some(typed))?
+            .unwrap_or_else(|| folder.request_path("")),
+        None => repository_argument(None, Some(typed))?.unwrap_or_default(),
+    })
+}
+
 /// The two options the repository-scoped verbs this unit adds carry,
 /// spelt and bound as the read verbs spell and bind them (SPEC u272
 /// Contract Surface, `RepoScopeArgs`). There is no `--version` beside
@@ -628,6 +653,34 @@ mod tests {
             );
             assert_eq!(err.exit_code(), 1);
         }
+    }
+
+    // issue 211 review: a file verb's `.` names no file, inside a folder
+    // or with none, while a dot segment naming a file resolves.
+    #[test]
+    fn file_argument_refuses_a_value_resolving_to_the_scope_itself() {
+        let folder = q3();
+        let mut identity = q3();
+        identity.identity = Some("work-q3".into());
+        for typed in [".", "./", "a/.."] {
+            for scope in [Some(&folder), Some(&identity), None] {
+                let err = file_argument(scope, typed).unwrap_err();
+                assert!(matches!(err, CliError::Config { .. }), "{typed}: {err:?}");
+            }
+        }
+        assert_eq!(
+            file_argument(Some(&folder), ".").unwrap_err().to_string(),
+            "configuration error: . names the folder /w/clients/q3 itself; name a file counted from it"
+        );
+        assert_eq!(
+            file_argument(Some(&folder), "sub/../x.md").unwrap(),
+            "clients/q3/x.md"
+        );
+        assert_eq!(file_argument(Some(&identity), "./x.md").unwrap(), "x.md");
+        assert_eq!(file_argument(None, "a/../x.md").unwrap(), "x.md");
+        assert_eq!(file_argument(None, "x.md").unwrap(), "x.md");
+        assert!(file_argument(None, "../x.md").is_err());
+        assert!(file_argument(Some(&folder), "../x.md").is_err());
     }
 
     // SPEC u302 Behaviour, `resolve_read_target` 1: inside a folder bound

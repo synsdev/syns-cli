@@ -36,7 +36,7 @@ use crate::push::folder_check::{FOLDER_SEND_BOUND, FolderCheck, named_head};
 use crate::push::hash::blob_sha1;
 use crate::push::manifest::Manifest;
 use crate::push::working_copy::{WorkingCopy, folder_base};
-use crate::read::repository_argument;
+use crate::read::file_argument;
 use crate::repo::folder::{FolderScope, lies_under, resolve_folder_scope};
 use crate::repo::identity::identity_head;
 use crate::repo::if_repo::resolve_full_or_skip;
@@ -158,11 +158,7 @@ impl WriteTarget {
     /// but for its `.` and `..` segments resolved (issue 211, D-134), and
     /// inside one joined under it, a path leaving it refused.
     pub fn repository_path(&self, typed: &str) -> Result<String, CliError> {
-        match &self.folder {
-            None => Ok(repository_argument(None, Some(typed))?.unwrap_or_default()),
-            Some(folder) => Ok(repository_argument(Some(folder), Some(typed))?
-                .unwrap_or_else(|| folder.request_path(""))),
-        }
+        file_argument(self.folder.as_ref(), typed)
     }
 }
 
@@ -1066,20 +1062,19 @@ pub async fn publish_changeset(
     // SPEC u291 `commit_changeset` 1 — inside a folder, every file and
     // deletion the changeset names taken as a path in the holder, a path
     // leaving the folder refused before the push.
-    let changeset = match &target.folder {
-        None => changeset,
-        Some(_) => Changeset {
-            files: changeset
-                .files
-                .into_iter()
-                .map(|(path, content)| Ok((target.repository_path(&path)?, content)))
-                .collect::<Result<_, CliError>>()?,
-            deletions: changeset
-                .deletions
-                .iter()
-                .map(|path| target.repository_path(path))
-                .collect::<Result<_, CliError>>()?,
-        },
+    // Issue 211, D-134: with no folder each path's dot segments resolved
+    // as well, so the push body carries the path the run names.
+    let changeset = Changeset {
+        files: changeset
+            .files
+            .into_iter()
+            .map(|(path, content)| Ok((target.repository_path(&path)?, content)))
+            .collect::<Result<_, CliError>>()?,
+        deletions: changeset
+            .deletions
+            .iter()
+            .map(|path| target.repository_path(path))
+            .collect::<Result<_, CliError>>()?,
     };
 
     // 1 and 2 — the caption, and each content's blob hash beside its path.
