@@ -3620,6 +3620,12 @@ type AtHead = (FolderCheck, String, BTreeMap<String, String>);
 /// with no wait and no round raised, wherever no version after the
 /// work's standing version changed the folder — at most
 /// `FOLDER_SEND_BOUND` sends in the run.
+///
+/// Issue 242 (`D-148`): a reviewed resolution's send refused by a head
+/// that moved only on paths the reviewed work left alone takes the head's
+/// changes in through `take_in_disjoint_move` and is sent again at that
+/// head, at the same round and with no wait, while a pass of the run
+/// remains; any other refusal goes to `guard_refused`.
 #[allow(clippy::too_many_arguments)]
 async fn publish_reviewed(
     client: &SynsClient,
@@ -3644,7 +3650,7 @@ async fn publish_reviewed(
     };
     let mut outbox_tree: Option<BTreeMap<String, String>> = None;
     let mut sends: u32 = 0;
-    'passes: for _ in 0..MAX_PASSES {
+    'passes: for pass in 0..MAX_PASSES {
         // 1 — the run's collection, or a fresh one after a publication
         // pass refused on a file changed since its collection, each such
         // path's record entry dropped first.
@@ -3814,6 +3820,46 @@ async fn publish_reviewed(
                         continue 'passes;
                     }
                 }
+                // Issue 242 (`D-148`): the review holds across a move
+                // disjoint from the reviewed work, while a pass remains.
+                if pass + 1 < MAX_PASSES
+                    && let (Some(standing), Some(since)) = (&resolution, &parent)
+                    && standing.reviewed_tree.is_some()
+                {
+                    match take_in_disjoint_move(
+                        client,
+                        token,
+                        copy,
+                        &opts,
+                        staging,
+                        standing.clone(),
+                        since,
+                        &reference,
+                        root,
+                    )
+                    .await?
+                    {
+                        TakenIn::Taken(head_commit, head_files) => {
+                            named = Some((head_commit, head_files));
+                            continue 'passes;
+                        }
+                        TakenIn::Answered(outcome) => return Ok(outcome),
+                        // Issue 242 CR H1: the resolution the take-in
+                        // prepared against the refused parent names the
+                        // collision; it stands as the round raise's
+                        // recomputation would have written it.
+                        TakenIn::Collided(mut prepared) => {
+                            prepared.round += 1;
+                            copy.write_resolution(&prepared)?;
+                            return Ok(if prepared.round > ROUND_BOUND {
+                                SyncOutcome::AttentionRequired(Some(prepared))
+                            } else {
+                                SyncOutcome::ResolutionRequired(prepared, None)
+                            });
+                        }
+                        TakenIn::Declined => {}
+                    }
+                }
                 return guard_refused(
                     client, token, copy, &opts, staging, resolution, parent, reference, &hashes,
                     root,
@@ -3825,6 +3871,135 @@ async fn publish_reviewed(
     }
 
     Ok(SyncOutcome::AttentionRequired(copy.resolution()?))
+}
+
+/// What `take_in_disjoint_move` made of a refused send.
+// One value per refusal, moved out at once; boxing buys nothing.
+#[allow(clippy::large_enum_variant)]
+enum TakenIn {
+    /// The head's changes stand in the folder and the resolution is
+    /// reviewed over them: send again at this commit over these files.
+    Taken(String, BTreeMap<String, String>),
+    /// The preparation answered otherwise than a resolution; answer it.
+    Answered(SyncOutcome),
+    /// A collision appeared while the head was taken in — a write since
+    /// the review onto a moved path: the resolution it wrote against the
+    /// refused parent, naming that collision, which the caller answers at
+    /// the next round, as a refused send's recomputation would.
+    Collided(Resolution),
+    /// The move is not disjoint from the reviewed work, or the head could
+    /// not be read whole: the refusal goes to the round raise untouched.
+    Declined,
+}
+
+/// Whether two paths touch: the same path, or one a folder above the other.
+fn paths_touch(a: &str, b: &str) -> bool {
+    a == b || lies_under(a, b) || lies_under(b, a)
+}
+
+/// Issue 242 (`D-148`): a reviewed resolution's send at `parent` refused
+/// because the head moved. The reviewed work is the paths where the sent
+/// tree differs from `reference`, the parent's tree; the move is the
+/// paths where the newest head differs from it. Where neither names the
+/// root identity file and no path of one touches a path of the other,
+/// prepare the candidate again over the newest head under the same
+/// recovery id and round — the preparation writing only the head's
+/// changes into the folder, each snapshotted and checked unchanged first
+/// — and record as reviewed the tree that was reviewed with the head's
+/// entries laid over it on the moved paths, so any other write since goes
+/// back for review (UC-13.3/written-since).
+#[allow(clippy::too_many_arguments)]
+async fn take_in_disjoint_move(
+    client: &SynsClient,
+    token: &str,
+    copy: &WorkingCopy,
+    opts: &SmartPushOptions,
+    staging: &Staging,
+    standing: Resolution,
+    parent: &str,
+    reference: &BTreeMap<String, String>,
+    root: &FolderRoot,
+) -> Result<TakenIn, CliError> {
+    let Some(reviewed) = standing.reviewed_tree.clone() else {
+        return Ok(TakenIn::Declined);
+    };
+    let local = differing_paths(reference, &reviewed);
+    let base_manifest = base_of(copy);
+    let head = read_head(
+        client,
+        Some(token),
+        copy,
+        HeadReading::Publication,
+        base_manifest.is_some(),
+    )
+    .await?;
+    let Some(head_commit) = head.commit.clone() else {
+        return Ok(TakenIn::Declined);
+    };
+    if head.truncated || head_commit == parent {
+        return Ok(TakenIn::Declined);
+    }
+    let head_files = without(
+        &head.files,
+        &excluded_on_disk(copy, &reviewed, head.files.keys()),
+    );
+    let moved = differing_paths(reference, &head_files);
+    let identity = |paths: &[String]| paths.iter().any(|path| path == ROOT_IDENTITY);
+    if identity(&local)
+        || identity(&moved)
+        || moved
+            .iter()
+            .any(|m| local.iter().any(|l| paths_touch(m, l)))
+    {
+        return Ok(TakenIn::Declined);
+    }
+
+    let written =
+        retrieval_wrote_root_identity(&copy.root, &copy.owner, &copy.name, base_manifest.as_ref());
+    let held_identity =
+        held_root_identity(&copy.root, &copy.owner, &copy.name, base_manifest.as_ref());
+    let mut existing = standing;
+    existing.reviewed_tree = None;
+    let prepared = prepare_candidate(
+        client,
+        Some(token),
+        copy,
+        opts,
+        staging,
+        Candidate {
+            base_commit: Some(parent.to_string()),
+            base_files: reference.clone(),
+            head: &head,
+            publishing: true,
+            existing: Some(existing),
+            force_resolution: true,
+            sent_identity_alone: false,
+            hold_root_identity: IdentityHold::Undecided,
+            written_root_identity: written,
+            held_root_identity: held_identity,
+            root,
+        },
+        None,
+    )
+    .await?;
+    let mut resolution = match prepared {
+        Prepared::Resolution(resolution) => resolution,
+        other => return Ok(TakenIn::Answered(prepared_outcome(other))),
+    };
+    if !resolution.collisions.is_empty() {
+        return Ok(TakenIn::Collided(resolution));
+    }
+
+    let mut reviewed = reviewed;
+    for path in &moved {
+        match head_files.get(path) {
+            Some(hash) => reviewed.insert(path.clone(), hash.clone()),
+            None => reviewed.remove(path),
+        };
+    }
+    resolution.reviewed_tree = Some(reviewed);
+    copy.write_resolution(&resolution)?;
+    Ok(TakenIn::Taken(head_commit, head.files))
 }
 
 /// `publish_reviewed` 7 and 8: raise the round, wait its backoff, and

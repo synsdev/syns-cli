@@ -7,7 +7,7 @@
 //! publication by the parent it names, and able to close a publication's
 //! connection unanswered — which no wiremock responder can do.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -191,6 +191,9 @@ async fn dropped_push_connection_classifies_as_server_unreachable() {
 
 // ---- a stateful fake repository ----------------------------------------
 
+/// One move of the head: each path and its new bytes, `None` removing it.
+type HeadMove<'a> = [(&'a str, Option<&'a [u8]>)];
+
 #[derive(Default)]
 struct FakeRepo {
     /// Every commit oldest first: its sha and its whole tree, path to bytes.
@@ -201,6 +204,13 @@ struct FakeRepo {
     /// Changes laid over the head as a fresh commit before the next
     /// publication is answered, so that publication meets a moved head.
     move_head_before_next_push: Option<Vec<(String, Option<Vec<u8>>)>>,
+    /// Issue 242: changes laid over the head as a fresh commit before each
+    /// of the next publications in turn, one entry per publication — a
+    /// live writer moving the head every time a send goes out.
+    head_moves: VecDeque<Vec<(String, Option<Vec<u8>>)>>,
+    /// Issue 242 CR H1: a folder file written with these bytes as the next
+    /// publication arrives — a local write landing while a send is out.
+    write_on_next_push: Option<(PathBuf, Vec<u8>)>,
     /// SPEC u318 Contract Surface, `FakeRepo::rewrite_on_push`: each
     /// publication carrying this path is committed with these bytes there
     /// in place of the ones it sent, its acknowledgment otherwise
@@ -299,11 +309,18 @@ impl FakeRepo {
                 Some(self.raw(&path, params.get("ref")))
             }
             ("PUT", "push") => {
+                if let Some((target, bytes)) = self.write_on_next_push.take() {
+                    std::fs::write(target, bytes).unwrap();
+                }
                 if self.drop_next_push {
                     self.drop_next_push = false;
                     return None;
                 }
-                if let Some(changes) = self.move_head_before_next_push.take() {
+                if let Some(changes) = self
+                    .move_head_before_next_push
+                    .take()
+                    .or_else(|| self.head_moves.pop_front())
+                {
                     let mut tree = self
                         .commits
                         .last()
@@ -647,6 +664,26 @@ impl Fake {
                 .map(|(p, c)| (p.to_string(), c.map(|c| c.as_bytes().to_vec())))
                 .collect(),
         );
+    }
+
+    /// Issue 242: lay each entry of `moves` over the head as a fresh commit
+    /// before the next publications in turn, one entry per publication.
+    pub(crate) fn move_head_before_pushes(&self, moves: &[&HeadMove]) {
+        self.repo.lock().unwrap().head_moves = moves
+            .iter()
+            .map(|changes| {
+                changes
+                    .iter()
+                    .map(|(p, c)| (p.to_string(), c.map(<[u8]>::to_vec)))
+                    .collect()
+            })
+            .collect();
+    }
+
+    /// Issue 242 CR H1: write `bytes` at `target` as the next publication
+    /// arrives, before it is answered.
+    pub(crate) fn write_on_next_push(&self, target: PathBuf, bytes: &[u8]) {
+        self.repo.lock().unwrap().write_on_next_push = Some((target, bytes.to_vec()));
     }
 
     /// Commit `text` at `path` in place of what each publication carrying
@@ -2451,7 +2488,11 @@ async fn guard_refusal_recomputes_against_the_newest_head() {
     let copy = e.copy(&dir);
     let (_h1, earlier) = collided(&e, &dir, &copy).await;
     write_files(&dir, &[("a.md", "a\nL and R\nc\n")]);
-    let h2 = e.fake.commit_changes(&[("z.md", Some("z2\n"))]);
+    // Issue 242 (D-148): the move touches the reviewed `a.md`, so the
+    // review does not hold across it.
+    let h2 = e
+        .fake
+        .commit_changes(&[("a.md", Some("a\nR2\nc\n")), ("z.md", Some("z2\n"))]);
 
     let outcome = continue_resolution(&e.fake.client(), TOKEN, &copy, e.opts())
         .await
@@ -2462,6 +2503,296 @@ async fn guard_refusal_recomputes_against_the_newest_head() {
     assert_eq!(recomputed.round, 2);
     assert_eq!(recomputed.recovery_id, earlier.recovery_id);
     assert!(recomputed.reviewed_tree.is_none());
+    assert_eq!(read(&dir, "z.md"), "z2\n");
+}
+
+// ---- issue 242 (D-148): a review holds across disjoint head moves ------
+
+/// The published commit and its response, or a panic naming the outcome.
+fn published_sha(outcome: SyncOutcome) -> String {
+    match outcome {
+        SyncOutcome::Synced {
+            published: Some((response, _, _)),
+            ..
+        } => response.commit_sha,
+        other => panic!("expected a publication, got {other:?}"),
+    }
+}
+
+// Issue 242 E1: a continue refused once by a head that moved only on a
+// path the reviewed work left alone publishes in the same run, at the
+// newest head, with no wait and no further review.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_continue_refused_by_a_head_moved_on_other_paths_publishes_in_the_same_run() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let (h1, _) = collided(&e, &dir, &copy).await;
+    write_files(&dir, &[("a.md", "a\nL and R\nc\n")]);
+    let h2 = e.fake.commit_changes(&[("z.md", Some("z2\n"))]);
+
+    let started = std::time::Instant::now();
+    let outcome = continue_resolution(&e.fake.client(), TOKEN, &copy, e.opts())
+        .await
+        .unwrap();
+
+    let published = published_sha(outcome);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "the run waited a backoff: {:?}",
+        started.elapsed()
+    );
+    let bodies = e.fake.push_bodies();
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[0]["parentSha"], h1.as_str());
+    assert_eq!(bodies[1]["parentSha"], h2.as_str());
+    let (head, tree) = e.fake.head();
+    assert_eq!(head, published);
+    assert_eq!(tree["a.md"], "a\nL and R\nc\n");
+    assert_eq!(tree["z.md"], "z2\n");
+    assert_eq!(read(&dir, "z.md"), "z2\n");
+    assert_eq!(read(&dir, "a.md"), "a\nL and R\nc\n");
+    assert_eq!(copy.base().unwrap().commit_sha(), Some(published.as_str()));
+    assert!(copy.resolution().unwrap().is_none());
+    assert!(copy.outbox().unwrap().is_none());
+    assert!(!copy.local_snapshot_path().exists());
+    assert!(!copy.remote_snapshot_path().exists());
+}
+
+// Issue 242 E1: a head a live writer moves before every send, each time on
+// paths the reviewed work left alone — a path starting with a digit and a
+// file that is not UTF-8 among them — is taken in send after send, and
+// the reviewed work published in the same run.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_continue_under_a_live_writer_on_other_paths_publishes_in_the_same_run() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    collided(&e, &dir, &copy).await;
+    write_files(&dir, &[("a.md", "a\nL and R\nc\n")]);
+    let binary: &[u8] = &[0xff, 0xfe, 0x00, 0x01];
+    e.fake.move_head_before_pushes(&[
+        &[("1-notes.md", Some(b"one\n"))],
+        &[
+            ("1-notes.md", Some(b"one\ntwo\n")),
+            ("bin.dat", Some(binary)),
+        ],
+        &[("1-notes.md", Some(b"one\ntwo\nthree\n")), ("z.md", None)],
+    ]);
+
+    let outcome = continue_resolution(&e.fake.client(), TOKEN, &copy, e.opts())
+        .await
+        .unwrap();
+
+    let published = published_sha(outcome);
+    let bodies = e.fake.push_bodies();
+    assert_eq!(bodies.len(), 4);
+    let (head, tree) = e.fake.head_bytes();
+    assert_eq!(head, published);
+    assert_eq!(tree["a.md"], b"a\nL and R\nc\n");
+    assert_eq!(tree["1-notes.md"], b"one\ntwo\nthree\n");
+    assert_eq!(tree["bin.dat"], binary);
+    assert!(!tree.contains_key("z.md"));
+    assert_eq!(read(&dir, "1-notes.md"), "one\ntwo\nthree\n");
+    assert_eq!(std::fs::read(dir.join("bin.dat")).unwrap(), binary);
+    assert!(!dir.join("z.md").exists());
+    assert_eq!(copy.base().unwrap().commit_sha(), Some(published.as_str()));
+    assert!(copy.resolution().unwrap().is_none());
+    assert!(copy.outbox().unwrap().is_none());
+}
+
+// Issue 242 E2: a move during the continue touching a path the reviewed
+// work changed still raises the round and asks for another review.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_continue_refused_by_a_head_moved_on_a_reviewed_path_raises_the_round() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let (_h1, earlier) = collided(&e, &dir, &copy).await;
+    write_files(&dir, &[("a.md", "a\nL and R\nc\n"), ("z.md", "z local\n")]);
+    e.fake.move_head_before_next_push(&[("z.md", Some("z2\n"))]);
+
+    let outcome = continue_resolution(&e.fake.client(), TOKEN, &copy, e.opts())
+        .await
+        .unwrap();
+
+    let raised = expect_resolution(outcome);
+    assert_eq!(raised.round, 2);
+    assert_eq!(raised.recovery_id, earlier.recovery_id);
+    assert_eq!(raised.head_commit, e.fake.head().0);
+    assert!(raised.reviewed_tree.is_none());
+    assert!(
+        names_collision(&raised, "z.md", "modify_modify"),
+        "{raised:?}"
+    );
+    assert_eq!(e.fake.push_bodies().len(), 1);
+    assert!(copy.outbox().unwrap().is_none());
+}
+
+// Issue 242 E3: a local write landing while the head's changes are taken
+// in goes back for review, named, and nothing more is sent.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_write_while_a_disjoint_move_is_taken_in_goes_back_for_review() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    collided(&e, &dir, &copy).await;
+    write_files(&dir, &[("a.md", "a\nL and R\nc\n")]);
+    let h2 = e.fake.commit_changes(&[("m.md", Some("m\n"))]);
+    e.fake.race_raw_reads("m.md", dir.join("late.md"), false);
+
+    let outcome = continue_resolution(&e.fake.client(), TOKEN, &copy, e.opts())
+        .await
+        .unwrap();
+
+    let fresh = expect_resolution(outcome);
+    assert!(
+        fresh.local_paths.contains(&"late.md".to_string()),
+        "{fresh:?}"
+    );
+    assert!(
+        fresh.combined_paths.contains(&"late.md".to_string()),
+        "{fresh:?}"
+    );
+    assert!(fresh.reviewed_tree.is_none());
+    assert_eq!(fresh.round, 1);
+    assert_eq!(fresh.head_commit, h2);
+    assert_eq!(read(&dir, "m.md"), "m\n");
+    assert_eq!(e.fake.push_bodies().len(), 1);
+    assert_eq!(e.fake.head().0, h2);
+    assert!(copy.outbox().unwrap().is_none());
+}
+
+// Issue 242 CR H1: a local write onto the path a disjoint move adds,
+// landing while the send is out, is a collision the take-in names at the
+// next round, so a second continue over its markers publishes nothing.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_write_onto_a_moved_path_while_the_send_is_out_is_named_a_collision() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let (_h1, earlier) = collided(&e, &dir, &copy).await;
+    write_files(&dir, &[("a.md", "a\nL and R\nc\n")]);
+    e.fake
+        .move_head_before_next_push(&[("m.md", Some("a\nhead\nc\n"))]);
+    e.fake
+        .write_on_next_push(dir.join("m.md"), b"a\nagent\nc\n");
+
+    let outcome = continue_resolution(&e.fake.client(), TOKEN, &copy, e.opts())
+        .await
+        .unwrap();
+
+    let raised = expect_resolution(outcome);
+    assert_eq!(raised.round, 2);
+    assert_eq!(raised.recovery_id, earlier.recovery_id);
+    assert!(names_collision(&raised, "m.md", "add_add"), "{raised:?}");
+    assert!(raised.reviewed_tree.is_none());
+    assert!(read(&dir, "m.md").contains("<<<<<<< local"));
+    let head = e.fake.head().0;
+
+    let again = continue_resolution(&e.fake.client(), TOKEN, &copy, e.opts())
+        .await
+        .unwrap();
+
+    expect_resolution(again);
+    assert_eq!(e.fake.head().0, head, "a publication landed over the head");
+    assert_eq!(e.fake.push_bodies().len(), 1);
+    assert_no_marker_published(&e);
+}
+
+// Issue 242 CR H1: the same with a file that is not text — the local
+// bytes stand, the head's go to the remote snapshot, the collision named.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_binary_write_onto_a_moved_path_while_the_send_is_out_is_named_a_collision() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    collided(&e, &dir, &copy).await;
+    write_files(&dir, &[("a.md", "a\nL and R\nc\n")]);
+    let theirs: &[u8] = &[0xff, 0x01, 0x00];
+    let ours: &[u8] = &[0xfe, 0x02, 0x00];
+    e.fake
+        .move_head_before_pushes(&[&[("m.bin", Some(theirs))]]);
+    e.fake.write_on_next_push(dir.join("m.bin"), ours);
+
+    let outcome = continue_resolution(&e.fake.client(), TOKEN, &copy, e.opts())
+        .await
+        .unwrap();
+
+    let raised = expect_resolution(outcome);
+    assert_eq!(raised.round, 2);
+    assert!(names_collision(&raised, "m.bin", "add_add"), "{raised:?}");
+    assert!(raised.reviewed_tree.is_none());
+    assert_eq!(std::fs::read(dir.join("m.bin")).unwrap(), ours);
+    assert!(copy.remote_snapshot_path().exists());
+    assert_eq!(e.fake.push_bodies().len(), 1);
+}
+
+// Issue 242: past the run's pass bound a head still moving falls to the
+// round raise, as any refused send did before.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_head_moving_past_the_pass_bound_raises_the_round() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    collided(&e, &dir, &copy).await;
+    write_files(&dir, &[("a.md", "a\nL and R\nc\n")]);
+    let lines: Vec<Vec<u8>> = (1..=12)
+        .map(|n| format!("line {n}\n").into_bytes())
+        .collect();
+    let moves: Vec<Box<HeadMove>> = lines
+        .iter()
+        .map(|line| Box::new([("live.md", Some(line.as_slice()))]) as Box<HeadMove>)
+        .collect();
+    let moves: Vec<&HeadMove> = moves.iter().map(|m| &**m).collect();
+    e.fake.move_head_before_pushes(&moves);
+
+    let outcome = continue_resolution(&e.fake.client(), TOKEN, &copy, e.opts())
+        .await
+        .unwrap();
+
+    let raised = expect_resolution(outcome);
+    assert_eq!(raised.round, 2);
+    assert!(raised.reviewed_tree.is_none());
+    let sends = e.fake.push_bodies().len();
+    assert!((2..12).contains(&sends), "{sends} sends");
+    assert_eq!(raised.head_commit, e.fake.head().0);
+}
+
+// Issue 242 E4 (`INV-59`): a sync with local work over a moved head still
+// asks for a review first, however disjoint the move.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_sync_over_a_disjoint_move_still_asks_for_a_review_first() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let h0 = e.fake.commit(&[("a.md", "a\n"), ("z.md", "z0\n")]);
+    checkout(&e.fake, &copy, &h0);
+    write_files(&dir, &[("a.md", "a local\n")]);
+    e.fake.move_head_before_next_push(&[("z.md", Some("z2\n"))]);
+
+    let outcome = converge(
+        &e.fake.client(),
+        Some(TOKEN),
+        &copy,
+        ConvergeMode::Publish,
+        e.opts(),
+    )
+    .await
+    .unwrap();
+
+    let resolution = expect_resolution(outcome);
+    assert_eq!(resolution.local_paths, vec!["a.md".to_string()]);
+    assert!(resolution.reviewed_tree.is_none());
+    assert_eq!(e.fake.push_bodies().len(), 1);
     assert_eq!(read(&dir, "z.md"), "z2\n");
 }
 

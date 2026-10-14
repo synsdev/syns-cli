@@ -1392,6 +1392,41 @@ fn a_folder_sync_behind_the_holder_prepares_a_review_and_continues_under_the_fol
     assert_eq!(exit_of(&shown), 4, "{}", stderr_of(&shown));
 }
 
+// Issue 242 (D-148), CR L1: a folder copy's continue refused by a head
+// that moved its folder on a path the reviewed work left alone takes that
+// change in and publishes at the newest head in the same run.
+#[test]
+#[serial]
+fn a_folder_continue_refused_by_a_move_of_the_folder_on_other_paths_publishes() {
+    let d = Deployment::converged();
+    d.advance_head(&[(in_folder("notes.md").as_str(), Some("noted\n"))]);
+    write(&d.folder().join(".page/board.json"), "{\"cards\":[4]}\n");
+    let sync = d.run_in(&d.folder(), b"", &["sync"]);
+    assert_eq!(exit_of(&sync), 4, "{}", stderr_of(&sync));
+    let moved = d.advance_head(&[(in_folder("live.md").as_str(), Some("live\n"))]);
+
+    let mark = d.mark();
+    let continued = d.run_in(&d.folder(), b"", &["resolution", "continue"]);
+
+    assert_eq!(exit_of(&continued), 0, "{}", stderr_of(&continued));
+    let pushes = d.pushes_since(mark);
+    assert_eq!(pushes.len(), 2, "{pushes:?}");
+    assert_eq!(pushes[0]["parentSha"], json!(h(2)));
+    assert_eq!(pushes[1]["parentSha"], json!(moved));
+    for push in &pushes {
+        for path in carried(push) {
+            assert!(path.starts_with(&format!("{FOLDER}/")), "{path}");
+        }
+    }
+    assert_eq!(read(&d.folder().join("live.md")), "live\n");
+    let state = d.state();
+    let head = &state.commits[state.head].1;
+    assert_eq!(head[&in_folder("live.md")], b"live\n");
+    assert_eq!(head[&in_folder(".page/board.json")], b"{\"cards\":[4]}\n");
+    drop(state);
+    assert!(!d.folder_resolution_stands());
+}
+
 #[test]
 #[serial]
 fn a_folder_the_head_lacks_reads_as_an_empty_folder() {
