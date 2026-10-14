@@ -1,7 +1,7 @@
 use crate::auth::token::TokenStore;
 use crate::client::{ForkRequest, SynsClient};
 use crate::config::Config;
-use crate::errors::CliError;
+use crate::errors::{ApiErrorContext, CliError};
 use crate::output::Output;
 use crate::repo::folder::refuse_holder_change;
 use crate::repo::syns_yaml::write_syns_yaml;
@@ -24,6 +24,40 @@ fn parse_fork_identity(id: &str) -> Option<(&str, &str)> {
         Some((parts[0], parts[1]))
     } else {
         None
+    }
+}
+
+/// Issue 253 (D-142): a `409` `conflict` naming no moved head gains the
+/// caller's next move — a source holding no version its caller reads, which
+/// no name lifts (`CS-fork-str-nothing-readable`), told apart by its served
+/// `reason` from a name already taken, which another name lifts
+/// (`CS-fork-str-name-taken`). Every other refusal passes through.
+fn with_conflict_move(err: CliError, source: &str, name: Option<&str>) -> CliError {
+    let line = match &err {
+        CliError::Api {
+            status: Some(409),
+            error,
+            context,
+        } if error == "conflict" => match context {
+            Some(ApiErrorContext::HeadMoved { .. }) => None,
+            Some(ApiErrorContext::ConflictReason { reason }) if reason == "empty_source" => {
+                Some(format!(
+                    "{source} holds no version you can read, and no other name lifts that; fork it once one lands there"
+                ))
+            }
+            _ => {
+                let taken =
+                    name.unwrap_or_else(|| source.split_once('/').map_or(source, |(_, n)| n));
+                Some(format!(
+                    "the name {taken} is taken in your account; fork under another with: syns fork {source} --name NEW_NAME"
+                ))
+            }
+        },
+        _ => None,
+    };
+    match line {
+        Some(line) => err.with_next_move(line),
+        None => err,
     }
 }
 
@@ -52,7 +86,10 @@ pub async fn cmd_fork(
 
     let request = ForkRequest { name };
 
-    let (response, raw) = client.fork(&repo, &token, &request).await?;
+    let (response, raw) = client
+        .fork(&repo, &token, &request)
+        .await
+        .map_err(|e| with_conflict_move(e, &repo, request.name.as_deref()))?;
 
     let fork_id = format!("{}/{}", response.owner, response.name);
     let fork_identity = parse_fork_identity(&fork_id);
@@ -196,5 +233,97 @@ mod tests {
         assert_eq!(raw["visibility"], serde_json::json!("public"));
         let expected: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(raw, expected);
+    }
+
+    /// Issue 253 (D-142): run `cmd_fork` against a `409` body, returning
+    /// the refusal's one line.
+    async fn fork_refused_with(body: serde_json::Value, name: Option<String>) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        TokenStore::new(dir.path().join("credentials.json"))
+            .write("test-token")
+            .unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/repos/bob/empty/fork"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(body))
+            .mount(&mock_server)
+            .await;
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(false);
+        let err = cmd_fork(&config, &output, "bob/empty".into(), name)
+            .await
+            .unwrap_err();
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+        assert!(!dir.path().join(".syns.yaml").exists());
+        err.to_string()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn fork_of_a_source_holding_nothing_readable_names_no_other_name() {
+        let line = fork_refused_with(
+            serde_json::json!({
+                "error": "conflict",
+                "message": "Cannot fork a repository that has no content",
+                "reason": "empty_source",
+            }),
+            Some("notes".into()),
+        )
+        .await;
+        assert_eq!(
+            line,
+            "server error (409): conflict \u{2014} bob/empty holds no version you can read, and no other name lifts that; fork it once one lands there"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn fork_onto_a_taken_name_names_the_name_and_the_flag() {
+        let typed = fork_refused_with(
+            serde_json::json!({"error": "conflict", "message": "Repository already exists"}),
+            Some("notes".into()),
+        )
+        .await;
+        assert_eq!(
+            typed,
+            "server error (409): conflict \u{2014} the name notes is taken in your account; fork under another with: syns fork bob/empty --name NEW_NAME"
+        );
+        let defaulted = fork_refused_with(
+            serde_json::json!({"error": "conflict", "message": "Repository already exists"}),
+            None,
+        )
+        .await;
+        assert_eq!(
+            defaulted,
+            "server error (409): conflict \u{2014} the name empty is taken in your account; fork under another with: syns fork bob/empty --name NEW_NAME"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn fork_refusal_other_than_conflict_keeps_its_line() {
+        let dir = tempfile::tempdir().unwrap();
+        TokenStore::new(dir.path().join("credentials.json"))
+            .write("test-token")
+            .unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/repos/bob/empty/fork"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(serde_json::json!({"error": "not_found"})),
+            )
+            .mount(&mock_server)
+            .await;
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(false);
+        let err = cmd_fork(&config, &output, "bob/empty".into(), None)
+            .await
+            .unwrap_err();
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+        assert_eq!(err.to_string(), "server error (404): not_found");
     }
 }

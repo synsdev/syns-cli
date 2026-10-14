@@ -1106,13 +1106,22 @@ async fn check_response(response: reqwest::Response) -> Result<reqwest::Response
             _ => "unknown error".to_string(),
         };
         let context = match (code, error.as_str(), &parsed) {
-            (409, "conflict", Some(body)) => {
-                body.get("currentSha")
-                    .and_then(|v| v.as_str())
-                    .map(|current_sha| ApiErrorContext::HeadMoved {
-                        current_sha: current_sha.to_string(),
+            // Issue 253 (D-142): a conflict naming no moved head keeps its
+            // served `reason`, so a fork of a source its caller reads no
+            // version of reads apart from a name already taken.
+            (409, "conflict", Some(body)) => body
+                .get("currentSha")
+                .and_then(|v| v.as_str())
+                .map(|current_sha| ApiErrorContext::HeadMoved {
+                    current_sha: current_sha.to_string(),
+                })
+                .or_else(|| {
+                    body.get("reason").and_then(|v| v.as_str()).map(|reason| {
+                        ApiErrorContext::ConflictReason {
+                            reason: reason.to_string(),
+                        }
                     })
-            }
+                }),
             // SPEC u280 `ApiErrorContext::MissingBlobs`: the `missing`
             // map crosses whole, and only where it is a map of path to
             // hash.

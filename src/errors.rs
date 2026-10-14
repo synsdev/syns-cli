@@ -307,6 +307,13 @@ pub enum ApiErrorContext {
     Reason {
         message: String,
     },
+    /// Issue 253 (D-142): the string `reason` a `409` `conflict` carrying
+    /// no `currentSha` served — `empty_source` where a fork's caller reads
+    /// no version of the source — so a command can tell that refusal from
+    /// a name already taken. It renders as a refusal carrying no context.
+    ConflictReason {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

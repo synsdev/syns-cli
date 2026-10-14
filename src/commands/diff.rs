@@ -4,6 +4,7 @@ use crate::commands::history::folder_history;
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
+use crate::read::version_not_found_refusal;
 use crate::repo::folder::{FolderScope, current_dir, resolve_scoped_or_skip};
 use console::style;
 
@@ -70,6 +71,28 @@ fn listed_pair(page: &VersionListResponse) -> Option<(String, String)> {
     match page.data.as_slice() {
         [newest, older, ..] => Some((older.version.to_string(), newest.version.to_string())),
         _ => None,
+    }
+}
+
+/// Issue 253 (`CS-diff-str-version-not-found`): a `404` `not_found` the
+/// diff entry answers names the versions the run asked for, both where they
+/// differ since the answer does not say which end it lacks; every other
+/// refusal passes through as it renders.
+fn version_not_found(err: CliError, from: &str, to: &str) -> CliError {
+    match &err {
+        CliError::Api {
+            status: Some(404),
+            error,
+            ..
+        } if error == "not_found" => {
+            let asked = if from == to {
+                from.to_string()
+            } else {
+                format!("{from} or {to}")
+            };
+            err.with_versioned_read_context(version_not_found_refusal(&asked))
+        }
+        _ => err,
     }
 }
 
@@ -144,7 +167,8 @@ pub async fn cmd_diff(
     // 3 — the difference between the two, whatever paths either changed.
     let (mut response, mut raw) = client
         .get_diff(&repo_id, token.as_deref(), &from_val, &to_val)
-        .await?;
+        .await
+        .map_err(|e| version_not_found(e, &from_val, &to_val))?;
 
     // 4 — inside a folder, the scoped diff entries alone; through an
     // identity every entry as served (SPEC u302 `cmd_diff` 1).
@@ -425,5 +449,71 @@ mod tests {
         assert_eq!(typed.files[0].path, "src/new.ts");
         let expected: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(raw, expected);
+    }
+
+    /// Issue 253: an endpoint the server's diff entry answers `404`
+    /// `not_found` for is refused naming the versions the run asked for,
+    /// the wire form and the status dropped.
+    #[tokio::test]
+    #[serial]
+    async fn diff_names_the_versions_a_not_found_answer_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".syns.yaml"), "owner: alice\nname: notes\n").unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/notes/diff"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(
+                serde_json::json!({"error": "not_found", "message": "Version not found"}),
+            ))
+            .mount(&mock_server)
+            .await;
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(false);
+        let two = cmd_diff(&config, &output, Some("1".into()), Some("99".into()), false)
+            .await
+            .unwrap_err();
+        assert_eq!(two.to_string(), "version not found: 1 or 99");
+        let one = cmd_diff(
+            &config,
+            &output,
+            Some("99".into()),
+            Some("99".into()),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(one.to_string(), "version not found: 99");
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+    }
+
+    /// Issue 253: a refusal other than `404` `not_found` keeps its own
+    /// line, a `forbidden`'s served reason included.
+    #[tokio::test]
+    #[serial]
+    async fn diff_keeps_other_refusals_as_they_render() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".syns.yaml"), "owner: alice\nname: notes\n").unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/notes/diff"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(
+                serde_json::json!({"error": "forbidden", "message": "Read access required"}),
+            ))
+            .mount(&mock_server)
+            .await;
+        let config = Config::new(Some(&mock_server.uri())).unwrap();
+        let output = Output::new(false);
+        let err = cmd_diff(&config, &output, Some("1".into()), Some("2".into()), false)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "server error (403): forbidden \u{2014} Read access required"
+        );
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
     }
 }
