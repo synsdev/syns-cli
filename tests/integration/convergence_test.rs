@@ -6684,3 +6684,68 @@ async fn a_head_gaining_another_repositorys_identity_file_does_not_replace_the_w
         (Some("alice"), "proj")
     );
 }
+
+// Issue 173: a directory re-created at the path of a removed working copy
+// begins a working copy of its own, so a retrieval into it takes every
+// head path rather than reading each path it lacks as removed locally —
+// against a head moved past the removed copy's base and an unmoved one.
+#[cfg(unix)]
+async fn re_created_directory_retrieval(move_head: bool) {
+    let e = env().await;
+    let folder = tempfile::tempdir().unwrap();
+    let dir = std::fs::canonicalize(folder.path()).unwrap().join("nwout");
+    e.fake.commit(&[("a.md", "a0\n"), ("b.md", "b0\n")]);
+    let pull = || {
+        cmd_pull(
+            &e.config,
+            &e.output,
+            Some(("alice".into(), "proj".into())),
+            Some(dir.display().to_string()),
+            None,
+            false,
+            false,
+            None,
+        )
+    };
+    let first = pull().await;
+    assert!(first.is_ok(), "{first:?}");
+    assert_eq!(read(&dir, "a.md"), "a0\n");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::create_dir(&dir).unwrap();
+    if move_head {
+        e.fake.commit_changes(&[("c.md", Some("c1\n"))]);
+    }
+
+    let second = pull().await;
+    assert!(second.is_ok(), "{second:?}");
+    assert_eq!(read(&dir, "a.md"), "a0\n");
+    assert_eq!(read(&dir, "b.md"), "b0\n");
+    if move_head {
+        assert_eq!(read(&dir, "c.md"), "c1\n");
+    }
+    assert_eq!(read(&dir, ".syns.yaml"), IDENTITY);
+    let copy = e.copy(&dir);
+    assert!(copy.resolution().unwrap().is_none());
+    assert_eq!(
+        working_copy_state(&e.fake.client(), Some(TOKEN), &copy)
+            .await
+            .unwrap(),
+        WorkingCopyState::Converged
+    );
+    assert!(e.fake.push_bodies().is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn retrieval_into_a_re_created_directory_past_a_moved_head_takes_every_head_path() {
+    re_created_directory_retrieval(true).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn retrieval_into_a_re_created_directory_at_an_unmoved_head_takes_every_head_path() {
+    re_created_directory_retrieval(false).await;
+}

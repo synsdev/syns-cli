@@ -36,6 +36,9 @@ const OUTBOX_FILE: &str = "outbox.json";
 const LOCAL_SNAPSHOT_FILE: &str = "local-snapshot.json";
 const REMOTE_SNAPSHOT_FILE: &str = "remote-snapshot.json";
 const STAT_RECORD_FILE: &str = "stat-record.json";
+/// Issue 173, D-163: the identity of the folder the default home's state
+/// was recorded for.
+const FOLDER_FILE: &str = "folder.json";
 
 /// SPEC u298, `IN_ROOT_HOME`: the directory at a working copy's root its
 /// state is kept in where the default root refuses a run's writes. A path
@@ -120,6 +123,58 @@ pub(crate) fn ensure_in_root_home(dir: &Path) -> Result<(), CliError> {
         write_atomic(&ignore, b"*\n", flush_directory)?;
     }
     Ok(())
+}
+
+/// What tells one folder from another created later at its path (D-163):
+/// its device and inode, and its birth time where the file system answers
+/// one, so an inode a removed folder freed and a new one took still
+/// differs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct FolderIdentity {
+    dev: u64,
+    ino: u64,
+    born: Option<(u64, u32)>,
+}
+
+impl FolderIdentity {
+    /// The identity of the folder at `root`, none where it cannot be read
+    /// or the platform answers no inode.
+    #[cfg(unix)]
+    fn of(root: &Path) -> Option<FolderIdentity> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(root).ok()?;
+        let born = meta
+            .created()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|since| (since.as_secs(), since.subsec_nanos()));
+        Some(FolderIdentity {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            born,
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn of(_root: &Path) -> Option<FolderIdentity> {
+        None
+    }
+
+    /// The identity recorded in `home`, none where none stands or it is
+    /// unreadable.
+    fn recorded(home: &Path) -> Option<FolderIdentity> {
+        let bytes = std::fs::read(home.join(FOLDER_FILE)).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// Whether `home` holds state recorded for a folder other than the
+    /// one at `root`: both identities known, and differing.
+    fn stale(home: &Path, root: &Path) -> bool {
+        match (Self::recorded(home), Self::of(root)) {
+            (Some(recorded), Some(current)) => recorded != current,
+            _ => false,
+        }
+    }
 }
 
 /// What a collection saw of each file it read, so the next collection
@@ -291,6 +346,9 @@ pub struct WorkingCopy {
     pub folder: Option<FolderScope>,
     stores: StoreRoots,
     other_home: PathBuf,
+    /// Issue 173, D-163: the default home holds state recorded for a
+    /// removed folder that stood at this root, read as absent.
+    stale_default: bool,
 }
 
 /// A reconciliation handed to a reviewer: what both sides changed, and
@@ -418,9 +476,74 @@ impl WorkingCopy {
                 ),
             })?;
         }
-        let copy = Self::at(stores, owner, name, canonical)?;
+        let mut copy = Self::at(stores, owner, name, canonical)?;
+        if !stores.default_refused {
+            copy.settle_folder_identity()?;
+        }
         copy.ensure_write_home()?;
         Ok(copy)
+    }
+
+    /// Issue 173, D-163: under the default home's lock, discard the state
+    /// it holds for a removed folder that stood at this root, and record
+    /// the identity of the folder standing there now — where none is
+    /// recorded, state written before the identity was kept adopted as it
+    /// stands.
+    fn settle_folder_identity(&mut self) -> Result<(), CliError> {
+        let home = self.default_home().to_path_buf();
+        let io = |err: std::io::Error| CliError::Io {
+            message: format!(
+                "could not settle working copy state {}: {err}",
+                home.display()
+            ),
+        };
+        let Some(current) = FolderIdentity::of(&self.root) else {
+            return Ok(());
+        };
+        if FolderIdentity::recorded(&home).as_ref() == Some(&current) {
+            self.stale_default = false;
+            return Ok(());
+        }
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(home.join(LOCK_FILE))
+            .map_err(io)?;
+        lock.lock().map_err(io)?;
+        if FolderIdentity::stale(&home, &self.root) {
+            for entry in std::fs::read_dir(&home).map_err(io)? {
+                let entry = entry.map_err(io)?;
+                if entry.file_name() == LOCK_FILE {
+                    continue;
+                }
+                let path = entry.path();
+                let removed = if entry.file_type().map_err(io)?.is_dir() {
+                    std::fs::remove_dir_all(&path)
+                } else {
+                    std::fs::remove_file(&path)
+                };
+                match removed {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(io(err)),
+                }
+            }
+        }
+        let json = serde_json::to_vec(&current).map_err(|err| io(std::io::Error::other(err)))?;
+        write_atomic(&home.join(FOLDER_FILE), &json, flush_directory)?;
+        self.stale_default = false;
+        Ok(())
+    }
+
+    /// The copy's default home, whichever role it plays.
+    fn default_home(&self) -> &Path {
+        if self.writes_in_root() {
+            &self.other_home
+        } else {
+            &self.state_dir
+        }
     }
 
     /// The copy of `owner/name` at the canonical root, both homes named
@@ -433,6 +556,7 @@ impl WorkingCopy {
     ) -> Result<WorkingCopy, CliError> {
         let default_home = Self::default_home_for(stores, owner, name, &canonical)?;
         let in_root = canonical.join(IN_ROOT_HOME);
+        let stale_default = FolderIdentity::stale(&default_home, &canonical);
         let (state_dir, other_home) = if stores.default_refused {
             (in_root, default_home)
         } else {
@@ -446,6 +570,7 @@ impl WorkingCopy {
             folder: None,
             stores: stores.clone(),
             other_home,
+            stale_default,
         })
     }
 
@@ -494,6 +619,9 @@ impl WorkingCopy {
     /// Whether `home` may be read: an in-root home standing as a link or
     /// owned by another account is read as holding no state.
     fn readable(&self, home: &Path) -> bool {
+        if home == self.default_home() {
+            return !self.stale_default;
+        }
         home != self.in_root_home() || !is_foreign_or_link(home)
     }
 
@@ -613,7 +741,8 @@ impl WorkingCopy {
             return Ok(None);
         };
         let in_root = canonical.join(IN_ROOT_HOME);
-        let standing = Self::state_dir_for(&stores.default, owner, name, &canonical).is_dir()
+        let default = Self::state_dir_for(&stores.default, owner, name, &canonical);
+        let standing = (default.is_dir() && !FolderIdentity::stale(&default, &canonical))
             || (in_root.is_dir() && !is_foreign_or_link(&in_root));
         if !standing {
             return Ok(None);
@@ -2636,5 +2765,111 @@ mod tests {
         let _lock = other.lock().unwrap();
         assert_eq!(other.resolution().unwrap(), None);
         assert!(!other.state_dir.join(RESOLUTION_FILE).exists());
+    }
+
+    // ---- issue 173, D-163: a working copy ends with its folder ------------
+
+    /// The folder identity is kept on unix only (D-163).
+    /// A copy at `h.root` over the writable roots holding a base, a
+    /// resolution and an outbox.
+    #[cfg(unix)]
+    fn copy_with_state(h: &Homes) -> WorkingCopy {
+        let copy = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        copy.record_base("h0", files(&[("a.md", "a0")])).unwrap();
+        copy.write_resolution(&Resolution {
+            recovery_id: "rec".into(),
+            base_commit: Some("h0".into()),
+            head_commit: "h1".into(),
+            round: 1,
+            local_paths: vec![],
+            remote_paths: vec![],
+            collisions: vec![],
+            combined_paths: vec![],
+            reviewed_tree: None,
+            pending_writes: None,
+        })
+        .unwrap();
+        copy.write_outbox(&Outbox {
+            parent_commit: Some("h0".into()),
+            tree: BTreeMap::new(),
+        })
+        .unwrap();
+        copy
+    }
+
+    #[cfg(unix)]
+    fn re_create(dir: &Path) {
+        // A sibling holds the removed folder's inode while the new one is
+        // made, so the two differ even where birth times are not kept.
+        let held = dir.with_extension("held");
+        std::fs::rename(dir, &held).unwrap();
+        std::fs::create_dir(dir).unwrap();
+        std::fs::remove_dir_all(&held).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_re_created_folder_opens_no_state_of_the_removed_one() {
+        let h = homes();
+        copy_with_state(&h);
+        re_create(&h.root);
+
+        assert!(
+            WorkingCopy::open_existing(&h.writable, "alice", "proj", &h.root)
+                .unwrap()
+                .is_none()
+        );
+        let copy = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        assert!(copy.base().is_none());
+        assert!(copy.resolution().unwrap().is_none());
+        assert!(copy.outbox().unwrap().is_none());
+        assert_eq!(read_files(&copy.state_dir), Vec::new());
+        copy.record_base("h1", files(&[("b.md", "b1")])).unwrap();
+        let again = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        assert_eq!(commit_of(&again).as_deref(), Some("h1"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_same_folder_reopened_or_moved_back_keeps_its_state() {
+        let h = homes();
+        copy_with_state(&h);
+        let reopened = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        assert_eq!(commit_of(&reopened).as_deref(), Some("h0"));
+        assert!(reopened.resolution().unwrap().is_some());
+
+        let away = h.root.with_extension("away");
+        std::fs::rename(&h.root, &away).unwrap();
+        std::fs::rename(&away, &h.root).unwrap();
+        let back = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        assert_eq!(commit_of(&back).as_deref(), Some("h0"));
+        assert!(back.outbox().unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_recorded_before_the_folder_identity_was_kept_is_adopted() {
+        let h = homes();
+        let copy = copy_with_state(&h);
+        std::fs::remove_file(copy.state_dir.join(FOLDER_FILE)).unwrap();
+        let reopened = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        assert_eq!(commit_of(&reopened).as_deref(), Some("h0"));
+        assert!(reopened.state_dir.join(FOLDER_FILE).is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_default_root_reads_a_removed_folders_state_as_absent() {
+        let h = homes();
+        copy_with_state(&h);
+        re_create(&h.root);
+        let copy = WorkingCopy::open(&h.refused, "alice", "proj", &h.root).unwrap();
+        assert!(copy.base().is_none());
+        assert!(copy.resolution().unwrap().is_none());
+        let _lock = copy.lock().unwrap();
+        assert!(
+            copy.base().is_none(),
+            "the lock adopts nothing from the stale home"
+        );
     }
 }
