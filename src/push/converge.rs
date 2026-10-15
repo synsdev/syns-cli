@@ -2724,13 +2724,13 @@ fn prepared_outcome(prepared: Prepared) -> SyncOutcome {
 // One value per run, moved out at once; boxing the outcome buys nothing.
 #[allow(clippy::large_enum_variant)]
 enum OutboxStep {
-    Completed(SyncOutcome),
     Resume(Option<String>),
     CarryOn,
 }
 
-/// `converge` 2 and 3: complete an acknowledged publication, resume one
-/// the head still carries no other change past, or drop the outbox.
+/// `converge` 2 and 3: complete an acknowledged publication and carry the
+/// run on past it, resume one the head still carries no other change past,
+/// or drop the outbox.
 async fn settle_outbox(
     client: &SynsClient,
     token: Option<&str>,
@@ -2768,11 +2768,10 @@ async fn settle_outbox(
         copy.remove_resolution()?;
         copy.remove_snapshots()?;
         copy.remove_outbox()?;
-        return Ok(OutboxStep::Completed(SyncOutcome::Synced {
-            written: Vec::new(),
-            removed: Vec::new(),
-            published: None,
-        }));
+        // The run goes on from the base just recorded: a folder edited
+        // since the landed publication is published past it, and one
+        // holding that head answers no changes (issue 196).
+        return Ok(OutboxStep::CarryOn);
     }
 
     // 3
@@ -2974,7 +2973,6 @@ async fn converge_locked(
 
     let outcome = match settle_outbox(client, token, copy, mode).await {
         Err(err) => Err(err),
-        Ok(OutboxStep::Completed(outcome)) => Ok(outcome),
         Ok(OutboxStep::Resume(parent)) => match token {
             None => Err(CliError::AuthRequired),
             // u308 CR2-1: a retrieval resuming an interrupted publication
@@ -4166,7 +4164,6 @@ async fn continue_locked(
 
     // 2
     match settle_outbox(client, Some(token), copy, ConvergeMode::Publish).await? {
-        OutboxStep::Completed(outcome) => return Ok(outcome),
         OutboxStep::Resume(parent) => {
             return publish_reviewed(
                 client,

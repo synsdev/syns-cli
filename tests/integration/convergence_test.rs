@@ -2447,6 +2447,75 @@ async fn a_retrieval_without_a_credential_settles_a_landed_publication_first() {
     assert_eq!(e.fake.head().1["a.md"], "a\nQ\nc\n");
 }
 
+/// A bare publication finding its earlier publication landed unacknowledged
+/// records that commit as the base and goes on to publish the edit the
+/// folder took since, as one commit, rather than answering no changes over
+/// it (issue 196).
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_publication_past_a_landed_outbox_publishes_the_edit_made_since() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let client = e.fake.client();
+    let (_h0, h1) = landed_unacknowledged(&e, &dir, &copy);
+
+    let outcome = converge(&client, Some(TOKEN), &copy, ConvergeMode::Publish, e.opts())
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(
+            outcome,
+            SyncOutcome::Synced {
+                published: Some(_),
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    let bodies = e.fake.push_bodies();
+    assert_eq!(bodies.len(), 1, "{bodies:?}");
+    assert_eq!(bodies[0]["parentSha"], h1.as_str());
+    let (head, tree) = e.fake.head();
+    assert_eq!(tree["a.md"], "a\nQ\nc\n");
+    assert_eq!(copy.base().unwrap().commit_sha(), Some(head.as_str()));
+    assert!(copy.outbox().unwrap().is_none());
+}
+
+/// A continue finding an earlier publication landed unacknowledged
+/// publishes the edit the folder took since, as a bare publication does
+/// (issue 196).
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_continue_past_a_landed_outbox_publishes_the_edit_made_since() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let client = e.fake.client();
+    landed_unacknowledged(&e, &dir, &copy);
+
+    let outcome = continue_resolution(&client, TOKEN, &copy, e.opts())
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(
+            outcome,
+            SyncOutcome::Synced {
+                published: Some(_),
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(e.fake.push_bodies().len(), 1);
+    let (head, tree) = e.fake.head();
+    assert_eq!(tree["a.md"], "a\nQ\nc\n");
+    assert_eq!(copy.base().unwrap().commit_sha(), Some(head.as_str()));
+    assert!(copy.outbox().unwrap().is_none());
+}
+
 /// A publication found landed once the head comes back to its tree keeps a
 /// resolution a run holding no credential prepared after it, rather than
 /// leaving that candidate's markers in the folder for the next sync to
