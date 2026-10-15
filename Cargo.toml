@@ -56,6 +56,10 @@ webpki-root-certs = "1"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.184"
 
+# D-164: a folder's volume serial and file index, its identity on Windows.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 serial_test = "3"
 wiremock = "0.6"

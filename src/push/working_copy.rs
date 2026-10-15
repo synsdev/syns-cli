@@ -138,7 +138,7 @@ struct FolderIdentity {
 
 impl FolderIdentity {
     /// The identity of the folder at `root`, none where it cannot be read
-    /// or the platform answers no inode.
+    /// or the platform answers no inode or file index.
     #[cfg(unix)]
     fn of(root: &Path) -> Option<FolderIdentity> {
         use std::os::unix::fs::MetadataExt;
@@ -155,7 +155,49 @@ impl FolderIdentity {
         })
     }
 
-    #[cfg(not(unix))]
+    /// On Windows the volume serial stands for the device and the file
+    /// index for the inode (D-164): the creation time alone is no identity
+    /// there, since NTFS tunnelling hands a name removed and created again
+    /// within 15 seconds its old creation time.
+    #[cfg(windows)]
+    fn of(root: &Path) -> Option<FolderIdentity> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+        };
+        // Backup semantics open a directory; full sharing never blocks a
+        // concurrent removal or rename of the folder.
+        let folder = OpenOptions::new()
+            .access_mode(0)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(root)
+            .ok()?;
+        // SAFETY: the handle is open for the call's length, and the
+        // structure is plain data the call fills.
+        let info = unsafe {
+            let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+            if GetFileInformationByHandle(folder.as_raw_handle(), &mut info) == 0 {
+                return None;
+            }
+            info
+        };
+        let born = folder
+            .metadata()
+            .ok()
+            .and_then(|meta| meta.created().ok())
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|since| (since.as_secs(), since.subsec_nanos()));
+        Some(FolderIdentity {
+            dev: u64::from(info.dwVolumeSerialNumber),
+            ino: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+            born,
+        })
+    }
+
+    #[cfg(not(any(unix, windows)))]
     fn of(_root: &Path) -> Option<FolderIdentity> {
         None
     }
@@ -2782,10 +2824,8 @@ mod tests {
 
     // ---- issue 173, D-163: a working copy ends with its folder ------------
 
-    /// The folder identity is kept on unix only (D-163).
     /// A copy at `h.root` over the writable roots holding a base, a
     /// resolution and an outbox.
-    #[cfg(unix)]
     fn copy_with_state(h: &Homes) -> WorkingCopy {
         let copy = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
         copy.record_base("h0", files(&[("a.md", "a0")])).unwrap();
@@ -2810,7 +2850,6 @@ mod tests {
         copy
     }
 
-    #[cfg(unix)]
     fn re_create(dir: &Path) {
         // A sibling holds the removed folder's inode while the new one is
         // made, so the two differ even where birth times are not kept.
@@ -2820,7 +2859,6 @@ mod tests {
         std::fs::remove_dir_all(&held).unwrap();
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_re_created_folder_opens_no_state_of_the_removed_one() {
         let h = homes();
@@ -2842,7 +2880,6 @@ mod tests {
         assert_eq!(commit_of(&again).as_deref(), Some("h1"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn the_same_folder_reopened_or_moved_back_keeps_its_state() {
         let h = homes();
@@ -2859,7 +2896,6 @@ mod tests {
         assert!(back.outbox().unwrap().is_some());
     }
 
-    #[cfg(unix)]
     #[test]
     fn state_recorded_before_the_folder_identity_was_kept_is_adopted() {
         let h = homes();
@@ -2870,7 +2906,6 @@ mod tests {
         assert!(reopened.state_dir.join(FOLDER_FILE).is_file());
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_refused_default_root_reads_a_removed_folders_state_as_absent() {
         let h = homes();
@@ -2887,7 +2922,6 @@ mod tests {
     }
 
     /// Rewrite the identity recorded in `home` through `change`.
-    #[cfg(unix)]
     fn edit_recorded(home: &Path, change: impl FnOnce(&mut FolderIdentity)) {
         let mut recorded = FolderIdentity::recorded(home).expect("a recorded identity");
         change(&mut recorded);
@@ -2898,7 +2932,6 @@ mod tests {
         .unwrap();
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_birth_time_moved_earlier_or_another_device_keeps_the_state() {
         let h = homes();
@@ -2923,7 +2956,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_reused_inode_with_a_later_birth_time_reads_as_another_folder() {
         let h = homes();
@@ -2944,6 +2976,23 @@ mod tests {
         let reopened = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
         assert!(reopened.base().is_none());
         assert!(reopened.resolution().unwrap().is_none());
+    }
+
+    /// A folder created at a removed one's path with an earlier birth time,
+    /// as NTFS tunnelling hands it the removed folder's own (D-164), still
+    /// reads as another folder: its file index differs.
+    #[test]
+    fn another_inode_with_an_earlier_birth_time_reads_as_another_folder() {
+        let h = homes();
+        let copy = copy_with_state(&h);
+        edit_recorded(&copy.state_dir, |id| {
+            id.ino = id.ino.wrapping_add(1);
+            id.born = id.born.map(|(secs, nanos)| (secs + 60, nanos));
+        });
+        let reopened = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        assert!(reopened.base().is_none());
+        assert!(reopened.resolution().unwrap().is_none());
+        assert!(reopened.outbox().unwrap().is_none());
     }
 
     #[cfg(unix)]

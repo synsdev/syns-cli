@@ -6690,7 +6690,6 @@ async fn a_head_gaining_another_repositorys_identity_file_does_not_replace_the_w
 // begins a working copy of its own, so a retrieval into it takes every
 // head path rather than reading each path it lacks as removed locally —
 // against a head moved past the removed copy's base and an unmoved one.
-#[cfg(unix)]
 async fn re_created_directory_retrieval(move_head: bool) {
     let e = env().await;
     let folder = tempfile::tempdir().unwrap();
@@ -6737,14 +6736,12 @@ async fn re_created_directory_retrieval(move_head: bool) {
     assert!(e.fake.push_bodies().is_empty());
 }
 
-#[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn retrieval_into_a_re_created_directory_past_a_moved_head_takes_every_head_path() {
     re_created_directory_retrieval(true).await;
 }
 
-#[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn retrieval_into_a_re_created_directory_at_an_unmoved_head_takes_every_head_path() {
