@@ -1172,6 +1172,22 @@ async fn check_response(response: reqwest::Response) -> Result<reqwest::Response
     Ok(response)
 }
 
+/// The refusal `check_response` folds a `409` `conflict` naming
+/// `currentSha` into: the head moved past the parent a publication
+/// claimed, and `current_sha` is that head. `D-166`, ruled on verify: a
+/// path-scoped publication from a folder with no base that would change
+/// anything is refused with this same value before any request, so it
+/// reads, renders and exits as the server's refusal does.
+pub(crate) fn head_moved(current_sha: &str) -> CliError {
+    CliError::Api {
+        status: Some(409),
+        error: "conflict".to_string(),
+        context: Some(ApiErrorContext::HeadMoved {
+            current_sha: current_sha.to_string(),
+        }),
+    }
+}
+
 pub(crate) fn undecodable(status: reqwest::StatusCode, e: impl std::fmt::Display) -> CliError {
     CliError::Api {
         status: Some(status.as_u16()),
@@ -3660,6 +3676,11 @@ mod head_moved_tests {
             .await
             .unwrap_err();
 
+        // `D-166`, ruled on verify: `head_moved` is this very fold.
+        assert_eq!(
+            format!("{err:?}"),
+            format!("{:?}", head_moved(&"c".repeat(40)))
+        );
         match err {
             CliError::Api {
                 status: Some(409),

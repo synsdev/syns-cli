@@ -314,26 +314,288 @@ fn a_forced_push_names_the_base_commit_it_did_not_claim() {
     }
 }
 
-/// With no recorded base the publication stands as before: the local
-/// record names the parent.
+/// Issue 303, `D-166`: with no recorded base, a path-scoped publication
+/// reads the head through `EP-tree` and claims it, whatever the local
+/// record names. It adds a file the head lacks and changes nothing the
+/// head holds, so it is not refused (`D-166`, ruled on verify).
 #[test]
 #[serial]
-fn a_scoped_push_with_no_base_claims_the_local_records_commit() {
+fn a_scoped_push_with_no_base_claims_the_head_not_the_local_record() {
     let d = Deployment::new();
     d.mount_push();
     let work = checkout();
     let root = work.path();
-    d.save_record(root, HEAD_SHA, hashes(root));
+    d.save_record(root, OLD_SHA, hashes(root));
+    d.mount_tree(HEAD_SHA, &hashes(root));
     assert!(d.copy(root).base().is_none(), "no base recorded");
 
-    std::fs::write(root.join("sub/s.md"), "seed s\nedited\n").expect("edit");
-    let out = d.run(root, &["push", "sub", "-m", "i157 no base"]);
+    std::fs::write(root.join("sub/added.md"), "added\n").expect("an addition");
+    let out = d.run(root, &["push", "sub", "-m", "i303 no base"]);
+
+    let pushes = d.pushes();
+    assert_eq!(pushes.len(), 1, "{}", stderr_of(&out));
+    assert_eq!(pushes[0]["parentSha"], json!(HEAD_SHA), "{}", pushes[0]);
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(d.record(root).commit_sha(), Some(NEXT_SHA));
+}
+
+/// A commit before `OLD_SHA`, where the other copy's base stands.
+const FIRST_SHA: &str = "ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00";
+
+/// Issue 303 Reproduction: two working copies of `alice/notes` under one
+/// cache directory. The other copy publishes `syns push sub` from its
+/// base at `FIRST_SHA`, landing at `OLD_SHA`, so the shared local record
+/// names `OLD_SHA`; a third writer then moves the head on to `HEAD_SHA`,
+/// whose tree also holds `theirs.md`, `sub/new.txt` and `1sub/x.txt`.
+/// This copy records no base. Returns the files the head holds.
+fn their_publication_then_the_head_moves_on(
+    d: &Deployment,
+    mine: &Path,
+    theirs: &Path,
+) -> HashMap<String, String> {
+    d.mount_push_at(FIRST_SHA, OLD_SHA);
+    d.copy(theirs)
+        .record_base(FIRST_SHA, hashes(theirs))
+        .expect("their base");
+    std::fs::write(theirs.join("sub/s.md"), "W2 rewrote it\n").expect("their edit");
+    let published = d.run(theirs, &["push", "sub", "-m", "i303 theirs"]);
+    assert_eq!(exit_of(&published), 0, "{}", stderr_of(&published));
+    assert_eq!(
+        d.record(mine).commit_sha(),
+        Some(OLD_SHA),
+        "the shared record names the other copy's commit"
+    );
+
+    let mut head = hashes(theirs);
+    head.insert("theirs.md".into(), "44".repeat(20));
+    head.insert("sub/new.txt".into(), "55".repeat(20));
+    head.insert("1sub/x.txt".into(), "66".repeat(20));
+    d.mount_push();
+    d.mount_tree(HEAD_SHA, &head);
+    assert!(d.copy(mine).base().is_none(), "this copy records no base");
+    head
+}
+
+/// The shared local record's bytes under the deployment's cache.
+fn record_bytes(d: &Deployment) -> Vec<u8> {
+    std::fs::read(d.cache.path().join(OWNER).join(format!("{NAME}.json"))).expect("shared record")
+}
+
+/// Issue 303, `D-166` ruled on verify (VERIFY.md F-1): the copy with no
+/// base holds `sub/s.md` as it stood before the other copy rewrote it,
+/// and `1sub/n.md` beside the head's `1sub/x.txt` it lacks. `syns push
+/// sub`, `syns push .` and `syns push 1sub` would each update or delete a
+/// path the head holds, so each is refused before any publication
+/// request, as a server `409` on a stale claim refuses it (exit 1,
+/// `server error (409): conflict`); the shared record is left as it stood
+/// and no base is recorded.
+#[test]
+#[serial]
+fn a_scoped_push_with_no_base_that_would_change_the_head_is_refused() {
+    for scope in ["sub", ".", "1sub"] {
+        let d = Deployment::new();
+        let mine = checkout();
+        let theirs = checkout();
+        std::fs::create_dir_all(mine.path().join("1sub")).expect("a digit-led folder");
+        std::fs::write(mine.path().join("1sub/n.md"), "n\n").expect("a digit-led file");
+        their_publication_then_the_head_moves_on(&d, mine.path(), theirs.path());
+        let before = record_bytes(&d);
+
+        let out = d.run(mine.path(), &["push", scope, "-m", "i303 scoped"]);
+
+        assert_eq!(exit_of(&out), 1, "{scope}: {}", stderr_of(&out));
+        assert!(
+            stderr_of(&out).contains("server error (409): conflict"),
+            "{scope}: {}",
+            stderr_of(&out)
+        );
+        assert!(d.pushes().is_empty(), "{scope}: no publication request");
+        assert_eq!(record_bytes(&d), before, "{scope}: the record stands");
+        assert!(d.copy(mine.path()).base().is_none(), "{scope}: no base");
+    }
+}
+
+/// The refusal reads exactly as the server's `409` on a path-scoped
+/// publication claiming a parent behind the head: the same exit, the same
+/// line, the same `--json` document.
+#[test]
+#[serial]
+fn the_refusal_with_no_base_reads_as_the_servers_409() {
+    for json_mode in [false, true] {
+        let d = Deployment::new();
+        let mine = checkout();
+        let theirs = checkout();
+        their_publication_then_the_head_moves_on(&d, mine.path(), theirs.path());
+        let behind = checkout();
+        d.copy(behind.path())
+            .record_base(OLD_SHA, hashes(behind.path()))
+            .expect("a base behind the head");
+        std::fs::write(behind.path().join("sub/s.md"), "behind\n").expect("edit");
+
+        let mut args = vec!["push", "sub", "-m", "i303 refusal"];
+        if json_mode {
+            args.insert(0, "--json");
+        }
+        let served = d.run(behind.path(), &args);
+        assert_eq!(d.pushes().len(), 1, "the server refused the stale claim");
+        let refused = d.run(mine.path(), &args);
+        assert_eq!(d.pushes().len(), 1, "no request from the copy with no base");
+
+        assert_eq!(exit_of(&refused), exit_of(&served), "json={json_mode}");
+        assert_eq!(stderr_of(&refused), stderr_of(&served), "json={json_mode}");
+        assert_eq!(refused.stdout, served.stdout, "json={json_mode}");
+    }
+}
+
+/// With no base and nothing under the scope differing from the head, the
+/// run is answered with the standing head: No changes.
+#[test]
+#[serial]
+fn a_scoped_push_with_no_base_changing_nothing_reports_no_changes() {
+    let d = Deployment::new();
+    let work = checkout();
+    let root = work.path();
+    d.save_record(root, OLD_SHA, hashes(root));
+    d.rt.block_on(async {
+        d.server.reset().await;
+        Mock::given(method("PUT"))
+            .and(path_matcher(format!("/api/v1/repos/{OWNER}/{NAME}/push")))
+            .and(body_partial_json(json!({"parentSha": HEAD_SHA})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "commitSha": HEAD_SHA, "version": 9, "filesChanged": 0, "created": false,
+            })))
+            .mount(&d.server)
+            .await;
+    });
+    d.mount_tree(HEAD_SHA, &hashes(root));
+
+    let out = d.run(root, &["push", "sub", "-m", "i303 unchanged"]);
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(stdout.contains("No changes"), "{stdout}{}", stderr_of(&out));
+    let pushes = d.pushes();
+    assert_eq!(pushes.len(), 1);
+    assert_eq!(pushes[0]["parentSha"], json!(HEAD_SHA));
+    assert_eq!(deletions(&pushes[0]), Vec::<String>::new());
+}
+
+/// `D-166`, last ruling (VERIFY.md F-2): with no base, the head's paths
+/// standing on disk but excluded from the walk — `sub/build/out.md` under
+/// the default skip list, `sub/private.md` under `.synsignore` — are
+/// neither deletions nor changes, so `syns push sub` adding
+/// `sub/new2.txt` lands claiming the head and names no deletion, and the
+/// record written afterwards still names both excluded paths.
+#[test]
+#[serial]
+fn a_scoped_push_with_no_base_leaves_the_paths_excluded_on_disk_alone() {
+    let d = Deployment::new();
+    let work = checkout();
+    let root = work.path();
+    std::fs::write(root.join(".synsignore"), "sub/private.md\n").expect("ignore file");
+    let mut head = hashes(root);
+    std::fs::create_dir_all(root.join("sub/build")).expect("a skipped folder");
+    std::fs::write(root.join("sub/build/out.md"), "built\n").expect("a skipped file");
+    std::fs::write(root.join("sub/private.md"), "private\n").expect("an ignored file");
+    head.insert("sub/build/out.md".into(), "11".repeat(20));
+    head.insert("sub/private.md".into(), "22".repeat(20));
+    d.save_record(root, OLD_SHA, head.clone());
+    d.mount_push();
+    d.mount_tree(HEAD_SHA, &head);
+    assert!(d.copy(root).base().is_none(), "no base recorded");
+
+    std::fs::write(root.join("sub/new2.txt"), "new\n").expect("an addition");
+    let out = d.run(root, &["push", "sub", "-m", "i303 excluded"]);
 
     assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
     let pushes = d.pushes();
-    assert_eq!(pushes.len(), 1);
+    assert_eq!(pushes.len(), 1, "{}", stderr_of(&out));
     assert_eq!(pushes[0]["parentSha"], json!(HEAD_SHA), "{}", pushes[0]);
-    assert_eq!(d.record(root).commit_sha(), Some(NEXT_SHA));
+    assert_eq!(deletions(&pushes[0]), Vec::<String>::new(), "{}", pushes[0]);
+    let record = d.record(root);
+    assert_eq!(record.commit_sha(), Some(NEXT_SHA));
+    let eleven = "11".repeat(20);
+    let twenty_two = "22".repeat(20);
+    assert_eq!(record.file_sha("sub/build/out.md"), Some(eleven.as_str()));
+    assert_eq!(record.file_sha("sub/private.md"), Some(twenty_two.as_str()));
+    assert!(record.file_sha("sub/new2.txt").is_some());
+}
+
+/// `D-166`, last ruling (REVIEW-delta-1.md I-1): the same for a path the
+/// caller's `--exclude` keeps out: `syns push sub --exclude sub/new.txt`,
+/// with `sub/new.txt` on disk and in the head, adding `sub/mine.md`,
+/// lands claiming the head and names no deletion.
+#[test]
+#[serial]
+fn a_scoped_push_with_no_base_leaves_a_path_its_exclude_keeps_out_alone() {
+    let d = Deployment::new();
+    let work = checkout();
+    let root = work.path();
+    std::fs::write(root.join("sub/new.txt"), "another writer's\n").expect("a head file");
+    let head = hashes(root);
+    d.save_record(root, OLD_SHA, head.clone());
+    d.mount_push();
+    d.mount_tree(HEAD_SHA, &head);
+
+    std::fs::write(root.join("sub/mine.md"), "mine\n").expect("an addition");
+    let out = d.run(
+        root,
+        &[
+            "push",
+            "sub",
+            "--exclude",
+            "sub/new.txt",
+            "-m",
+            "i303 exclude",
+        ],
+    );
+
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    let pushes = d.pushes();
+    assert_eq!(pushes.len(), 1, "{}", stderr_of(&out));
+    assert_eq!(pushes[0]["parentSha"], json!(HEAD_SHA), "{}", pushes[0]);
+    assert_eq!(deletions(&pushes[0]), Vec::<String>::new(), "{}", pushes[0]);
+    assert!(d.record(root).file_sha("sub/new.txt").is_some());
+}
+
+/// Issue 303 Expected row 2: `syns push --force` from the copy with no
+/// base names the head as the parent it dropped — on the diagnostic
+/// stream and as `unclaimedParent` under `--json` — never the commit the
+/// other copy wrote into the shared record.
+#[test]
+#[serial]
+fn a_forced_push_with_no_base_names_the_head_it_did_not_claim() {
+    for json_mode in [false, true] {
+        let d = Deployment::new();
+        let mine = checkout();
+        let theirs = checkout();
+        their_publication_then_the_head_moves_on(&d, mine.path(), theirs.path());
+
+        std::fs::write(mine.path().join("a.md"), "a\nforced\n").expect("my edit");
+        let mut args = vec!["push", "--force", "sub", "-m", "i303 forced"];
+        if json_mode {
+            args.insert(0, "--json");
+        }
+        let out = d.run(mine.path(), &args);
+        assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+
+        if json_mode {
+            let document: Value =
+                serde_json::from_slice(&out.stdout).expect("one document on the primary stream");
+            assert_eq!(document["unclaimedParent"], json!(HEAD_SHA), "{document}");
+        } else {
+            let line = stderr_of(&out);
+            assert!(line.contains("the head check did not run"), "{line}");
+            assert!(line.contains(HEAD_SHA), "{line}");
+            assert!(!line.contains(OLD_SHA), "{line}");
+        }
+        for push in d.pushes() {
+            assert!(
+                push.get("parentSha").is_none(),
+                "--force claims none: {push}"
+            );
+        }
+    }
 }
 
 /// The paths a push body names as deletions.

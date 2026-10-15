@@ -7,7 +7,7 @@ use syns_cli::client::SynsClient;
 use syns_cli::commands::push::{PushArgs, cmd_push};
 use syns_cli::errors::{CliError, EdgeRejecter};
 use syns_cli::push::hash::blob_sha1;
-use syns_cli::push::manifest::Manifest;
+use syns_cli::push::working_copy::WorkingCopy;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
 
@@ -80,22 +80,23 @@ async fn push_sends_only_changed_files() {
     )
     .unwrap();
 
-    let mut manifest = Manifest::default();
-    manifest.update(
-        "1111111111111111111111111111111111111111".to_string(),
+    // Issue 303 (`D-166`): a path-scoped publication stands on the
+    // folder's base, never on the local record.
+    WorkingCopy::open(
+        ctx.config.stores(),
+        "bob",
+        "my-repo",
+        ctx.project_dir.path(),
+    )
+    .unwrap()
+    .record_base(
+        "1111111111111111111111111111111111111111",
         HashMap::from([
             ("a.txt".to_string(), blob_sha1(b"unchanged")),
             ("b.txt".to_string(), blob_sha1(b"original")),
         ]),
-    );
-    manifest
-        .save(
-            ctx.config.stores(),
-            "bob",
-            "my-repo",
-            ctx.config.cache_dir(),
-        )
-        .unwrap();
+    )
+    .unwrap();
 
     Mock::given(method("PUT"))
         .and(path("/api/v1/repos/bob/my-repo/push"))

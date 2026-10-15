@@ -16,7 +16,6 @@ use serial_test::serial;
 use syns_cli::auth::token::TokenStore;
 use syns_cli::push::collector::MAX_FILE_BYTES;
 use syns_cli::push::hash::blob_sha1;
-use syns_cli::push::manifest::Manifest;
 use syns_cli::push::working_copy::{Resolution, WorkingCopy};
 use tempfile::TempDir;
 use wiremock::matchers::{header, method, path};
@@ -521,27 +520,18 @@ async fn missing_blobs_resend_keeps_the_byte_field() {
     write(&dir, ".syns.yaml", identity());
     write(&dir, "img/image.png", PNG);
     write(&dir, "a.md", b"a\n");
-    let mut record = Manifest::default();
-    record.update(
-        "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0".into(),
-        [
-            (".syns.yaml".to_string(), blob_sha1(identity())),
-            ("img/image.png".to_string(), blob_sha1(PNG)),
-            ("a.md".to_string(), blob_sha1(b"a\n")),
-        ]
-        .into_iter()
-        .collect(),
-    );
-    record
-        .save(
-            &syns_cli::config::StoreRoots::resolve(
-                Some(m.cache.path()),
-                m.cache.path(),
-                m.cache.path(),
-            ),
-            "alice",
-            "proj",
-            m.cache.path(),
+    // Issue 303 (`D-166`): a scoped publication stands on the folder's
+    // base, never on the local record.
+    m.copy()
+        .record_base(
+            "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
+            [
+                (".syns.yaml".to_string(), blob_sha1(identity())),
+                ("img/image.png".to_string(), blob_sha1(PNG)),
+                ("a.md".to_string(), blob_sha1(b"a\n")),
+            ]
+            .into_iter()
+            .collect(),
         )
         .unwrap();
 
@@ -604,19 +594,10 @@ fn recorded_eight(m: &Machine, len: usize, rewritten: &[usize]) -> Vec<String> {
         };
         write(&dir, name, &now);
     }
-    let mut record = Manifest::default();
-    record.update("b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0".into(), recorded);
-    record
-        .save(
-            &syns_cli::config::StoreRoots::resolve(
-                Some(m.cache.path()),
-                m.cache.path(),
-                m.cache.path(),
-            ),
-            "alice",
-            "proj",
-            m.cache.path(),
-        )
+    // Issue 303 (`D-166`): a path-scoped publication stands on the
+    // folder's base, never on the local record.
+    m.copy()
+        .record_base("b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0", recorded)
         .unwrap();
     names
 }

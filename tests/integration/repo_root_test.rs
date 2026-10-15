@@ -293,7 +293,9 @@ async fn scoped_push_confines_deletions_to_the_named_subtree() {
     let ctx = setup().await;
     seed_credentials(&ctx, "test-token", "alice");
     let root = seed_tree(&ctx);
-    seed_record(&ctx);
+    // Issue 303 (`D-166`): a scoped publication stands on the folder's
+    // base, never on the local record.
+    seed_converged_base(&ctx, &root).await;
     fs::remove_file(root.join("sub/nested.md")).unwrap();
     mount_push_mocks(&ctx, "alice/proj").await;
 
@@ -337,7 +339,9 @@ async fn scoped_push_leaves_the_local_record_naming_the_whole_tree() {
     let ctx = setup().await;
     seed_credentials(&ctx, "test-token", "alice");
     let root = seed_tree(&ctx);
-    seed_record(&ctx);
+    // Issue 303 (`D-166`): a scoped publication stands on the folder's
+    // base, never on the local record.
+    seed_converged_base(&ctx, &root).await;
     mount_push_mocks(&ctx, "alice/proj").await;
 
     {
@@ -360,7 +364,9 @@ async fn forced_scoped_push_leaves_the_local_record_naming_the_whole_tree() {
     let ctx = setup().await;
     seed_credentials(&ctx, "test-token", "alice");
     let root = seed_tree(&ctx);
-    seed_record(&ctx);
+    // Issue 303 (`D-166`): a scoped publication stands on the folder's
+    // base, never on the local record.
+    seed_converged_base(&ctx, &root).await;
     mount_push_mocks(&ctx, "alice/proj").await;
 
     {

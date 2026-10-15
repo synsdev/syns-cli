@@ -241,6 +241,8 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
         // its claimed parent (or the one `--force` drops) and the record
         // written after — not on the repository-wide local record, which
         // no convergence writes and every copy under the cache shares.
+        // Where it records none, the run reads the head through `EP-tree`
+        // and still never that record (`D-166`, issue 303).
         opts.base_record = copy
             .base()
             .filter(|base| base.commit_sha().is_some_and(|commit| !commit.is_empty()));
@@ -1432,22 +1434,23 @@ mod tests {
             .up_to_n_times(1)
             .mount(&server)
             .await;
-        let mut record = crate::push::manifest::Manifest::default();
-        record.update(
-            "a11ce000a11ce000".into(),
-            std::collections::HashMap::from([
-                (
-                    "README.md".to_string(),
-                    crate::push::hash::blob_sha1(&readme),
-                ),
-                (
-                    ".syns.yaml".to_string(),
-                    crate::push::hash::blob_sha1(&identity),
-                ),
-            ]),
-        );
-        record
-            .save(config.stores(), "alice", "test-repo", config.cache_dir())
+        // Issue 303 (`D-166`): the run stands on this folder's recorded
+        // base, never on the local record.
+        WorkingCopy::open(config.stores(), "alice", "test-repo", folder.path())
+            .unwrap()
+            .record_base(
+                "a11ce000a11ce000",
+                std::collections::HashMap::from([
+                    (
+                        "README.md".to_string(),
+                        crate::push::hash::blob_sha1(&readme),
+                    ),
+                    (
+                        ".syns.yaml".to_string(),
+                        crate::push::hash::blob_sha1(&identity),
+                    ),
+                ]),
+            )
             .unwrap();
 
         let args = PushArgs {

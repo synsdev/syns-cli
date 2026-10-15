@@ -109,12 +109,13 @@ pub struct SmartPushOptions {
     /// run held and claimed none of, answered as its meta's
     /// `unclaimed_parent`.
     pub declined_parent: Option<String>,
-    /// `D-162` (issue 157): the working copy's recorded base, standing in
-    /// for the local record `Manifest::load` would read. Its files are the
-    /// reference set and the record Phase 6 lays the publication over; its
-    /// commit is the parent claimed, or under `--force` the parent the run
-    /// reports dropping. Unlike `reference` it leaves the identity-file
+    /// `D-162` (issue 157): the working copy's recorded base. Its files are
+    /// the reference set and the record Phase 6 lays the publication over;
+    /// its commit is the parent claimed, or under `--force` the parent the
+    /// run reports dropping. Unlike `reference` it leaves the identity-file
     /// write and the merged record as a publication handed none has them.
+    /// Unset, the run reads the head through `EP-tree` and never the local
+    /// record (`D-166`, issue 303).
     pub base_record: Option<Manifest>,
 }
 
@@ -1060,11 +1061,28 @@ pub(crate) fn strict_refuses(skipped: &[SkippedFile]) -> bool {
     skipped.iter().any(|sf| sf.reason == SkipReason::TooLarge)
 }
 
-/// Whether the tree read `smart_push` 1 makes where no local record loads
-/// answered a repository holding no commit: any `404`, as the run read it
-/// before (`not_found` and `repo_not_found` among them), or the empty
-/// repository's `422` `validation_error` (SPEC u300 `smart_push` 1, issue
-/// 220), as `converge`'s `is_empty_repository` reads it.
+/// The paths of `shas` this run walked — every one, or those within
+/// `prefix` — that stand on disk under `root` and the collection left
+/// out: files an exclusion keeps out, never a deletion or a change
+/// (`excluded_on_disk`; `D-162` ruled on review I-2, `D-166`).
+fn excluded_on_disk<V>(
+    root: &Path,
+    prefix: Option<&str>,
+    local_files: &HashMap<String, V>,
+    shas: &HashMap<String, String>,
+) -> std::collections::BTreeSet<String> {
+    let walked = shas.keys().filter(|p| match prefix {
+        Some(prefix) => path_within_prefix(p, prefix),
+        None => true,
+    });
+    crate::push::converge::excluded_local_files(root, |p| local_files.contains_key(p), walked)
+}
+
+/// Whether the tree read `smart_push` 1 makes where no base stands
+/// (`D-166`) answered a repository holding no commit: any `404`, as the
+/// run read it before (`not_found` and `repo_not_found` among them), or
+/// the empty repository's `422` `validation_error` (SPEC u300 `smart_push`
+/// 1, issue 220), as `converge`'s `is_empty_repository` reads it.
 fn holds_no_commit(err: &CliError) -> bool {
     match err {
         CliError::Api {
@@ -1186,91 +1204,80 @@ pub async fn smart_push(
     // `reference` stands in for both reads (SPEC u256), so neither the
     // local record nor `EP-tree` is consulted and only `parent_sha`
     // names a parent.
+    // `D-166`: a run standing on the head alone — no convergence
+    // reference, no scoped folder, no recorded base.
+    let on_the_head_alone =
+        opts.reference.is_none() && folder.is_none() && opts.base_record.is_none();
     let (manifest_existed, record_base, remote_parent_sha) = match &opts.reference {
         Some(reference) => (!reference.is_empty(), reference.clone(), None),
         // SPEC u291 `smart_push` 1: a publication from a scoped folder
         // loads no local record and reads no tree; handed no reference it
         // takes an empty one and claims no parent of its own.
         None if folder.is_some() => (false, HashMap::new(), None),
-        None => {
-            // Phase 3b — Load manifest unconditionally (so
-            // `manifest_existed` is set even when --force bypasses the
-            // reference state from it).
-            //
-            // `D-162`: the working copy's recorded base, where the command
-            // hands one, stands in for that record — the local record is
-            // one file per repository under a cache, which no convergence
-            // writes and every other copy of the repository shares.
-            let from_base = opts.base_record.is_some();
-            let loaded_manifest = opts
-                .base_record
-                .take()
-                .or_else(|| Manifest::load(&opts.stores, owner, name, path));
-            let manifest_existed = loaded_manifest.is_some();
-            let record_from_manifest: Option<(HashMap<String, String>, Option<String>)> =
-                loaded_manifest.map(|manifest| {
-                    let mut shas: HashMap<String, String> = manifest
-                        .file_paths()
-                        .filter_map(|p| {
-                            manifest
-                                .file_sha(p)
-                                .map(|sha| (p.to_string(), sha.to_string()))
-                        })
-                        .collect();
-                    // `D-162`, ruled on review (I-2): the base stands in
-                    // with the paths excluded on disk taken out, as every
-                    // convergence consumer of it does (`excluded_on_disk`)
-                    // — a base path inside what this run walked, standing
-                    // on disk and left out of the collection, is a file an
-                    // exclusion keeps out, never a deletion. A base path
-                    // outside the scope was not walked and stays.
-                    if from_base {
-                        let walked = shas.keys().filter(|p| match opts.prefix.as_deref() {
-                            Some(prefix) => path_within_prefix(p, prefix),
-                            None => true,
-                        });
-                        let excluded = crate::push::converge::excluded_local_files(
-                            path,
-                            |p| local_files.contains_key(p),
-                            walked,
-                        );
-                        shas.retain(|p, _| !excluded.contains(p));
-                    }
-                    let parent = manifest.commit_sha().map(String::from);
-                    (shas, parent)
-                });
-
-            // Phase 3c — Phase 6 lays the collected set over THIS map,
-            // which is what keeps a scoped publication's record naming
-            // the whole tree rather than just its scope.
-            //
-            // Where no local record loads — a checkout that has never
-            // written one, or `--force` having discarded it — the remote
-            // path set through `EP-tree` is the base instead. The extra
-            // request on that path is deliberate: a `--force` scoped
-            // publication with no record on disk is the one corner that
-            // would otherwise rewrite the record from the scope alone
-            // and hand the NEXT bare publication a deletion for every
-            // out-of-scope path.
-            let (record_base, remote_parent_sha) = match &record_from_manifest {
-                Some((shas, parent)) => (shas.clone(), parent.clone()),
-                None => match client.pull(repo_id, Some(token)).await {
-                    Ok(tree) => {
-                        let parent = Some(tree.commit_sha.clone());
-                        (tree_to_sha_map(&tree), parent)
-                    }
-                    // SPEC u300 `smart_push` 1: a repository not found, and
-                    // one created empty — whose tree read answers `422`
-                    // `validation_error` (issue 220) — read as a head holding
-                    // no file and no commit, so the publication claims no
-                    // parent; every other refusal stops the run.
-                    Err(err) if holds_no_commit(&err) => (HashMap::new(), None),
-                    Err(e) => return Err(e),
-                },
-            };
-            (manifest_existed, record_base, remote_parent_sha)
+        // Phase 3b — `D-162` (issue 157): the working copy's recorded
+        // base, where the command hands one, is the record the run stands
+        // on — its file set the reference set, its commit the parent
+        // claimed (or the one `--force` reports dropping).
+        None if opts.base_record.is_some() => {
+            let base = opts.base_record.take().expect("a base stands");
+            let mut shas: HashMap<String, String> = base
+                .file_paths()
+                .filter_map(|p| base.file_sha(p).map(|sha| (p.to_string(), sha.to_string())))
+                .collect();
+            // `D-162`, ruled on review (I-2): the base stands in with the
+            // paths excluded on disk taken out, as every convergence
+            // consumer of it does (`excluded_on_disk`) — a base path
+            // inside what this run walked, standing on disk and left out
+            // of the collection, is a file an exclusion keeps out, never
+            // a deletion. A base path outside the scope was not walked
+            // and stays.
+            let excluded = excluded_on_disk(path, opts.prefix.as_deref(), &local_files, &shas);
+            shas.retain(|p, _| !excluded.contains(p));
+            (true, shas, base.commit_sha().map(String::from))
         }
+        // Phase 3b' — `D-166` (issue 303): with no base, the run reads
+        // the head through `EP-tree` — its reference set and its parent —
+        // and never the local record `<cache>/<owner>/<name>.json`: that
+        // record is one file per repository under a cache, which another
+        // working copy of the repository may have written, so a parent
+        // taken from it is that copy's commit and the head check passes
+        // on it. The record is still written after the run (Phase 6).
+        //
+        // Phase 3c — Phase 6 lays the collected set over THIS map, which
+        // is what keeps a scoped publication's record naming the whole
+        // tree rather than just its scope; a `--force` scoped publication
+        // would otherwise rewrite the record from the scope alone and
+        // hand the NEXT bare publication a deletion for every
+        // out-of-scope path.
+        None => match client.pull(repo_id, Some(token)).await {
+            // A head holding a commit is a prior state the run stood on:
+            // a publication it answers unchanged is up to date, not the
+            // first-publication no-op `format_response` warns about.
+            Ok(tree) => (true, tree_to_sha_map(&tree), Some(tree.commit_sha.clone())),
+            // SPEC u300 `smart_push` 1: a repository not found, and one
+            // created empty — whose tree read answers `422`
+            // `validation_error` (issue 220) — read as a head holding no
+            // file and no commit, so the publication claims no parent;
+            // every other refusal stops the run.
+            Err(err) if holds_no_commit(&err) => (false, HashMap::new(), None),
+            Err(e) => return Err(e),
+        },
     };
+
+    // The head `EP-tree` read, where the run stands on it alone.
+    let head_read = remote_parent_sha.clone().filter(|_| on_the_head_alone);
+
+    // `D-166`, last ruling (VERIFY.md F-2): the head's tree stands in for
+    // a base the way the base does, with the paths excluded on disk taken
+    // out of the reference set — a head path standing on disk that an
+    // exclusion keeps out of the walk is neither a deletion nor a change,
+    // so it neither refuses the run nor is sent. The record Phase 6 lays
+    // the publication over keeps them: the head still holds them.
+    let mut reference_base = record_base.clone();
+    if on_the_head_alone {
+        let excluded = excluded_on_disk(path, opts.prefix.as_deref(), &local_files, &record_base);
+        reference_base.retain(|p, _| !excluded.contains(p));
+    }
 
     // Phase 3d — Build reference state: the diff base the wire payload
     // is computed against. `--force` empties it so every collected
@@ -1285,7 +1292,7 @@ pub async fn smart_push(
             opts.declined_parent.clone().or(remote_parent_sha),
         )
     } else {
-        (record_base.clone(), remote_parent_sha, None)
+        (reference_base, remote_parent_sha, None)
     };
 
     let parent_sha = if opts.parent_sha.is_some() {
@@ -1310,6 +1317,23 @@ pub async fn smart_push(
         opts.prefix.as_deref(),
         folder.as_deref(),
     )?;
+    // `D-166`, ruled on verify: claiming the head stands in for a base
+    // the folder does not hold. With no base there is no right parent for
+    // the server's head check to refuse, so the run refuses for it: a
+    // publication that would change any path the head holds — an update
+    // or a deletion — is refused before any request, with the very
+    // refusal the server's `409` on a stale claim gives (`CONFLICT`, the
+    // head named). `syns sync` puts every differing path up for review
+    // (`INV-59`), or `--force` publishes past it: a forced run's
+    // reference set is empty, so it names no update and no deletion here.
+    // A run adding only paths the head lacks overwrites nothing and goes
+    // on; one changing nothing is answered with the standing head.
+    if let Some(head) = head_read.as_deref() {
+        let updates = pending.iter().any(|p| reference_shas.contains_key(&p.path));
+        if updates || !deletes.is_empty() {
+            return Err(crate::client::head_moved(head));
+        }
+    }
     let hash_only = if pending.is_empty() && deletes.is_empty() {
         standing_head_entry(&local_files, folder.as_deref())
     } else {
@@ -1467,6 +1491,19 @@ pub async fn smart_push(
             deleted: deleted_paths,
         },
     ))
+}
+
+/// Issue 303, `D-166`: a run reads no local record, so a test standing a
+/// run on the record it saved hands that record over as the working
+/// copy's base, which is what a run stands on now.
+#[cfg(test)]
+fn the_saved_record(cache: &Path, owner: &str, name: &str) -> Option<Manifest> {
+    Manifest::load(
+        &StoreRoots::resolve(Some(cache), cache, cache),
+        owner,
+        name,
+        cache,
+    )
 }
 
 #[cfg(test)]
@@ -1668,7 +1705,7 @@ mod tests {
                 renders_publication_summary: false,
                 folder: None,
                 declined_parent: None,
-                base_record: None,
+                base_record: the_saved_record(cache_dir.path(), "bob", "my-repo"),
             },
         )
         .await;
@@ -1775,7 +1812,7 @@ mod tests {
                 renders_publication_summary: false,
                 folder: None,
                 declined_parent: None,
-                base_record: None,
+                base_record: the_saved_record(cache_dir.path(), "owner", "repo"),
             },
         )
         .await;
@@ -1901,7 +1938,7 @@ mod tests {
                 renders_publication_summary: false,
                 folder: None,
                 declined_parent: None,
-                base_record: None,
+                base_record: the_saved_record(cache_dir.path(), "owner", "repo"),
             },
         )
         .await;
@@ -2013,7 +2050,7 @@ mod tests {
                 renders_publication_summary: false,
                 folder: None,
                 declined_parent: None,
-                base_record: None,
+                base_record: the_saved_record(cache_dir.path(), "owner", "repo"),
             },
         )
         .await;
@@ -2168,7 +2205,7 @@ mod tests {
         let (_response, _raw, meta) = result.unwrap();
         assert!(
             !meta.manifest_existed,
-            "stub should be rejected by Manifest::load"
+            "a run with no base reads no local record (`D-166`)"
         );
 
         // After call: cache file is overwritten by Phase 6 save.
@@ -2744,7 +2781,7 @@ mod tests {
                 renders_publication_summary: false,
                 folder: None,
                 declined_parent: None,
-                base_record: None,
+                base_record: the_saved_record(cache_dir.path(), "charlie", "repo"),
             },
         )
         .await;
@@ -3291,7 +3328,10 @@ mod unclaimed_parent_tests {
             "t",
             "alice/notes",
             folder.path(),
-            opts(cache.path(), true),
+            SmartPushOptions {
+                base_record: the_saved_record(cache.path(), "alice", "notes"),
+                ..opts(cache.path(), true)
+            },
         )
         .await
         .unwrap();
@@ -3478,7 +3518,10 @@ mod unclaimed_parent_tests {
             "t",
             "alice/notes",
             folder.path(),
-            opts(cache.path(), false),
+            SmartPushOptions {
+                base_record: the_saved_record(cache.path(), "alice", "notes"),
+                ..opts(cache.path(), false)
+            },
         )
         .await
         .unwrap();
@@ -3987,7 +4030,10 @@ mod u280_publication_tests {
             "t",
             "alice/repo",
             folder.path(),
-            opts(cache.path()),
+            SmartPushOptions {
+                base_record: the_saved_record(cache.path(), "alice", "repo"),
+                ..opts(cache.path())
+            },
         )
         .await
         .unwrap_err();
@@ -4225,7 +4271,10 @@ mod issue290_tests {
             "t",
             "alice/repo",
             folder.path(),
-            opts(cache.path()),
+            SmartPushOptions {
+                base_record: the_saved_record(cache.path(), "alice", "repo"),
+                ..opts(cache.path())
+            },
         )
         .await
         .unwrap();
@@ -4254,7 +4303,10 @@ mod issue290_tests {
             "t",
             "alice/repo",
             folder.path(),
-            opts(cache.path()),
+            SmartPushOptions {
+                base_record: the_saved_record(cache.path(), "alice", "repo"),
+                ..opts(cache.path())
+            },
         )
         .await
         .unwrap();
@@ -4406,6 +4458,7 @@ mod issue290_tests {
         let client = SynsClient::new(&server.uri()).unwrap();
         let mut options = opts(cache.path());
         options.prefix = Some("docs".into());
+        options.base_record = the_saved_record(cache.path(), "alice", "repo");
 
         smart_push(&client, "t", "alice/repo", folder.path(), options)
             .await
@@ -4509,5 +4562,600 @@ mod issue290_tests {
         carried.dedup();
         assert_eq!(before, carried.len(), "no path rides twice");
         assert_eq!(carried.len(), 10_002, "every file and the identity file");
+    }
+}
+
+/// Issue 303, `D-166`: a forced or path-scoped publication from a folder
+/// recording no base reads the head through `EP-tree` — its reference set
+/// and the parent it claims, or under `--force` the parent it reports
+/// dropping — and never the local record, which another working copy
+/// under the same cache may have written.
+#[cfg(test)]
+mod issue303_tests {
+    use super::*;
+    use crate::push::hash::blob_sha1;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The commit another working copy published, which the shared local
+    /// record names.
+    const THEIRS: &str = "cc22cc22cc22cc22cc22cc22cc22cc22cc22cc22";
+    /// The head `EP-tree` reads, moved on past `THEIRS`.
+    const HEAD: &str = "dd33dd33dd33dd33dd33dd33dd33dd33dd33dd33";
+    /// The commit a landed publication is answered with.
+    const LANDED: &str = "ee44ee44ee44ee44ee44ee44ee44ee44ee44ee44";
+
+    fn stores(cache: &Path) -> StoreRoots {
+        StoreRoots::resolve(Some(cache), cache, cache)
+    }
+
+    fn opts(cache: &Path, force: bool, prefix: Option<&str>) -> SmartPushOptions {
+        SmartPushOptions {
+            force,
+            message: "push".into(),
+            author: None,
+            parent_sha: None,
+            excludes: vec![],
+            stores: stores(cache),
+            description: None,
+            tags: None,
+            status: None,
+            visibility: None,
+            strict: false,
+            allow_empty: false,
+            debug: false,
+            no_default_excludes: false,
+            prefix: prefix.map(String::from),
+            reference: None,
+            expected: None,
+            provenance: None,
+            collected: None,
+            held: None,
+            json_output: false,
+            renders_publication_summary: false,
+            folder: None,
+            declined_parent: None,
+            base_record: None,
+        }
+    }
+
+    /// This folder: `a.md` at the root and `sub/s.md` under the scope,
+    /// the scoped file edited past what either commit holds.
+    fn folder() -> tempfile::TempDir {
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(folder.path().join("a.md"), "a\n").unwrap();
+        std::fs::create_dir_all(folder.path().join("sub")).unwrap();
+        std::fs::write(folder.path().join("sub/s.md"), "mine\n").unwrap();
+        folder
+    }
+
+    /// The shared local record, as the other copy's publication wrote
+    /// it: `THEIRS`, holding a file the head no longer holds.
+    fn their_record(cache: &Path) {
+        let mut record = Manifest::default();
+        record.update(
+            THEIRS.into(),
+            HashMap::from([
+                ("a.md".to_string(), blob_sha1(b"a\n")),
+                ("sub/s.md".to_string(), blob_sha1(b"theirs\n")),
+                ("sub/only-theirs.md".to_string(), blob_sha1(b"gone\n")),
+            ]),
+        );
+        record.save(&stores(cache), "alice", "repo", cache).unwrap();
+    }
+
+    /// `EP-tree` at `HEAD`, holding `a.md`, the head's `sub/s.md`, `b.md`
+    /// outside the scope and `sub/new.txt` inside it, both of which this
+    /// folder lacks.
+    async fn mount_head(server: &MockServer) {
+        let entry = |p: &str, content: &[u8]| {
+            serde_json::json!({
+                "name": p.rsplit('/').next().unwrap(), "path": p,
+                "type": "file", "size": content.len(), "sha": blob_sha1(content),
+            })
+        };
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/repo/tree"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "entries": [
+                    entry("a.md", b"a\n"),
+                    entry("b.md", b"b\n"),
+                    entry("sub/new.txt", b"added by another writer\n"),
+                    entry("sub/s.md", b"head\n"),
+                ],
+                "commitSha": HEAD, "truncated": false,
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_push(server: &MockServer, files_changed: u32) {
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/repos/alice/repo/push"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "commitSha": LANDED, "version": 3,
+                "filesChanged": files_changed, "created": false,
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn put_bodies(server: &MockServer) -> Vec<serde_json::Value> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.method == reqwest::Method::PUT)
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect()
+    }
+
+    /// The head's own files — `a.md`, `b.md`, `sub/new.txt` and the
+    /// head's `sub/s.md` — with `extra` beside them and `missing` taken
+    /// out.
+    fn holding_the_head(extra: &[(&str, &[u8])], missing: &[&str]) -> tempfile::TempDir {
+        let folder = tempfile::tempdir().unwrap();
+        let files: [(&str, &[u8]); 4] = [
+            ("a.md", b"a\n"),
+            ("b.md", b"b\n"),
+            ("sub/new.txt", b"added by another writer\n"),
+            ("sub/s.md", b"head\n"),
+        ];
+        for (p, content) in files.iter().chain(extra.iter()) {
+            if missing.contains(p) {
+                continue;
+            }
+            let at = folder.path().join(p);
+            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+            std::fs::write(at, content).unwrap();
+        }
+        folder
+    }
+
+    /// The shared record's bytes, to show a refused run left it alone.
+    fn record_bytes(cache: &Path) -> Vec<u8> {
+        std::fs::read(cache.join("alice").join("repo.json")).expect("the shared record")
+    }
+
+    /// `D-166`, ruled on verify (issue 303's case): `syns push sub` or
+    /// `syns push .` from a folder with no base whose `sub/s.md` differs
+    /// from the head is refused before any request, with the very
+    /// refusal a server `409` on a stale claim folds into, naming the
+    /// head — never the shared record's commit. The shared record is
+    /// left as it stood.
+    #[tokio::test]
+    async fn a_run_with_no_base_that_would_update_a_head_path_is_refused() {
+        for prefix in [Some("sub"), None] {
+            let server = MockServer::start().await;
+            mount_head(&server).await;
+            mount_push(&server, 1).await;
+            let folder = folder();
+            let cache = tempfile::tempdir().unwrap();
+            their_record(cache.path());
+            let before = record_bytes(cache.path());
+            let client = SynsClient::new(&server.uri()).unwrap();
+
+            let err = smart_push(
+                &client,
+                "t",
+                "alice/repo",
+                folder.path(),
+                opts(cache.path(), false, prefix),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(
+                format!("{err:?}"),
+                format!("{:?}", crate::client::head_moved(HEAD)),
+                "{prefix:?}"
+            );
+            assert!(put_bodies(&server).await.is_empty(), "{prefix:?}: no PUT");
+            assert_eq!(record_bytes(cache.path()), before, "{prefix:?}");
+        }
+    }
+
+    /// The same where the only change is a deletion: a head path under
+    /// the scope the folder lacks (`sub/new.txt`, another writer's), or a
+    /// scope emptied on disk.
+    #[tokio::test]
+    async fn a_run_with_no_base_that_would_delete_a_head_path_is_refused() {
+        let folders = [
+            holding_the_head(&[], &["sub/new.txt"]),
+            holding_the_head(&[], &["sub/new.txt", "sub/s.md"]),
+        ];
+        for folder in folders {
+            let server = MockServer::start().await;
+            mount_head(&server).await;
+            mount_push(&server, 1).await;
+            let cache = tempfile::tempdir().unwrap();
+            their_record(cache.path());
+            let client = SynsClient::new(&server.uri()).unwrap();
+
+            let err = smart_push(
+                &client,
+                "t",
+                "alice/repo",
+                folder.path(),
+                opts(cache.path(), false, Some("sub")),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(
+                format!("{err:?}"),
+                format!("{:?}", crate::client::head_moved(HEAD))
+            );
+            assert!(put_bodies(&server).await.is_empty(), "no PUT");
+        }
+    }
+
+    /// Expected rows 1 and 5: a run with no base that only adds paths the
+    /// head lacks overwrites nothing, so it claims the head `EP-tree`
+    /// reads — never the shared record's commit — names no deletion, and
+    /// writes the record afterwards as the whole tree, the publication
+    /// laid over the head.
+    #[tokio::test]
+    async fn a_run_with_no_base_adding_only_claims_the_head() {
+        for prefix in [Some("sub"), None] {
+            let server = MockServer::start().await;
+            mount_head(&server).await;
+            mount_push(&server, 1).await;
+            let folder = holding_the_head(&[("sub/mine.md", b"mine\n")], &[]);
+            let cache = tempfile::tempdir().unwrap();
+            their_record(cache.path());
+            let client = SynsClient::new(&server.uri()).unwrap();
+
+            let (_response, _raw, meta) = smart_push(
+                &client,
+                "t",
+                "alice/repo",
+                folder.path(),
+                opts(cache.path(), false, prefix),
+            )
+            .await
+            .unwrap();
+
+            let bodies = put_bodies(&server).await;
+            assert_eq!(bodies.len(), 1);
+            assert_eq!(bodies[0]["parentSha"].as_str(), Some(HEAD), "{}", bodies[0]);
+            assert!(bodies[0].get("deletions").is_none(), "{}", bodies[0]);
+            let sent: Vec<&str> = bodies[0]["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| f["path"].as_str().unwrap())
+                .collect();
+            let expected: Vec<&str> = match prefix {
+                // The identity file the run writes is an addition too.
+                None => vec![".syns.yaml", "sub/mine.md"],
+                Some(_) => vec!["sub/mine.md"],
+            };
+            assert_eq!(sent, expected, "{prefix:?}");
+            assert!(meta.manifest_existed);
+
+            let record = Manifest::load(&stores(cache.path()), "alice", "repo", cache.path())
+                .expect("the record is written after the run");
+            assert_eq!(record.commit_sha(), Some(LANDED));
+            for path in ["a.md", "b.md", "sub/new.txt", "sub/s.md", "sub/mine.md"] {
+                assert!(record.file_sha(path).is_some(), "{prefix:?}: {path}");
+            }
+            assert_eq!(
+                record.file_sha("sub/s.md"),
+                Some(blob_sha1(b"head\n").as_str())
+            );
+        }
+    }
+
+    /// Expected row 2: `syns push --force` from a folder with no base
+    /// reports dropping the head's commit, never the shared record's.
+    #[tokio::test]
+    async fn a_forced_run_with_no_base_names_the_head_as_the_parent_it_dropped() {
+        for prefix in [None, Some("sub")] {
+            let server = MockServer::start().await;
+            mount_head(&server).await;
+            mount_push(&server, 1).await;
+            let folder = folder();
+            let cache = tempfile::tempdir().unwrap();
+            their_record(cache.path());
+            let client = SynsClient::new(&server.uri()).unwrap();
+
+            let (_response, _raw, meta) = smart_push(
+                &client,
+                "t",
+                "alice/repo",
+                folder.path(),
+                opts(cache.path(), true, prefix),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(meta.sent_parent, None, "{prefix:?}: --force claims none");
+            assert_eq!(
+                meta.unclaimed_parent.as_deref(),
+                Some(HEAD),
+                "{prefix:?}: the parent dropped is the head"
+            );
+            let bodies = put_bodies(&server).await;
+            assert!(bodies[0].get("parentSha").is_none(), "{}", bodies[0]);
+        }
+    }
+
+    /// Expected row 4: into a repository holding no commit — `EP-tree`
+    /// answering `422` `validation_error` or `404` — a run with no base
+    /// claims no parent and names none dropped, whatever the shared
+    /// record names.
+    #[tokio::test]
+    async fn a_run_with_no_base_into_a_repository_holding_no_commit_claims_none() {
+        let refusals = [
+            (422, serde_json::json!({"error": "validation_error"})),
+            (404, serde_json::json!({"error": "repo_not_found"})),
+        ];
+        for (status, body) in refusals {
+            for force in [false, true] {
+                let server = MockServer::start().await;
+                Mock::given(method("GET"))
+                    .and(path("/api/v1/repos/alice/repo/tree"))
+                    .respond_with(ResponseTemplate::new(status).set_body_json(body.clone()))
+                    .mount(&server)
+                    .await;
+                mount_push(&server, 1).await;
+                let folder = folder();
+                let cache = tempfile::tempdir().unwrap();
+                their_record(cache.path());
+                let client = SynsClient::new(&server.uri()).unwrap();
+
+                let (_response, _raw, meta) = smart_push(
+                    &client,
+                    "t",
+                    "alice/repo",
+                    folder.path(),
+                    opts(cache.path(), force, Some("sub")),
+                )
+                .await
+                .unwrap();
+
+                assert_eq!(meta.sent_parent, None, "{status} force={force}");
+                assert_eq!(meta.unclaimed_parent, None, "{status} force={force}");
+                assert!(!meta.manifest_existed, "{status} force={force}");
+                let bodies = put_bodies(&server).await;
+                assert!(bodies[0].get("parentSha").is_none(), "{}", bodies[0]);
+                assert!(bodies[0].get("deletions").is_none(), "{}", bodies[0]);
+            }
+        }
+    }
+
+    /// Expected row 3: a run handed a base stands on it and reads neither
+    /// the shared record nor `EP-tree` (`D-162`, unchanged).
+    #[tokio::test]
+    async fn a_run_with_a_base_stands_on_it_and_reads_no_tree() {
+        let server = MockServer::start().await;
+        mount_push(&server, 1).await;
+        let folder = folder();
+        let cache = tempfile::tempdir().unwrap();
+        their_record(cache.path());
+        let mut base = Manifest::default();
+        base.update(
+            "ab".repeat(20),
+            HashMap::from([
+                ("a.md".to_string(), blob_sha1(b"a\n")),
+                ("sub/s.md".to_string(), blob_sha1(b"base\n")),
+            ]),
+        );
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let mut options = opts(cache.path(), false, Some("sub"));
+        options.base_record = Some(base);
+
+        let (_response, _raw, meta) =
+            smart_push(&client, "t", "alice/repo", folder.path(), options)
+                .await
+                .unwrap();
+
+        assert_eq!(meta.sent_parent, Some("ab".repeat(20)));
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests.iter().all(|r| r.method != reqwest::Method::GET),
+            "no tree read where a base stands"
+        );
+    }
+
+    /// An unchanged run with no base, answered with the standing head,
+    /// stood on a head holding a commit: the command answers No changes
+    /// rather than the first-publication warning.
+    #[tokio::test]
+    async fn an_unchanged_run_with_no_base_at_the_head_reads_as_up_to_date() {
+        let server = MockServer::start().await;
+        let entry = |p: &str, content: &[u8]| {
+            serde_json::json!({
+                "name": p, "path": p, "type": "file",
+                "size": content.len(), "sha": blob_sha1(content),
+            })
+        };
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/repo/tree"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "entries": [entry("a.md", b"a\n")],
+                "commitSha": HEAD, "truncated": false,
+            })))
+            .mount(&server)
+            .await;
+        mount_push(&server, 0).await;
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(folder.path().join("a.md"), "a\n").unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let client = SynsClient::new(&server.uri()).unwrap();
+
+        let (response, _raw, meta) = smart_push(
+            &client,
+            "t",
+            "alice/repo",
+            folder.path(),
+            opts(cache.path(), false, None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.files_changed, 0);
+        assert!(meta.manifest_existed, "the command answers No changes");
+        assert_eq!(meta.sent_parent.as_deref(), Some(HEAD));
+    }
+
+    /// `D-166`, ruled on verify: a run with no base whose scope differs
+    /// from the head in nothing is answered with the standing head, as
+    /// before — the command answers No changes.
+    #[tokio::test]
+    async fn a_scoped_run_with_no_base_changing_nothing_reads_as_up_to_date() {
+        let server = MockServer::start().await;
+        mount_head(&server).await;
+        mount_push(&server, 0).await;
+        let folder = holding_the_head(&[], &[]);
+        let cache = tempfile::tempdir().unwrap();
+        their_record(cache.path());
+        let client = SynsClient::new(&server.uri()).unwrap();
+
+        let (response, _raw, meta) = smart_push(
+            &client,
+            "t",
+            "alice/repo",
+            folder.path(),
+            opts(cache.path(), false, Some("sub")),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.files_changed, 0);
+        assert!(meta.manifest_existed, "the command answers No changes");
+        let bodies = put_bodies(&server).await;
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0]["parentSha"].as_str(), Some(HEAD));
+        assert!(bodies[0].get("deletions").is_none(), "{}", bodies[0]);
+    }
+
+    /// `D-166`, last ruling (VERIFY.md F-2): with no base, a head path
+    /// under the scope standing on disk but kept out of the walk — the
+    /// default-skipped `sub/build/x`, the `.synsignore`d `sub/ignored.txt`
+    /// whose bytes on disk differ from the head's — is neither a deletion
+    /// nor a change. A run adding `sub/new2.txt` lands claiming the head,
+    /// names no deletion, and the record written afterwards still names
+    /// both excluded paths at the head's hashes.
+    #[tokio::test]
+    async fn a_run_with_no_base_takes_the_paths_excluded_on_disk_out_of_the_head() {
+        let server = MockServer::start().await;
+        let ignore: &[u8] = b"sub/ignored.txt\n";
+        let head: [(&str, &[u8]); 7] = [
+            (".synsignore", ignore),
+            ("a.md", b"a\n"),
+            ("b.md", b"b\n"),
+            ("sub/build/x", b"built\n"),
+            ("sub/ignored.txt", b"the head's\n"),
+            ("sub/new.txt", b"added by another writer\n"),
+            ("sub/s.md", b"head\n"),
+        ];
+        let entries: Vec<serde_json::Value> = head
+            .iter()
+            .map(|(p, content)| {
+                serde_json::json!({
+                    "name": p.rsplit('/').next().unwrap(), "path": p,
+                    "type": "file", "size": content.len(), "sha": blob_sha1(content),
+                })
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/repo/tree"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "entries": entries, "commitSha": HEAD, "truncated": false,
+            })))
+            .mount(&server)
+            .await;
+        mount_push(&server, 1).await;
+        let folder = holding_the_head(
+            &[
+                (".synsignore", ignore),
+                ("sub/build/x", b"built\n"),
+                ("sub/ignored.txt", b"mine, ignored\n"),
+                ("sub/new2.txt", b"new\n"),
+            ],
+            &[],
+        );
+        let cache = tempfile::tempdir().unwrap();
+        their_record(cache.path());
+        let client = SynsClient::new(&server.uri()).unwrap();
+
+        let (_response, _raw, meta) = smart_push(
+            &client,
+            "t",
+            "alice/repo",
+            folder.path(),
+            opts(cache.path(), false, Some("sub")),
+        )
+        .await
+        .unwrap();
+
+        let bodies = put_bodies(&server).await;
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0]["parentSha"].as_str(), Some(HEAD), "{}", bodies[0]);
+        assert!(bodies[0].get("deletions").is_none(), "{}", bodies[0]);
+        let sent: Vec<&str> = bodies[0]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(sent, vec!["sub/new2.txt"]);
+        assert!(meta.deleted.is_empty());
+
+        let record = Manifest::load(&stores(cache.path()), "alice", "repo", cache.path())
+            .expect("the record is written after the run");
+        assert_eq!(record.commit_sha(), Some(LANDED));
+        assert_eq!(
+            record.file_sha("sub/build/x"),
+            Some(blob_sha1(b"built\n").as_str())
+        );
+        assert_eq!(
+            record.file_sha("sub/ignored.txt"),
+            Some(blob_sha1(b"the head's\n").as_str())
+        );
+        assert!(record.file_sha("sub/new2.txt").is_some());
+    }
+
+    /// `D-166`, last ruling (REVIEW-delta-1.md I-1): a head path the
+    /// caller's `--exclude` keeps out of the walk while it stands on disk
+    /// is neither a deletion nor a change. `syns push sub --exclude
+    /// sub/new.txt` adding `sub/mine.md` lands claiming the head.
+    #[tokio::test]
+    async fn a_run_with_no_base_leaves_a_path_its_exclude_keeps_out_alone() {
+        let server = MockServer::start().await;
+        mount_head(&server).await;
+        mount_push(&server, 1).await;
+        let folder = holding_the_head(&[("sub/mine.md", b"mine\n")], &[]);
+        let cache = tempfile::tempdir().unwrap();
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let mut options = opts(cache.path(), false, Some("sub"));
+        options.excludes = vec!["sub/new.txt".into()];
+
+        let (_response, _raw, meta) =
+            smart_push(&client, "t", "alice/repo", folder.path(), options)
+                .await
+                .unwrap();
+
+        let bodies = put_bodies(&server).await;
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0]["parentSha"].as_str(), Some(HEAD), "{}", bodies[0]);
+        assert!(bodies[0].get("deletions").is_none(), "{}", bodies[0]);
+        assert_eq!(
+            bodies[0]["files"].as_array().unwrap().len(),
+            1,
+            "{}",
+            bodies[0]
+        );
+        assert_eq!(bodies[0]["files"][0]["path"].as_str(), Some("sub/mine.md"));
+        assert!(meta.deleted.is_empty());
+        let record = Manifest::load(&stores(cache.path()), "alice", "repo", cache.path())
+            .expect("the record is written after the run");
+        assert!(
+            record.file_sha("sub/new.txt").is_some(),
+            "the head still holds it"
+        );
     }
 }
