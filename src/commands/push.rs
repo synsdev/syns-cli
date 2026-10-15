@@ -1398,13 +1398,16 @@ mod tests {
         let config = Config::new(Some(&server.uri())).unwrap();
         store_bob_credential(&config);
 
+        // Issue 290 (`D-161`): an unchanged run names one path, the least
+        // collected one, and that is the path a `MISSING_BLOBS` resends.
         let readme = std::fs::read(folder.path().join("README.md")).unwrap();
+        let identity = std::fs::read(folder.path().join(".syns.yaml")).unwrap();
         Mock::given(method("PUT"))
             .and(path(NON_OWNER_PUSH_PATH))
             .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
                 "error": "missing_blobs",
                 "message": "some referenced blobs are missing on the server",
-                "missing": {"README.md": crate::push::hash::blob_sha1(&readme)}
+                "missing": {".syns.yaml": crate::push::hash::blob_sha1(&identity)}
             })))
             .with_priority(1)
             .up_to_n_times(1)
@@ -1413,10 +1416,16 @@ mod tests {
         let mut record = crate::push::manifest::Manifest::default();
         record.update(
             "a11ce000a11ce000".into(),
-            std::collections::HashMap::from([(
-                "README.md".to_string(),
-                crate::push::hash::blob_sha1(&readme),
-            )]),
+            std::collections::HashMap::from([
+                (
+                    "README.md".to_string(),
+                    crate::push::hash::blob_sha1(&readme),
+                ),
+                (
+                    ".syns.yaml".to_string(),
+                    crate::push::hash::blob_sha1(&identity),
+                ),
+            ]),
         );
         record
             .save(config.stores(), "alice", "test-repo", config.cache_dir())
@@ -1431,11 +1440,14 @@ mod tests {
 
         let bodies = put_bodies(&server).await;
         assert_eq!(bodies.len(), 2);
-        assert!(file_entry(&bodies[0], "README.md")["content"].is_null());
+        assert!(file_entry(&bodies[0], ".syns.yaml")["content"].is_null());
         assert_eq!(
-            file_entry(&bodies[1], "README.md")["content"].as_str(),
-            Some("edited by bob\n")
+            file_entry(&bodies[1], ".syns.yaml")["content"].as_str(),
+            Some("owner: alice\nname: test-repo\n")
         );
+        for body in &bodies {
+            assert_eq!(body["files"].as_array().unwrap().len(), 1, "{body}");
+        }
         for body in &bodies {
             assert!(body.get("author").is_none(), "{body}");
         }

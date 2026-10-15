@@ -150,13 +150,10 @@ async fn push_sends_only_changed_files() {
         "b.txt should have content (file changed)"
     );
 
-    let a_entry = files
-        .iter()
-        .find(|f| f["path"] == "a.txt")
-        .expect("a.txt not in files");
+    // Issue 290 (`D-161`): an unchanged file is named nowhere.
     assert!(
-        a_entry.get("content").is_none(),
-        "a.txt should not have content key (file unchanged)"
+        files.iter().all(|f| f["path"] != "a.txt"),
+        "a.txt should not be named (file unchanged)"
     );
 }
 

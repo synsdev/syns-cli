@@ -502,7 +502,7 @@ async fn missing_blobs_resend_keeps_the_byte_field() {
         .and(path("/api/v1/repos/alice/proj/push"))
         .respond_with(ResponseTemplate::new(409).set_body_json(json!({
             "error": "missing_blobs",
-            "missing": {"image.png": blob_sha1(PNG)},
+            "missing": {"img/image.png": blob_sha1(PNG)},
         })))
         .with_priority(1)
         .up_to_n_times(1)
@@ -514,20 +514,20 @@ async fn missing_blobs_resend_keeps_the_byte_field() {
         .with_priority(2)
         .mount(&server)
         .await;
+    // Issue 290 (`D-161`): only an unchanged run names a path by its hash
+    // — the least it collected, here the one image of the scoped folder.
     let m = Machine::new(&server.uri());
     let dir = m.dir();
     write(&dir, ".syns.yaml", identity());
-    write(&dir, "image.png", PNG);
+    write(&dir, "img/image.png", PNG);
     write(&dir, "a.md", b"a\n");
-    write(&dir, "b.md", b"b edited\n");
     let mut record = Manifest::default();
     record.update(
         "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0".into(),
         [
             (".syns.yaml".to_string(), blob_sha1(identity())),
-            ("image.png".to_string(), blob_sha1(PNG)),
+            ("img/image.png".to_string(), blob_sha1(PNG)),
             ("a.md".to_string(), blob_sha1(b"a\n")),
-            ("b.md".to_string(), blob_sha1(b"b\n")),
         ]
         .into_iter()
         .collect(),
@@ -545,32 +545,26 @@ async fn missing_blobs_resend_keeps_the_byte_field() {
         )
         .unwrap();
 
-    let out = m.run(&["push", dir.to_str().unwrap()]).await;
+    let out = m.run(&["push", dir.join("img").to_str().unwrap()]).await;
 
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let bodies = put_bodies(&server).await;
     assert_eq!(bodies.len(), 2);
     assert!(
-        entry(&bodies[0], "image.png")
+        entry(&bodies[0], "img/image.png")
             .get("contentBase64")
             .is_none()
     );
-    let resent = entry(&bodies[1], "image.png");
+    for body in &bodies {
+        assert_eq!(body["files"].as_array().unwrap().len(), 1, "{body}");
+    }
+    let resent = entry(&bodies[1], "img/image.png");
     assert!(resent.get("content").is_none(), "{resent}");
     assert_eq!(
         base64::engine::general_purpose::STANDARD
             .decode(resent["contentBase64"].as_str().unwrap())
             .unwrap(),
         PNG
-    );
-    let b = entry(&bodies[1], "b.md");
-    assert_eq!(b["content"], json!("b edited\n"));
-    assert!(b.get("contentBase64").is_none(), "{b}");
-    let a = entry(&bodies[1], "a.md");
-    assert_eq!(a["sha"], json!(blob_sha1(b"a\n")));
-    assert!(
-        a.get("content").is_none() && a.get("contentBase64").is_none(),
-        "{a}"
     );
 }
 
@@ -660,8 +654,8 @@ async fn accepting_after(server: &MockServer, first: ResponseTemplate) {
 }
 
 /// Issue 186: a publication whose changed content passes the chunk
-/// budget sends content for the changed files alone, every other file
-/// riding the first batch by its hash.
+/// budget sends content for the changed files alone; since issue 290
+/// (`D-161`) every other file is named in no batch.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn a_chunked_publication_sends_only_changed_content() {
@@ -685,20 +679,18 @@ async fn a_chunked_publication_sends_only_changed_content() {
     sent.sort();
     assert_eq!(sent, vec!["f1.bin", "f4.bin", "f6.bin"]);
     let unchanged: Vec<&String> = [0, 2, 3, 5, 7].iter().map(|&i| &names[i]).collect();
-    let (_, first_by_hash) = carried(&bodies[0]);
-    for name in &unchanged {
-        assert!(first_by_hash.contains(name), "{name} rode the first batch");
-    }
-    for body in &bodies[1..] {
+    for body in &bodies {
         let (_, by_hash) = carried(body);
+        assert!(by_hash.is_empty(), "{by_hash:?} named by hash");
         for name in &unchanged {
-            assert!(!by_hash.contains(name), "{name} named again");
+            assert!(!sent.contains(name), "{name} named");
         }
     }
 }
 
 /// Issue 186: the edge refusing the one request as too large chunks the
-/// changed content alone, every other file named by its hash.
+/// changed content alone; since issue 290 (`D-161`) no other file is
+/// named.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn a_too_large_refusal_resends_only_changed_content() {
@@ -720,17 +712,19 @@ async fn a_too_large_refusal_resends_only_changed_content() {
     let (mut with_content, by_hash) = carried(&bodies[1]);
     with_content.sort();
     assert_eq!(with_content, vec!["f2.bin", "f5.bin"]);
+    assert!(by_hash.is_empty(), "{by_hash:?} named by hash");
     for i in [0, 1, 3, 4, 6, 7] {
-        assert!(by_hash.contains(&names[i]), "{} by its hash", names[i]);
+        assert!(!with_content.contains(&names[i]), "{} named", names[i]);
     }
 }
 
-/// Issue 186: a `MISSING_BLOBS` refusing a chunked publication's first
-/// batch resends the path its `missing` map names beside the changed
-/// ones, and no other.
+/// Issue 186, since issue 290 (`D-161`): a chunked publication's first
+/// batch names no path by its hash, so a `MISSING_BLOBS` refusing it
+/// names nothing a resend could carry and stands as the run's refusal,
+/// no batch sent after it.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn a_missing_blob_in_a_chunked_publication_is_resent_by_name() {
+async fn a_missing_blob_in_a_chunked_publication_ends_the_run() {
     let server = MockServer::start().await;
     let named = noise(1, 10 * 1024 * 1024);
     accepting_after(
@@ -742,33 +736,18 @@ async fn a_missing_blob_in_a_chunked_publication_is_resent_by_name() {
     )
     .await;
     let m = Machine::new(&server.uri());
-    let names = recorded_eight(&m, 10 * 1024 * 1024, &[1, 4, 6]);
+    recorded_eight(&m, 10 * 1024 * 1024, &[1, 4, 6]);
     let dir = m.dir();
 
     let out = m.run(&["push", dir.to_str().unwrap()]).await;
 
-    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_ne!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert!(stderr(&out).contains("missing_blobs"), "{}", stderr(&out));
     let bodies = put_bodies(&server).await;
-    assert_eq!(bodies.len(), 5, "one refused PUT, then four");
-    let mut sent = Vec::new();
-    for body in &bodies[1..] {
-        let (with_content, _) = carried(body);
-        assert_eq!(with_content.len(), 1, "{with_content:?}");
-        sent.extend(with_content);
-    }
-    sent.sort();
-    assert_eq!(sent, vec!["f0.bin", "f1.bin", "f4.bin", "f6.bin"]);
-    let others: Vec<&String> = [2, 3, 5, 7].iter().map(|&i| &names[i]).collect();
-    let (_, first_by_hash) = carried(&bodies[1]);
-    for name in &others {
-        assert!(first_by_hash.contains(name), "{name} rode the first batch");
-    }
-    for body in &bodies[2..] {
-        let (_, by_hash) = carried(body);
-        for name in &others {
-            assert!(!by_hash.contains(name), "{name} named again");
-        }
-    }
+    assert_eq!(bodies.len(), 1, "the refused PUT alone");
+    let (with_content, by_hash) = carried(&bodies[0]);
+    assert_eq!(with_content.len(), 1, "{with_content:?}");
+    assert!(by_hash.is_empty(), "{by_hash:?} named by hash");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1313,9 +1292,14 @@ async fn a_refused_trusted_entry_is_read_again() {
     let out = m.run(&["push"]).await;
 
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    // Issue 290 (`D-161`): a.png, read again, is unchanged, so the run
+    // publishes nothing and names one path by its hash, the least.
     let bodies = fake.push_bodies();
     let last = bodies.last().unwrap();
-    assert_eq!(entry(last, "a.png")["sha"], json!(blob_sha1(PNG)));
+    assert_eq!(
+        last["files"],
+        json!([{"path": ".syns.yaml", "sha": blob_sha1(identity())}])
+    );
     assert!(
         bodies.iter().all(|b| b["files"]
             .as_array()

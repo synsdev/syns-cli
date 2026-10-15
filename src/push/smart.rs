@@ -184,6 +184,13 @@ pub struct PushPipelineMeta {
 /// rewrites the propagated error with the offending batch's metrics.
 pub const CHUNK_BUDGET_BYTES: usize = 25 * 1024 * 1024;
 
+/// `LIM-files-per-push`: the `files` entries one `EP-push` body may carry,
+/// a deletion spending none of it (`SECURITY.md`, `INTERFACES.md`
+/// § EP-push). The auto-chunker closes a batch at this count as it does at
+/// `CHUNK_BUDGET_BYTES`, so a publication writing more files than this —
+/// a first push, `--force` — goes as several requests (issue 290, `D-161`).
+pub const FILES_PER_PUSH: usize = 10_000;
+
 /// Returns the size in bytes of the JSON-encoded wire body for a
 /// `PushRequest`. Falls back to `usize::MAX` on a (impossible-in-practice)
 /// serialization failure so the caller errs on the side of chunking
@@ -357,27 +364,34 @@ fn build_push_entries(
     Ok((entries, deletes))
 }
 
-/// The hash-only entries for every collected path no pending entry
-/// carries, in ascending path order.
-fn hash_only_entries(
+/// The one hash-only entry a run that changes and deletes nothing sends
+/// (issue 290, `D-161`): the collected path first in ascending wire order,
+/// at the hash the reference set already holds for it, none where nothing
+/// was collected.
+///
+/// A publication names only the paths it changes; `EP-push` refuses a body
+/// whose `files` and `deletions` are both empty, and answers a body writing
+/// nothing with the standing head after its head check, applying any
+/// repository metadata the body carries. This one entry is what keeps an
+/// unchanged run answered as before — the standing head's `CommitResult`,
+/// "No changes", a moved head refused as `CONFLICT` — without a body naming
+/// every path of the tree.
+fn standing_head_entry(
     local_files: &HashMap<String, CollectedFile>,
-    pending: &[PendingEntry],
     folder: Option<&str>,
 ) -> Vec<PushFileEntry> {
-    let carried: std::collections::HashSet<&str> =
-        pending.iter().map(|p| p.path.as_str()).collect();
-    let mut entries: Vec<PushFileEntry> = local_files
+    local_files
         .iter()
-        .filter(|(path, _)| !carried.contains(path.as_str()))
+        .map(|(path, file)| (wire_path(folder, path), file))
+        .min_by(|a, b| a.0.cmp(&b.0))
         .map(|(path, file)| PushFileEntry {
-            path: wire_path(folder, path).into_owned(),
+            path: path.into_owned(),
             sha: file.sha.clone(),
             content: None,
             content_base64: None,
         })
-        .collect();
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
-    entries
+        .into_iter()
+        .collect()
 }
 
 /// What every serialised `PushRequest` opens on: its `files` array, the
@@ -589,9 +603,10 @@ fn projected_body_bytes(base: &PushRequest, pending: &[PendingEntry]) -> usize {
 #[derive(Debug, Clone, Copy)]
 struct Overheads {
     first: usize,
-    /// Whether the first batch's frame carries entries of its own, so
-    /// every pending entry packed beside them adds a separator.
-    first_carries: bool,
+    /// The `files` entries the first batch's frame carries of its own:
+    /// every pending entry packed beside them adds a separator, and they
+    /// count against `FILES_PER_PUSH` beside the batch's own.
+    first_entries: usize,
     later: usize,
 }
 
@@ -617,7 +632,7 @@ fn batch_overheads(base_request: &PushRequest) -> Overheads {
     let first = estimate_body_bytes(&probe);
     Overheads {
         first,
-        first_carries: !base_request.files.is_empty(),
+        first_entries: base_request.files.len(),
         later,
     }
 }
@@ -625,9 +640,10 @@ fn batch_overheads(base_request: &PushRequest) -> Overheads {
 /// Pack pending entries into batches by their serialised lengths: in
 /// descending `encoded_len`, ascending path among equal lengths, a batch
 /// closed before an entry that would carry it past `CHUNK_BUDGET_BYTES`
-/// and a lone entry past it standing alone, the first batch's budget
-/// counting the hash-only entries its frame carries (SPEC u280
-/// `smart_push` 4).
+/// or past `FILES_PER_PUSH` entries and a lone entry past the budget
+/// standing alone, the first batch's budget and count including the
+/// hash-only entries its frame carries (SPEC u280 `smart_push` 4; issue
+/// 290, `D-161`).
 fn pack_batches(mut pending: Vec<PendingEntry>, overheads: Overheads) -> Vec<Vec<PendingEntry>> {
     pending.sort_by(|a, b| {
         b.encoded_len
@@ -637,16 +653,20 @@ fn pack_batches(mut pending: Vec<PendingEntry>, overheads: Overheads) -> Vec<Vec
     let mut batches: Vec<Vec<PendingEntry>> = Vec::new();
     let mut current: Vec<PendingEntry> = Vec::new();
     let mut current_len = overheads.first;
-    let mut carries = overheads.first_carries;
+    let mut carried = overheads.first_entries;
+    // The separator an entry adds: none before the first entry of a body.
+    let separator =
+        |carried: usize, current: &[PendingEntry]| usize::from(carried > 0 || !current.is_empty());
     for entry in pending {
-        let added = entry.encoded_len + usize::from(carries || !current.is_empty());
-        if !current.is_empty() && current_len.saturating_add(added) > CHUNK_BUDGET_BYTES {
+        let added = entry.encoded_len + separator(carried, &current);
+        let past_budget = current_len.saturating_add(added) > CHUNK_BUDGET_BYTES;
+        let past_count = carried + current.len() >= FILES_PER_PUSH;
+        if !current.is_empty() && (past_budget || past_count) {
             batches.push(std::mem::take(&mut current));
             current_len = overheads.later;
-            carries = false;
+            carried = 0;
         }
-        current_len = current_len
-            .saturating_add(entry.encoded_len + usize::from(carries || !current.is_empty()));
+        current_len = current_len.saturating_add(entry.encoded_len + separator(carried, &current));
         current.push(entry);
     }
     if !current.is_empty() || batches.is_empty() {
@@ -704,7 +724,8 @@ struct Target<'a> {
 
 /// One publication pass (SPEC u280 `smart_push` 4): `pending` sent beside
 /// every hash-only entry and deletion `request` carries as one body, or
-/// chunked where that body's projection passes `CHUNK_BUDGET_BYTES` or
+/// chunked where that body's projection passes `CHUNK_BUDGET_BYTES`, its
+/// `files` would pass `FILES_PER_PUSH` entries (issue 290, `D-161`), or
 /// the edge refused it as `PAYLOAD_TOO_LARGE`. The one buffer a not-held
 /// file is read into is allocated once for the pass.
 async fn publish_pass(
@@ -713,8 +734,9 @@ async fn publish_pass(
     pending: &[PendingEntry],
 ) -> Result<(PushResponse, serde_json::Value), PassRefusal> {
     let mut scratch = scratch_for(target.local_files, pending);
-    let oversize =
-        !pending.is_empty() && projected_body_bytes(request, pending) > CHUNK_BUDGET_BYTES;
+    let oversize = !pending.is_empty()
+        && (projected_body_bytes(request, pending) > CHUNK_BUDGET_BYTES
+            || request.files.len() + pending.len() > FILES_PER_PUSH);
     if !oversize {
         let body = fill_batch(
             target.root,
@@ -743,8 +765,9 @@ async fn publish_pass(
 
 /// Auto-chunk a publication into sequential `push_body` calls, each
 /// batch's serialised body under `CHUNK_BUDGET_BYTES` where its entries
-/// allow. Used by `publish_pass` both pre-flight (when the projected body
-/// exceeds the budget) and as a 413 fallback (when the wire returns
+/// allow and its `files` at most `FILES_PER_PUSH` entries. Used by
+/// `publish_pass` both pre-flight (when the projected body exceeds the
+/// budget or the file bound) and as a 413 fallback (when the wire returns
 /// `PayloadTooLarge`). Only the pending entries are packed: every
 /// hash-only entry rides the first batch's frame and is counted against
 /// its budget, and the deletions ride the last (SPEC u280 `smart_push`
@@ -1236,8 +1259,13 @@ pub async fn smart_push(
     };
 
     // Phase 4 — the payload (SPEC u280 `smart_push` 3): each changed
-    // path pending for its bytes, every other path named by its hash,
-    // prefix-gated on the deletion side per SPEC u255 `smart_push` 4.
+    // path pending for its bytes, prefix-gated on the deletion side per
+    // SPEC u255 `smart_push` 4. No unchanged path is named (issue 290,
+    // `D-161`): `EP-push` edits the base tree, so a path in neither list
+    // survives, and naming one counts against `LIM-files-per-push` for a
+    // write it does not make. A run changing and deleting nothing sends
+    // the one entry `standing_head_entry` names, so it is still answered
+    // with the standing head.
     let (pending, deletes) = build_push_entries(
         path,
         &local_files,
@@ -1246,7 +1274,11 @@ pub async fn smart_push(
         opts.prefix.as_deref(),
         folder.as_deref(),
     )?;
-    let hash_only = hash_only_entries(&local_files, &pending, folder.as_deref());
+    let hash_only = if pending.is_empty() && deletes.is_empty() {
+        standing_head_entry(&local_files, folder.as_deref())
+    } else {
+        Vec::new()
+    };
 
     // Phase 4b — Empty guard. A publication is refused where it
     // carries neither a file nor a deletion, and ALSO where its walk
@@ -1314,11 +1346,11 @@ pub async fn smart_push(
     let sent_parent = request.parent_sha.clone();
 
     // Phase 5 — Submit (SPEC u280 `smart_push` 4–5): the pending entries
-    // beside every hash-only entry and deletion as one body, chunked
-    // where that body passes the budget or the edge refuses it, and a
-    // `MISSING_BLOBS` on the one request or on a chunked publication's
-    // first batch answered by one more pass carrying content for the
-    // hash-only paths its `missing` map names.
+    // beside the hash-only entry, if any, and every deletion as one body,
+    // chunked where that body passes the budget or the file bound or the
+    // edge refuses it, and a `MISSING_BLOBS` on the one request or on a
+    // chunked publication's first batch answered by one more pass
+    // carrying content for the hash-only path its `missing` map names.
     let target = Target {
         client,
         token,
@@ -1357,7 +1389,10 @@ pub async fn smart_push(
             pending.push(pend(path, named_path, file, folder.as_deref())?);
         }
         pending.sort_by(|a, b| a.path.cmp(&b.path));
-        request.files = hash_only_entries(&local_files, &pending, folder.as_deref());
+        request.files.retain(|entry| {
+            counted_back(folder.as_deref(), &entry.path)
+                .is_none_or(|counted| !named.iter().any(|n| n == counted))
+        });
     };
 
     // Phase 6 — Manifest save (guarded per SPEC u213 § 4 Phase 6).
@@ -1609,11 +1644,11 @@ mod tests {
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&put_request.body).unwrap();
 
+        // Issue 290 (`D-161`): an unchanged file is not named at all.
         let files = body["files"].as_array().unwrap();
-        let a_entry = files.iter().find(|f| f["path"] == "a.txt").unwrap();
         assert!(
-            a_entry["content"].is_null(),
-            "unchanged file should be sha-only"
+            files.iter().all(|f| f["path"] != "a.txt"),
+            "unchanged file should not be named"
         );
         let b_entry = files.iter().find(|f| f["path"] == "b.txt").unwrap();
         assert_eq!(b_entry["content"].as_str(), Some("modified"));
@@ -1723,11 +1758,11 @@ mod tests {
             .collect();
         assert_eq!(deletes, vec!["removed.txt"]);
 
+        // Issue 290 (`D-161`): a delete-only run names no unchanged file.
         let files = body["files"].as_array().unwrap();
-        let keep_entry = files.iter().find(|f| f["path"] == "keep.txt").unwrap();
         assert!(
-            keep_entry["content"].is_null(),
-            "unchanged file should be sha-only"
+            files.iter().all(|f| f["path"] != "keep.txt"),
+            "unchanged file should not be named"
         );
     }
 
@@ -1753,7 +1788,7 @@ mod tests {
             .and(path("/api/v1/repos/owner/repo/push"))
             .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
                 "error": "missing_blobs",
-                "missing": {"b.txt": blob_sha1(b"old-b")},
+                "missing": {"a.txt": blob_sha1(b"old-a")},
             })))
             .with_priority(1)
             .up_to_n_times(1)
@@ -1761,7 +1796,7 @@ mod tests {
             .await;
 
         let temp_dir = tempfile::tempdir().unwrap();
-        std::fs::write(temp_dir.path().join("a.txt"), "new-a").unwrap();
+        std::fs::write(temp_dir.path().join("a.txt"), "old-a").unwrap();
         std::fs::write(temp_dir.path().join("b.txt"), "old-b").unwrap();
         std::fs::write(
             temp_dir.path().join(".syns.yaml"),
@@ -1803,7 +1838,7 @@ mod tests {
                 message: "retry".into(),
                 author: Some("owner".into()),
                 parent_sha: None,
-                excludes: vec![],
+                excludes: vec![".syns.yaml".into()],
                 stores: crate::config::StoreRoots::resolve(
                     Some(cache_dir.path()),
                     cache_dir.path(),
@@ -1840,27 +1875,20 @@ mod tests {
             .collect();
         assert_eq!(put_requests.len(), 2, "should have made 2 PUT requests");
 
-        // First request: b.txt should be sha-only (unchanged per manifest)
+        // Issue 290 (`D-161`): an unchanged run names only its least path,
+        // a.txt, by its hash, and that is the path the resend carries.
         let body1: serde_json::Value = serde_json::from_slice(&put_requests[0].body).unwrap();
-        let b_entry1 = body1["files"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|f| f["path"] == "b.txt")
-            .unwrap()
-            .clone();
-        assert!(b_entry1["content"].is_null());
+        let files1 = body1["files"].as_array().unwrap();
+        assert_eq!(files1.len(), 1, "{body1}");
+        assert_eq!(files1[0]["path"], "a.txt");
+        assert!(files1[0]["content"].is_null());
 
-        // Second request (retry): b.txt should have content (upgraded)
+        // Second request (retry): a.txt with content, and nothing else
         let body2: serde_json::Value = serde_json::from_slice(&put_requests[1].body).unwrap();
-        let b_entry2 = body2["files"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|f| f["path"] == "b.txt")
-            .unwrap()
-            .clone();
-        assert_eq!(b_entry2["content"].as_str(), Some("old-b"));
+        let files2 = body2["files"].as_array().unwrap();
+        assert_eq!(files2.len(), 1, "{body2}");
+        assert_eq!(files2[0]["path"], "a.txt");
+        assert_eq!(files2[0]["content"].as_str(), Some("old-a"));
     }
 
     #[tokio::test]
@@ -2561,15 +2589,14 @@ mod tests {
         }
     }
 
-    // MED-3: 409 missing_blobs retry → upgraded body exceeds budget →
-    // chunker fires. Primes the manifest with SHA-only entries whose
-    // upgraded full content total > CHUNK_BUDGET_BYTES (14 MiB + 14 MiB
-    // = 28 MiB > 25 MiB). Mocks: first PUT → 409 missing_blobs; second
-    // and subsequent PUTs → 200. Verifies (a) chunker fires after the
-    // 409 (≥ 2 PUTs after the first one), (b) final response is the
-    // last batch's, (c) parentSha chains across the chunked PUTs.
+    // MED-3, since issue 290 (`D-161`): an unchanged run names one path
+    // by its hash, the least it collected, so a `MISSING_BLOBS` naming
+    // more paths than the body carried resends that one path alone —
+    // the resend that once carried every unchanged path past the budget
+    // carries one file. Mocks: first PUT → 409 missing_blobs naming both
+    // files; second PUT → 200.
     #[tokio::test]
-    async fn smart_push_chunks_when_409_missing_blobs_retry_body_exceeds_budget() {
+    async fn a_missing_blobs_resend_carries_only_the_path_the_body_named() {
         let mock_server = MockServer::start().await;
 
         // Priority 1, up_to_n_times(1) → first PUT returns 409 missing_blobs.
@@ -2588,7 +2615,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        // Priority 2, up_to_n_times(1) → second PUT (chunked batch 1) returns 200 / aaaa...001.
+        // Priority 2 → the resend returns 200 / aaaa...001.
         Mock::given(method("PUT"))
             .and(path("/api/v1/repos/charlie/repo/push"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2598,28 +2625,11 @@ mod tests {
                 "created": false,
             })))
             .with_priority(2)
-            .up_to_n_times(1)
             .mount(&mock_server)
             .await;
 
-        // Priority 3 → third PUT (chunked batch 2) returns 200 / bbbb...002.
-        Mock::given(method("PUT"))
-            .and(path("/api/v1/repos/charlie/repo/push"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "commitSha": "bbbbbbbb00000000000000000000000000000002",
-                "version": 3,
-                "filesChanged": 1,
-                "created": false,
-            })))
-            .with_priority(3)
-            .mount(&mock_server)
-            .await;
-
-        // Pre-create local files (14 MiB + 14 MiB = 28 MiB > 25 MiB
-        // after upgrade) and .syns.yaml + matching manifest so the
-        // happy path emits SHA-only entries (no content) on the first
-        // PUT — the 409 then forces an upgrade to full content, and
-        // the upgraded body exceeds the budget → chunker fires.
+        // Two 14 MiB files (28 MiB together, past the budget) and a
+        // manifest naming both at their hashes: the run changes nothing.
         let temp_dir = tempfile::tempdir().unwrap();
         let big1_content = vec![b'a'; 14 * 1024 * 1024];
         let big2_content = vec![b'b'; 14 * 1024 * 1024];
@@ -2631,10 +2641,6 @@ mod tests {
         )
         .unwrap();
 
-        // Prime the manifest with matching SHAs for big1 and big2 (so
-        // build_push_entries produces SHA-only entries — content is
-        // None for the changed=false files because their SHA matches
-        // the manifest's reference).
         let cache_dir = tempfile::tempdir().unwrap();
         let big1_sha = blob_sha1(&big1_content);
         let big2_sha = blob_sha1(&big2_content);
@@ -2698,10 +2704,10 @@ mod tests {
         )
         .await;
 
-        let (response, _raw, _meta) = result.expect("smart_push must succeed on 409→chunker path");
+        let (response, _raw, _meta) = result.expect("smart_push must succeed on the resend");
         assert_eq!(
-            response.commit_sha, "bbbbbbbb00000000000000000000000000000002",
-            "final response should carry the LAST batch's commit_sha",
+            response.commit_sha, "aaaaaaaa00000000000000000000000000000001",
+            "the resend's answer",
         );
 
         let requests = mock_server.received_requests().await.unwrap();
@@ -2709,38 +2715,26 @@ mod tests {
             .iter()
             .filter(|r| r.method == reqwest::Method::PUT)
             .collect();
-        assert_eq!(
-            puts.len(),
-            3,
-            "expected 1 initial 409 PUT + 2 chunked PUTs = 3 total",
-        );
+        assert_eq!(puts.len(), 2, "expected the 409 PUT and its one resend");
 
-        // First PUT: SHA-only entries (no content), parentSha = manifest.
+        // First PUT: big1.txt by its hash alone, parentSha = manifest.
         let body0: serde_json::Value = serde_json::from_slice(&puts[0].body).unwrap();
         assert_eq!(body0["parentSha"].as_str(), Some("old-parent-sha"));
+        let files0 = body0["files"].as_array().unwrap();
+        assert_eq!(files0.len(), 1);
+        assert_eq!(files0[0]["path"], "big1.txt");
+        assert!(files0[0].get("content").is_none());
 
-        // Second PUT (chunked batch 1): full content, parentSha inherits
-        // the original request's parent_sha (i.e. manifest's commit_sha).
+        // Second PUT: big1.txt with its content, and nothing else.
         let body1: serde_json::Value = serde_json::from_slice(&puts[1].body).unwrap();
         assert_eq!(body1["parentSha"].as_str(), Some("old-parent-sha"));
-        assert!(
-            body1["message"]
-                .as_str()
-                .is_some_and(|m| m.contains("(part 1/2)")),
-            "chunked batch 1 message should include '(part 1/2)', got: {:?}",
-            body1["message"],
-        );
-
-        // Third PUT (chunked batch 2): parentSha chains to batch 1's commit.
-        let body2: serde_json::Value = serde_json::from_slice(&puts[2].body).unwrap();
+        assert_eq!(body1["message"].as_str(), Some("retry-upgrade"));
+        let files1 = body1["files"].as_array().unwrap();
+        assert_eq!(files1.len(), 1);
+        assert_eq!(files1[0]["path"], "big1.txt");
         assert_eq!(
-            body2["parentSha"].as_str(),
-            Some("aaaaaaaa00000000000000000000000000000001"),
-        );
-        assert!(
-            body2["message"]
-                .as_str()
-                .is_some_and(|m| m.contains("(part 2/2)")),
+            files1[0]["content"].as_str().map(str::len),
+            Some(big1_content.len())
         );
     }
 
@@ -3286,15 +3280,6 @@ mod unclaimed_parent_tests {
     #[tokio::test]
     async fn a_folder_publication_carries_every_path_under_the_folder() {
         let server = MockServer::start().await;
-        Mock::given(method("PUT"))
-            .and(path("/api/v1/repos/alice/notes/push"))
-            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
-                "error": "missing_blobs",
-                "missing": {"clients/q3/a.md": blob_sha1(b"a")},
-            })))
-            .up_to_n_times(1)
-            .mount(&server)
-            .await;
         mount_push(&server).await;
         let folder = tempfile::tempdir().unwrap();
         std::fs::write(folder.path().join("a.md"), "a").unwrap();
@@ -3322,34 +3307,19 @@ mod unclaimed_parent_tests {
             .iter()
             .map(|r| r.body_json().unwrap())
             .collect();
-        assert_eq!(bodies.len(), 2);
-        for body in &bodies {
-            assert_eq!(body["parentSha"], serde_json::json!(RECORDED));
-            for file in body["files"].as_array().unwrap() {
-                assert!(
-                    file["path"].as_str().unwrap().starts_with("clients/q3/"),
-                    "{file}"
-                );
-            }
-            assert_eq!(
-                body["deletions"],
-                serde_json::json!([{"path": "clients/q3/gone.md"}])
-            );
-        }
-        let first_a = bodies[0]["files"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|f| f["path"] == "clients/q3/a.md")
-            .unwrap();
-        assert!(first_a.get("content").is_none(), "{first_a}");
-        let resent_a = bodies[1]["files"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|f| f["path"] == "clients/q3/a.md")
-            .unwrap();
-        assert_eq!(resent_a["content"], serde_json::json!("a"));
+        // Issue 290 (`D-161`): the changed path alone, under the folder;
+        // the unchanged `a.md` is named nowhere.
+        assert_eq!(bodies.len(), 1);
+        let body = &bodies[0];
+        assert_eq!(body["parentSha"], serde_json::json!(RECORDED));
+        assert_eq!(
+            body["files"],
+            serde_json::json!([{"path": "clients/q3/b.md", "sha": blob_sha1(b"b two"), "content": "b two"}])
+        );
+        assert_eq!(
+            body["deletions"],
+            serde_json::json!([{"path": "clients/q3/gone.md"}])
+        );
         assert_eq!(meta.deleted, vec!["gone.md".to_string()]);
         assert!(meta.collected.contains_key("a.md"));
         assert!(!cache.path().join("alice").exists(), "a record was written");
@@ -3387,15 +3357,6 @@ mod unclaimed_parent_tests {
     #[tokio::test]
     async fn an_identity_publication_carries_every_path_as_collected() {
         let server = MockServer::start().await;
-        Mock::given(method("PUT"))
-            .and(path("/api/v1/repos/alice/notes/push"))
-            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
-                "error": "missing_blobs",
-                "missing": {"a.md": blob_sha1(b"a")},
-            })))
-            .up_to_n_times(1)
-            .mount(&server)
-            .await;
         mount_push(&server).await;
         let folder = tempfile::tempdir().unwrap();
         std::fs::write(folder.path().join("a.md"), "a").unwrap();
@@ -3423,25 +3384,14 @@ mod unclaimed_parent_tests {
             .iter()
             .map(|r| r.body_json().unwrap())
             .collect();
-        assert_eq!(bodies.len(), 2);
-        for body in &bodies {
-            let mut sent: Vec<&str> = body["files"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|f| f["path"].as_str().unwrap())
-                .collect();
-            sent.sort();
-            assert_eq!(sent, vec!["a.md", "b.md"]);
-            assert_eq!(body["deletions"], serde_json::json!([{"path": "gone.md"}]));
-        }
-        let resent_a = bodies[1]["files"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|f| f["path"] == "a.md")
-            .unwrap();
-        assert_eq!(resent_a["content"], serde_json::json!("a"));
+        // Issue 290 (`D-161`): the changed path alone, as collected.
+        assert_eq!(bodies.len(), 1);
+        let body = &bodies[0];
+        assert_eq!(
+            body["files"],
+            serde_json::json!([{"path": "b.md", "sha": blob_sha1(b"b two"), "content": "b two"}])
+        );
+        assert_eq!(body["deletions"], serde_json::json!([{"path": "gone.md"}]));
         assert_eq!(meta.deleted, vec!["gone.md".to_string()]);
         assert!(!cache.path().join("alice").exists(), "a record was written");
         assert!(
@@ -3933,7 +3883,8 @@ mod u280_publication_tests {
     }
 
     /// CR3-1: a second `MISSING_BLOBS` ends the run, nothing further
-    /// sent (SPEC u280 `smart_push` 5).
+    /// sent (SPEC u280 `smart_push` 5) — here an unchanged run's, whose
+    /// one named path is resent once (issue 290, `D-161`).
     #[tokio::test]
     async fn a_second_missing_blobs_ends_the_run() {
         let server = MockServer::start().await;
@@ -3941,7 +3892,7 @@ mod u280_publication_tests {
             .and(path("/api/v1/repos/alice/repo/push"))
             .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
                 "error": "missing_blobs",
-                "missing": {"a.txt": blob_sha1(b"a")},
+                "missing": {".syns.yaml": blob_sha1(b"owner: alice\nname: repo\n")},
             })))
             .with_priority(1)
             .up_to_n_times(1)
@@ -3961,7 +3912,7 @@ mod u280_publication_tests {
         std::fs::write(folder.path().join(".syns.yaml"), identity).unwrap();
         std::fs::write(folder.path().join("a.txt"), "a").unwrap();
         std::fs::write(folder.path().join("b.txt"), "b").unwrap();
-        std::fs::write(folder.path().join("c.txt"), "c edited").unwrap();
+        std::fs::write(folder.path().join("c.txt"), "c").unwrap();
         let cache = tempfile::tempdir().unwrap();
         let mut manifest = Manifest::default();
         manifest.update(
@@ -4038,10 +3989,11 @@ mod u280_publication_tests {
         assert!(beside_many.iter().all(|batch| batch.len() == 1));
     }
 
-    /// CR3-3: a refused first batch reports every entry its body carried,
-    /// the hash-only ones its frame names included.
+    /// CR3-3: a refused first batch reports every entry its body carried —
+    /// since issue 290 (`D-161`) its own alone, the unchanged paths beside
+    /// it named nowhere.
     #[tokio::test]
-    async fn a_refused_first_batch_counts_its_hash_only_entries() {
+    async fn a_refused_first_batch_counts_the_entries_it_carried() {
         let server = MockServer::start().await;
         Mock::given(method("PUT"))
             .and(path("/api/v1/repos/alice/repo/push"))
@@ -4091,9 +4043,422 @@ mod u280_publication_tests {
         .unwrap_err();
 
         match err {
-            CliError::PayloadTooLarge { file_count, .. } => assert_eq!(file_count, 4),
+            CliError::PayloadTooLarge { file_count, .. } => assert_eq!(file_count, 1),
             other => panic!("expected PAYLOAD_TOO_LARGE, got {other:?}"),
         }
         assert_eq!(put_count(&server.received_requests().await.unwrap()), 1);
+    }
+}
+
+/// Issue 290, `D-161`: a publication names only the paths it changes, and
+/// no batch carries more than `LIM-files-per-push` entries.
+#[cfg(test)]
+mod issue290_tests {
+    use super::*;
+    use crate::push::hash::blob_sha1;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const IDENTITY: &[u8] = b"owner: alice\nname: repo\n";
+
+    fn stores(cache: &Path) -> StoreRoots {
+        StoreRoots::resolve(Some(cache), cache, cache)
+    }
+
+    fn opts(cache: &Path) -> SmartPushOptions {
+        SmartPushOptions {
+            force: false,
+            message: "push".into(),
+            author: None,
+            parent_sha: None,
+            excludes: vec![],
+            stores: stores(cache),
+            description: None,
+            tags: None,
+            status: None,
+            visibility: None,
+            strict: false,
+            allow_empty: false,
+            debug: false,
+            no_default_excludes: false,
+            prefix: None,
+            reference: None,
+            expected: None,
+            provenance: None,
+            collected: None,
+            held: None,
+            json_output: false,
+            renders_publication_summary: false,
+            folder: None,
+            declined_parent: None,
+        }
+    }
+
+    /// A repository-shaped folder: the identity file and `count` files
+    /// under nested directories, each with its own content, and the
+    /// record naming every one of them at its hash, at `base-sha`.
+    fn repository(count: usize) -> (tempfile::TempDir, HashMap<String, String>) {
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(folder.path().join(".syns.yaml"), IDENTITY).unwrap();
+        let mut record = HashMap::from([(".syns.yaml".to_string(), blob_sha1(IDENTITY))]);
+        for i in 0..count {
+            let rel = format!("area-{}/item-{i:03}/NOTE.md", i % 7);
+            let content = format!("note {i}\n");
+            std::fs::create_dir_all(folder.path().join(&rel).parent().unwrap()).unwrap();
+            std::fs::write(folder.path().join(&rel), &content).unwrap();
+            record.insert(rel, blob_sha1(content.as_bytes()));
+        }
+        (folder, record)
+    }
+
+    fn save_record(cache: &Path, record: HashMap<String, String>) {
+        let mut manifest = Manifest::default();
+        manifest.update("base-sha".into(), record);
+        manifest
+            .save(&stores(cache), "alice", "repo", cache)
+            .unwrap();
+    }
+
+    async fn standing_head_server(files_changed: u32) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/repos/alice/repo/push"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "commitSha": "base-sha",
+                "version": 7,
+                "filesChanged": files_changed,
+                "created": false
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn put_bodies(server: &MockServer) -> Vec<serde_json::Value> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.method == reqwest::Method::PUT)
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect()
+    }
+
+    fn paths_of(body: &serde_json::Value, key: &str) -> Vec<String> {
+        body[key]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|e| e["path"].as_str().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Expected row 1: a one-file change in a repository of many files
+    /// sends one `files` entry, the changed path with its content, beside
+    /// the deletion it names; no unchanged path rides the body.
+    #[tokio::test]
+    async fn a_one_file_change_names_that_file_alone() {
+        let (folder, mut record) = repository(60);
+        std::fs::write(folder.path().join("1-changed.md"), "new\n").unwrap();
+        record.insert("1-changed.md".into(), blob_sha1(b"old\n"));
+        record.insert("gone.md".into(), blob_sha1(b"gone\n"));
+        let cache = tempfile::tempdir().unwrap();
+        save_record(cache.path(), record);
+        let server = standing_head_server(2).await;
+        let client = SynsClient::new(&server.uri()).unwrap();
+
+        smart_push(
+            &client,
+            "t",
+            "alice/repo",
+            folder.path(),
+            opts(cache.path()),
+        )
+        .await
+        .unwrap();
+
+        let bodies = put_bodies(&server).await;
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(paths_of(&bodies[0], "files"), vec!["1-changed.md"]);
+        assert_eq!(bodies[0]["files"][0]["content"].as_str(), Some("new\n"));
+        assert_eq!(paths_of(&bodies[0], "deletions"), vec!["gone.md"]);
+        assert_eq!(bodies[0]["parentSha"].as_str(), Some("base-sha"));
+    }
+
+    /// Expected row 2: a run where nothing changed and nothing is deleted
+    /// is answered with the standing head, without a body naming the
+    /// tree, and its record stays at that head.
+    #[tokio::test]
+    async fn an_unchanged_run_names_no_tree() {
+        let (folder, record) = repository(60);
+        let cache = tempfile::tempdir().unwrap();
+        save_record(cache.path(), record.clone());
+        let server = standing_head_server(0).await;
+        let client = SynsClient::new(&server.uri()).unwrap();
+
+        let (response, _raw, meta) = smart_push(
+            &client,
+            "t",
+            "alice/repo",
+            folder.path(),
+            opts(cache.path()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.files_changed, 0);
+        assert!(!response.created);
+        assert!(meta.manifest_existed, "the command answers No changes");
+        assert!(meta.deleted.is_empty());
+        for body in put_bodies(&server).await {
+            let files = paths_of(&body, "files");
+            assert!(files.len() <= 1, "the body named {} paths", files.len());
+            assert!(
+                body["files"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|e| e.get("content").is_none() && e.get("contentBase64").is_none()),
+                "no content rides an unchanged run"
+            );
+            assert!(paths_of(&body, "deletions").is_empty());
+            assert_eq!(body["parentSha"].as_str(), Some("base-sha"));
+        }
+        let manifest = Manifest::load(&stores(cache.path()), "alice", "repo", cache.path())
+            .expect("the record stands");
+        assert_eq!(manifest.commit_sha(), Some("base-sha"));
+        assert_eq!(manifest.file_paths().count(), record.len());
+    }
+
+    /// `pack_batches` closes a batch at `LIM-files-per-push` entries as it
+    /// does at the byte budget, counting the entries the first batch's
+    /// frame carries.
+    #[test]
+    fn a_batch_closes_at_the_file_bound() {
+        let pending: Vec<PendingEntry> = (0..20_001)
+            .map(|i| PendingEntry {
+                path: format!("f/{i:05}.md"),
+                sha: "1".repeat(40),
+                text: true,
+                size: 1,
+                encoded_len: 64,
+            })
+            .collect();
+        let mut frame = PushRequest {
+            files: Vec::new(),
+            deletions: None,
+            message: Some("push".into()),
+            author: None,
+            parent_sha: None,
+            description: None,
+            tags: None,
+            status: None,
+            visibility: None,
+            provenance: None,
+        };
+
+        let batches = pack_batches(pending.clone(), batch_overheads(&frame));
+        assert_eq!(
+            batches.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![10_000, 10_000, 1]
+        );
+
+        frame.files = vec![PushFileEntry {
+            path: "a.md".into(),
+            sha: "0".repeat(40),
+            content: None,
+            content_base64: None,
+        }];
+        let batches = pack_batches(pending, batch_overheads(&frame));
+        assert_eq!(batches[0].len(), 9_999, "the frame's own entry counts");
+        assert!(batches.iter().all(|b| b.len() <= 10_000));
+        assert_eq!(batches.iter().map(Vec::len).sum::<usize>(), 20_001);
+    }
+
+    /// Expected row 4, a folder's publication (SPEC u291): an unchanged run
+    /// names its one path under the folder's recorded path, and a
+    /// `MISSING_BLOBS` naming it is answered by that path's content alone.
+    #[tokio::test]
+    async fn an_unchanged_folder_run_resends_its_one_path_under_the_folder() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/repos/alice/notes/push"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "error": "missing_blobs",
+                "missing": {"clients/q3/a.md": blob_sha1(b"a"), "elsewhere.md": blob_sha1(b"e")},
+            })))
+            .with_priority(1)
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/repos/alice/notes/push"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "commitSha": "c".repeat(40), "version": 3,
+                "filesChanged": 0, "created": false,
+            })))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(folder.path().join("a.md"), "a").unwrap();
+        std::fs::write(folder.path().join("b.md"), "b").unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut options = opts(cache.path());
+        options.folder = Some("clients/q3".into());
+        options.parent_sha = Some("c".repeat(40));
+        options.reference = Some(HashMap::from([
+            ("a.md".to_string(), blob_sha1(b"a")),
+            ("b.md".to_string(), blob_sha1(b"b")),
+        ]));
+        let client = SynsClient::new(&server.uri()).unwrap();
+
+        let (response, _raw, meta) =
+            smart_push(&client, "t", "alice/notes", folder.path(), options)
+                .await
+                .unwrap();
+
+        assert_eq!(response.files_changed, 0);
+        assert!(meta.deleted.is_empty());
+        let bodies = put_bodies_at(&server, "/api/v1/repos/alice/notes/push").await;
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(
+            bodies[0]["files"],
+            serde_json::json!([{"path": "clients/q3/a.md", "sha": blob_sha1(b"a")}])
+        );
+        assert_eq!(
+            bodies[1]["files"],
+            serde_json::json!([{"path": "clients/q3/a.md", "sha": blob_sha1(b"a"), "content": "a"}])
+        );
+        for body in &bodies {
+            assert!(paths_of(body, "deletions").is_empty());
+            assert_eq!(body["parentSha"].as_str(), Some("c".repeat(40).as_str()));
+        }
+    }
+
+    /// Expected row 4, a scoped publication (SPEC u255): an unchanged run
+    /// scoped to one subtree names one path of that subtree, and no
+    /// deletion outside it.
+    #[tokio::test]
+    async fn an_unchanged_scoped_run_names_one_path_within_its_scope() {
+        let (folder, mut record) = repository(20);
+        std::fs::create_dir_all(folder.path().join("docs")).unwrap();
+        std::fs::write(folder.path().join("docs/x.md"), "x").unwrap();
+        std::fs::write(folder.path().join("docs/y.md"), "y").unwrap();
+        record.insert("docs/x.md".into(), blob_sha1(b"x"));
+        record.insert("docs/y.md".into(), blob_sha1(b"y"));
+        let cache = tempfile::tempdir().unwrap();
+        save_record(cache.path(), record);
+        let server = standing_head_server(0).await;
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let mut options = opts(cache.path());
+        options.prefix = Some("docs".into());
+
+        smart_push(&client, "t", "alice/repo", folder.path(), options)
+            .await
+            .unwrap();
+
+        let bodies = put_bodies(&server).await;
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(
+            bodies[0]["files"],
+            serde_json::json!([{"path": "docs/x.md", "sha": blob_sha1(b"x")}])
+        );
+        assert!(paths_of(&bodies[0], "deletions").is_empty());
+    }
+
+    async fn put_bodies_at(server: &MockServer, at: &str) -> Vec<serde_json::Value> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.method == reqwest::Method::PUT && r.url.path() == at)
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect()
+    }
+
+    /// Expected row 3: a first publication of more than 10,000 files goes
+    /// as several requests, none past 10,000 entries, chained by parent,
+    /// every path carried once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_publication_past_the_file_bound_goes_as_several_requests() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/repo/tree"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(serde_json::json!({"error": "not_found"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/repos/alice/repo/push"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "commitSha": "a".repeat(40),
+                "version": 1,
+                "filesChanged": 10_000,
+                "created": true
+            })))
+            .with_priority(1)
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/repos/alice/repo/push"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "commitSha": "b".repeat(40),
+                "version": 2,
+                "filesChanged": 2,
+                "created": false
+            })))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(folder.path().join("f")).unwrap();
+        for i in 0..10_001 {
+            std::fs::write(folder.path().join(format!("f/{i:05}.txt")), format!("{i}")).unwrap();
+        }
+        let cache = tempfile::tempdir().unwrap();
+        let client = SynsClient::new(&server.uri()).unwrap();
+
+        let (response, _raw, _meta) = smart_push(
+            &client,
+            "t",
+            "alice/repo",
+            folder.path(),
+            opts(cache.path()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.commit_sha, "b".repeat(40));
+        let bodies = put_bodies(&server).await;
+        assert_eq!(bodies.len(), 2, "10,002 files go as two requests");
+        let mut carried: Vec<String> = Vec::new();
+        for (k, body) in bodies.iter().enumerate() {
+            let files = paths_of(body, "files");
+            assert!(files.len() <= 10_000, "batch {k} named {}", files.len());
+            assert!(
+                body["message"]
+                    .as_str()
+                    .is_some_and(|m| m.ends_with(&format!("(part {}/2)", k + 1)))
+            );
+            carried.extend(files);
+        }
+        assert!(bodies[0].get("parentSha").is_none() || bodies[0]["parentSha"].is_null());
+        assert_eq!(
+            bodies[1]["parentSha"].as_str(),
+            Some("a".repeat(40).as_str())
+        );
+        carried.sort();
+        let before = carried.len();
+        carried.dedup();
+        assert_eq!(before, carried.len(), "no path rides twice");
+        assert_eq!(carried.len(), 10_002, "every file and the identity file");
     }
 }
