@@ -126,9 +126,9 @@ pub(crate) fn ensure_in_root_home(dir: &Path) -> Result<(), CliError> {
 }
 
 /// What tells one folder from another created later at its path (D-163):
-/// its device and inode, and its birth time where the file system answers
-/// one, so an inode a removed folder freed and a new one took still
-/// differs.
+/// its inode, and its birth time where the file system answers one, so an
+/// inode a removed folder freed and a new one took still differs. The
+/// device is recorded but not compared.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct FolderIdentity {
     dev: u64,
@@ -167,11 +167,24 @@ impl FolderIdentity {
         serde_json::from_slice(&bytes).ok()
     }
 
+    /// Whether a folder answering `self` was created after the one
+    /// `recorded` describes: its inode differs, or both birth times are
+    /// known and its own is later. The device is not compared, since it
+    /// moves across mounts of one file system; a birth time moved earlier,
+    /// as `touch -t` or `rsync -a` on the folder does on APFS, is the same
+    /// folder (issue 173 review, C1).
+    fn replaces(&self, recorded: &FolderIdentity) -> bool {
+        if self.ino != recorded.ino {
+            return true;
+        }
+        matches!((self.born, recorded.born), (Some(now), Some(then)) if now > then)
+    }
+
     /// Whether `home` holds state recorded for a folder other than the
-    /// one at `root`: both identities known, and differing.
+    /// one at `root`, a folder created there since.
     fn stale(home: &Path, root: &Path) -> bool {
         match (Self::recorded(home), Self::of(root)) {
-            (Some(recorded), Some(current)) => recorded != current,
+            (Some(recorded), Some(current)) => current.replaces(&recorded),
             _ => false,
         }
     }
@@ -2871,5 +2884,81 @@ mod tests {
             copy.base().is_none(),
             "the lock adopts nothing from the stale home"
         );
+    }
+
+    /// Rewrite the identity recorded in `home` through `change`.
+    #[cfg(unix)]
+    fn edit_recorded(home: &Path, change: impl FnOnce(&mut FolderIdentity)) {
+        let mut recorded = FolderIdentity::recorded(home).expect("a recorded identity");
+        change(&mut recorded);
+        std::fs::write(
+            home.join(FOLDER_FILE),
+            serde_json::to_vec(&recorded).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_birth_time_moved_earlier_or_another_device_keeps_the_state() {
+        let h = homes();
+        let copy = copy_with_state(&h);
+        if FolderIdentity::of(&h.root).unwrap().born.is_none() {
+            return;
+        }
+        // The folder's birth time now stands earlier than the recorded one
+        // (`touch -t` or `rsync -a` on APFS), and the device moved.
+        edit_recorded(&copy.state_dir, |id| {
+            let (secs, nanos) = id.born.unwrap();
+            id.born = Some((secs + 60, nanos));
+            id.dev = id.dev.wrapping_add(1);
+        });
+        let reopened = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        assert_eq!(commit_of(&reopened).as_deref(), Some("h0"));
+        assert!(reopened.resolution().unwrap().is_some());
+        assert!(reopened.outbox().unwrap().is_some());
+        assert_eq!(
+            FolderIdentity::recorded(&reopened.state_dir),
+            FolderIdentity::of(&h.root)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reused_inode_with_a_later_birth_time_reads_as_another_folder() {
+        let h = homes();
+        let copy = copy_with_state(&h);
+        if FolderIdentity::of(&h.root).unwrap().born.is_none() {
+            return;
+        }
+        // A removed folder's inode taken again by one created after it.
+        edit_recorded(&copy.state_dir, |id| {
+            let (secs, nanos) = id.born.unwrap();
+            id.born = Some((secs - 60, nanos));
+        });
+        assert!(
+            WorkingCopy::open_existing(&h.writable, "alice", "proj", &h.root)
+                .unwrap()
+                .is_none()
+        );
+        let reopened = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        assert!(reopened.base().is_none());
+        assert!(reopened.resolution().unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn touching_the_folder_back_in_time_keeps_the_state() {
+        let h = homes();
+        copy_with_state(&h);
+        let touched = std::process::Command::new("touch")
+            .args(["-t", "200001010000"])
+            .arg(&h.root)
+            .status()
+            .unwrap();
+        assert!(touched.success());
+        let reopened = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        assert_eq!(commit_of(&reopened).as_deref(), Some("h0"));
+        assert!(reopened.resolution().unwrap().is_some());
     }
 }
