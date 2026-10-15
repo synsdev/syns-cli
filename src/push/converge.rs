@@ -1737,6 +1737,50 @@ fn without(
         .collect()
 }
 
+/// `D-162`, ruled on review: a forced publication from a copy that is no
+/// folder claims no parent, so nothing lays it over the base. Once it has
+/// landed at `commit`, the tree at that commit is read and recorded as the
+/// base only where the folder, collected again as `opts` collects it,
+/// holds exactly that tree — paths excluded on disk aside — as a landed
+/// publication's outbox is settled and as a head matching the folder is
+/// adopted. A commit holding anything the folder lacks or holds otherwise
+/// (another writer's files the forced run kept) leaves the base where it
+/// stood, and so does a copy recording no base, one holding a resolution
+/// or an outbox, a truncated tree, and any failed read or collection.
+pub(crate) async fn adopt_forced_publication(
+    client: &SynsClient,
+    token: &str,
+    copy: &WorkingCopy,
+    opts: &SmartPushOptions,
+    commit: &str,
+) {
+    if commit.is_empty() || copy.folder.is_some() || copy.base().is_none() {
+        return;
+    }
+    let Ok(head) = read_tree(client, Some(token), copy, Some(commit)).await else {
+        return;
+    };
+    if head.truncated || head.commit.as_deref() != Some(commit) {
+        return;
+    }
+    let Ok(_lock) = copy.lock() else {
+        return;
+    };
+    if !matches!(copy.resolution(), Ok(None)) || !matches!(copy.outbox(), Ok(None)) {
+        return;
+    }
+    let Ok(folder) = collect_folder(copy, opts, &[], false, &FolderRoot::whole(&copy.root)) else {
+        return;
+    };
+    let excluded = excluded_on_disk(copy, &folder.hashes, head.files.keys());
+    if without(&head.files, &excluded) != folder.hashes {
+        return;
+    }
+    if let Err(err) = copy.record_base(commit, to_hash_map(&head.files)) {
+        eprintln!("warning: could not record the working copy base: {err}");
+    }
+}
+
 /// Whether a head at the base's commit holds the base's tree (SPEC u318
 /// Contract Surface, `head_holds_base_tree`): every path outside
 /// `excluded` that either map names is named by both, at one hash. A head
@@ -4433,6 +4477,7 @@ mod tests {
             renders_publication_summary: false,
             folder: None,
             declined_parent: None,
+            base_record: None,
         };
         let head = Head {
             commit: Some("h1".into()),
@@ -4514,6 +4559,7 @@ mod tests {
             renders_publication_summary: false,
             folder: None,
             declined_parent: None,
+            base_record: None,
         }
     }
 

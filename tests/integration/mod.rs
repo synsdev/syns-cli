@@ -15,6 +15,7 @@ mod if_repo_test;
 mod place_test;
 mod pull_identity_test;
 mod pull_positionals_test;
+mod push_base_parent_test;
 mod push_empty_test;
 mod push_manifest_stub_test;
 mod push_no_parent_ignore_test;

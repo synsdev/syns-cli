@@ -800,6 +800,7 @@ fn opts_at(cache_dir: &Path) -> SmartPushOptions {
         renders_publication_summary: false,
         folder: None,
         declined_parent: None,
+        base_record: None,
     }
 }
 

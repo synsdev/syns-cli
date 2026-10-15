@@ -16,9 +16,9 @@ use crate::push::collector::{
     CollectOptions, HELD_BYTES_BUDGET, HeldBytes, SkippedFile, write_skip_summary,
 };
 use crate::push::converge::{
-    ConvergeMode, FolderRoot, SyncOutcome, check_holder, collect_in_place, converge,
-    identity_holder_synsignore, lay_over_enclosing, read_folder_tree, read_holder_synsignore,
-    read_identity_tree, resolution_elsewhere,
+    ConvergeMode, FolderRoot, SyncOutcome, adopt_forced_publication, check_holder,
+    collect_in_place, converge, identity_holder_synsignore, lay_over_enclosing, read_folder_tree,
+    read_holder_synsignore, read_identity_tree, resolution_elsewhere,
 };
 use crate::push::folder_check::{FOLDER_SEND_BOUND, FolderCheck, named_head};
 use crate::push::smart::{PushPipelineMeta, SmartPushOptions, smart_push};
@@ -178,7 +178,7 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
 
     let message = message_of(args);
 
-    let opts = SmartPushOptions {
+    let mut opts = SmartPushOptions {
         force: args.force,
         message,
         // SPEC u258 `cmd_push` 2 (D-065): no author on any branch, so the
@@ -212,6 +212,7 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
         renders_publication_summary: true,
         folder: None,
         declined_parent: None,
+        base_record: None,
     };
 
     let client = match client {
@@ -235,6 +236,15 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
         // u308 round 2, ruled: nor past a marked root identity file.
         refuse_marked_root_identity(&scope.root)?;
 
+        // `D-162` (issue 157): the publication stands on this copy's
+        // recorded base wherever one names a commit — its reference set,
+        // its claimed parent (or the one `--force` drops) and the record
+        // written after — not on the repository-wide local record, which
+        // no convergence writes and every copy under the cache shares.
+        opts.base_record = copy
+            .base()
+            .filter(|base| base.commit_sha().is_some_and(|commit| !commit.is_empty()));
+
         // `cmd_push` 3 — the registered publication, unchanged.
         //
         // CODE_REVIEW M3 / H2: the per-category breakdown for
@@ -245,9 +255,17 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
         // `CliError::json_value` to the structured wire form before any
         // prose reaches the output stream — no separate intercept site
         // needed.
+        let collecting = args.force.then(|| opts.clone());
         let (response, raw, meta) =
             smart_push(&client, &token, &repo_id, &scope.root, opts).await?;
         lay_publication_over_base(&copy, &response, &meta);
+        // `D-162`, ruled on review: a forced publication claimed no
+        // parent, so the base is advanced to its commit only where the
+        // folder holds exactly the tree that commit carries.
+        if let Some(collecting) = collecting.filter(|_| meta.sent_parent.is_none()) {
+            adopt_forced_publication(&client, &token, &copy, &collecting, &response.commit_sha)
+                .await;
+        }
         format_response(output, &response, &raw, &repo_id, &meta);
         return Ok(());
     }
@@ -386,6 +404,7 @@ async fn push_folder(
             scope.path.clone()
         }),
         declined_parent: None,
+        base_record: None,
     };
 
     // 6 — a bare publication converges the folder copy.

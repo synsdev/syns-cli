@@ -93,6 +93,7 @@ pub fn convergence_options(config: &Config) -> SmartPushOptions {
         renders_publication_summary: false,
         folder: None,
         declined_parent: None,
+        base_record: None,
     }
 }
 

@@ -109,6 +109,13 @@ pub struct SmartPushOptions {
     /// run held and claimed none of, answered as its meta's
     /// `unclaimed_parent`.
     pub declined_parent: Option<String>,
+    /// `D-162` (issue 157): the working copy's recorded base, standing in
+    /// for the local record `Manifest::load` would read. Its files are the
+    /// reference set and the record Phase 6 lays the publication over; its
+    /// commit is the parent claimed, or under `--force` the parent the run
+    /// reports dropping. Unlike `reference` it leaves the identity-file
+    /// write and the merged record as a publication handed none has them.
+    pub base_record: Option<Manifest>,
 }
 
 impl Clone for SmartPushOptions {
@@ -138,6 +145,7 @@ impl Clone for SmartPushOptions {
             renders_publication_summary: self.renders_publication_summary,
             folder: self.folder.clone(),
             declined_parent: self.declined_parent.clone(),
+            base_record: self.base_record.clone(),
         }
     }
 }
@@ -1188,11 +1196,20 @@ pub async fn smart_push(
             // Phase 3b — Load manifest unconditionally (so
             // `manifest_existed` is set even when --force bypasses the
             // reference state from it).
-            let loaded_manifest = Manifest::load(&opts.stores, owner, name, path);
+            //
+            // `D-162`: the working copy's recorded base, where the command
+            // hands one, stands in for that record — the local record is
+            // one file per repository under a cache, which no convergence
+            // writes and every other copy of the repository shares.
+            let from_base = opts.base_record.is_some();
+            let loaded_manifest = opts
+                .base_record
+                .take()
+                .or_else(|| Manifest::load(&opts.stores, owner, name, path));
             let manifest_existed = loaded_manifest.is_some();
             let record_from_manifest: Option<(HashMap<String, String>, Option<String>)> =
                 loaded_manifest.map(|manifest| {
-                    let shas: HashMap<String, String> = manifest
+                    let mut shas: HashMap<String, String> = manifest
                         .file_paths()
                         .filter_map(|p| {
                             manifest
@@ -1200,6 +1217,25 @@ pub async fn smart_push(
                                 .map(|sha| (p.to_string(), sha.to_string()))
                         })
                         .collect();
+                    // `D-162`, ruled on review (I-2): the base stands in
+                    // with the paths excluded on disk taken out, as every
+                    // convergence consumer of it does (`excluded_on_disk`)
+                    // — a base path inside what this run walked, standing
+                    // on disk and left out of the collection, is a file an
+                    // exclusion keeps out, never a deletion. A base path
+                    // outside the scope was not walked and stays.
+                    if from_base {
+                        let walked = shas.keys().filter(|p| match opts.prefix.as_deref() {
+                            Some(prefix) => path_within_prefix(p, prefix),
+                            None => true,
+                        });
+                        let excluded = crate::push::converge::excluded_local_files(
+                            path,
+                            |p| local_files.contains_key(p),
+                            walked,
+                        );
+                        shas.retain(|p, _| !excluded.contains(p));
+                    }
                     let parent = manifest.commit_sha().map(String::from);
                     (shas, parent)
                 });
@@ -1507,6 +1543,7 @@ mod tests {
                 renders_publication_summary: false,
                 folder: None,
                 declined_parent: None,
+                base_record: None,
             },
         )
         .await;
@@ -1631,6 +1668,7 @@ mod tests {
                 renders_publication_summary: false,
                 folder: None,
                 declined_parent: None,
+                base_record: None,
             },
         )
         .await;
@@ -1737,6 +1775,7 @@ mod tests {
                 renders_publication_summary: false,
                 folder: None,
                 declined_parent: None,
+                base_record: None,
             },
         )
         .await;
@@ -1862,6 +1901,7 @@ mod tests {
                 renders_publication_summary: false,
                 folder: None,
                 declined_parent: None,
+                base_record: None,
             },
         )
         .await;
@@ -1973,6 +2013,7 @@ mod tests {
                 renders_publication_summary: false,
                 folder: None,
                 declined_parent: None,
+                base_record: None,
             },
         )
         .await;
@@ -2032,6 +2073,7 @@ mod tests {
             renders_publication_summary: false,
             folder: None,
             declined_parent: None,
+            base_record: None,
         }
     }
 
@@ -2418,6 +2460,7 @@ mod tests {
                 renders_publication_summary: false,
                 folder: None,
                 declined_parent: None,
+                base_record: None,
             },
         )
         .await;
@@ -2563,6 +2606,7 @@ mod tests {
                 renders_publication_summary: false,
                 folder: None,
                 declined_parent: None,
+                base_record: None,
             },
         )
         .await;
@@ -2700,6 +2744,7 @@ mod tests {
                 renders_publication_summary: false,
                 folder: None,
                 declined_parent: None,
+                base_record: None,
             },
         )
         .await;
@@ -2835,6 +2880,7 @@ mod tests {
                 renders_publication_summary: false,
                 folder: None,
                 declined_parent: None,
+                base_record: None,
             },
         )
         .await;
@@ -3199,6 +3245,7 @@ mod unclaimed_parent_tests {
             renders_publication_summary: false,
             folder: None,
             declined_parent: None,
+            base_record: None,
         }
     }
 
@@ -3506,6 +3553,7 @@ mod u280_publication_tests {
             renders_publication_summary: false,
             folder: None,
             declined_parent: None,
+            base_record: None,
         }
     }
 
@@ -4091,6 +4139,7 @@ mod issue290_tests {
             renders_publication_summary: false,
             folder: None,
             declined_parent: None,
+            base_record: None,
         }
     }
 
