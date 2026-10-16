@@ -1,5 +1,6 @@
 use crate::errors::CliError;
 use crate::push::hash::{blob_sha1, hash_pieces};
+use crate::push::machine_local;
 use crate::push::working_copy::StatRecord;
 use crate::repo::root::{path_is_prefix_ancestor, path_within_prefix, to_forward_slash};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
@@ -145,6 +146,7 @@ pub struct CollectOptions {
     /// Mirror of CLI `--no-default-excludes`. When `true`, the
     /// built-in skip list (`DEFAULT_EXCLUDE_DIRS`) is bypassed and
     /// build / cache directory contents flow into the kept set.
+    /// Machine-local files stay dropped under it (`D-173`).
     pub no_default_excludes: bool,
     /// Mirror of CLI `--debug`. When `true`, every skip decision is
     /// emitted to stderr as `[debug] skip {path}: {reason} ({source})`.
@@ -175,6 +177,13 @@ pub struct CollectOptions {
     /// collection rooted at the holder's root gives it. None leaves both
     /// walks as u255 and u280 give them.
     pub holder_synsignore: Option<(String, Vec<u8>)>,
+    /// roadmap/232 (`D-173`): the walk root's `/`-joined place under the
+    /// holder repository's root, where the copy stands in no checkout of
+    /// its holder. The machine-local shapes R2–R7 read each walked path
+    /// joined under it — its repository path — so either copy of a folder
+    /// gives a path the same answer. None where the walk root is the
+    /// repository's root.
+    pub holder_place: Option<String>,
 }
 
 /// The root a holder's `.synsignore` lines are anchored at: no directory
@@ -291,18 +300,19 @@ impl HolderRules {
         Match::None
     }
 
-    /// Whether the walk keeps the entry at `path`.
-    fn keeps(&self, path: &Path, is_dir: bool) -> bool {
+    /// What the ranked rules decide for the entry at `path`: the first
+    /// rule that matches it, in the walk's rank.
+    fn decides(&self, path: &Path, is_dir: bool) -> Match<()> {
         let Ok(rel) = path.strip_prefix(&self.root) else {
-            return true;
+            return Match::None;
         };
         let Some(rel) = to_forward_slash(rel) else {
-            return true;
+            return Match::None;
         };
         if rel.is_empty() {
-            return true;
+            return Match::None;
         }
-        let decided = [
+        [
             self.chain_match(&self.synsignore, path, is_dir),
             self.holder
                 .matched(under_holder_root(&self.place, &rel), is_dir)
@@ -313,14 +323,131 @@ impl HolderRules {
         ]
         .into_iter()
         .find(|matched| !matched.is_none())
-        .unwrap_or(Match::None);
-        !decided.is_ignore()
+        .unwrap_or(Match::None)
+    }
+
+    /// Whether the walk keeps the entry at `path`.
+    fn keeps(&self, path: &Path, is_dir: bool) -> bool {
+        !self.decides(path, is_dir).is_ignore()
+    }
+}
+
+/// One directory's ignore files as the crate's walk reads them there.
+struct DirRules {
+    synsignore: Gitignore,
+    ignore: Gitignore,
+    gitignore: Gitignore,
+    exclude: Gitignore,
+}
+
+impl DirRules {
+    /// The ignore files standing in `dir`.
+    fn read(dir: &Path) -> DirRules {
+        DirRules {
+            synsignore: dir_matcher(dir, &dir.join(".synsignore")),
+            ignore: dir_matcher(dir, &dir.join(".ignore")),
+            gitignore: dir_matcher(dir, &dir.join(".gitignore")),
+            exclude: dir_matcher(dir, &dir.join(".git").join("info").join("exclude")),
+        }
+    }
+}
+
+/// One ignore file standing at `file`, anchored at `dir`; empty where
+/// none stands.
+fn dir_matcher(dir: &Path, file: &Path) -> Gitignore {
+    if !file.is_file() {
+        return Gitignore::empty();
+    }
+    let mut builder = GitignoreBuilder::new(dir);
+    builder.add(file);
+    builder.build().unwrap_or_else(|_| Gitignore::empty())
+}
+
+/// What the owner's ignore files decide for a path the walk kept, built
+/// at the first machine-local match by name and asked only for such
+/// paths (roadmap/232 § The rule, ranking step 4).
+///
+/// Handed the holder's root `.synsignore`, the collection's own ranked
+/// rules answer. Otherwise the answer is the one the `ignore` crate's
+/// walk (0.4.25, `Ignore::matched_ignore` under `require_git(false)` and
+/// `parents(false)`) reaches: from the path's own directory up to the
+/// walk root, the nearest `.synsignore`, `.ignore`, `.gitignore` and
+/// `.git/info/exclude` match of each kind, ranked in that order, then the
+/// global git ignore anchored at the working directory. Under
+/// `require_git(false)` the crate sees no repository boundary, so the
+/// lookup does not stop at a nested `.git` and reads each directory's own
+/// `.git/info/exclude`, a worktree's `.git` file read as none. Only the
+/// directories of matched paths are read, each once.
+enum OwnerRules {
+    Holder(Arc<HolderRules>),
+    Standard {
+        root: PathBuf,
+        dirs: HashMap<PathBuf, DirRules>,
+        global: Option<Gitignore>,
+    },
+}
+
+impl OwnerRules {
+    fn standard(root: &Path) -> OwnerRules {
+        OwnerRules::Standard {
+            root: root.to_path_buf(),
+            dirs: HashMap::new(),
+            global: None,
+        }
+    }
+
+    /// Whether the rule deciding `path` among the owner's ignore files is
+    /// a `!` line.
+    fn whitelists(&mut self, path: &Path) -> bool {
+        match self {
+            OwnerRules::Holder(rules) => rules.decides(path, false).is_whitelist(),
+            OwnerRules::Standard { root, dirs, global } => {
+                let mut kinds: [Match<()>; 4] =
+                    [Match::None, Match::None, Match::None, Match::None];
+                let mut dir = path.parent();
+                while let Some(at) = dir {
+                    if !at.starts_with(&*root) {
+                        break;
+                    }
+                    if !dirs.contains_key(at) {
+                        dirs.insert(at.to_path_buf(), DirRules::read(at));
+                    }
+                    let rules = &dirs[at];
+                    for (kind, matcher) in kinds.iter_mut().zip([
+                        &rules.synsignore,
+                        &rules.ignore,
+                        &rules.gitignore,
+                        &rules.exclude,
+                    ]) {
+                        if kind.is_none() {
+                            *kind = matcher.matched(path, false).map(|_| ());
+                        }
+                    }
+                    if at == root.as_path() {
+                        break;
+                    }
+                    dir = at.parent();
+                }
+                let global = global.get_or_insert_with(|| {
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    GitignoreBuilder::new(cwd).build_global().0
+                });
+                kinds
+                    .into_iter()
+                    .find(|kind| !kind.is_none())
+                    .unwrap_or_else(|| global.matched(path, false).map(|_| ()))
+                    .is_whitelist()
+            }
+        }
     }
 }
 
 /// One reason a file was excluded from the push. First match wins per
 /// SPEC u280: `TooLarge > DefaultExcludeDir > UserExclude > Gitignore >
-/// Synsignore`, and no reason names content.
+/// Synsignore`, and no reason names content. `MachineLocal` (`D-173`)
+/// names a file the walk kept and the machine-local shapes dropped, so
+/// no other reason claims it; it is ordered after the built-in skip list
+/// in every summary.
 ///
 /// IMPORTANT: declaration order is contractual. The enum is cast as
 /// `u8` (sort key of `collect_files`' `skipped`) and as `usize` (group
@@ -331,10 +458,15 @@ impl HolderRules {
 pub enum SkipReason {
     TooLarge,
     DefaultExcludeDir,
+    MachineLocal,
     UserExclude,
     Gitignore,
     Synsignore,
 }
+
+/// The number of `SkipReason` variants: the length of every array a
+/// reason indexes.
+pub const SKIP_REASONS: usize = 6;
 
 /// The bound one file may hold as every label names it: `{n} MiB`, `{n}`
 /// the whole MiB `MAX_FILE_BYTES` holds — the size drop's summary source
@@ -354,6 +486,7 @@ impl SkipReason {
         match self {
             SkipReason::TooLarge => "size-limit",
             SkipReason::DefaultExcludeDir => "default-excludes",
+            SkipReason::MachineLocal => "machine-local",
             SkipReason::UserExclude => "--exclude",
             SkipReason::Gitignore => ".gitignore",
             SkipReason::Synsignore => ".synsignore",
@@ -366,6 +499,7 @@ impl std::fmt::Display for SkipReason {
         match self {
             SkipReason::TooLarge => write!(f, "{}", too_large_label()),
             SkipReason::DefaultExcludeDir => write!(f, "default-excluded directory"),
+            SkipReason::MachineLocal => write!(f, "machine-local"),
             SkipReason::UserExclude => write!(f, "--exclude pattern"),
             SkipReason::Gitignore => write!(f, ".gitignore rule"),
             SkipReason::Synsignore => write!(f, ".synsignore rule"),
@@ -645,6 +779,9 @@ pub fn collect_files(
         .as_ref()
         .map(|(place, bytes)| Arc::new(HolderRules::new(path, place, bytes)));
     let kept_rules = holder_rules.clone();
+    // roadmap/232: the owner's decision for a machine-local match by name,
+    // built at the first one.
+    let mut owner_rules: Option<OwnerRules> = None;
     let mut kept_builder = WalkBuilder::new(path);
     match &holder_rules {
         None => {
@@ -688,6 +825,7 @@ pub fn collect_files(
 
     let mut kept_files: HashMap<String, CollectedFile> = HashMap::new();
     let mut too_large: HashSet<String> = HashSet::new();
+    let mut machine_local: HashSet<String> = HashSet::new();
     let mut reached: HashSet<String> = HashSet::new();
 
     for result in kept_walker {
@@ -713,6 +851,29 @@ pub fn collect_files(
             Some(p) => p,
             None => continue,
         };
+        // 0 — machine-local files (`D-173`), told before any stat or read
+        // of the file: a socket, pipe or device by the type the entry
+        // carries, which no owner rule re-includes; R2–R7 by the
+        // repository path, unless the owner's deciding rule is a `!` line.
+        if machine_local::by_type(file_type) {
+            machine_local.insert(rel_path_str);
+            continue;
+        }
+        let repository_path = match opts.holder_place.as_deref() {
+            Some(place) if !place.is_empty() => Cow::Owned(format!("{place}/{rel_path_str}")),
+            _ => Cow::Borrowed(rel_path_str.as_str()),
+        };
+        if machine_local::by_name(&repository_path) {
+            let owner = owner_rules.get_or_insert_with(|| match &holder_rules {
+                Some(rules) => OwnerRules::Holder(rules.clone()),
+                None => OwnerRules::standard(path),
+            });
+            if !owner.whitelists(entry.path()) {
+                machine_local.insert(rel_path_str);
+                continue;
+            }
+        }
+
         let unreadable = |err: std::io::Error| CliError::Io {
             message: format!("could not read {rel_path_str}: {err}"),
         };
@@ -865,6 +1026,8 @@ pub fn collect_files(
 
         let reason = if too_large.contains(&rel_path_str) {
             SkipReason::TooLarge
+        } else if machine_local.contains(&rel_path_str) {
+            SkipReason::MachineLocal
         } else if !opts.no_default_excludes && in_default_exclude_dir(&rel_path_buf) {
             SkipReason::DefaultExcludeDir
         } else if matches!(
@@ -1055,9 +1218,10 @@ pub fn write_skip_summary<W: std::fmt::Write>(
 
     // Group by reason (fixed declaration-order indexing; relies on
     // the `#[repr(u8)]` ABI contract on `SkipReason`).
-    let mut groups: [(SkipReason, Vec<&str>); 5] = [
+    let mut groups: [(SkipReason, Vec<&str>); SKIP_REASONS] = [
         (TooLarge, Vec::new()),
         (DefaultExcludeDir, Vec::new()),
+        (MachineLocal, Vec::new()),
         (UserExclude, Vec::new()),
         (Gitignore, Vec::new()),
         (Synsignore, Vec::new()),
@@ -1078,7 +1242,9 @@ pub fn write_skip_summary<W: std::fmt::Write>(
             continue;
         }
         let total = paths.len();
-        if *reason == TooLarge {
+        // The too-large and machine-local lines name every path they
+        // count (SPEC u280; roadmap/232, the item agent's ruling).
+        if *reason == TooLarge || *reason == MachineLocal {
             writeln!(out, "  {reason} ({total}): {}", paths.join(", "))?;
             continue;
         }
@@ -1126,8 +1292,38 @@ pub fn too_large_line(skipped: &[SkippedFile]) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Runs `body`, the test `name` of `module` (`module_path!()`), in a
+    /// child of this test binary whose `HOME` and `XDG_CONFIG_HOME` are a
+    /// scratch directory — the two the `ignore` crate reads the global git
+    /// ignore from — so no host's global ignore (one listing `.DS_Store`,
+    /// common on macOS) decides what a collection keeps, as the binary
+    /// rows' scratch `HOME` does for them (roadmap/232 review L2).
+    pub(crate) fn without_global_ignore(module: &str, name: &str, body: impl FnOnce()) {
+        const CHILD: &str = "SYNS_TEST_WITHOUT_GLOBAL_IGNORE";
+        let test = match module.split_once("::") {
+            Some((_, rest)) => format!("{rest}::{name}"),
+            None => name.to_string(),
+        };
+        if std::env::var_os(CHILD).is_some_and(|v| v == test.as_str()) {
+            body();
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([test.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD, &test)
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join(".config"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{test}:\n{stdout}\n{stderr}");
+        assert!(stdout.contains("1 passed"), "{test} did not run:\n{stdout}");
+    }
 
     fn collect(
         path: &Path,
@@ -1641,6 +1837,7 @@ mod tests {
                 debug: false,
                 prefix: None,
                 holder_synsignore: None,
+                holder_place: None,
             },
         )
         .unwrap();
@@ -2190,5 +2387,423 @@ mod tests {
         let mut out = String::new();
         write_skip_summary(&mut out, &ignored, false, false).unwrap();
         assert!(!out.contains("hint"), "{out}");
+    }
+
+    // ---- roadmap/232: machine-local files (D-173) ----------------------
+
+    /// Write each `(path, content)` under `root`, making its directories.
+    fn lay(root: &Path, files: &[(&str, &str)]) {
+        for (rel, content) in files {
+            let at = root.join(rel);
+            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+            std::fs::write(at, content).unwrap();
+        }
+    }
+
+    /// The paths a collection dropped as machine-local, sorted.
+    fn machine_local_drops(result: &CollectResult) -> Vec<String> {
+        let mut paths: Vec<String> = result
+            .skipped
+            .iter()
+            .filter(|s| s.reason == SkipReason::MachineLocal)
+            .map(|s| s.path.clone())
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    // E1 at the collector (names the machine's own global git ignore may
+    // list are left to the binary rows, which run with none): the shapes
+    // drop, every other file under a harness directory is kept, and no
+    // dropped file is opened.
+    #[test]
+    fn machine_local_shapes_are_dropped_and_every_other_harness_file_is_kept() {
+        without_global_ignore(
+            module_path!(),
+            "machine_local_shapes_are_dropped_and_every_other_harness_file_is_kept",
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                lay(
+                    dir.path(),
+                    &[
+                        ("README.md", "r"),
+                        (".claude/scheduled_tasks.lock", "{\"sessionId\":\"s1\"}"),
+                        (".claude/skills/x/SKILL.md", "s"),
+                        (".claude/skills/x/bun.lock", "{}"),
+                        (".codex/config.toml", "c"),
+                        (".codex/session.pid", "1"),
+                        (".idea/dataSources.local.xml", "<x/>"),
+                        (".env.local", "S=1"),
+                        (".env.local.example", "S="),
+                        ("CLAUDE.local.md", "l"),
+                        ("Cargo.lock", "l"),
+                        (".DS_Store", "d"),
+                        ("media/Thumbs.db", "t"),
+                        ("media/._cover.png", "a"),
+                        ("media/desktop.ini", "i"),
+                        ("._x", "a real file named ._x"),
+                    ],
+                );
+                let result = collect(dir.path(), &[], CollectOptions::default()).unwrap();
+                let (kept, _) = kept_and_skipped(&result);
+                assert_eq!(
+                    kept,
+                    vec![
+                        ".claude/skills/x/SKILL.md",
+                        ".claude/skills/x/bun.lock",
+                        ".codex/config.toml",
+                        ".env.local.example",
+                        "CLAUDE.local.md",
+                        "Cargo.lock",
+                        "README.md",
+                        "media/desktop.ini",
+                    ]
+                );
+                assert_eq!(
+                    machine_local_drops(&result),
+                    vec![
+                        ".DS_Store",
+                        "._x",
+                        ".claude/scheduled_tasks.lock",
+                        ".codex/session.pid",
+                        ".env.local",
+                        ".idea/dataSources.local.xml",
+                        "media/._cover.png",
+                        "media/Thumbs.db",
+                    ]
+                );
+                assert_eq!(result.total_walked, 16);
+                // The skipped list sorts by reason, then by path.
+                let reasons: Vec<SkipReason> = result.skipped.iter().map(|s| s.reason).collect();
+                assert!(reasons.iter().all(|r| *r == SkipReason::MachineLocal));
+            },
+        );
+    }
+
+    // E4: `--no-default-excludes` reopens build directories and no
+    // machine-local file.
+    #[test]
+    fn no_default_excludes_leaves_machine_local_files_dropped() {
+        without_global_ignore(
+            module_path!(),
+            "no_default_excludes_leaves_machine_local_files_dropped",
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                lay(
+                    dir.path(),
+                    &[
+                        ("a.md", "a"),
+                        ("node_modules/x.js", "x"),
+                        (".DS_Store", "d"),
+                        (".codex/session.pid", "1"),
+                    ],
+                );
+                let result = collect(
+                    dir.path(),
+                    &[],
+                    CollectOptions {
+                        no_default_excludes: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                assert!(result.files.contains_key("node_modules/x.js"));
+                assert_eq!(
+                    machine_local_drops(&result),
+                    vec![".DS_Store", ".codex/session.pid"]
+                );
+            },
+        );
+    }
+
+    // E6, E7 and the ranking: the owner's rules decide first, a path they
+    // exclude is attributed to them, and a `!` line deciding a path in any
+    // owner file publishes it, nearest first within each kind.
+    #[test]
+    fn the_owners_rules_rank_above_the_machine_local_shapes() {
+        without_global_ignore(
+            module_path!(),
+            "the_owners_rules_rank_above_the_machine_local_shapes",
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                lay(
+                    dir.path(),
+                    &[
+                        (".synsignore", "!.DS_Store\n!/.a/s.pid\n"),
+                        (".ignore", "!i.lock\n"),
+                        (".gitignore", "Thumbs.db\n*.pid\n!g.pid\n"),
+                        (".DS_Store", "d"),
+                        ("m/.DS_Store", "d"),
+                        (".a/s.pid", "1"),
+                        (".a/i.lock", "1"),
+                        (".a/g.pid", "1"),
+                        (".a/other.pid", "1"),
+                        ("m/Thumbs.db", "t"),
+                        // Nearest first: the deeper `.gitignore` re-includes what
+                        // the root one excludes, and excludes what it re-includes.
+                        (".n/.gitignore", "!near.pid\ng.pid\n"),
+                        (".n/near.pid", "1"),
+                        (".n/g.pid", "1"),
+                        // A `!` line deciding another path re-includes nothing.
+                        (".o/x.lock", "1"),
+                    ],
+                );
+                let result = collect(dir.path(), &[], CollectOptions::default()).unwrap();
+                for kept in [
+                    ".DS_Store",
+                    "m/.DS_Store",
+                    ".a/s.pid",
+                    ".a/i.lock",
+                    ".a/g.pid",
+                    ".n/near.pid",
+                ] {
+                    assert!(result.files.contains_key(kept), "{kept} is published");
+                }
+                assert_eq!(machine_local_drops(&result), vec![".o/x.lock"]);
+                let (_, skipped) = kept_and_skipped(&result);
+                for (path, reason) in [
+                    (".a/other.pid", SkipReason::Gitignore),
+                    (".n/g.pid", SkipReason::Gitignore),
+                    ("m/Thumbs.db", SkipReason::Gitignore),
+                ] {
+                    assert!(
+                        skipped.contains(&(path.to_string(), reason)),
+                        "{path}: {skipped:?}"
+                    );
+                }
+            },
+        );
+    }
+
+    // The walk root's `.git/info/exclude` is an owner file: its `!` line
+    // publishes a shape match.
+    #[test]
+    fn the_walk_roots_info_exclude_re_includes_a_shape_match() {
+        without_global_ignore(
+            module_path!(),
+            "the_walk_roots_info_exclude_re_includes_a_shape_match",
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                lay(
+                    dir.path(),
+                    &[
+                        (".git/info/exclude", "!.x/z.pid\n"),
+                        (".x/z.pid", "1"),
+                        (".x/y.pid", "1"),
+                    ],
+                );
+                let result = collect(dir.path(), &[], CollectOptions::default()).unwrap();
+                assert!(result.files.contains_key(".x/z.pid"));
+                assert_eq!(machine_local_drops(&result), vec![".x/y.pid"]);
+            },
+        );
+    }
+
+    // SPEC_REVIEW M6, as the crate's walk answers under `require_git(false)`
+    // (ignore 0.4.25, `IgnoreBuilder::add_child_path`: `has_git` is set only
+    // where a repository is required). The walk sees no repository
+    // boundary: a rule above a nested `.git` reaches the files below it,
+    // the nested repository's own `info/exclude` is read, and a worktree's
+    // `.git` file is read as none. The owner decision answers the same:
+    // the first half pins what the walk does with excluding lines, the
+    // second that a `!` line reaches a shape match exactly as far.
+    #[test]
+    fn the_owner_decision_reaches_into_nested_repositories_as_the_walk_does() {
+        without_global_ignore(
+            module_path!(),
+            "the_owner_decision_reaches_into_nested_repositories_as_the_walk_does",
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let root = dir.path();
+                let common = tempfile::tempdir().unwrap();
+                lay(
+                    common.path(),
+                    &[("info/exclude", "w.txt\n!.x/w.pid\n"), ("commondir", ".\n")],
+                );
+                lay(
+                    root,
+                    &[
+                        (".gitignore", "a.txt\n!x.pid\n"),
+                        ("nested/.git/HEAD", "ref: refs/heads/main\n"),
+                        ("nested/.git/info/exclude", "b.txt\n!y.pid\n"),
+                        ("nested/a.txt", "a"),
+                        ("nested/b.txt", "b"),
+                        ("nested/.x/x.pid", "1"),
+                        ("nested/.x/y.pid", "1"),
+                        ("nested/.x/z.pid", "1"),
+                        ("wt/w.txt", "w"),
+                        ("wt/.x/w.pid", "1"),
+                    ],
+                );
+                std::fs::write(
+                    root.join("wt/.git"),
+                    format!("gitdir: {}\n", common.path().display()),
+                )
+                .unwrap();
+                let result = collect(root, &[], CollectOptions::default()).unwrap();
+                // The walk: the outer `.gitignore` and the nested `info/exclude`
+                // reach `nested/`; the worktree's exclude file is not read.
+                assert!(!result.files.contains_key("nested/a.txt"));
+                assert!(!result.files.contains_key("nested/b.txt"));
+                assert!(result.files.contains_key("wt/w.txt"));
+                // The owner decision, the same reach.
+                assert!(result.files.contains_key("nested/.x/x.pid"));
+                assert!(result.files.contains_key("nested/.x/y.pid"));
+                assert_eq!(
+                    machine_local_drops(&result),
+                    vec!["nested/.x/z.pid", "wt/.x/w.pid"]
+                );
+            },
+        );
+    }
+
+    // E12 and R1 at the collector: a socket and a FIFO with no writer are
+    // dropped by their type and never stat'd or read; no `!` line reaches
+    // them; an owner rule excluding one still attributes it.
+    #[cfg(unix)]
+    #[test]
+    fn sockets_and_fifos_are_dropped_by_type_and_no_negation_reopens_them() {
+        without_global_ignore(
+            module_path!(),
+            "sockets_and_fifos_are_dropped_by_type_and_no_negation_reopens_them",
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                lay(
+                    dir.path(),
+                    &[
+                        (".synsignore", "!app.sock\n!run/p\n"),
+                        (".gitignore", "*.ignored\n"),
+                        ("notes.sock", "a regular file"),
+                    ],
+                );
+                std::fs::create_dir_all(dir.path().join(".x")).unwrap();
+                std::fs::create_dir_all(dir.path().join("run")).unwrap();
+                let _a =
+                    std::os::unix::net::UnixListener::bind(dir.path().join("app.sock")).unwrap();
+                let _d =
+                    std::os::unix::net::UnixListener::bind(dir.path().join(".x/d.sock")).unwrap();
+                let _g =
+                    std::os::unix::net::UnixListener::bind(dir.path().join("s.ignored")).unwrap();
+                let made = std::process::Command::new("mkfifo")
+                    .arg(dir.path().join("run/p"))
+                    .status()
+                    .unwrap();
+                assert!(made.success());
+
+                let result = collect(dir.path(), &[], CollectOptions::default()).unwrap();
+                assert!(result.files.contains_key("notes.sock"));
+                assert_eq!(
+                    machine_local_drops(&result),
+                    vec![".x/d.sock", "app.sock", "run/p"]
+                );
+                let (_, skipped) = kept_and_skipped(&result);
+                assert!(skipped.contains(&("s.ignored".to_string(), SkipReason::Gitignore)));
+            },
+        );
+    }
+
+    // E15, E16 at the collector: the shapes read the repository path, the
+    // walk root's place joined in front, and the walk root's own name is
+    // part of no path.
+    #[test]
+    fn the_shapes_read_the_path_joined_under_the_holder_place() {
+        without_global_ignore(
+            module_path!(),
+            "the_shapes_read_the_path_joined_under_the_holder_place",
+            || {
+                let tree = tempfile::tempdir().unwrap();
+                let root = tree.path().join(".claude");
+                lay(
+                    &root,
+                    &[
+                        ("run.pid", "1"),
+                        ("cfg.local.json", "{}"),
+                        ("x.lock", "1"),
+                        ("notes.md", "n"),
+                    ],
+                );
+                let alone = collect(&root, &[], CollectOptions::default()).unwrap();
+                assert!(machine_local_drops(&alone).is_empty());
+                assert_eq!(alone.files.len(), 4);
+
+                let placed = collect(
+                    &root,
+                    &[],
+                    CollectOptions {
+                        holder_place: Some("tools/.agent".into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    machine_local_drops(&placed),
+                    vec!["cfg.local.json", "run.pid", "x.lock"]
+                );
+                assert!(placed.files.contains_key("notes.md"));
+            },
+        );
+    }
+
+    // A collection handed the holder's root `.synsignore` asks the holder's
+    // lines too: a `!` line there anchored at the holder's root publishes.
+    #[test]
+    fn the_holders_lines_decide_a_shape_match_of_a_folder_standing_alone() {
+        without_global_ignore(
+            module_path!(),
+            "the_holders_lines_decide_a_shape_match_of_a_folder_standing_alone",
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                lay(dir.path(), &[("run.pid", "1"), ("other.pid", "1")]);
+                let result = collect(
+                    dir.path(),
+                    &[],
+                    CollectOptions {
+                        holder_synsignore: Some((
+                            "tools/.agent".into(),
+                            b"!/tools/.agent/run.pid\n".to_vec(),
+                        )),
+                        holder_place: Some("tools/.agent".into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                assert!(result.files.contains_key("run.pid"));
+                assert_eq!(machine_local_drops(&result), vec!["other.pid"]);
+            },
+        );
+    }
+
+    // E2, E5: the machine-local line follows the built-in skip list line,
+    // names every path it counts, and carries no hint.
+    #[test]
+    fn the_summary_names_every_machine_local_path_after_the_directory_line() {
+        let mut skipped: Vec<SkippedFile> = (0..7)
+            .map(|i| SkippedFile {
+                path: format!(".x/{i}.pid"),
+                reason: SkipReason::MachineLocal,
+            })
+            .collect();
+        skipped.push(SkippedFile {
+            path: "node_modules/a.js".into(),
+            reason: SkipReason::DefaultExcludeDir,
+        });
+        skipped.push(SkippedFile {
+            path: "k.env".into(),
+            reason: SkipReason::UserExclude,
+        });
+        let mut out = String::new();
+        write_skip_summary(&mut out, &skipped, false, true).unwrap();
+        assert_eq!(
+            out,
+            "warning: 9 file(s) skipped from push\n\
+             \x20 default-excluded directory (1): node_modules/a.js\n\
+             \x20 machine-local (7): .x/0.pid, .x/1.pid, .x/2.pid, .x/3.pid, .x/4.pid, .x/5.pid, .x/6.pid\n\
+             \x20 --exclude pattern (1): k.env\n"
+        );
+        assert_eq!(SkipReason::MachineLocal.debug_source(), "machine-local");
+        assert_eq!(
+            serde_json::to_value(SkipReason::MachineLocal).unwrap(),
+            serde_json::json!("machine_local")
+        );
     }
 }

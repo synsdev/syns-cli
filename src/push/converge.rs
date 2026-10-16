@@ -926,12 +926,16 @@ impl Folder {
 /// Where one run collects a working copy's files from: the walk root, the
 /// copy's place under it, and the holder's root `.synsignore` handed to a
 /// collection standing in no checkout of its holder. A copy that is no
-/// folder walks its own root with neither.
+/// folder walks its own root with neither. `holder_place` is the walk
+/// root's place under the holder's root wherever that root is no
+/// checkout of it, whether or not the holder's root `.synsignore` came
+/// back (roadmap/232, SPEC_REVIEW M1).
 #[derive(Debug, Clone)]
 pub(crate) struct FolderRoot {
     root: PathBuf,
     place: Option<String>,
     holder_synsignore: Option<(String, Vec<u8>)>,
+    holder_place: Option<String>,
 }
 
 impl FolderRoot {
@@ -941,6 +945,7 @@ impl FolderRoot {
             root: root.to_path_buf(),
             place: None,
             holder_synsignore: None,
+            holder_place: None,
         }
     }
 
@@ -959,6 +964,7 @@ impl FolderRoot {
                 root: checkout.clone(),
                 place: Some(scope.path.clone()),
                 holder_synsignore: None,
+                holder_place: None,
             };
         }
         match scope.enclosing.last() {
@@ -966,11 +972,13 @@ impl FolderRoot {
                 root: outer.dir.clone(),
                 place: Some(scope.path[outer.path.len() + 1..].to_string()),
                 holder_synsignore: holder.map(|bytes| (outer.path.clone(), bytes)),
+                holder_place: Some(outer.path.clone()),
             },
             None => FolderRoot {
                 root: folder_dir.to_path_buf(),
                 place: None,
                 holder_synsignore: holder.map(|bytes| (scope.path.clone(), bytes)),
+                holder_place: Some(scope.path.clone()),
             },
         }
     }
@@ -1049,6 +1057,7 @@ pub(crate) fn collect_in_place(
 ) -> Result<CollectResult, CliError> {
     let mut opts = opts;
     opts.holder_synsignore = root.holder_synsignore.clone();
+    opts.holder_place = root.holder_place.clone();
     let Some(place) = root.place.as_deref().filter(|p| !p.is_empty()) else {
         return collect_files(&root.root, excludes, opts, record, held);
     };
@@ -1135,6 +1144,7 @@ fn collect_folder(
             debug: opts.debug,
             prefix: None,
             holder_synsignore: None,
+            holder_place: None,
         },
         record.as_mut(),
         &held,
@@ -4777,6 +4787,108 @@ mod tests {
         assert_eq!(
             exclude_under("clients/q3", "docs/résumé"),
             "clients/q3/docs/résumé"
+        );
+    }
+
+    // roadmap/232 (SPEC_REVIEW M1): every collection learns the walk
+    // root's place under the holder's root wherever that root is no
+    // checkout of it, whether or not the holder's `.synsignore` came back.
+    #[test]
+    fn a_folder_root_carries_its_place_in_the_holder_where_no_checkout_holds_it() {
+        let tree = tempfile::tempdir().unwrap();
+        let w = tree.path().to_path_buf();
+        let folder = w.join("tools/.agent");
+
+        let inside = scope_at(&folder, "tools/.agent", Some(w.clone()));
+        let root = FolderRoot::of_scope(&folder, &inside, None);
+        assert_eq!(root.holder_place, None);
+        assert_eq!(root.place.as_deref(), Some("tools/.agent"));
+
+        let alone = scope_at(&folder, "tools/.agent", None);
+        for holder in [None, Some(b"*.env\n".to_vec())] {
+            let root = FolderRoot::of_scope(&folder, &alone, holder.clone());
+            assert_eq!(root.holder_place.as_deref(), Some("tools/.agent"));
+            assert_eq!(root.root, folder);
+        }
+
+        let outer_dir = tree.path().join("tools");
+        let outer = scope_at(&outer_dir, "tools", None);
+        let mut enclosed = scope_at(&folder, "tools/.agent", None);
+        enclosed.enclosing = vec![outer];
+        for holder in [None, Some(b"*.env\n".to_vec())] {
+            let root = FolderRoot::of_scope(&folder, &enclosed, holder);
+            assert_eq!(root.holder_place.as_deref(), Some("tools"));
+            assert_eq!(root.place.as_deref(), Some(".agent"));
+        }
+
+        assert_eq!(FolderRoot::whole(&w).holder_place, None);
+    }
+
+    // roadmap/232 E16 at the collection: a folder's copy inside its holder's
+    // checkout and its copy standing alone drop the same machine-local
+    // files, the folder's place part of each path's repository path.
+    #[test]
+    fn both_copies_of_a_folder_drop_the_same_machine_local_files() {
+        crate::push::collector::tests::without_global_ignore(
+            module_path!(),
+            "both_copies_of_a_folder_drop_the_same_machine_local_files",
+            || {
+                let cache = tempfile::tempdir().unwrap();
+                let stores = crate::config::StoreRoots::resolve(
+                    Some(cache.path()),
+                    cache.path(),
+                    cache.path(),
+                );
+                for (place, files, kept) in [
+                    (
+                        "tools/.agent",
+                        &["run.pid", "cfg.local.json", "notes.md"][..],
+                        &["notes.md"][..],
+                    ),
+                    (
+                        ".claude/skills/app",
+                        &["config.local.json", "index.html"][..],
+                        &["index.html"][..],
+                    ),
+                ] {
+                    let tree = tempfile::tempdir().unwrap();
+                    let w = std::fs::canonicalize(tree.path()).unwrap();
+                    let in_checkout = w.join(place);
+                    let away = tempfile::tempdir().unwrap();
+                    let alone = std::fs::canonicalize(away.path()).unwrap().join("copy");
+                    for dir in [&in_checkout, &alone] {
+                        std::fs::create_dir_all(dir).unwrap();
+                        for file in files {
+                            std::fs::write(dir.join(file), "x").unwrap();
+                        }
+                    }
+                    let mut answers = Vec::new();
+                    for scope in [
+                        scope_at(&in_checkout, place, Some(w.clone())),
+                        scope_at(&alone, place, None),
+                    ] {
+                        let copy = WorkingCopy::open_folder(&stores, &scope).unwrap();
+                        let root = FolderRoot::of_scope(&copy.root, &scope, None);
+                        let collected =
+                            collect_folder(&copy, &bare_opts(cache.path()), &[], false, &root)
+                                .unwrap();
+                        let mut dropped: Vec<String> = collected
+                            .skipped
+                            .iter()
+                            .filter(|s| s.reason == SkipReason::MachineLocal)
+                            .map(|s| s.path.clone())
+                            .collect();
+                        dropped.sort();
+                        answers.push((
+                            collected.hashes.keys().cloned().collect::<Vec<_>>(),
+                            dropped,
+                        ));
+                    }
+                    assert_eq!(answers[0], answers[1], "{place}");
+                    assert_eq!(answers[0].0, kept, "{place}");
+                    assert_eq!(answers[0].1.len(), files.len() - kept.len(), "{place}");
+                }
+            },
         );
     }
 

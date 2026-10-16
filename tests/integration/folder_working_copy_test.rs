@@ -1038,13 +1038,10 @@ fn the_holder_and_folder_ignore_files_hold_their_paths_out_of_every_publication(
     let folder = d.folder();
     write(&d.w.join(".synsignore"), "*.env\n");
     write(&d.w.join("clients/.gitignore"), "*.tmp\n");
-    write(&folder.join(".synsignore"), ".claude/settings.local.json\n");
+    write(&folder.join(".synsignore"), ".claude/notes.json\n");
+    write(&folder.join(".claude/notes.json"), "{\"local\":true}\n");
     write(
-        &folder.join(".claude/settings.local.json"),
-        "{\"local\":true}\n",
-    );
-    write(
-        &folder.join(".page/.claude/settings.local.json"),
+        &folder.join(".page/.claude/notes.json"),
         "{\"page\":true}\n",
     );
     write(&folder.join("k.env"), "SECRET=1\n");
@@ -1062,7 +1059,7 @@ fn the_holder_and_folder_ignore_files_hold_their_paths_out_of_every_publication(
     for push in &pushes {
         for path in carried(push) {
             for kept_out in [
-                in_folder(".claude/settings.local.json"),
+                in_folder(".claude/notes.json"),
                 in_folder("k.env"),
                 in_folder("n.tmp"),
             ] {
@@ -1073,11 +1070,11 @@ fn the_holder_and_folder_ignore_files_hold_their_paths_out_of_every_publication(
     let first = named(&pushes[0]);
     assert!(first.contains(&in_folder(".page/board.json")), "{first:?}");
     assert!(
-        first.contains(&in_folder(".page/.claude/settings.local.json")),
+        first.contains(&in_folder(".page/.claude/notes.json")),
         "{first:?}"
     );
     assert_eq!(
-        read(&folder.join(".claude/settings.local.json")),
+        read(&folder.join(".claude/notes.json")),
         "{\"local\":true}\n"
     );
 }
@@ -2852,4 +2849,275 @@ fn a_repo_write_from_a_folder_checked_out_alone_lands_where_the_folder_is_clean_
     );
     let body: Value = serde_json::from_slice(&pushes[0].body).expect("push body");
     assert_eq!(named(&body), vec!["notes.md".to_string()]);
+}
+
+// ---- roadmap/232: machine-local files (D-173) --------------------------
+
+/// Every object in `doc`, at any depth, carrying the key `key`.
+fn objects_with<'a>(doc: &'a Value, key: &str, out: &mut Vec<&'a Value>) {
+    match doc {
+        Value::Object(map) => {
+            if map.contains_key(key) {
+                out.push(doc);
+            }
+            for value in map.values() {
+                objects_with(value, key, out);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                objects_with(item, key, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+// roadmap/232 E10: a sync's `--json` outcome names each machine-local drop
+// of its publication under `machine_local`.
+#[test]
+#[serial]
+fn e10_a_sync_publication_names_its_machine_local_drops_in_json() {
+    let d = Deployment::converged();
+    write(
+        &d.w.join(".claude/scheduled_tasks.lock"),
+        "{\"sessionId\":\"s1\",\"pid\":1}",
+    );
+    write(&d.w.join(".DS_Store"), "\0\0\0\x01Bud1");
+    write(&d.w.join("README.md"), "# readme\n");
+    let mark = d.mark();
+
+    let sync = d.run_in(&d.w, b"", &["--json", "sync"]);
+    assert_eq!(exit_of(&sync), 0, "{}", stderr_of(&sync));
+    let doc = one_document(&sync);
+    let skipped: Vec<(String, String)> = doc["publication"]["skipped"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{doc}"))
+        .iter()
+        .map(|s| {
+            (
+                s["path"].as_str().expect("path").to_string(),
+                s["reason"].as_str().expect("reason").to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        skipped,
+        vec![
+            (".DS_Store".to_string(), "machine_local".to_string()),
+            (
+                ".claude/scheduled_tasks.lock".to_string(),
+                "machine_local".to_string()
+            ),
+        ]
+    );
+    for push in d.pushes_since(mark) {
+        for path in carried(&push) {
+            assert!(
+                path != ".DS_Store" && path != ".claude/scheduled_tasks.lock",
+                "{push}"
+            );
+        }
+    }
+}
+
+// roadmap/232 E11: a machine-local path the head already stores, still on
+// disk with new content, is neither updated nor deleted (VIS-4).
+#[test]
+#[serial]
+fn e11_a_machine_local_file_the_head_stores_is_neither_updated_nor_deleted() {
+    let mut tree = h1_tree();
+    tree.insert(
+        ".claude/scheduled_tasks.lock".into(),
+        b"{\"sessionId\":\"old\"}".to_vec(),
+    );
+    let d = Deployment::converged_over(tree);
+    assert_eq!(
+        read(&d.w.join(".claude/scheduled_tasks.lock")),
+        "{\"sessionId\":\"old\"}"
+    );
+    write(
+        &d.w.join(".claude/scheduled_tasks.lock"),
+        "{\"sessionId\":\"new\"}",
+    );
+    write(&d.w.join(".page/x.json"), "{\"x\":2}\n");
+    let mark = d.mark();
+
+    let sync = d.run_in(&d.w, b"", &["sync"]);
+    assert_eq!(exit_of(&sync), 0, "{}", stderr_of(&sync));
+    let pushes = d.pushes_since(mark);
+    assert_eq!(pushes.len(), 1, "{pushes:?}");
+    assert_eq!(named(&pushes[0]), vec![".page/x.json".to_string()]);
+    for path in carried(&pushes[0]) {
+        assert_ne!(path, ".claude/scheduled_tasks.lock", "{}", pushes[0]);
+    }
+    let state = d.state();
+    let head = &state.commits[state.head].1;
+    assert_eq!(
+        head.get(".claude/scheduled_tasks.lock").map(Vec::as_slice),
+        Some(&b"{\"sessionId\":\"old\"}"[..])
+    );
+    drop(state);
+    assert_eq!(
+        read(&d.w.join(".claude/scheduled_tasks.lock")),
+        "{\"sessionId\":\"new\"}"
+    );
+}
+
+/// The folders E16 places, each with the files written into it and the
+/// ones of them that publish.
+const E16_FOLDERS: [(&str, &[&str], &[&str]); 2] = [
+    (
+        "tools/.agent",
+        &["run.pid", "cfg.local.json", "notes.md"],
+        &["notes.md"],
+    ),
+    (
+        ".claude/skills/app",
+        &["config.local.json", "index.html"],
+        &["index.html"],
+    ),
+];
+
+/// A head holding each E16 folder's identity file beside `h1`'s tree.
+fn e16_tree() -> BTreeMap<String, Vec<u8>> {
+    let mut tree = h1_tree();
+    for (place, _, _) in E16_FOLDERS {
+        tree.insert(
+            format!("{place}/.syns.yaml"),
+            format!("holder: alice/work\npath: {place}\n").into_bytes(),
+        );
+    }
+    tree
+}
+
+/// The paths the publications since `mark` carried, each under `place`.
+fn e16_carried(d: &Deployment, mark: usize, place: &str) -> Vec<String> {
+    let mut paths: Vec<String> = d
+        .pushes_since(mark)
+        .iter()
+        .flat_map(carried)
+        .inspect(|path| assert!(path.starts_with(&format!("{place}/")), "{path}"))
+        .collect();
+    paths.sort();
+    paths
+}
+
+// roadmap/232 E16 (SPEC_REVIEW M1): the rule reads the repository path, so
+// a folder's copy inside its holder's checkout and its copy standing alone
+// give the same answer, the folder's place included.
+#[test]
+#[serial]
+fn e16_both_copies_of_a_folder_drop_the_same_machine_local_files() {
+    for (place, files, published) in E16_FOLDERS {
+        let expected: Vec<String> = published.iter().map(|p| format!("{place}/{p}")).collect();
+
+        // The copy inside the holder's checkout.
+        let d = Deployment::with_head(e16_tree());
+        d.pull_in(&d.w.clone());
+        let inside = d.w.join(place);
+        d.pull_in(&inside);
+        for file in files {
+            write(&inside.join(file), "x\n");
+        }
+        let mark = d.mark();
+        let sync = d.run_in(&inside, b"", &["sync"]);
+        assert_eq!(exit_of(&sync), 0, "{place}: {}", stderr_of(&sync));
+        assert_eq!(e16_carried(&d, mark, place), expected, "{place} inside");
+
+        // The copy standing in no checkout.
+        let d = Deployment::with_head(e16_tree());
+        let (_u_dir, u) = empty_u();
+        let pull = d.run_in(&u, b"", &["pull", REPO, "--path", place, "alone"]);
+        assert_eq!(exit_of(&pull), 0, "{place}: {}", stderr_of(&pull));
+        let alone = u.join("alone");
+        for file in files {
+            write(&alone.join(file), "x\n");
+        }
+        let mark = d.mark();
+        let sync = d.run_in(&alone, b"", &["sync"]);
+        assert_eq!(exit_of(&sync), 0, "{place}: {}", stderr_of(&sync));
+        assert_eq!(e16_carried(&d, mark, place), expected, "{place} alone");
+    }
+}
+
+// roadmap/232 E21 (237 case 4): `.DS_Store` files appearing in a folder
+// that matches the head make no commit.
+#[test]
+#[serial]
+fn e21_os_metadata_appearing_in_a_converged_copy_makes_no_commit() {
+    let d = Deployment::converged();
+    let head_before = d.state().head;
+    write(&d.w.join(".DS_Store"), "\0\0\0\x01Bud1");
+    write(&d.w.join("a/.DS_Store"), "\0\0\0\x01Bud1");
+    let mark = d.mark();
+
+    let sync = d.run_in(&d.w, b"", &["sync"]);
+    assert_eq!(exit_of(&sync), 0, "{}", stderr_of(&sync));
+    let json_sync = d.run_in(&d.w, b"", &["--json", "sync"]);
+    assert_eq!(exit_of(&json_sync), 0, "{}", stderr_of(&json_sync));
+    let doc = one_document(&json_sync);
+    assert!(doc.get("publication").is_none_or(Value::is_null), "{doc}");
+    assert!(d.pushes_since(mark).is_empty());
+    assert_eq!(d.state().head, head_before);
+}
+
+// roadmap/232 E22 (237 case 5): a resolution's path summaries never carry
+// a machine-local path, and its continue publishes none.
+#[test]
+#[serial]
+fn e22_a_resolution_lists_no_machine_local_path_and_its_continue_publishes_none() {
+    let d = Deployment::converged();
+    d.advance_head(&[(in_folder("notes.md").as_str(), Some("noted\n"))]);
+    write(&d.folder().join("media/new.md"), "new\n");
+    write(&d.folder().join("media/.DS_Store"), "\0\0\0\x01Bud1");
+    let mark = d.mark();
+
+    let sync = d.run_in(&d.folder(), b"", &["sync"]);
+    assert_eq!(exit_of(&sync), 4, "{}", stderr_of(&sync));
+    let shown = d.run_in(&d.folder(), b"", &["--json", "resolution", "show"]);
+    let doc = one_document(&shown);
+    let mut summaries = Vec::new();
+    objects_with(&doc, "localPaths", &mut summaries);
+    assert!(!summaries.is_empty(), "{doc}");
+    for summary in summaries {
+        for key in ["localPaths", "remotePaths", "combinedPaths"] {
+            let paths: Vec<&str> = summary[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("{key}: {summary}"))
+                .iter()
+                .map(|p| p.as_str().expect("path"))
+                .collect();
+            assert!(!paths.contains(&"media/.DS_Store"), "{key}: {summary}");
+        }
+        assert!(
+            summary["collisions"]
+                .as_array()
+                .expect("collisions")
+                .iter()
+                .all(|c| c["path"] != "media/.DS_Store"),
+            "{summary}"
+        );
+        assert!(
+            summary["localPaths"]
+                .as_array()
+                .expect("localPaths")
+                .contains(&json!("media/new.md")),
+            "{summary}"
+        );
+    }
+
+    let continued = d.run_in(&d.folder(), b"", &["resolution", "continue"]);
+    assert_eq!(exit_of(&continued), 0, "{}", stderr_of(&continued));
+    let pushes = d.pushes_since(mark);
+    assert_eq!(pushes.len(), 1, "{pushes:?}");
+    let paths = carried(&pushes[0]);
+    assert!(paths.contains(&in_folder("media/new.md")), "{paths:?}");
+    assert!(!paths.contains(&in_folder("media/.DS_Store")), "{paths:?}");
+    let state = d.state();
+    assert!(
+        !state.commits[state.head]
+            .1
+            .contains_key(&in_folder("media/.DS_Store"))
+    );
 }

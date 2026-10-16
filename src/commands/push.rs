@@ -488,6 +488,7 @@ async fn push_folder(
         debug: args.debug,
         prefix: prefix.clone(),
         holder_synsignore: None,
+        holder_place: None,
     };
     let collect = || collect_in_place(&root, &args.exclude, collect_options.clone(), None, &held);
     opts.collected = Some(collect()?);

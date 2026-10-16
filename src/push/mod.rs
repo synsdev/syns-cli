@@ -2,6 +2,7 @@ pub mod collector;
 pub mod converge;
 pub mod folder_check;
 pub mod hash;
+pub mod machine_local;
 pub mod manifest;
 pub mod reconcile;
 pub mod smart;

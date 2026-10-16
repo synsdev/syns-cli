@@ -12,6 +12,7 @@ mod history_file_test;
 mod identifier_segment_test;
 mod identity_checkout_test;
 mod if_repo_test;
+mod machine_local_test;
 mod place_test;
 mod pull_identity_test;
 mod pull_positionals_test;

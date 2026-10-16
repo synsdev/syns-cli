@@ -12,8 +12,9 @@ use crate::client::{
 use crate::config::StoreRoots;
 use crate::errors::{ApiErrorContext, CliError};
 use crate::push::collector::{
-    CollectOptions, CollectResult, CollectedFile, HELD_BYTES_BUDGET, HeldBytes, SkipReason,
-    SkippedFile, collect_files, is_text, read_collected, read_collected_into, too_large_label,
+    CollectOptions, CollectResult, CollectedFile, HELD_BYTES_BUDGET, HeldBytes, SKIP_REASONS,
+    SkipReason, SkippedFile, collect_files, is_text, read_collected, read_collected_into,
+    too_large_label,
 };
 use crate::push::manifest::Manifest;
 use crate::repo::root::path_within_prefix;
@@ -1011,6 +1012,10 @@ fn named_hash_only(
         .collect()
 }
 
+/// `PushEmpty`'s cause where machine-local files are most of the drops
+/// (roadmap/232 E13).
+pub(crate) const MACHINE_LOCAL_CAUSE: &str = "every file is machine-local (a socket or pipe, a lock, pid or .local file in a dot-folder, a .local dotfile, or OS metadata such as .DS_Store); a ! line in .synsignore publishes one";
+
 /// Pick one human-readable most-likely cause for `PushEmpty`'s
 /// diagnostic (SPEC u213 § 5 D4). Single-line output; no path list.
 fn skip_summary_cause(skipped: &[SkippedFile], source: &Path) -> String {
@@ -1021,7 +1026,7 @@ fn skip_summary_cause(skipped: &[SkippedFile], source: &Path) -> String {
     }
 
     let total = skipped.len();
-    let mut counts: [usize; 5] = [0; 5];
+    let mut counts: [usize; SKIP_REASONS] = [0; SKIP_REASONS];
     for sf in skipped {
         counts[sf.reason as usize] += 1;
     }
@@ -1034,6 +1039,8 @@ fn skip_summary_cause(skipped: &[SkippedFile], source: &Path) -> String {
         format!("every file is {}", too_large_label())
     } else if majority(DefaultExcludeDir as usize) {
         "every file is inside a default-excluded directory (node_modules, dist, build, target, .venv, …); pass --no-default-excludes to override".to_string()
+    } else if majority(MachineLocal as usize) {
+        MACHINE_LOCAL_CAUSE.to_string()
     } else if gitignore_present && majority(Gitignore as usize) {
         format!(
             "a .gitignore file in {} excludes every file",
@@ -1148,6 +1155,7 @@ pub async fn smart_push(
                 debug: opts.debug,
                 prefix: opts.prefix.clone(),
                 holder_synsignore: None,
+                holder_place: None,
             },
             None,
             &opts.held_bytes(),
@@ -1514,6 +1522,38 @@ mod tests {
     use std::path::PathBuf;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // roadmap/232 E13, E14: machine-local drops alone name their own cause,
+    // and none of them refuses a strict publication.
+    #[test]
+    fn machine_local_drops_name_their_cause_and_never_refuse_strict() {
+        let dir = tempfile::tempdir().unwrap();
+        let drop = |path: &str, reason| SkippedFile {
+            path: path.into(),
+            reason,
+        };
+        let skipped = vec![
+            drop(".syns.yaml", SkipReason::UserExclude),
+            drop(".DS_Store", SkipReason::MachineLocal),
+            drop(".claude/a.lock", SkipReason::MachineLocal),
+            drop(".env.local", SkipReason::MachineLocal),
+        ];
+        assert_eq!(
+            skip_summary_cause(&skipped, dir.path()),
+            MACHINE_LOCAL_CAUSE
+        );
+        assert_eq!(
+            MACHINE_LOCAL_CAUSE,
+            "every file is machine-local (a socket or pipe, a lock, pid or .local file in a dot-folder, a .local dotfile, or OS metadata such as .DS_Store); a ! line in .synsignore publishes one"
+        );
+        assert!(!strict_refuses(&skipped));
+        // Half is no majority.
+        let halved = vec![
+            drop("a.tmp", SkipReason::UserExclude),
+            drop(".DS_Store", SkipReason::MachineLocal),
+        ];
+        assert_ne!(skip_summary_cause(&halved, dir.path()), MACHINE_LOCAL_CAUSE);
+    }
 
     #[tokio::test]
     async fn first_push_sends_all_files_with_content() {
