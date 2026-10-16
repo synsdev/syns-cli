@@ -21,6 +21,7 @@ targets = [
 pr-run-mode = "plan"
 
 [dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
 x86_64-apple-darwin = "macos-15-intel"
 
 [dist.github-action-commits]

@@ -95,11 +95,13 @@ jobs:
             ]
           }
           EOF
-          (cd fixture-server && python3 -m http.server 18080 >server.log 2>&1) &
+          # Bind IPv4 loopback explicitly: on macos-15 the default bind is not
+          # reachable at 127.0.0.1, where the steps below connect.
+          (cd fixture-server && python3 -m http.server 18080 --bind 127.0.0.1 >server.log 2>&1) &
           # Give the server time to come up.
           sleep 3
-          curl -fsS http://127.0.0.1:18080/repos/synsdev/syns-cli/releases/latest \
-            | head -c 200
+          curl -fsS --max-time 10 http://127.0.0.1:18080/repos/synsdev/syns-cli/releases/latest \
+            | head -c 200 || { cat fixture-server/server.log; exit 1; }
           echo
 
       - name: Invoke `syns upgrade --check-only --json`
