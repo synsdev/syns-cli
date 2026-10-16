@@ -72,6 +72,19 @@ jobs:
           fi
           echo "DEST=${DEST}" >> "${GITHUB_ENV}"
 
+      # macos-15 drops connections to the loopback fixture server below (curl
+      # times out, bound to 127.0.0.1 or not); suspected: the application
+      # firewall holding an unsigned python3. Log the state and turn it off.
+      - name: Let the fixture server accept connections (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          F=/usr/libexec/ApplicationFirewall/socketfilterfw
+          sw_vers; command -v python3; python3 -V
+          $F --getglobalstate; $F --getblockall; $F --getstealthmode
+          sudo $F --setglobalstate off
+          sudo pfctl -s info 2>&1 | head -2 || true
+
       - name: Start fixture HTTP server
         shell: bash
         run: |
@@ -95,13 +108,12 @@ jobs:
             ]
           }
           EOF
-          # Bind IPv4 loopback explicitly: on macos-15 the default bind is not
-          # reachable at 127.0.0.1, where the steps below connect.
-          (cd fixture-server && python3 -m http.server 18080 --bind 127.0.0.1 >server.log 2>&1) &
+          # Every client below connects to 127.0.0.1, so bind exactly that.
+          (cd fixture-server && python3 -u -m http.server 18080 --bind 127.0.0.1 >server.log 2>&1) &
           # Give the server time to come up.
           sleep 3
           curl -fsS --max-time 10 http://127.0.0.1:18080/repos/synsdev/syns-cli/releases/latest \
-            | head -c 200 || { cat fixture-server/server.log; exit 1; }
+            | head -c 200 || { cat fixture-server/server.log; lsof -nP -iTCP:18080 || true; exit 1; }
           echo
 
       - name: Invoke `syns upgrade --check-only --json`
