@@ -41,7 +41,7 @@ jobs:
             expected_method: curl
             install_dir_relative: .local/bin
             target_triple: x86_64-unknown-linux-gnu
-          - os: macos-14
+          - os: macos-15
             expected_method: curl
             install_dir_relative: .local/bin
             target_triple: aarch64-apple-darwin
