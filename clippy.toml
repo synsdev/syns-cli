@@ -1,5 +1,8 @@
 # The error every command returns carries the misplaced-folder refusal,
 # whose six fields (SPEC u290, and u291's `back`) sit just past clippy's
 # default bound of 128 bytes; the bound rises to hold it rather than
-# boxing a variant whose fields both units fix.
-large-error-threshold = 160
+# boxing a variant whose fields both units fix. Three of the six are
+# `PathBuf`s, 24 bytes on unix but 32 on Windows (issue 325), so the
+# variant is 144 bytes on unix and 168 on Windows. Clippy flags an error
+# at the bound too, so the bound sits one byte above the Windows size.
+large-error-threshold = 169
