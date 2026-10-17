@@ -94,6 +94,8 @@ pub(crate) fn ensure_in_root_home(dir: &Path) -> Result<(), CliError> {
         return Err(refuse(&foreign));
     }
     if !dir.is_dir() {
+        // Only the unix mode below mutates it (issue 325: Windows clippy).
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {

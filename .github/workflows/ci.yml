@@ -30,6 +30,12 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
       - run: cargo test --locked --test cli_integration convergence
       - run: cargo test --locked --lib push::working_copy
+      # issue 325: Windows is the only platform whose `syns upgrade` unpacks a
+      # zip (`extract_binary`, cfg windows); t10 builds a zip fixture only here.
+      - run: cargo test --locked --test cli_integration upgrade
+      - run: cargo test --locked --lib commands::upgrade
+      # The only lint over cfg(windows) code; the ubuntu job cannot see it.
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
   install-detect-smoke:
     name: install-detect-smoke (${{ matrix.os }})
