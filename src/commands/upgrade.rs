@@ -892,7 +892,9 @@ fn extract_binary(
             .map_err(|e| UpgradeError::ExtractFailed {
                 message: format!("zip by_index({i}): {e}"),
             })?;
-        if entry.name() == "syns.exe" {
+        // zip 9: `name()` is fallible (an undecodable name); such an entry
+        // is not `syns.exe`, so it is skipped like any other.
+        if matches!(entry.name().as_deref(), Ok("syns.exe")) {
             let mut out = fs::File::create(dest).map_err(|e| UpgradeError::IoError {
                 path: dest.to_path_buf(),
                 operation: "extract-binary-create",

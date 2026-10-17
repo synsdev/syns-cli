@@ -268,7 +268,7 @@ async fn t10_happy_path_full_swap() {
         let mut buf = Vec::new();
         {
             let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-            let options: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+            let options = zip::write::SimpleFileOptions::default();
             zip.start_file("syns.exe", options).expect("zip start_file");
             zip.write_all(&sentinel_bytes).expect("zip write_all");
             zip.finish().expect("zip finish");
