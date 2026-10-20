@@ -697,7 +697,9 @@ pub async fn cmd_resolution(
             // 3
             ResolutionAction::Continue => {
                 let token = load_token(config)?;
-                let client = SynsClient::new(config.server_url())?.bulk_reads();
+                // `resolution` is a verb of its own: its reads carry no
+                // lane (roadmap 271, C-2).
+                let client = SynsClient::new(config.server_url())?;
                 ensure_copy_identity(&copy, &owner, &name)?;
                 let outcome = continue_resolution(
                     &client,

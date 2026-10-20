@@ -175,6 +175,27 @@ async fn pull_and_sync_send_their_reads_bulk_and_every_other_verb_sends_no_lane(
         "delta\n"
     );
 
+    // C-2: `resolution` is its own verb: a continued resolution's reads
+    // carry no lane, though the sync that prepared it sent its own bulk.
+    fake.commit_changes(&[("a.md", Some("remote edit\n"))]);
+    std::fs::write(m.dir().join("a.md"), "local edit\n").unwrap();
+    let out = m.run(&["sync"]).await;
+    assert_eq!(out.status.code(), Some(4), "{}", stderr(&out));
+    assert_bulk_reads("sync meeting a collision", &fake.lanes(true));
+    std::fs::write(m.dir().join("a.md"), "resolved\n").unwrap();
+    let out = m.run(&["resolution", "continue"]).await;
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let continued = fake.lanes(true);
+    assert!(
+        continued.iter().any(|(_, t, _)| is_read(t)),
+        "{continued:?}"
+    );
+    assert!(
+        continued.iter().any(|(m, _, _)| m == "PUT"),
+        "{continued:?}"
+    );
+    assert_no_lane("resolution continue", &continued);
+
     // C-2: the reading verbs, whatever they answer.
     for args in [
         &["cat", "a.md"][..],
