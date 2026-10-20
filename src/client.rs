@@ -1258,10 +1258,17 @@ pub(crate) mod u272_bodies {
 
 // --- SynsClient ---
 
+/// The header asking the server to send a request's engine work in an
+/// admission lane (roadmap 271): only `bulk` has an effect.
+pub const LANE_HEADER: &str = "Syns-Lane";
+
 #[derive(Debug, Clone)]
 pub struct SynsClient {
     client: reqwest::Client,
     base_url: String,
+    /// Its `EP-tree` and `EP-file-read-bytes` requests carry `Syns-Lane:
+    /// bulk` (roadmap 271, C-1): a pull's and a sync's client.
+    bulk_reads: bool,
 }
 
 impl SynsClient {
@@ -1276,7 +1283,31 @@ impl SynsClient {
 
         let client = api_client()?;
 
-        Ok(SynsClient { client, base_url })
+        Ok(SynsClient {
+            client,
+            base_url,
+            bulk_reads: false,
+        })
+    }
+
+    /// This client, its tree and content reads (`EP-tree`,
+    /// `EP-file-read-bytes`, `GET` and `HEAD`) sent with `Syns-Lane: bulk`,
+    /// so a whole pull or sync waits in the engine's bulk lane rather than
+    /// beside a page's reads (roadmap 271, C-1). Every other request it
+    /// sends carries no lane.
+    pub fn bulk_reads(mut self) -> SynsClient {
+        self.bulk_reads = true;
+        self
+    }
+
+    /// `request` with `Syns-Lane: bulk` where this client marks its reads
+    /// bulk.
+    fn in_read_lane(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.bulk_reads {
+            request.header(LANE_HEADER, "bulk")
+        } else {
+            request
+        }
     }
 
     /// One `EP-push` request carrying `body` as it stands (SPEC u280
@@ -1311,7 +1342,9 @@ impl SynsClient {
 
     pub async fn pull(&self, repo_id: &str, token: Option<&str>) -> Result<PullResponse, CliError> {
         let url = format!("{}/api/v1/repos/{}/tree", self.base_url, repo_id);
-        let mut req = self.client.get(&url).query(&[("recursive", "true")]);
+        let mut req = self
+            .in_read_lane(self.client.get(&url))
+            .query(&[("recursive", "true")]);
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
@@ -1390,7 +1423,7 @@ impl SynsClient {
             ),
             None => format!("{}/api/v1/repos/{}/tree", self.base_url, repo_id),
         };
-        let mut req = self.client.get(&url);
+        let mut req = self.in_read_lane(self.client.get(&url));
         if recursive {
             req = req.query(&[("recursive", "true")]);
         }
@@ -1444,7 +1477,7 @@ impl SynsClient {
             repo_id,
             encode_path_segments(path)?
         );
-        let mut req = self.client.request(method, &url);
+        let mut req = self.in_read_lane(self.client.request(method, &url));
         if let Some(r) = version_ref {
             req = req.query(&[("ref", r)]);
         }

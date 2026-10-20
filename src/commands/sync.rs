@@ -545,7 +545,7 @@ pub async fn cmd_sync(config: &Config, output: &Output, if_repo: bool) -> Result
         // 3
         let token = load_token(config)?;
         // 4
-        let client = SynsClient::new(config.server_url())?;
+        let client = SynsClient::new(config.server_url())?.bulk_reads();
         ensure_copy_identity(&copy, &owner, &name)?;
         let converged = converge(
             &client,
@@ -697,7 +697,7 @@ pub async fn cmd_resolution(
             // 3
             ResolutionAction::Continue => {
                 let token = load_token(config)?;
-                let client = SynsClient::new(config.server_url())?;
+                let client = SynsClient::new(config.server_url())?.bulk_reads();
                 ensure_copy_identity(&copy, &owner, &name)?;
                 let outcome = continue_resolution(
                     &client,

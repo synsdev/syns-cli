@@ -46,6 +46,8 @@ struct RawRequest {
     method: String,
     target: String,
     body: Vec<u8>,
+    /// Its `Syns-Lane` header, where it carried one (roadmap 271).
+    lane: Option<String>,
 }
 
 /// Reads one HTTP/1.1 request, or `None` where the peer closed first.
@@ -67,8 +69,13 @@ async fn read_raw_request(sock: &mut TcpStream) -> Option<RawRequest> {
     let mut request_line = lines.next()?.split(' ');
     let method = request_line.next()?.to_string();
     let target = request_line.next()?.to_string();
-    let length = lines
-        .filter_map(|l| l.split_once(':'))
+    let headers: Vec<(&str, &str)> = lines.filter_map(|l| l.split_once(':')).collect();
+    let lane = headers
+        .iter()
+        .find(|(k, _)| k.trim().eq_ignore_ascii_case("syns-lane"))
+        .map(|(_, v)| v.trim().to_string());
+    let length = headers
+        .iter()
         .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
         .and_then(|(_, v)| v.trim().parse::<usize>().ok())
         .unwrap_or(0);
@@ -84,6 +91,7 @@ async fn read_raw_request(sock: &mut TcpStream) -> Option<RawRequest> {
         method,
         target,
         body,
+        lane,
     })
 }
 
@@ -200,6 +208,8 @@ struct FakeRepo {
     commits: Vec<(String, BTreeMap<String, Vec<u8>>)>,
     /// Every request received: method, target and body.
     requests: Vec<(String, String, Vec<u8>)>,
+    /// Every request received: method, target and its `Syns-Lane`.
+    lanes: Vec<(String, String, Option<String>)>,
     drop_next_push: bool,
     /// Changes laid over the head as a fresh commit before the next
     /// publication is answered, so that publication meets a moved head.
@@ -276,6 +286,8 @@ impl FakeRepo {
     fn answer(&mut self, req: &RawRequest) -> Option<Answer> {
         self.requests
             .push((req.method.clone(), req.target.clone(), req.body.clone()));
+        self.lanes
+            .push((req.method.clone(), req.target.clone(), req.lane.clone()));
         let (route, query) = req.target.split_once('?').unwrap_or((&req.target, ""));
         let params: HashMap<String, String> = query
             .split('&')
@@ -656,6 +668,17 @@ impl Fake {
             .filter(|(method, _, _)| method == "PUT")
             .map(|(_, _, body)| serde_json::from_slice(body).unwrap())
             .collect()
+    }
+
+    /// Every request received so far, its method, target and `Syns-Lane`
+    /// (roadmap 271); `clear` empties the record.
+    pub(crate) fn lanes(&self, clear: bool) -> Vec<(String, String, Option<String>)> {
+        let mut repo = self.repo.lock().unwrap();
+        if clear {
+            std::mem::take(&mut repo.lanes)
+        } else {
+            repo.lanes.clone()
+        }
     }
 
     /// Close the next raw read of `path` unanswered (issue 270 M2).

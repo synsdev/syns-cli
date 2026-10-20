@@ -334,7 +334,7 @@ pub async fn cmd_pull(
             .read()
             .ok()
             .flatten();
-        let client = SynsClient::new(config.server_url())?;
+        let client = SynsClient::new(config.server_url())?.bulk_reads();
         let record = client
             .get_repo(&format!("{owner}/{name}"), token.as_deref())
             .await?;
@@ -386,7 +386,7 @@ pub async fn cmd_pull(
         .read()
         .ok()
         .flatten();
-    let client = SynsClient::new(config.server_url())?;
+    let client = SynsClient::new(config.server_url())?.bulk_reads();
 
     if let Some(version) = version {
         return pull_snapshot(
@@ -492,7 +492,7 @@ async fn pull_into_folder(
         .read()
         .ok()
         .flatten();
-    let client = SynsClient::new(config.server_url())?;
+    let client = SynsClient::new(config.server_url())?.bulk_reads();
     let copy = WorkingCopy::open_folder(config.stores(), &scope)?;
 
     let retrieved = match version.as_deref() {
@@ -614,7 +614,7 @@ async fn pull_folder_alone(
         .read()
         .ok()
         .flatten();
-    let client = SynsClient::new(config.server_url())?;
+    let client = SynsClient::new(config.server_url())?.bulk_reads();
     let at = version.as_deref().unwrap_or("the tip");
     let unmarked = || CliError::Config {
         message: folder_unmarked(&holder, path, at),
