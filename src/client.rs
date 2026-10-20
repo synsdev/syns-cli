@@ -340,6 +340,33 @@ pub struct StagedRaw {
     pub etag: Option<String>,
 }
 
+/// A conditional raw read's answer at its head (roadmap 278): a `304`,
+/// or a `200` whose body is still unread.
+#[derive(Debug)]
+pub enum RawHead {
+    NotModified {
+        etag: Option<String>,
+    },
+    Body {
+        response: reqwest::Response,
+        etag: Option<String>,
+        media_type: Option<String>,
+        /// The `Content-Length` the answer declared, none where it
+        /// declared none or arrived compressed.
+        declared: Option<u64>,
+    },
+}
+
+impl RawHead {
+    /// The body of a `200`, read whole within `ANSWER_STALL` per chunk.
+    pub async fn body(
+        response: reqwest::Response,
+        declared: Option<u64>,
+    ) -> Result<Vec<u8>, CliError> {
+        read_body(response, ANSWER_STALL, unsized_capacity(declared)).await
+    }
+}
+
 fn etag_of(response: &reqwest::Response) -> Option<String> {
     response
         .headers()
@@ -1652,6 +1679,58 @@ impl SynsClient {
             bytes,
             etag,
             media_type,
+        })
+    }
+
+    /// One conditional `GET` of the raw entry, answered at its head
+    /// (roadmap 278): `If-None-Match: "<held>"` sent where the store holds
+    /// a verified blob for the path, and `Accept-Encoding: identity` where
+    /// `identity` stands, so the answer declares its length and the body
+    /// can be left unread (D-242 § Amended §6). A `304` is answered as
+    /// `RawHead::NotModified`, every refusal as `get_raw` raises it.
+    /// `on_refusal` runs once the final answer's status line names a
+    /// refusal, before its body is read: a `--max-bytes` run counts the
+    /// path at 0 there, so a refusal never waits on bodies the budget holds
+    /// unread (REVIEW-syns-cli finding 1).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn raw_head(
+        &self,
+        repo_id: &str,
+        token: Option<&str>,
+        path: &str,
+        version_ref: &str,
+        held: Option<&str>,
+        identity: bool,
+        on_refusal: impl FnOnce(),
+    ) -> Result<RawHead, CliError> {
+        let mut request = self.raw_request(
+            reqwest::Method::GET,
+            repo_id,
+            token,
+            path,
+            Some(version_ref),
+        )?;
+        if let Some(sha) = held {
+            request = request.header(reqwest::header::IF_NONE_MATCH, format!("\"{sha}\""));
+        }
+        if identity {
+            request = request.header(reqwest::header::ACCEPT_ENCODING, "identity");
+        }
+        let response = request.send_empty_bounded().await?;
+        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            return Ok(RawHead::NotModified {
+                etag: etag_of(&response),
+            });
+        }
+        if !response.status().is_success() {
+            on_refusal();
+        }
+        let response = check_response(response).await?;
+        Ok(RawHead::Body {
+            etag: etag_of(&response),
+            media_type: media_type_of(&response),
+            declared: response.content_length(),
+            response,
         })
     }
 
@@ -5214,6 +5293,105 @@ mod r277_tests {
         (port, handshakes)
     }
 
+    /// The receive windows a client advertises when it opens an HTTP/2
+    /// connection: its `SETTINGS_INITIAL_WINDOW_SIZE` (the protocol's 65,535
+    /// where it sends none) and the connection window its first
+    /// `WINDOW_UPDATE` on stream 0 raises from 65,535.
+    async fn advertised_windows(windows: crate::shared_client::Windows) -> (u32, u32) {
+        use rustls::pki_types::pem::PemObject;
+        use tokio::io::AsyncReadExt;
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tls");
+        let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![
+                rustls::pki_types::CertificateDer::from_pem_file(fixtures.join("localhost.pem"))
+                    .unwrap(),
+            ],
+            rustls::pki_types::PrivateKeyDer::from_pem_file(fixtures.join("localhost.key"))
+                .unwrap(),
+        )
+        .unwrap();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let sniffed = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(sock).await.unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let (mut stream, mut connection) = (65_535u32, 65_535u32);
+            loop {
+                let n =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), tls.read(&mut chunk))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert!(n > 0, "the client closed before its request");
+                bytes.extend_from_slice(&chunk[..n]);
+                // The 24-byte preface, then frames: length (3), type,
+                // flags, stream (4), payload.
+                let mut at = 24;
+                while bytes.len() >= at + 9 {
+                    let len =
+                        u32::from_be_bytes([0, bytes[at], bytes[at + 1], bytes[at + 2]]) as usize;
+                    let (kind, flags) = (bytes[at + 3], bytes[at + 4]);
+                    let stream_id =
+                        u32::from_be_bytes(bytes[at + 5..at + 9].try_into().unwrap()) & 0x7fff_ffff;
+                    if bytes.len() < at + 9 + len {
+                        break;
+                    }
+                    let payload = &bytes[at + 9..at + 9 + len];
+                    match kind {
+                        0x4 if flags & 1 == 0 => {
+                            for setting in payload.chunks(6) {
+                                if u16::from_be_bytes([setting[0], setting[1]]) == 0x4 {
+                                    stream = u32::from_be_bytes(setting[2..6].try_into().unwrap());
+                                }
+                            }
+                        }
+                        0x8 if stream_id == 0 => {
+                            connection = 65_535
+                                + (u32::from_be_bytes(payload.try_into().unwrap()) & 0x7fff_ffff);
+                        }
+                        0x1 => return (stream, connection),
+                        _ => {}
+                    }
+                    at += 9 + len;
+                }
+            }
+        });
+        let client =
+            crate::shared_client::build_api_client(test_tls(), Arc::default(), windows).unwrap();
+        let _ = client
+            .get(format!("https://localhost:{port}/api/health"))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await;
+        sniffed.await.unwrap()
+    }
+
+    // VERIFY.md row 19a: a `--max-bytes` run's client advertises the
+    // protocol's 64 KiB stream window and one such window per read in
+    // flight for its connection; every other run keeps hyper's windows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_max_bytes_client_advertises_small_receive_windows() {
+        use crate::shared_client::{BOUNDED_CONNECTION_WINDOW, Windows};
+        assert_eq!(
+            advertised_windows(Windows::Bounded).await,
+            (65_535, BOUNDED_CONNECTION_WINDOW)
+        );
+        assert_eq!(BOUNDED_CONNECTION_WINDOW, 16 * 65_535);
+        let (stream, connection) = advertised_windows(Windows::Default).await;
+        assert!(stream >= 1 << 20, "{stream}");
+        assert!(connection >= 4 << 20, "{connection}");
+    }
+
     const HEAD: &str = "def4560000000000000000000000000000000000";
 
     async fn mount_read(server: &MockServer, newest: &str) {
@@ -5279,6 +5457,7 @@ mod r277_tests {
     async fn an_unpinned_cat_makes_one_tls_connection_for_every_request() {
         let config_dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", config_dir.path()) };
+        unsafe { std::env::set_var("SYNS_CACHE_DIR", config_dir.path()) };
         let server = MockServer::start().await;
         mount_read(&server, HEAD).await;
         let (port, handshakes) = tls_front(*server.address()).await;
@@ -5298,6 +5477,7 @@ mod r277_tests {
         )
         .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+        unsafe { std::env::remove_var("SYNS_CACHE_DIR") };
         answered.unwrap();
 
         assert_eq!(*handshakes.lock().unwrap(), vec!["h2".to_string()]);

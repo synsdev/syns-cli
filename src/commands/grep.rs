@@ -20,7 +20,7 @@ use crate::client::{EntryType, SynsClient};
 use crate::config::Config;
 use crate::errors::{CliError, partial_truncated_tree, partial_unread_paths};
 use crate::output::Output;
-use crate::read::cache::{BlobCache, BlobContent};
+use crate::read::store::{BlobContent, Store, get_or_fetch};
 use crate::read::{
     ReadOptions, ReadTarget, bind_read_folder, counted_from, mark_partial, read_not_found,
     report_reference, repository_argument, resolve_read_target,
@@ -46,8 +46,8 @@ pub fn offset_help() -> String {
 }
 
 /// The count of content requests outstanding at once, with nothing else
-/// pacing them.
-pub const IN_FLIGHT: usize = 16;
+/// pacing them: the one bound `syns cat PATH…` shares (roadmap 278).
+pub use crate::read::IN_FLIGHT;
 
 /// The three output modes, spelt `content`, `files` and `count`. A value
 /// outside the three ends the run through the argument parser at exit
@@ -422,10 +422,11 @@ pub async fn grep_document(
     kept.truncate(end);
     kept.drain(..start);
 
-    // 5 — fetch through the cache, searching each content as it lands
+    // 5 — fetch through the store, searching each content as it lands
     // and closing the fan-out at the first content that carries the run
-    // past `--head-limit`.
-    let cache = Arc::new(BlobCache::open(config)?);
+    // past `--head-limit`. A store the run cannot use is skipped without
+    // a word (D-242 §11).
+    let cache = Store::open(config, target.token.as_deref()).map(Arc::new);
     let client = Arc::new(client);
     let target = Arc::new(target);
     let kept = Arc::new(kept);
@@ -442,16 +443,21 @@ pub async fn grep_document(
             while issued < pool && set.len() < IN_FLIGHT {
                 let index = issued;
                 issued += 1;
-                let cache = Arc::clone(&cache);
+                let cache = cache.clone();
                 let client = Arc::clone(&client);
                 let target: Arc<ReadTarget> = Arc::clone(&target);
                 let matcher = Arc::clone(&matcher);
                 let kept = Arc::clone(&kept);
                 set.spawn(async move {
                     let entry = &kept[index];
-                    let answer = cache
-                        .get_or_fetch(&client, &target, &entry.path, entry.sha.as_deref())
-                        .await;
+                    let answer = get_or_fetch(
+                        cache.as_deref(),
+                        &client,
+                        &target,
+                        &entry.path,
+                        entry.sha.as_deref(),
+                    )
+                    .await;
                     let outcome = match answer {
                         Err(e) => return (index, Err(e)),
                         Ok(BlobContent::Binary) => PathOutcome::Binary,
@@ -503,13 +509,15 @@ pub async fn grep_document(
     }
     let attempted = issued;
 
-    // The one eviction pass of the run, after its last fetch has landed.
+    // The run's hints merged and, where the store stands past its cap,
+    // its one sweep, after its last fetch has landed.
     set.shutdown().await;
-    let swept = cache.sweep();
+    if let Some(cache) = &cache {
+        cache.finish();
+    }
     if let Some(e) = fatal {
         return Err(e);
     }
-    swept?;
 
     // Assemble in ascending path order — the pool is sorted, so the
     // index order is the path order.

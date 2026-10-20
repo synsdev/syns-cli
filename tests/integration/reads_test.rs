@@ -4,8 +4,9 @@
 //! Every row of that table stands here under the name the table gives
 //! it, but the two the cache's own module cases carry
 //! (`a_blob_whose_served_hash_does_not_match_its_bytes_is_not_stored`
-//! and `cache_evicts_least_recently_touched_past_the_cap`), which drive
-//! `BlobCache` directly rather than through the binary.
+//! and `cache_evicts_least_recently_touched_past_the_cap`), which drove
+//! the grep cache directly; roadmap 278's store replaced it, and
+//! `src/read/store.rs` and `cat_many_test.rs` carry those rows now.
 
 use assert_cmd::Command as AssertCommand;
 use serde_json::{Value, json};
@@ -96,17 +97,30 @@ impl Deployment {
             .expect("run syns")
     }
 
-    /// The bytes the `blobs` directory holds, which the cap bounds.
+    /// The bytes the store's `blobs` directories hold, which the cap
+    /// bounds per account (roadmap 278: `store/<server>/<account>/blobs`).
     fn blob_bytes(&self) -> u64 {
-        let blobs = self.cache.path().join("blobs");
-        let Ok(dir) = std::fs::read_dir(&blobs) else {
+        let mut total = 0;
+        let Ok(servers) = std::fs::read_dir(self.cache.path().join("store")) else {
             return 0;
         };
-        dir.flatten()
-            .filter_map(|e| e.metadata().ok())
-            .filter(|m| m.is_file())
-            .map(|m| m.len())
-            .sum()
+        for server in servers.flatten() {
+            let Ok(accounts) = std::fs::read_dir(server.path()) else {
+                continue;
+            };
+            for account in accounts.flatten() {
+                let Ok(dir) = std::fs::read_dir(account.path().join("blobs")) else {
+                    continue;
+                };
+                total += dir
+                    .flatten()
+                    .filter_map(|e| e.metadata().ok())
+                    .filter(|m| m.is_file())
+                    .map(|m| m.len())
+                    .sum::<u64>();
+            }
+        }
+        total
     }
 }
 
@@ -559,7 +573,12 @@ fn read_prints_the_numbered_window() {
     let d = Deployment::new();
     mount_head(&d);
     let third = "c".repeat(2100);
-    mount_file(&d, "a.md", &format!("one\ntwo\n{third}\nfour\nfive\n"));
+    // Roadmap 278 (D-242 §10): `read` asks the raw entry.
+    mount_raw(
+        &d,
+        "a.md",
+        format!("one\ntwo\n{third}\nfour\nfive\n").as_bytes(),
+    );
 
     let output = d.run(&[
         "read", "a.md", "--repo", REPO, "--offset", "2", "--limit", "2",
@@ -579,7 +598,7 @@ fn read_prints_the_numbered_window() {
 fn read_window_past_the_last_line_prints_nothing() {
     let d = Deployment::new();
     mount_head(&d);
-    mount_file(&d, "a.md", "one\ntwo\nthree\n");
+    mount_raw(&d, "a.md", b"one\ntwo\nthree\n");
 
     let output = d.run(&["read", "a.md", "--repo", REPO, "--offset", "99"]);
     assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
@@ -1368,15 +1387,15 @@ fn a_flat_listing_names_each_entry_by_its_base_name() {
 fn read_at_a_version_sends_the_pinned_ordinal() {
     let d = Deployment::new();
     mount_version(&d, "2", 2, OLD_SHA);
-    mount_file(&d, "a.md", "one\ntwo\n");
+    mount_raw(&d, "a.md", b"one\ntwo\n");
 
     let output = d.run(&["read", "a.md", "--repo", REPO, "--version", "2"]);
     assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
     let requests = d.requests();
     let file = requests
         .iter()
-        .find(|r| r.url.path().contains("/files/"))
-        .expect("a file request");
+        .find(|r| r.url.path().contains("/raw/"))
+        .expect("a raw request");
     assert_eq!(query_of(file, "ref").as_deref(), Some("2"));
 }
 

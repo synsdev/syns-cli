@@ -269,6 +269,29 @@ impl Config {
     pub fn cache_dir(&self) -> &Path {
         &self.stores().write
     }
+
+    /// Every root a content store can stand under, each once, probing and
+    /// creating nothing (D-242 §8): the configured root where
+    /// `SYNS_CACHE_DIR` names one, the platform default, and the
+    /// per-account fallback under the system temp directory, marked so
+    /// `syns logout --purge` walks it only where it is confined.
+    pub fn store_roots(&self) -> Vec<(PathBuf, bool)> {
+        let mut roots: Vec<(PathBuf, bool)> = Vec::new();
+        let candidates = self
+            .configured_cache
+            .iter()
+            .map(|root| (root.clone(), false))
+            .chain([
+                (self.default_cache.clone(), false),
+                (fallback_root(&std::env::temp_dir()), true),
+            ]);
+        for (root, fallback) in candidates {
+            if !roots.iter().any(|(seen, _)| seen == &root) {
+                roots.push((root, fallback));
+            }
+        }
+        roots
+    }
 }
 
 /// The one refusal every check of a server address answers off TLS and

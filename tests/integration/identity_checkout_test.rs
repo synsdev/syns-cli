@@ -732,7 +732,7 @@ fn reads_through_an_identity_take_its_newest_listed_version_as_head() {
     let targets = d.targets();
     let reads: Vec<&String> = targets
         .iter()
-        .filter(|t| t.contains("/files/document.html"))
+        .filter(|t| t.contains("/raw/document.html"))
         .collect();
     assert_eq!(reads.len(), 2, "{targets:?}");
     assert!(reads.iter().all(|t| t.ends_with("ref=4")), "{reads:?}");

@@ -162,11 +162,17 @@ enum Commands {
         #[command(flatten)]
         read: ReadOpts,
     },
-    /// View a file's content
+    /// View one file's content, or many files' at one commit
     Cat {
-        /// File path to display
-        #[arg()]
-        path: String,
+        /// File paths to display; two or more, --paths-from or --max-bytes under --json answer one files document
+        #[arg(value_name = "PATH", required_unless_present = "paths_from")]
+        paths: Vec<String>,
+        /// Read the paths from standard input, one per line (only - is accepted)
+        #[arg(long, value_name = "-", value_parser = parse_paths_from, conflicts_with = "paths")]
+        paths_from: Option<String>,
+        /// Under --json, defer every path from the first that would take the answer past this many bytes
+        #[arg(long, value_name = "N")]
+        max_bytes: Option<u64>,
         #[command(flatten)]
         read: ReadOpts,
     },
@@ -497,7 +503,11 @@ enum Commands {
     /// Authenticate with the server
     Login {},
     /// Clear stored credentials
-    Logout {},
+    Logout {
+        /// Also remove every file of this machine's content store, for every account and server
+        #[arg(long)]
+        purge: bool,
+    },
     /// Show current authenticated user
     Whoami {},
 }
@@ -522,6 +532,32 @@ enum ResolutionCommand {
         #[arg(long)]
         if_repo: bool,
     },
+}
+
+/// Ends the process with the parser's refusal of `--max-bytes` given
+/// without `--json` (D-242 §6): `deferred` stands only in the `files`
+/// document. Exit `2`, as every parser refusal.
+fn refuse_max_bytes_without_json() -> ! {
+    let mut command = Cli::command();
+    command.build();
+    let cat = command
+        .find_subcommand_mut("cat")
+        .expect("the cat subcommand is declared");
+    cat.error(
+        clap::error::ErrorKind::MissingRequiredArgument,
+        "--max-bytes needs --json: the paths it defers are named in the JSON answer's deferred",
+    )
+    .exit()
+}
+
+/// `--paths-from`'s one value (D-242 §6): `-`, standard input. A file
+/// path can be admitted later under the same flag.
+fn parse_paths_from(value: &str) -> Result<String, String> {
+    if value == "-" {
+        Ok(value.to_string())
+    } else {
+        Err("only - (standard input) is accepted".to_string())
+    }
 }
 
 /// The stack `syns` runs on, reserved by this program rather than by
@@ -558,6 +594,13 @@ fn main() {
 #[tokio::main]
 async fn run_cli() {
     let cli = Cli::parse();
+    if let Commands::Cat {
+        max_bytes: Some(_), ..
+    } = &cli.command
+        && !cli.json
+    {
+        refuse_max_bytes_without_json();
+    }
     let output = output::Output::new(cli.json);
 
     let config = match config::Config::new(cli.server.as_deref()) {
@@ -624,8 +667,18 @@ async fn run(
             recursive,
             read,
         } => commands::ls::cmd_ls(config, output, path, recursive, read.into()).await?,
-        Commands::Cat { path, read } => {
-            commands::cat::cmd_cat(config, output, path, read.into()).await?
+        Commands::Cat {
+            paths,
+            paths_from,
+            max_bytes,
+            read,
+        } => {
+            let request = commands::cat::CatPaths {
+                paths,
+                from_stdin: paths_from.is_some(),
+                max_bytes,
+            };
+            commands::cat::cmd_cat_paths(config, output, request, read.into()).await?
         }
         Commands::Read {
             path,
@@ -824,7 +877,7 @@ async fn run(
         Commands::Teams { action } => commands::teams::cmd_teams(config, output, action).await?,
         Commands::Upgrade(args) => commands::upgrade::run(args, output).await?,
         Commands::Login {} => commands::login::cmd_login(config, output).await?,
-        Commands::Logout {} => commands::logout::cmd_logout(config, output).await?,
+        Commands::Logout { purge } => commands::logout::cmd_logout(config, output, purge).await?,
         Commands::Whoami {} => commands::whoami::cmd_whoami(config, output).await?,
     }
     Ok(())

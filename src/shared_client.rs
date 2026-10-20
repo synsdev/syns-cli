@@ -25,8 +25,50 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 struct Shared {
     runtime: tokio::runtime::Id,
     origin: String,
+    windows: Windows,
     client: reqwest::Client,
     gate: Arc<HandshakeGate>,
+}
+
+/// The HTTP/2 receive windows a client advertises (roadmap 278).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Windows {
+    /// hyper's own: 2 MiB a stream, 5 MiB a connection.
+    #[default]
+    Default,
+    /// `BOUNDED_STREAM_WINDOW` a stream and `BOUNDED_CONNECTION_WINDOW` a
+    /// connection: a `--max-bytes` run's, so a read cancelled at the cut
+    /// has let at most one stream window of its body cross the wire
+    /// (VERIFY.md row 19a).
+    Bounded,
+}
+
+/// The protocol's initial stream window, 64 KiB less one byte.
+pub(crate) const BOUNDED_STREAM_WINDOW: u32 = 65_535;
+
+/// One stream window for each read in flight: the streams whose bodies a
+/// `--max-bytes` run holds unread can fill their own windows and still
+/// leave every other stream its whole one, so a held body never starves a
+/// read the budget has decided in (and a refusal is counted at its status
+/// line, which flow control does not hold).
+pub(crate) const BOUNDED_CONNECTION_WINDOW: u32 =
+    crate::read::IN_FLIGHT as u32 * BOUNDED_STREAM_WINDOW;
+
+/// Set once a run is given `--max-bytes`, before its first request.
+static BOUNDED: AtomicBool = AtomicBool::new(false);
+
+/// Makes every client this process builds from now on advertise the
+/// bounded windows (`--max-bytes`, roadmap 278).
+pub(crate) fn bound_receive_windows() {
+    BOUNDED.store(true, Ordering::Release);
+}
+
+fn current_windows() -> Windows {
+    if BOUNDED.load(Ordering::Acquire) {
+        Windows::Bounded
+    } else {
+        Windows::Default
+    }
 }
 
 /// The clients this process shares, one per tokio runtime and server: a
@@ -53,20 +95,21 @@ fn origin_of(url: &str) -> String {
 /// shared by every `SynsClient`, sign-in and sign-out. Called off any
 /// runtime, it answers a client of its own.
 pub(crate) fn api_client(server_url: &str) -> Result<reqwest::Client, CliError> {
+    let windows = current_windows();
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-        return build_api_client(crate::tls::tls_config()?, Arc::default());
+        return build_api_client(crate::tls::tls_config()?, Arc::default(), windows);
     };
     let (runtime, origin) = (runtime.id(), origin_of(server_url));
     let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(kept) = shared
         .iter()
-        .find(|kept| kept.runtime == runtime && kept.origin == origin)
+        .find(|kept| kept.runtime == runtime && kept.origin == origin && kept.windows == windows)
     {
         return Ok(kept.client.clone());
     }
     let gate = Arc::<HandshakeGate>::default();
-    let client = build_api_client(crate::tls::tls_config()?, gate.clone())?;
-    keep(&mut shared, runtime, origin, client.clone(), gate);
+    let client = build_api_client(crate::tls::tls_config()?, gate.clone(), windows)?;
+    keep(&mut shared, runtime, origin, windows, client.clone(), gate);
     Ok(client)
 }
 
@@ -74,6 +117,7 @@ fn keep(
     shared: &mut Vec<Shared>,
     runtime: tokio::runtime::Id,
     origin: String,
+    windows: Windows,
     client: reqwest::Client,
     gate: Arc<HandshakeGate>,
 ) {
@@ -84,6 +128,7 @@ fn keep(
     shared.push(Shared {
         runtime,
         origin,
+        windows,
         client,
         gate,
     });
@@ -95,10 +140,18 @@ fn keep(
 #[cfg(test)]
 pub(crate) fn share_for_this_runtime(server_url: &str, tls: rustls::ClientConfig) {
     let gate = Arc::<HandshakeGate>::default();
-    let client = build_api_client(tls, gate.clone()).unwrap();
+    let windows = current_windows();
+    let client = build_api_client(tls, gate.clone(), windows).unwrap();
     let runtime = tokio::runtime::Handle::current().id();
     let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
-    keep(&mut shared, runtime, origin_of(server_url), client, gate);
+    keep(
+        &mut shared,
+        runtime,
+        origin_of(server_url),
+        windows,
+        client,
+        gate,
+    );
 }
 
 /// The runtimes a client for `server_url` is kept for, oldest first.
@@ -143,6 +196,7 @@ pub(crate) fn answered(url: &reqwest::Url) {
 pub(crate) fn build_api_client(
     tls: rustls::ClientConfig,
     gate: Arc<HandshakeGate>,
+    windows: Windows,
 ) -> Result<reqwest::Client, CliError> {
     use reqwest::header::{HeaderMap, HeaderValue};
     let mut headers = HeaderMap::new();
@@ -156,7 +210,13 @@ pub(crate) fn build_api_client(
     {
         headers.insert(crate::client_identity::INSTALL_ID_HEADER, id);
     }
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder();
+    if windows == Windows::Bounded {
+        builder = builder
+            .http2_initial_stream_window_size(BOUNDED_STREAM_WINDOW)
+            .http2_initial_connection_window_size(BOUNDED_CONNECTION_WINDOW);
+    }
+    builder
         .tls_backend_preconfigured(tls)
         .user_agent(crate::client_identity::process_user_agent())
         .default_headers(headers)

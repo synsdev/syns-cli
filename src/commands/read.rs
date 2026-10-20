@@ -10,6 +10,8 @@ use crate::config::Config;
 use crate::errors::{CliError, NotTextSurface};
 use crate::output::Output;
 use crate::push::collector::is_text;
+use crate::read::files::{Outcome, Policy, read_path};
+use crate::read::store::Store;
 use crate::read::{
     ReadOptions, bind_read_folder, counted_from, read_not_found, report_reference,
     repository_argument, resolve_read_target,
@@ -58,18 +60,26 @@ pub async fn cmd_read(
     };
     let client = SynsClient::new(config.server_url())?;
 
-    // 2 — read the mapped path at that reference.
-    let version_ref = target.version_ref();
-    let (response, raw) = match client
-        .get_file(
-            &target.repo_id,
-            target.token.as_deref(),
-            &mapped,
-            Some(&version_ref),
-        )
-        .await
-    {
-        Ok(tuple) => tuple,
+    // 2 — read the mapped path at that reference through the store and
+    // the raw entry, as `cat` reads it (D-242 §10): a verified blob asked
+    // with `If-None-Match`, a `200` checked against its `ETag`.
+    let store = Store::open(config, target.token.as_deref());
+    let read = read_path(
+        &client,
+        &target,
+        store.as_ref(),
+        &mapped,
+        &path,
+        Policy::default(),
+        None,
+    )
+    .await;
+    if let Some(store) = &store {
+        store.finish();
+    }
+    let answer = match read {
+        Ok(Outcome::Read(answer)) => answer,
+        Ok(Outcome::Deferred) => unreachable!("a read with no budget is never deferred"),
         Err(e) => {
             if opts.version.is_some() {
                 return Err(read_not_found(e, &opts, &target.reference, &path));
@@ -81,12 +91,12 @@ pub async fn cmd_read(
         }
     };
 
-    // 3 — classify the decoded content, then split a text one on
-    // newlines and take the window the two options name.
-    // `content: null` is a content that is not text, as one holding a
-    // NUL or failing UTF-8 is (SPEC u280 `FileResponse`).
-    let content = match response.content {
-        Some(content) if is_text(content.as_bytes()) => content,
+    // 3 — the text test applied to the bytes, then a text content split
+    // on newlines and the window the two options name taken.
+    let size = answer.bytes.len();
+    let sha = answer.sha;
+    let content = match String::from_utf8(answer.bytes) {
+        Ok(content) if is_text(content.as_bytes()) => content,
         _ => {
             return Err(CliError::NotText {
                 path,
@@ -102,15 +112,9 @@ pub async fn cmd_read(
     // 4 — write the numbered lines, or the read document.
     if output.is_json() {
         let document = serde_json::json!({
-            "path": match raw.get("path").and_then(|p| p.as_str()) {
-                Some(served) => serde_json::Value::from(counted_from(target.folder.as_ref(), served)),
-                None => raw
-                    .get("path")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::from(path.as_str())),
-            },
-            "sha": response.sha,
-            "size": response.size,
+            "path": counted_from(target.folder.as_ref(), &mapped),
+            "sha": sha,
+            "size": size,
             "version": target.reference.version,
             "commitSha": target.reference.commit_sha,
             "offset": offset,
@@ -165,12 +169,20 @@ mod tests {
             .await;
     }
 
+    /// The raw entry `syns read` asks (D-242 §10), answering `content`
+    /// under an `ETag` of its blob hash.
     async fn mount_file(server: &MockServer, content: &str) {
         Mock::given(method("GET"))
-            .and(path_matcher("/api/v1/repos/alice/notes/files/a.md"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "path": "a.md", "sha": "abc", "content": content, "size": content.len(),
-            })))
+            .and(path_matcher("/api/v1/repos/alice/notes/raw/a.md"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "ETag",
+                        format!("\"{}\"", crate::push::hash::blob_sha1(content.as_bytes()))
+                            .as_str(),
+                    )
+                    .set_body_bytes(content.as_bytes().to_vec()),
+            )
             .mount(server)
             .await;
     }
@@ -200,6 +212,7 @@ mod tests {
     async fn read_prints_the_numbered_window() {
         let dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+        unsafe { std::env::set_var("SYNS_CACHE_DIR", dir.path()) };
         let server = MockServer::start().await;
         mount_reference(&server).await;
         let third = "c".repeat(2100);
@@ -210,6 +223,7 @@ mod tests {
         let output = Output::new(true);
         let result = cmd_read(&config, &output, "a.md".into(), 2, 2, named()).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+        unsafe { std::env::remove_var("SYNS_CACHE_DIR") };
         assert!(result.is_ok(), "{result:?}");
     }
 
@@ -219,6 +233,7 @@ mod tests {
     async fn read_window_past_the_last_line_exits_zero() {
         let dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+        unsafe { std::env::set_var("SYNS_CACHE_DIR", dir.path()) };
         let server = MockServer::start().await;
         mount_reference(&server).await;
         mount_file(&server, "one\ntwo\n").await;
@@ -227,6 +242,7 @@ mod tests {
         let output = Output::new(false);
         let result = cmd_read(&config, &output, "a.md".into(), 99, DEFAULT_LIMIT, named()).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+        unsafe { std::env::remove_var("SYNS_CACHE_DIR") };
         assert!(result.is_ok(), "{result:?}");
     }
 
@@ -236,6 +252,7 @@ mod tests {
     async fn a_nul_bearing_content_is_refused_by_the_numbered_read() {
         let dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+        unsafe { std::env::set_var("SYNS_CACHE_DIR", dir.path()) };
         let server = MockServer::start().await;
         mount_reference(&server).await;
         mount_file(&server, "one\u{0}two").await;
@@ -253,6 +270,7 @@ mod tests {
         .await
         .unwrap_err();
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+        unsafe { std::env::remove_var("SYNS_CACHE_DIR") };
 
         assert_eq!(
             err.to_string(),
@@ -268,6 +286,7 @@ mod tests {
     async fn a_zero_window_option_is_refused_before_any_request() {
         let dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("SYNS_CONFIG_DIR", dir.path()) };
+        unsafe { std::env::set_var("SYNS_CACHE_DIR", dir.path()) };
         let server = MockServer::start().await;
         let config = Config::new(Some(&server.uri())).unwrap();
         let output = Output::new(false);
@@ -279,6 +298,7 @@ mod tests {
             .await
             .unwrap_err();
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+        unsafe { std::env::remove_var("SYNS_CACHE_DIR") };
 
         assert_eq!(
             offset_err.to_string(),

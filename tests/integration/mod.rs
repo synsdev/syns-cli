@@ -2,6 +2,7 @@ mod api_parity_test;
 mod auth_test;
 mod binary_content_test;
 mod binary_read_write_test;
+mod cat_many_test;
 mod client_identity_test;
 mod collaborators_add_json_test;
 mod common;

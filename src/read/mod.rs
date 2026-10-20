@@ -7,7 +7,8 @@
 //! time-travel read never pays the commit walk a full content hash costs
 //! (`issues/148-ref-by-content-hash-resolved-by-scanning-every-commit`).
 
-pub mod cache;
+pub mod files;
+pub mod store;
 
 use crate::auth::token::TokenStore;
 use crate::client::SynsClient;
@@ -18,6 +19,11 @@ use crate::output::Output;
 use crate::repo::folder::{FolderScope, current_dir, resolve_folder_scope, resolve_scoped_or_skip};
 use crate::repo::identity::identity_head;
 use crate::repo::if_repo::resolve_full_or_skip;
+
+/// The count of content reads outstanding at once, with nothing else
+/// pacing them: grep's fan-out and `syns cat PATH…` alike (Q-0119,
+/// roadmap 278).
+pub const IN_FLIGHT: usize = 16;
 
 /// The three options every read verb carries, spelt and bound
 /// identically on each (SPEC u270 Contract Surface, `ReadOptions`).
@@ -261,7 +267,7 @@ pub async fn resolve_read_target(
 /// with no folder and no identity file read, and `resolve_scoped_or_skip`
 /// from the working directory otherwise, its refusal naming `--repo`.
 /// Answers `None` only where the skip envelope was written.
-fn bind_repository(
+pub(crate) fn bind_repository(
     repo: Option<&str>,
     if_repo: bool,
     output: &Output,
@@ -370,6 +376,22 @@ pub fn repository_argument(
         return Ok(folder.identity.is_none().then(|| folder.path.clone()));
     }
     Ok(Some(folder.request_path(&resolved.join("/"))))
+}
+
+/// A path typed for the `files` answer of `syns cat PATH…` as a path in
+/// the repository (D-242 Amended §7): `repository_argument`'s mapping,
+/// with a value left empty once trimmed, and every value resolving to
+/// the repository's root or to the scoped folder itself (`.`, `a/..`),
+/// refused as the empty path before any request, inside a folder or not.
+pub fn listed_argument(folder: Option<&FolderScope>, typed: &str) -> Result<String, CliError> {
+    let empty = || CliError::Config {
+        message: EMPTY_PATH_REFUSAL.to_string(),
+    };
+    refuse_empty_path(typed)?;
+    if resolve_dot_segments(typed).is_some_and(|resolved| resolved.is_empty()) {
+        return Err(empty());
+    }
+    repository_argument(folder, Some(typed))?.ok_or_else(empty)
 }
 
 /// A typed path a file verb acts on (`syns revert`, the write verbs) as

@@ -24,7 +24,7 @@ async fn logout_clears_credentials() {
         .mount(&ctx.mock_server)
         .await;
 
-    let result = cmd_logout(&ctx.config, &ctx.output).await;
+    let result = cmd_logout(&ctx.config, &ctx.output, false).await;
     assert!(result.is_ok());
     assert_eq!(store.read().unwrap(), None);
 }

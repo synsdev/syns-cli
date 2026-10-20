@@ -212,12 +212,15 @@ async fn every_request_names_the_build() {
         })))
         .mount(&server)
         .await;
+    // Roadmap 278 (D-242 §10): `read` asks the raw entry.
     Mock::given(method("GET"))
-        .and(path("/api/v1/repos/alice/proj/files/a.md"))
+        .and(path("/api/v1/repos/alice/proj/raw/a.md"))
         .and(header("user-agent", agent.as_str()))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "path": "a.md", "sha": blob_sha1(b"a\n"), "content": "a\n", "size": 2,
-        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("ETag", format!("\"{}\"", blob_sha1(b"a\n")).as_str())
+                .set_body_bytes(b"a\n".to_vec()),
+        )
         .mount(&server)
         .await;
     Mock::given(method("POST"))
@@ -310,12 +313,16 @@ async fn cat_passes_bytes_through() {
 async fn null_content_reads_as_not_text() {
     let server = MockServer::start().await;
     mount_reference(&server).await;
+    // Roadmap 278 (D-242 §10): `read` asks the raw entry and applies its
+    // text test to the bytes, as `cat --json` does.
     Mock::given(method("GET"))
-        .and(path("/api/v1/repos/alice/proj/files/image.png"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "path": "image.png", "sha": blob_sha1(PNG), "content": null,
-            "size": PNG.len(), "mediaType": "image/png",
-        })))
+        .and(path("/api/v1/repos/alice/proj/raw/image.png"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("ETag", format!("\"{}\"", blob_sha1(PNG)).as_str())
+                .insert_header("Content-Type", "image/png")
+                .set_body_bytes(PNG.to_vec()),
+        )
         .mount(&server)
         .await;
     let m = Machine::new(&server.uri());

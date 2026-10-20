@@ -8,7 +8,10 @@ use std::time::Duration;
 const SIGN_OUT_PATH: &str = "/api/auth/sign-out";
 const SIGN_OUT_TIMEOUT_SECS: u64 = 5;
 
-pub async fn cmd_logout(config: &Config, output: &Output) -> Result<(), CliError> {
+/// `syns logout [--purge]`: the credential gone from the machine, and
+/// under `--purge` every file of this OS user's content store too, for
+/// every account and server, whether or not a credential stood (D-242 §8).
+pub async fn cmd_logout(config: &Config, output: &Output, purge: bool) -> Result<(), CliError> {
     let store = TokenStore::new(config.credentials_path());
     let token = store.read().ok().flatten();
 
@@ -30,6 +33,19 @@ pub async fn cmd_logout(config: &Config, output: &Output) -> Result<(), CliError
     }
 
     store.clear()?;
+
+    if purge {
+        let removed = crate::read::store::purge(&config.store_roots())?;
+        if output.is_json() {
+            output.json(&json!({"message": "Logged out", "removedBytes": removed}));
+        } else {
+            output.success(&format!(
+                "Logged out; removed the local content store ({})",
+                crate::read::store::human_bytes(removed)
+            ));
+        }
+        return Ok(());
+    }
 
     if output.is_json() {
         output.json(&json!({"message": "Logged out"}));
@@ -56,7 +72,7 @@ mod tests {
         let config = Config::new(Some("http://127.0.0.1:1")).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_logout(&config, &output).await;
+        let result = cmd_logout(&config, &output, false).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
@@ -86,7 +102,7 @@ mod tests {
             .unwrap();
         let output = Output::new(false);
 
-        let result = cmd_logout(&config, &output).await;
+        let result = cmd_logout(&config, &output, false).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
         assert!(result.is_ok());
         assert!(!config.credentials_path().exists());
@@ -122,7 +138,7 @@ mod tests {
         let config = Config::new(Some("http://127.0.0.1:1")).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_logout(&config, &output).await;
+        let result = cmd_logout(&config, &output, false).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
