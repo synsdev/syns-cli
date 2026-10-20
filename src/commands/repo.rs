@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use crate::auth::token::TokenStore;
 use crate::client::{RepoResponse, RepoStatus, RepoUpdate, SynsClient, Visibility};
 use crate::commands::repos::ReposArgs;
@@ -6,7 +8,8 @@ use crate::config::Config;
 use crate::errors::{ApiErrorContext, CliError};
 use crate::output::Output;
 use crate::repo::folder::{
-    FolderScope, current_dir, refuse_holder_change, resolve_folder_scope, resolve_scoped_or_skip,
+    FolderScope, current_dir, lies_within, refuse_holder_change, resolve_folder_scope,
+    resolve_scoped_or_skip,
 };
 use crate::repo::identity::identity_head;
 use crate::repo::if_repo::resolve_full_or_skip;
@@ -124,28 +127,72 @@ struct ReadAnswer<'a> {
     /// the nearest identity at or above its recorded path, where one
     /// answered.
     folder_visibility: Option<Visibility>,
+    /// Roadmap 277: where `--within` was given, whether the run's folder
+    /// lies inside that root in the same repository.
+    within: Option<bool>,
 }
 
 /// The visibility of the nearest identity at or above the folder's
 /// recorded path (SPEC u329 Behaviour, `cmd_repo` 1, Q-06): the share
-/// lookup at the path and then at each enclosing path nearest first,
+/// lookup at the path and at each enclosing path, read nearest first,
 /// going on where no identity stands there and stopping at the first
 /// identity, and at any other refusal with none.
+///
+/// Roadmap 277 (LAT-23): every lookup is sent at once rather than one
+/// after another, and the answers are read in the same order, so the
+/// visibility answered is the one the walk answered. It settles as soon
+/// as every lookup nearer than an answer is `not_found` — the walk would
+/// have stopped there — and the farther lookups still out are dropped
+/// unawaited (review m2).
 async fn folder_visibility(
     client: &SynsClient,
     token: Option<&str>,
     scope: &FolderScope,
 ) -> Option<Visibility> {
+    use futures_util::StreamExt;
     let holder = scope.holder();
-    let mut path = scope.path.as_str();
-    loop {
-        match client.get_share(&holder, token, path).await {
-            Ok((identity, _)) => return Some(identity.visibility),
-            Err(err) if is_not_shared(&err) => {}
-            Err(_) => return None,
-        }
-        path = &path[..path.rfind('/')?];
+    let mut paths = vec![scope.path.as_str()];
+    while let Some(cut) = paths.last().and_then(|path| path.rfind('/')) {
+        let enclosing = &paths[paths.len() - 1][..cut];
+        paths.push(enclosing);
     }
+    let mut lookups: futures_util::stream::FuturesUnordered<_> = paths
+        .iter()
+        .enumerate()
+        .map(|(nearness, path)| {
+            let holder = &holder;
+            async move { (nearness, client.get_share(holder, token, path).await) }
+        })
+        .collect();
+    // Each lookup's answer as it arrives, nearest first; `None` while it
+    // is still out.
+    let mut answers: Vec<Option<Lookup>> = paths.iter().map(|_| None).collect();
+    let mut walked = 0;
+    while let Some((nearness, answer)) = lookups.next().await {
+        answers[nearness] = Some(match answer {
+            Ok((identity, _)) => Lookup::Settles(Some(identity.visibility)),
+            Err(err) if is_not_shared(&err) => Lookup::NoIdentity,
+            Err(_) => Lookup::Settles(None),
+        });
+        while let Some(Some(answer)) = answers.get_mut(walked) {
+            match answer {
+                Lookup::NoIdentity => walked += 1,
+                Lookup::Settles(visibility) => return visibility.take(),
+            }
+        }
+        if walked == answers.len() {
+            return None;
+        }
+    }
+    None
+}
+
+/// One share lookup's answer as the walk reads it: no identity at that
+/// path, going on; or the walk's answer, an identity's visibility or,
+/// for any other refusal, none.
+enum Lookup {
+    NoIdentity,
+    Settles(Option<Visibility>),
 }
 
 fn display_repo(output: &Output, response: &RepoResponse, read: Option<ReadAnswer<'_>>) {
@@ -158,6 +205,7 @@ fn display_repo(output: &Output, response: &RepoResponse, read: Option<ReadAnswe
                 folder,
                 version,
                 folder_visibility,
+                within,
             }) => {
                 let mut document = serde_json::to_value(response).unwrap_or_default();
                 if let Some(map) = document.as_object_mut() {
@@ -171,6 +219,9 @@ fn display_repo(output: &Output, response: &RepoResponse, read: Option<ReadAnswe
                             "folderVisibility".to_string(),
                             serde_json::to_value(visibility).unwrap_or_default(),
                         );
+                    }
+                    if let Some(within) = within {
+                        map.insert("within".to_string(), within.into());
                     }
                 }
                 output.json(&document);
@@ -238,6 +289,16 @@ fn display_repo(output: &Output, response: &RepoResponse, read: Option<ReadAnswe
             vec!["Created".into(), response.created_at.clone()],
             vec!["Updated".into(), response.updated_at.clone()],
         ]);
+        if let Some(ReadAnswer {
+            within: Some(within),
+            ..
+        }) = &read
+        {
+            rows.push(vec![
+                "Within".into(),
+                if *within { "yes" } else { "no" }.to_string(),
+            ]);
+        }
         output.table(&["Property", "Value"], rows);
     }
 }
@@ -251,6 +312,7 @@ pub async fn cmd_repo(
     visibility: Option<CliVisibility>,
     tags: Vec<String>,
     if_repo: bool,
+    within: Option<PathBuf>,
     action: Option<RepoAction>,
 ) -> Result<(), CliError> {
     // The noun's four update options, tested once: the create's
@@ -259,6 +321,16 @@ pub async fn cmd_repo(
     // neither rather than leaving the refusal blind to it (CR2-2).
     let names_update_options =
         description.is_some() || status.is_some() || visibility.is_some() || !tags.is_empty();
+
+    // Roadmap 277: `--within` asks about a read of the repository, so it
+    // stands beside no update option and no subcommand, refused before
+    // any request. An empty root never reaches here: the argument parser
+    // refuses it at exit 2.
+    if within.is_some() && (names_update_options || action.is_some()) {
+        return Err(CliError::Config {
+            message: WITHIN_READS_ALONE.to_string(),
+        });
+    }
 
     match action {
         Some(RepoAction::List(repos_args)) => {
@@ -367,25 +439,30 @@ pub async fn cmd_repo(
         return Ok(());
     };
     let repo_id = format!("{owner}/{name}");
+    // Roadmap 277: whether the folder lies inside `--within`'s root in
+    // the same repository, from the identity files on disk alone.
+    let within = within.map(|root| lies_within(&current_dir, &current_dir.join(root)));
     let client = SynsClient::new(config.server_url())?;
     let token = TokenStore::new(config.credentials_path())
         .read()
         .ok()
         .flatten();
 
-    // 3 — the holder's record.
-    let mut response = client.get_repo(&repo_id, token.as_deref()).await?;
-
     // SPEC u302 `cmd_repo` 1–2: inside a folder bound to its identity, the
     // identity's record at its newest listed version — `commitSha` as
     // served and `version` null where it lists none — with no holder and
-    // no path.
+    // no path. Roadmap 277: the record and the newest version are asked
+    // at once.
     if folder
         .as_ref()
         .is_some_and(|scope| scope.identity.is_some())
     {
-        let newest = identity_head(&client, token.as_deref(), &repo_id).await?;
-        let version = newest.map(|newest| {
+        let (response, newest) = tokio::join!(
+            client.get_repo(&repo_id, token.as_deref()),
+            identity_head(&client, token.as_deref(), &repo_id),
+        );
+        let mut response = response?;
+        let version = newest?.map(|newest| {
             response.commit_sha = Some(newest.sha);
             newest.version
         });
@@ -396,37 +473,45 @@ pub async fn cmd_repo(
                 folder: None,
                 version,
                 folder_visibility: None,
+                within,
             }),
         );
         return Ok(());
     }
 
-    // SPEC u329 `cmd_repo` 1 — inside a folder bound to its holder, the
-    // visibility of the nearest identity at or above its path.
-    let folder_visibility = match folder.as_ref() {
-        Some(scope) => folder_visibility(&client, token.as_deref(), scope).await,
-        None => None,
+    // 3 — the holder's record; SPEC u329 `cmd_repo` 1, inside a folder
+    // bound to its holder, the visibility of the nearest identity at or
+    // above its path; and 4, under `--json`, the newest version. Roadmap
+    // 277 (LAT-23): all of them asked at once.
+    let record = client.get_repo(&repo_id, token.as_deref());
+    let visibility = async {
+        match folder.as_ref() {
+            Some(scope) => folder_visibility(&client, token.as_deref(), scope).await,
+            None => None,
+        }
     };
+    let newest = async {
+        match output.is_json() {
+            true => Some(identity_head(&client, token.as_deref(), &repo_id).await),
+            false => None,
+        }
+    };
+    let (response, folder_visibility, newest) = tokio::join!(record, visibility, newest);
+    let response = response?;
 
     // 4 — under `--json`, at a root and inside a folder alike, the number
     // of the version the head names: the newest row of the version list
     // where its hash is the head's, and the single version at the head
     // only where it is not. The render carries no number, so it reads
     // neither.
-    let version = match response.commit_sha.as_deref() {
-        Some(head) if output.is_json() => {
-            let (page, _raw) = client
-                .list_versions(&repo_id, token.as_deref(), 1, 0, None)
-                .await?;
-            match page.data.first() {
-                Some(newest) if newest.sha == head => Some(newest.version),
-                _ => {
-                    let (entry, _raw) =
-                        client.get_version(&repo_id, token.as_deref(), head).await?;
-                    Some(entry.version)
-                }
+    let version = match (response.commit_sha.as_deref(), newest) {
+        (Some(head), Some(newest)) => match newest? {
+            Some(newest) if newest.sha == head => Some(newest.version),
+            _ => {
+                let (entry, _raw) = client.get_version(&repo_id, token.as_deref(), head).await?;
+                Some(entry.version)
             }
-        }
+        },
         _ => None,
     };
 
@@ -438,10 +523,16 @@ pub async fn cmd_repo(
             folder: folder.as_ref(),
             version,
             folder_visibility,
+            within,
         }),
     );
     Ok(())
 }
+
+/// The refusal of `--within` beside an update option or a subcommand
+/// (roadmap 277).
+pub const WITHIN_READS_ALONE: &str =
+    "--within answers a read of the repository; it takes no update option and no subcommand";
 
 #[cfg(test)]
 mod tests {
@@ -486,7 +577,18 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_repo(&config, &output, None, None, None, vec![], false, None).await;
+        let result = cmd_repo(
+            &config,
+            &output,
+            None,
+            None,
+            None,
+            vec![],
+            false,
+            None,
+            None,
+        )
+        .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
@@ -540,6 +642,7 @@ mod tests {
             vec![],
             false,
             None,
+            None,
         )
         .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
@@ -582,7 +685,7 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_repo(&config, &output, None, None, None, vec![], true, None).await;
+        let result = cmd_repo(&config, &output, None, None, None, vec![], true, None, None).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
@@ -599,7 +702,7 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_repo(&config, &output, None, None, None, vec![], true, None).await;
+        let result = cmd_repo(&config, &output, None, None, None, vec![], true, None, None).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
@@ -749,6 +852,7 @@ mod tests {
             None,
             vec![],
             false,
+            None,
             Some(RepoAction::Create {
                 name: "u272-parity-probe".to_string(),
                 description: None,

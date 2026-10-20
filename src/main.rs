@@ -13,11 +13,24 @@ use syns_cli::commands::teams::TeamsAction;
 use syns_cli::commands::upgrade::UpgradeArgs;
 use syns_cli::read::RepoScopeArgs;
 
+/// The environment a run reads beside its flags (roadmap 277).
+const ENVIRONMENT_HELP: &str = "\
+Environment:
+  SYNS_URL     The server URL, as --server
+  SYNS_CALLER  A name the program running syns gives itself, sent in the User-Agent as
+               `syns/<version> (<name>)` and used in the server's logs only. Syns defines
+               no values and reads no meaning from it; a name outside 1-32 characters of
+               a-z 0-9 . _ - (starting with a letter or digit) is not sent
+
+Every request also carries X-Syns-Install-Id, an anonymous random id kept beside the
+credential in the configuration folder (none is sent where it cannot be kept).";
+
 #[derive(Parser)]
 #[command(
     name = "syns",
     version,
-    about = "Push, pull, and manage versioned file repositories"
+    about = "Push, pull, and manage versioned file repositories",
+    after_help = ENVIRONMENT_HELP
 )]
 struct Cli {
     /// Override server URL
@@ -326,6 +339,17 @@ enum Commands {
         /// Silently skip (exit 0) when no Syns repo identity resolves
         #[arg(long)]
         if_repo: bool,
+        /// Also answer whether this folder lies inside ROOT in the same repository ("within")
+        #[arg(
+            long,
+            value_name = "ROOT",
+            long_help = "Also answer whether this folder lies inside ROOT and both belong to the \
+                         same repository, a placed folder counting as its holder's: \
+                         \"within\": true or false under --json. It is read from the identity \
+                         files on disk and sends no request; a ROOT that does not exist, or is \
+                         no folder, holds nothing"
+        )]
+        within: Option<std::path::PathBuf>,
         #[command(subcommand)]
         action: Option<RepoAction>,
     },
@@ -702,6 +726,7 @@ async fn run(
             visibility,
             tag,
             if_repo,
+            within,
             action,
         } => {
             commands::repo::cmd_repo(
@@ -712,6 +737,7 @@ async fn run(
                 visibility,
                 tag,
                 if_repo,
+                within,
                 action,
             )
             .await?

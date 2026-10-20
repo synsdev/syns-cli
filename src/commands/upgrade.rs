@@ -389,9 +389,14 @@ pub async fn run_with(
         );
     }
 
+    // Roadmap 277: the release host's client is its own, apart from the
+    // one every Syns request shares, and asks for its answers as before:
+    // uncompressed, its `User-Agent` naming the build alone.
     let client = Client::builder()
         .user_agent(format!("syns/{}", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(HTTP_TIMEOUT_SECONDS))
+        .no_gzip()
+        .no_zstd()
         .build()
         .map_err(|e| UpgradeError::GitHubApiFailed(e.to_string()))?;
 

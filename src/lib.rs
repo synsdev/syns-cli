@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod checksum_verify;
 pub mod client;
+pub mod client_identity;
 pub mod commands;
 pub mod config;
 pub mod errors;
@@ -12,5 +13,6 @@ pub mod prompts;
 pub mod push;
 pub mod read;
 pub mod repo;
+mod shared_client;
 mod tls;
 pub mod write;

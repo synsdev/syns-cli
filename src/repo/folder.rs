@@ -529,6 +529,67 @@ pub fn resolve_scoped_or_skip(
     )
 }
 
+/// The repository the folder `dir` belongs to, from the identity files
+/// on disk alone (roadmap 277): a scoped folder's holder, whichever
+/// binding it has, so a placed folder counts as its holder's; and the
+/// repository the identity ladder names everywhere else. None where
+/// neither names a whole `OWNER/NAME`, or an identity file is refused.
+pub fn repository_of(dir: &Path) -> Option<String> {
+    match resolve_folder_scope(dir) {
+        Ok(Some(scope)) => Some(scope.holder()),
+        Ok(None) => match crate::repo::resolve::resolve_repo_identity(None, dir) {
+            Ok((identity, _source)) => identity
+                .owner
+                .map(|owner| format!("{owner}/{}", identity.name).to_ascii_lowercase()),
+            Err(_) => None,
+        },
+        Err(_) => None,
+    }
+}
+
+/// Whether the folder `dir` lies inside the folder `root`, `root` itself
+/// included, and both belong to the same repository (roadmap 277, `syns
+/// repo --within`). It reads the identity files on disk, sends nothing
+/// and writes nothing. A `root` that does not stand, or is no folder,
+/// holds nothing, and a folder in no repository is within none.
+pub fn lies_within(dir: &Path, root: &Path) -> bool {
+    // Both canonical, so a `..` is the folder above and not a component
+    // the identity walk would read past.
+    let (Ok(dir), Ok(root)) = (dir.canonicalize(), root.canonicalize()) else {
+        return false;
+    };
+    let Ok(root_meta) = std::fs::metadata(&root) else {
+        return false;
+    };
+    if !root_meta.is_dir() || !lies_inside(&dir, &root, &root_meta) {
+        return false;
+    }
+    match (repository_of(&dir), repository_of(&root)) {
+        (Some(folder), Some(root)) => folder == root,
+        _ => false,
+    }
+}
+
+/// Whether `dir`, canonical, or a folder above it is `root`: on unix the
+/// same device and inode, whatever spelling, letter case or link names
+/// either; elsewhere the canonical paths.
+fn lies_inside(dir: &Path, root: &Path, root_meta: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = root;
+        dir.ancestors().any(|above| {
+            std::fs::metadata(above)
+                .is_ok_and(|meta| meta.dev() == root_meta.dev() && meta.ino() == root_meta.ino())
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root_meta;
+        root.canonicalize().is_ok_and(|root| dir.starts_with(root))
+    }
+}
+
 /// Refuses a command that would change the holding repository inside a
 /// scoped folder (SPEC u290 Behaviour, `refuse_holder_change`, `D-102`).
 /// It sends nothing, reads no credential and raises no prompt.

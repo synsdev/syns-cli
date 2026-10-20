@@ -167,6 +167,19 @@ pub fn fallback_root(temp: &Path) -> PathBuf {
     }
 }
 
+/// The configuration directory the credential and the install id stand
+/// in: `SYNS_CONFIG_DIR` where it names one, the platform's otherwise.
+pub fn config_dir() -> Result<PathBuf, CliError> {
+    match std::env::var("SYNS_CONFIG_DIR") {
+        Ok(val) if !val.is_empty() => Ok(PathBuf::from(val)),
+        _ => Ok(dirs::config_dir()
+            .ok_or_else(|| CliError::Config {
+                message: "could not determine config directory".into(),
+            })?
+            .join(CONFIG_SUBDIR)),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     server_url: String,
@@ -207,14 +220,7 @@ impl Config {
         }
 
         // Config directory resolution
-        let config_dir = match std::env::var("SYNS_CONFIG_DIR") {
-            Ok(val) if !val.is_empty() => PathBuf::from(val),
-            _ => dirs::config_dir()
-                .ok_or_else(|| CliError::Config {
-                    message: "could not determine config directory".into(),
-                })?
-                .join(CONFIG_SUBDIR),
-        };
+        let config_dir = config_dir()?;
 
         // Cache directory resolution: the configured root, and the
         // platform default the run falls back from (SPEC u298).

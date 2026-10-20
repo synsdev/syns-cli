@@ -345,14 +345,14 @@ mod tests {
     fn provenance_cell_names_what_the_commit_asserted() {
         let asserted = CommitProvenance {
             publisher: "ana".into(),
-            integration: Some("claude-code".into()),
+            integration: Some("tool-a".into()),
             run: Some("session-9".into()),
             trigger: Some("stop".into()),
             task_ref: None,
         };
         assert_eq!(
             provenance_cell(Some(&asserted), "ana"),
-            "Published by: ana\nIntegration: claude-code\nRun: session-9\nTrigger: stop"
+            "Published by: ana\nIntegration: tool-a\nRun: session-9\nTrigger: stop"
         );
 
         let other_publisher = CommitProvenance {
@@ -650,7 +650,7 @@ mod tests {
                     "version": 439,
                     "sha": "739d8dc0c095de7ab390d685c0e2e8629d61db1f",
                     "blobSha": "d54fa145810ef1ad6183d93229bb2982571cc3da",
-                    "message": "claude code session (part 3/3)",
+                    "message": "tool-a session (part 3/3)",
                     "author": "bartsoj",
                     "createdAt": "2026-09-13T14:34:58Z",
                     "content": "# syns",
@@ -660,7 +660,7 @@ mod tests {
                     "version": 436,
                     "sha": "ff7f52cad5c73554fff96676478cd4b2a509fbdc",
                     "blobSha": null,
-                    "message": "claude code session",
+                    "message": "tool-a session",
                     "author": "bartsoj",
                     "createdAt": "2026-09-13T14:31:20Z",
                     "content": null,
@@ -670,7 +670,7 @@ mod tests {
                     "version": 435,
                     "sha": "d1781077fe841cf6422624473c79f370ec24780c",
                     "blobSha": "d54fa145810ef1ad6183d93229bb2982571cc3da",
-                    "message": "claude code session (part 3/3)",
+                    "message": "tool-a session (part 3/3)",
                     "author": "bartsoj",
                     "createdAt": "2026-09-13T13:58:41Z",
                     "content": "# syns",

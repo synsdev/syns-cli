@@ -658,11 +658,18 @@ fn glob_answers_matching_paths_in_ascending_path_order() {
         Some(HEAD_VERSION.to_string().as_str())
     );
     assert_eq!(d.file_calls(), 0, "the file endpoint received nothing");
-    assert!(
-        !d.paths().iter().any(|p| p.ends_with("/versions")),
-        "no version-listing request was made: {:?}",
-        d.paths()
-    );
+    // Roadmap 277: the one version listing made is the newest version,
+    // asked beside the record; no page of the history is walked.
+    let listings: Vec<_> = requests
+        .iter()
+        .filter(|r| r.url.path().ends_with("/versions"))
+        .collect();
+    assert_eq!(listings.len(), 1, "{:?}", d.paths());
+    for listing in listings {
+        assert_eq!(query_of(listing, "limit").as_deref(), Some("1"));
+        assert_eq!(query_of(listing, "offset").as_deref(), Some("0"));
+        assert_eq!(query_of(listing, "path"), None);
+    }
 }
 
 #[test]

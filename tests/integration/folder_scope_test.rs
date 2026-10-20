@@ -426,7 +426,7 @@ fn history_inside_a_folder_lists_the_versions_that_changed_it() {
     let mut five = version_body(5, &"5".repeat(40), &[&format!("{FOLDER}/.page/board.json")]);
     five["parentSha"] = json!("p4");
     five["provenance"] = json!({
-        "publisher": "alice", "integration": "bb", "run": "r1",
+        "publisher": "alice", "integration": "tool-b", "run": "r1",
         "trigger": null, "taskRef": null,
     });
     let three = version_body(3, &"3".repeat(40), &[&format!("{FOLDER}/notes/a.md")]);
@@ -457,7 +457,7 @@ fn history_inside_a_folder_lists_the_versions_that_changed_it() {
     assert_eq!(document["data"][0]["parentSha"], json!("p4"));
     assert_eq!(
         document["data"][0]["provenance"]["integration"],
-        json!("bb")
+        json!("tool-b")
     );
     assert_eq!(document["data"][0]["provenance"]["run"], json!("r1"));
     assert_eq!(document["total"], json!(2));
@@ -955,9 +955,21 @@ fn repo_at_a_root_answers_a_null_version_where_no_head_stands() {
     let document = one_document(&out);
     let keys = document.as_object().expect("an object");
     assert_eq!(keys.get("version"), Some(&Value::Null), "{document}");
-    let requests = d.requests();
-    assert_eq!(requests.len(), 1, "{requests:?}");
-    assert_eq!(requests[0].url.path(), format!("/api/v1/repos/{REPO}"));
+    // Roadmap 277: the newest version is asked beside the record, and
+    // with no head nothing is looked up by hash.
+    let mut paths: Vec<String> = d
+        .requests()
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect();
+    paths.sort();
+    assert_eq!(
+        paths,
+        vec![
+            format!("/api/v1/repos/{REPO}"),
+            format!("/api/v1/repos/{REPO}/versions"),
+        ]
+    );
 }
 
 #[test]
@@ -1705,10 +1717,12 @@ fn a_refused_nearer_lookup_names_no_folder_visibility() {
             .contains_key("folderVisibility"),
         "{document}"
     );
+    // Roadmap 277: every lookup is sent at once, so the identity further
+    // up was asked too, and is read past the refusal nearer than it.
     assert!(
         d.requests()
             .iter()
-            .all(|r| r.url.path() != "/api/v1/repos/alice/handbook/shares/drafts"),
-        "a lookup went past the refused one"
+            .any(|r| r.url.path() == "/api/v1/repos/alice/handbook/shares/drafts"),
+        "the lookups were not all sent"
     );
 }

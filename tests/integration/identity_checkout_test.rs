@@ -7,8 +7,8 @@
 //! and `carry_base_never_overwrites_a_later_base` stand in the tests
 //! module of `src/push/working_copy.rs`,
 //! `a_carried_base_the_identity_does_not_list_is_numbered_through_the_holder`
-//! in that of `src/push/folder_check.rs`, and
-//! `carol_edits_her_shared_folder_in_a_thread_page_session` is driven at
+//! in that of `src/push/folder_check.rs`, and the row of a collaborator
+//! editing her shared folder in a calling tool's session is driven at
 //! verification against a deployment. Each test drives one deployment of
 //! its own — the SPEC Tests default: `U/q3-plan` whose `.syns.yaml` reads
 //! `holder: alice/docs`, `path: q3-plan` and `shared_as: docs-q3-plan`

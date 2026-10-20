@@ -752,7 +752,7 @@ fn sync_inside_a_folder_publishes_the_folder_alone() {
     let out = d.run_with(
         &d.folder().join("sub"),
         &[
-            ("SYNS_INTEGRATION", "bb"),
+            ("SYNS_INTEGRATION", "tool-b"),
             ("SYNS_RUN", "r1"),
             ("SYNS_TRIGGER", "page"),
         ],
@@ -780,7 +780,7 @@ fn sync_inside_a_folder_publishes_the_folder_alone() {
         json!("{\"cards\":[1]}\n")
     );
     assert!(push.get("deletions").is_none(), "{push}");
-    assert_eq!(push["provenance"]["integration"], "bb");
+    assert_eq!(push["provenance"]["integration"], "tool-b");
     assert_eq!(push["provenance"]["run"], "r1");
     assert_eq!(push["provenance"]["trigger"], "page");
     assert_eq!(read(&d.w.join(".page/x.json")), "{\"x\":\"edited\"}\n");
@@ -860,7 +860,7 @@ fn a_write_inside_a_folder_is_guarded_by_the_folder_alone() {
         "--json",
         "write",
         parent.as_str(),
-        "--integration=bb",
+        "--integration=tool-b",
         "--run=r1",
         "--trigger=page",
         "--",
@@ -1537,9 +1537,9 @@ fn the_plugin_and_hook_invocations_answer_inside_a_folder() {
     let d = Deployment::converged();
     d.state().advance = false;
     let envs = [
-        ("SYNS_INTEGRATION", "syns-bb-plugin"),
+        ("SYNS_INTEGRATION", "tool-a"),
         ("SYNS_RUN", "s1"),
-        ("SYNS_TRIGGER", "thread-page"),
+        ("SYNS_TRIGGER", "trigger-a"),
     ];
     let folder = d.folder();
     let mark = d.mark();
@@ -1558,8 +1558,8 @@ fn the_plugin_and_hook_invocations_answer_inside_a_folder() {
             "--bytes",
             parent.as_str(),
             "--message=m",
-            "--integration=syns-bb-plugin",
-            "--trigger=thread-page",
+            "--integration=tool-a",
+            "--trigger=trigger-a",
             "--run=s1",
             "--json",
             "--",
@@ -2191,8 +2191,8 @@ fn a_hash_parent_is_numbered_once() {
             "write",
             &parent,
             "--message=m",
-            "--integration=syns-bb-plugin",
-            "--trigger=thread-page",
+            "--integration=tool-a",
+            "--trigger=trigger-a",
             "--run=s1",
             "--json",
             "--",
@@ -2531,8 +2531,8 @@ fn ten_page_saves_land_between_ten_pushes_outside_the_folder() {
             &[
                 "write",
                 &parent_arg,
-                "--integration=syns-bb-plugin",
-                "--trigger=thread-page",
+                "--integration=tool-a",
+                "--trigger=trigger-a",
                 "--run=s1",
                 "--json",
                 "--",

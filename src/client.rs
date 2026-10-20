@@ -1,6 +1,5 @@
 #![allow(dead_code)] // Types and methods used by downstream units (U10, U11, U21+)
 
-use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
 
 use crate::errors::{ApiErrorContext, CliError, EdgeRejecter};
@@ -825,23 +824,44 @@ pub fn request_deadline(body_len: usize) -> std::time::Duration {
     std::time::Duration::from_millis(millis)
 }
 
-/// The one client builder every client of `BND-public-api` is built by:
-/// the build's `User-Agent`, no redirect followed, and `REQUEST_CEILING`
-/// as its only client-wide bound.
-///
-/// SPEC u298: built over `tls_config`, the one TLS configuration every
-/// client of `BND-public-api` shares.
-pub(crate) fn api_client() -> Result<reqwest::Client, CliError> {
-    reqwest::Client::builder()
-        .tls_backend_preconfigured(crate::tls::tls_config()?)
-        .user_agent(USER_AGENT)
-        .timeout(REQUEST_CEILING)
-        .redirect(Policy::none())
-        .build()
-        .map_err(|e| CliError::Config {
-            message: e.to_string(),
-        })
-}
+/// How many times one read (`GET` or `HEAD`) is sent at most, its first
+/// send included: a `Retry-After` refusal's resend and a resend of an
+/// answer that did not arrive whole count against the one number (issue
+/// 268, roadmap 277).
+pub const READ_ATTEMPTS: u32 = 4;
+
+/// The longest a read waits on one `Retry-After` before it is sent again
+/// (roadmap 277): an answer naming a longer wait is the run's answer, sent
+/// no more.
+pub const RETRY_AFTER_CAP: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The pause before a read whose answer did not arrive is sent again,
+/// doubled at each resend (issue 268).
+pub(crate) const RESEND_PAUSE: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(5)
+} else {
+    std::time::Duration::from_secs(1)
+};
+
+/// How long after its first send a read whose answer did not arrive is
+/// still sent again: one request's ceiling, so a read that failed by
+/// outliving it — which the same file over the same link does again — is
+/// not (issue 268 CR1-1).
+pub(crate) const RESEND_WITHIN: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_secs(1)
+} else {
+    REQUEST_CEILING
+};
+
+/// The `Accept-Encoding` every request sends: the server compresses an
+/// answer in either, and the client decodes both before any byte of it
+/// is read, hashed or parsed (roadmap 277).
+pub const ACCEPT_ENCODING: &str = "zstd, gzip";
+
+// Roadmap 277: the one client every request of a run shares.
+pub(crate) use crate::shared_client::api_client;
+#[cfg(test)]
+pub(crate) use crate::shared_client::{kept_runtimes, share_for_this_runtime};
 
 fn unreachable_at(url: &str) -> CliError {
     CliError::ServerUnreachable {
@@ -849,14 +869,92 @@ fn unreachable_at(url: &str) -> CliError {
     }
 }
 
+tokio::task_local! {
+    /// The sends a read made so far, inside `resend_read`: its
+    /// `Retry-After` resends and its resends of an answer that did not
+    /// arrive draw on the one `READ_ATTEMPTS`.
+    static READ_SENDS: std::cell::Cell<u32>;
+}
+
+/// Counts one send of a read against the read's attempts, answering
+/// whether another may follow it.
+fn count_send(local: &mut u32) -> bool {
+    let sent = READ_SENDS
+        .try_with(|sends| {
+            sends.set(sends.get() + 1);
+            sends.get()
+        })
+        .unwrap_or_else(|_| {
+            *local += 1;
+            *local
+        });
+    sent < READ_ATTEMPTS
+}
+
+/// The wait a refusal names: a `503` (the engine busy, `D-230`) or a
+/// `429` carrying `Retry-After` in seconds, at most `RETRY_AFTER_CAP`.
+/// None for every other answer: a wait longer than the cap, which a
+/// resend before it has passed would only meet again, and a
+/// `Retry-After` given as a date among them.
+pub(crate) fn retry_after(response: &reqwest::Response) -> Option<std::time::Duration> {
+    if !matches!(
+        response.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE | reqwest::StatusCode::TOO_MANY_REQUESTS
+    ) {
+        return None;
+    }
+    let seconds: u64 = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let wait = std::time::Duration::from_secs(seconds);
+    (wait <= RETRY_AFTER_CAP).then_some(wait)
+}
+
 /// Send `request`, awaiting its answer's head within the deadline a body
 /// of `body_len` bytes earns, the client's ceiling bounding the rest.
+///
+/// Roadmap 277: a read (`GET` or `HEAD`) answered `503` or `429` with a
+/// `Retry-After` waits it out, at most `RETRY_AFTER_CAP`, and is sent
+/// again, up to `READ_ATTEMPTS` sends; the last answer is the run's. A
+/// write is sent once, whatever it is answered.
 pub(crate) async fn send_bounded(
     request: reqwest::RequestBuilder,
     body_len: usize,
 ) -> Result<reqwest::Response, CliError> {
     let (client, request) = request.build_split();
-    let request = request?;
+    let mut request = request?;
+    let is_read = matches!(
+        *request.method(),
+        reqwest::Method::GET | reqwest::Method::HEAD
+    );
+    let mut sends = 0u32;
+    loop {
+        let resend = if is_read { request.try_clone() } else { None };
+        let more = count_send(&mut sends);
+        let response = send_once(&client, request, body_len).await?;
+        match (resend, retry_after(&response)) {
+            (Some(next), Some(wait)) if more => {
+                drop(response);
+                tokio::time::sleep(wait).await;
+                request = next;
+            }
+            _ => return Ok(response),
+        }
+    }
+}
+
+/// One send of `request`, its answer's head awaited within the deadline
+/// a body of `body_len` bytes earns.
+async fn send_once(
+    client: &reqwest::Client,
+    request: reqwest::Request,
+    body_len: usize,
+) -> Result<reqwest::Response, CliError> {
     let url = request.url().to_string();
     match tokio::time::timeout(request_deadline(body_len), client.execute(request)).await {
         Err(_elapsed) => Err(unreachable_at(&url)),
@@ -871,8 +969,47 @@ pub(crate) async fn send_bounded(
             None => Err(unreachable_at(&url)),
         },
         Ok(Err(_transport)) => Err(unreachable_at(&url)),
-        Ok(Ok(response)) => Ok(response),
+        Ok(Ok(response)) => {
+            crate::shared_client::answered(response.url());
+            Ok(response)
+        }
     }
+}
+
+/// `read` sent until it answers anything but `SERVER_UNREACHABLE`, its
+/// sends — every `Retry-After` resend `send_bounded` makes inside it
+/// among them — at most `READ_ATTEMPTS`, and resent only while
+/// `RESEND_WITHIN` has not passed since its first send, pausing
+/// `RESEND_PAUSE` doubled at each resend: a raw read at a pinned commit,
+/// its answer checked against the tree's hash, writes the same bytes
+/// however often it is sent, so one answer that did not arrive costs one
+/// request rather than the walk (issue 268, roadmap 277).
+pub(crate) async fn resend_read<T, F, Fut>(mut read: F) -> Result<T, CliError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, CliError>>,
+{
+    READ_SENDS
+        .scope(std::cell::Cell::new(0), async move {
+            let first_sent = std::time::Instant::now();
+            let mut pause = RESEND_PAUSE;
+            let mut tries = 0u32;
+            loop {
+                tries += 1;
+                let answered = read().await;
+                let sent = READ_SENDS.with(std::cell::Cell::get).max(tries);
+                match answered {
+                    Err(CliError::ServerUnreachable { .. })
+                        if sent < READ_ATTEMPTS && first_sent.elapsed() < RESEND_WITHIN =>
+                    {
+                        tokio::time::sleep(pause).await;
+                        pause *= 2;
+                    }
+                    answered => return answered,
+                }
+            }
+        })
+        .await
 }
 
 /// The TLS layer's own reason where `err`'s source chain holds a
@@ -1247,7 +1384,7 @@ pub(crate) mod u272_bodies {
     pub const LINKS_UPDATE: &str = r##"{"links":[{"id":"6efbd0a9-e09d-459d-9277-98838c854b5b","kind":"linkedin","value":"https://www.linkedin.com/in/bartsoj/","label":null,"sortOrder":0,"createdAt":"2026-05-26T11:29:05.737Z","updatedAt":"2026-05-26T11:29:33.124Z"},{"id":"21474465-4502-4150-adf0-aa0b6a0cc4d5","kind":"github","value":"https://github.com/BartSoj","label":null,"sortOrder":1,"createdAt":"2026-05-26T11:28:51.635Z","updatedAt":"2026-05-26T11:29:40.643Z"},{"id":"c3927ea2-a953-498b-8e83-86c870887758","kind":"generic","value":"https://u272.example.test/probe","label":"u272 probe updated","sortOrder":2,"createdAt":"2026-09-21T04:41:05.688Z","updatedAt":"2026-09-21T04:41:05.854Z"}]}"##;
     pub const LINKS_REORDER: &str = r##"{"links":[{"id":"c3927ea2-a953-498b-8e83-86c870887758","kind":"generic","value":"https://u272.example.test/probe","label":"u272 probe updated","sortOrder":0,"createdAt":"2026-09-21T04:41:05.688Z","updatedAt":"2026-09-21T04:41:06.038Z"},{"id":"21474465-4502-4150-adf0-aa0b6a0cc4d5","kind":"github","value":"https://github.com/BartSoj","label":null,"sortOrder":1,"createdAt":"2026-05-26T11:28:51.635Z","updatedAt":"2026-09-21T04:41:06.050Z"},{"id":"6efbd0a9-e09d-459d-9277-98838c854b5b","kind":"linkedin","value":"https://www.linkedin.com/in/bartsoj/","label":null,"sortOrder":2,"createdAt":"2026-05-26T11:29:05.737Z","updatedAt":"2026-09-21T04:41:06.062Z"}]}"##;
     pub const LINKS_DELETE: &str = r##"{"links":[{"id":"6efbd0a9-e09d-459d-9277-98838c854b5b","kind":"linkedin","value":"https://www.linkedin.com/in/bartsoj/","label":null,"sortOrder":0,"createdAt":"2026-05-26T11:29:05.737Z","updatedAt":"2026-09-21T04:41:06.239Z"},{"id":"21474465-4502-4150-adf0-aa0b6a0cc4d5","kind":"github","value":"https://github.com/BartSoj","label":null,"sortOrder":1,"createdAt":"2026-05-26T11:28:51.635Z","updatedAt":"2026-09-21T04:41:06.252Z"}]}"##;
-    pub const VERSION_HEAD: &str = r##"{"version":596,"sha":"7618bcff37fa4dc19f976c9e29019d56d6aeed68","parentSha":"686ee7156c28aca8f7d9411c3f1a50631257d59d","message":"claude code session","messageBody":null,"author":"bartsoj","createdAt":"2026-09-20T13:55:04Z","filesChanged":["decisions/D-080-partial-and-not-text-reads/DECISION.md","decisions/_NEXT_DECISION_ID","issues/144-cli-short-aliases-absent-from-clap-tree/ISSUE.md","issues/148-ref-by-content-hash-resolved-by-scanning-every-commit/ISSUE.md","issues/149-versions-paging-cost-rises-with-offset/ISSUE.md","issues/_NEXT_TRIGGER_ID","roadmap/028-cli-time-travel-reads/ROADMAP.md","roadmap/213-cli-repository-reads/ROADMAP.md","roadmap/214-cli-grep-file-type-filter-and-multiline/ROADMAP.md","roadmap/_NEXT_TRIGGER_ID","units/_NEXT_UNIT_ID","units/_PHASES/PH-decide","units/cli/u270/PROTOTYPE.md","units/cli/u270/SPEC.md","units/cli/u270/SPEC_REVIEW.md","units/cli/u270/SPEC_REVIEW_R2.md","units/cli/u270/_PHASES/PH-pickup"],"provenance":{"publisher":"bartsoj","integration":null,"run":null,"trigger":null,"taskRef":null}}"##;
+    pub const VERSION_HEAD: &str = r##"{"version":596,"sha":"7618bcff37fa4dc19f976c9e29019d56d6aeed68","parentSha":"686ee7156c28aca8f7d9411c3f1a50631257d59d","message":"tool-a session","messageBody":null,"author":"bartsoj","createdAt":"2026-09-20T13:55:04Z","filesChanged":["decisions/D-080-partial-and-not-text-reads/DECISION.md","decisions/_NEXT_DECISION_ID","issues/144-cli-short-aliases-absent-from-clap-tree/ISSUE.md","issues/148-ref-by-content-hash-resolved-by-scanning-every-commit/ISSUE.md","issues/149-versions-paging-cost-rises-with-offset/ISSUE.md","issues/_NEXT_TRIGGER_ID","roadmap/028-cli-time-travel-reads/ROADMAP.md","roadmap/213-cli-repository-reads/ROADMAP.md","roadmap/214-cli-grep-file-type-filter-and-multiline/ROADMAP.md","roadmap/_NEXT_TRIGGER_ID","units/_NEXT_UNIT_ID","units/_PHASES/PH-decide","units/cli/u270/PROTOTYPE.md","units/cli/u270/SPEC.md","units/cli/u270/SPEC_REVIEW.md","units/cli/u270/SPEC_REVIEW_R2.md","units/cli/u270/_PHASES/PH-pickup"],"provenance":{"publisher":"bartsoj","integration":null,"run":null,"trigger":null,"taskRef":null}}"##;
     pub const FORKS_LOCAL: &str = r##"{"data":[{"owner":"u272bob","name":"u272-fork","description":"the fork","commitSha":null,"status":"active","author":null,"tags":[],"visibility":"public","forkedFrom":{"owner":"u272alice","name":"u272-parent"},"forkCount":0,"fileCount":3,"role":null,"createdAt":"2026-09-21T04:43:40.644Z","updatedAt":"2026-09-21T04:43:40.644Z"}],"total":1,"limit":20,"offset":0}"##;
     pub const FORKS_EMPTY: &str = r##"{"data":[],"total":0,"limit":20,"offset":0}"##;
     pub const ROLE_LOCAL: &str = r##"{"user":{"id":"u272user1111111111111111111111111","name":"U272 Bob","username":"u272bob","email":"u272bob@example.test","emailVerified":true,"image":null,"createdAt":"2026-09-21T04:43:40.637Z","updatedAt":"2026-09-21T04:43:40.637Z"},"role":"write","addedBy":"u272alice","createdAt":"2026-09-21T04:43:40.645Z"}"##;
@@ -1281,7 +1418,7 @@ impl SynsClient {
 
         let base_url = server_url.trim_end_matches('/').to_string();
 
-        let client = api_client()?;
+        let client = api_client(&base_url)?;
 
         Ok(SynsClient {
             client,
@@ -3576,7 +3713,7 @@ mod provenance_tests {
         assert!(body.get("provenance").is_none(), "{body}");
 
         let block = PushProvenance {
-            integration: "claude-code".into(),
+            integration: "tool-a".into(),
             run: "session-1".into(),
             trigger: "stop".into(),
             task_ref: None,
@@ -3584,7 +3721,7 @@ mod provenance_tests {
         let body = serde_json::to_value(&block).unwrap();
         assert_eq!(
             body,
-            serde_json::json!({"integration": "claude-code", "run": "session-1", "trigger": "stop"})
+            serde_json::json!({"integration": "tool-a", "run": "session-1", "trigger": "stop"})
         );
         assert!(body.get("taskRef").is_none());
 
@@ -3600,7 +3737,7 @@ mod provenance_tests {
         let diff = "--- a/CLAUDE.md\n+++ /dev/null\n@@ -1 +0,0 @@\n-# syns\n";
         let entry: FileVersionEntry = serde_json::from_value(serde_json::json!({
             "version": 436, "sha": "ff7f52cad5c73554fff96676478cd4b2a509fbdc",
-            "blobSha": null, "message": "claude code session", "author": "bartsoj",
+            "blobSha": null, "message": "tool-a session", "author": "bartsoj",
             "createdAt": "2026-09-13T14:31:20Z", "content": null, "diff": diff,
             "provenance": null
         }))
@@ -3616,7 +3753,7 @@ mod provenance_tests {
         let entry: FileVersionEntry = serde_json::from_value(serde_json::json!({
             "version": 439, "sha": "739d8dc0c095de7ab390d685c0e2e8629d61db1f",
             "blobSha": "d54fa145810ef1ad6183d93229bb2982571cc3da",
-            "message": "claude code session (part 3/3)", "author": "bartsoj",
+            "message": "tool-a session (part 3/3)", "author": "bartsoj",
             "createdAt": "2026-09-13T14:34:58Z", "content": "# syns", "diff": null
         }))
         .unwrap();
@@ -3646,12 +3783,12 @@ mod provenance_tests {
         let asserted: VersionEntry = serde_json::from_value(serde_json::json!({
             "version": 1, "sha": "a", "message": "m", "author": "ana",
             "createdAt": "2026-01-01T00:00:00Z", "filesChanged": [],
-            "provenance": {"publisher": "bo", "integration": "codex", "run": "r", "trigger": null, "taskRef": null}
+            "provenance": {"publisher": "bo", "integration": "tool-b", "run": "r", "trigger": null, "taskRef": null}
         }))
         .unwrap();
         let p = asserted.provenance.unwrap();
         assert_eq!(p.publisher, "bo");
-        assert_eq!(p.integration.as_deref(), Some("codex"));
+        assert_eq!(p.integration.as_deref(), Some("tool-b"));
         assert!(p.trigger.is_none() && p.task_ref.is_none());
     }
 }
@@ -4489,7 +4626,7 @@ mod u280_transport_tests {
     }
 
     async fn head_of(url: &str) -> reqwest::Response {
-        let client = api_client().unwrap();
+        let client = api_client(url).unwrap();
         send_bounded(client.get(url), 0).await.unwrap()
     }
 
@@ -4888,11 +5025,488 @@ mod u280_transport_tests {
             "messageBody": "b", "author": "alice", "createdAt": "2026-01-01T00:00:00Z",
             "filesChanged": ["a.md"],
             "provenance": {
-                "publisher": "alice", "integration": "bb", "run": "r1",
+                "publisher": "alice", "integration": "tool-b", "run": "r1",
                 "trigger": null, "taskRef": null,
             },
         });
         let entry: VersionEntry = serde_json::from_value(served.clone()).unwrap();
         assert_eq!(serde_json::to_value(&entry).unwrap(), served);
+    }
+}
+
+/// Roadmap 277: one client per process (per runtime), and a read answered
+/// with a `Retry-After` sent again; a write never.
+#[cfg(test)]
+mod r277_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A loopback HTTP/1.1 server keeping every connection alive and
+    /// answering each request `{}`, counting the connections it accepts.
+    fn counting_server() -> (String, Arc<AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counted = accepted.clone();
+        std::thread::spawn(move || {
+            for sock in listener.incoming() {
+                let Ok(sock) = sock else { return };
+                counted.fetch_add(1, Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(sock.try_clone().unwrap());
+                    let mut sock = sock;
+                    loop {
+                        let mut line = String::new();
+                        loop {
+                            line.clear();
+                            match reader.read_line(&mut line) {
+                                Ok(0) | Err(_) => return,
+                                Ok(_) if line == "\r\n" => break,
+                                Ok(_) => {}
+                            }
+                        }
+                        let answer = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}";
+                        if sock.write_all(answer.as_bytes()).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), accepted)
+    }
+
+    async fn get_through_shared(url: &str) {
+        let client = api_client(url).unwrap();
+        let response = send_bounded(client.get(url), 0).await.unwrap();
+        assert_eq!(response.status(), 200);
+        read_body(response, ANSWER_STALL, None).await.unwrap();
+    }
+
+    // X1: every client one runtime asks for is the one client, so every
+    // request of a run shares its connection.
+    #[tokio::test]
+    async fn every_client_of_one_runtime_shares_one_connection() {
+        let (url, accepted) = counting_server();
+        for _ in 0..3 {
+            get_through_shared(&url).await;
+        }
+        // Two `SynsClient`s, as a read verb and its read layer build.
+        let first = SynsClient::new(&url).unwrap();
+        let second = SynsClient::new(&url).unwrap();
+        for client in [&first, &second] {
+            let response = send_bounded(client.client.get(&url), 0).await.unwrap();
+            read_body(response, ANSWER_STALL, None).await.unwrap();
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    // X1: a runtime never meets a client another runtime pooled its
+    // connections in: the runtime started after one is dropped gets a
+    // client of its own, which opens its own connection and is answered.
+    #[test]
+    fn a_dropped_runtime_s_pooled_connection_is_not_reused() {
+        let (url, accepted) = counting_server();
+        let first = tokio::runtime::Runtime::new().unwrap();
+        let first_id = first.handle().id();
+        first.block_on(get_through_shared(&url));
+        drop(first);
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        // The registry is shared with every test running beside this one,
+        // which may push this server's entry out, so only presence is read.
+        assert!(kept_runtimes(&url).contains(&first_id));
+
+        let second = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let second_id = second.handle().id();
+        assert_ne!(second_id, first_id);
+        second.block_on(async {
+            get_through_shared(&url).await;
+            get_through_shared(&url).await;
+        });
+        drop(second);
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+        // Review m3: the second runtime was handed a client of its own,
+        // kept beside the first's, never the first runtime's client, whose
+        // pool only the dropped runtime drove.
+        assert!(kept_runtimes(&url).contains(&second_id));
+    }
+
+    /// The test certificate authority's roots, offering `h2` then
+    /// `http/1.1` as `tls_config` does.
+    fn test_tls() -> rustls::ClientConfig {
+        use rustls::pki_types::pem::PemObject;
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(
+                rustls::pki_types::CertificateDer::from_pem_file(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/tls/root.pem"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        tls.alpn_protocols = crate::tls::tls_config().unwrap().alpn_protocols;
+        tls
+    }
+
+    /// A TLS front for `localhost` before `upstream`, offering `h2` and
+    /// `http/1.1`: it counts the connections it accepts and the protocol
+    /// each handshake settled on, and pipes each one to `upstream`.
+    async fn tls_front(
+        upstream: std::net::SocketAddr,
+    ) -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
+        use rustls::pki_types::pem::PemObject;
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tls");
+        let certs = vec![
+            rustls::pki_types::CertificateDer::from_pem_file(fixtures.join("localhost.pem"))
+                .unwrap(),
+        ];
+        let key = rustls::pki_types::PrivateKeyDer::from_pem_file(fixtures.join("localhost.key"))
+            .unwrap();
+        let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap();
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handshakes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = handshakes.clone();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                let recorded = recorded.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(sock).await else {
+                        return;
+                    };
+                    let alpn = tls.get_ref().1.alpn_protocol().unwrap_or_default().to_vec();
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&alpn).into_owned());
+                    let Ok(mut upstream) = tokio::net::TcpStream::connect(upstream).await else {
+                        return;
+                    };
+                    let _ = tokio::io::copy_bidirectional(&mut tls, &mut upstream).await;
+                });
+            }
+        });
+        (port, handshakes)
+    }
+
+    const HEAD: &str = "def4560000000000000000000000000000000000";
+
+    async fn mount_read(server: &MockServer, newest: &str) {
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/proj"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "owner": "alice", "name": "proj", "description": null,
+                "commitSha": HEAD, "status": "active", "author": null, "tags": [],
+                "visibility": "public", "forkedFrom": null, "forkCount": 0,
+                "fileCount": 1, "role": null,
+                "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/proj/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{
+                    "version": 8, "sha": newest, "parentSha": HEAD, "message": "m",
+                    "messageBody": null, "author": "alice",
+                    "createdAt": "2026-01-01T00:00:00Z", "filesChanged": ["a.md"],
+                }],
+                "total": 8, "limit": 1, "offset": 0,
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/repos/alice/proj/versions/{HEAD}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "version": 7, "sha": HEAD, "parentSha": null, "message": "m",
+                "messageBody": null, "author": "alice",
+                "createdAt": "2026-01-01T00:00:00Z", "filesChanged": ["a.md"],
+            })))
+            .mount(server)
+            .await;
+        let bytes = b"alpha\n";
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/alice/proj/raw/a.md"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "ETag",
+                        format!("\"{}\"", crate::push::hash::blob_sha1(bytes)).as_str(),
+                    )
+                    .set_body_bytes(bytes.to_vec()),
+            )
+            .mount(server)
+            .await;
+    }
+
+    fn routes(requests: &[wiremock::Request]) -> Vec<String> {
+        let mut routes: Vec<String> = requests.iter().map(|r| r.url.path().to_string()).collect();
+        routes.sort();
+        routes
+    }
+
+    // X1, X7: an unpinned `syns cat` over TLS makes one connection and one
+    // handshake, settled on HTTP/2, for all of its requests: the record
+    // and the newest version, asked at once, and the content; the newest
+    // being the head, nothing is looked up by hash.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn an_unpinned_cat_makes_one_tls_connection_for_every_request() {
+        let config_dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", config_dir.path()) };
+        let server = MockServer::start().await;
+        mount_read(&server, HEAD).await;
+        let (port, handshakes) = tls_front(*server.address()).await;
+        let url = format!("https://localhost:{port}");
+        share_for_this_runtime(&url, test_tls());
+
+        let config = crate::config::Config::new(Some(&url)).unwrap();
+        let opts = crate::read::ReadOptions {
+            repo: Some("alice/proj".to_string()),
+            ..Default::default()
+        };
+        let answered = crate::commands::cat::cmd_cat(
+            &config,
+            &crate::output::Output::new(true),
+            "a.md".to_string(),
+            opts,
+        )
+        .await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+        answered.unwrap();
+
+        assert_eq!(*handshakes.lock().unwrap(), vec!["h2".to_string()]);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            routes(&requests),
+            vec![
+                "/api/v1/repos/alice/proj",
+                "/api/v1/repos/alice/proj/raw/a.md",
+                "/api/v1/repos/alice/proj/versions",
+            ]
+        );
+    }
+
+    // X7: where the newest version is not the head, the head alone is
+    // looked up by its hash, and the run reads at the head.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_unpinned_read_looks_the_head_up_only_where_the_newest_is_not_it() {
+        let config_dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("SYNS_CONFIG_DIR", config_dir.path()) };
+        let server = MockServer::start().await;
+        mount_read(&server, "abc0000000000000000000000000000000000000").await;
+        let config = crate::config::Config::new(Some(&server.uri())).unwrap();
+        let opts = crate::read::ReadOptions {
+            repo: Some("alice/proj".to_string()),
+            ..Default::default()
+        };
+        let target =
+            crate::read::resolve_read_target(&config, &crate::output::Output::new(true), &opts)
+                .await;
+        unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
+        let target = target.unwrap().unwrap();
+
+        assert_eq!(target.reference.version, 7);
+        assert_eq!(target.reference.commit_sha, HEAD);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            routes(&requests),
+            vec![
+                "/api/v1/repos/alice/proj".to_string(),
+                "/api/v1/repos/alice/proj/versions".to_string(),
+                format!("/api/v1/repos/alice/proj/versions/{HEAD}"),
+            ]
+        );
+    }
+
+    fn busy(status: u16, retry_after: Option<&str>) -> ResponseTemplate {
+        let template = ResponseTemplate::new(status)
+            .set_body_json(serde_json::json!({"error": "engine_busy", "message": "busy"}));
+        match retry_after {
+            Some(value) => template.insert_header("Retry-After", value),
+            None => template,
+        }
+    }
+
+    async fn sends(server: &MockServer) -> usize {
+        server.received_requests().await.unwrap().len()
+    }
+
+    // X8: a read answered `503` or `429` with a `Retry-After` is sent again
+    // once the wait has passed, and the answer after it is the run's.
+    #[tokio::test]
+    async fn a_read_answered_busy_with_a_retry_after_is_sent_again() {
+        for (verb, status) in [("GET", 503), ("GET", 429), ("HEAD", 503)] {
+            let server = MockServer::start().await;
+            Mock::given(method(verb))
+                .and(path("/r"))
+                .respond_with(busy(status, Some("1")))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(method(verb))
+                .and(path("/r"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+            let url = format!("{}/r", server.uri());
+            let client = api_client(&url).unwrap();
+            let request = match verb {
+                "GET" => client.get(&url),
+                _ => client.head(&url),
+            };
+            let started = std::time::Instant::now();
+            let response = send_bounded(request, 0).await.unwrap();
+            assert_eq!(response.status(), 200, "{verb} {status}");
+            assert!(
+                started.elapsed() >= std::time::Duration::from_secs(1),
+                "{verb} {status}: {:?}",
+                started.elapsed()
+            );
+            assert_eq!(sends(&server).await, 2, "{verb} {status}");
+        }
+    }
+
+    // X8: a read refused busy at every send is sent `READ_ATTEMPTS` times,
+    // and the last refusal is the run's.
+    #[tokio::test]
+    async fn a_read_refused_busy_every_time_is_sent_four_times() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(busy(503, Some("0")))
+            .mount(&server)
+            .await;
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let refused = client.get_repo("alice/proj", None).await.unwrap_err();
+        assert!(
+            matches!(&refused, CliError::Api { status: Some(503), error, .. } if error == "engine_busy"),
+            "{refused:?}"
+        );
+        assert_eq!(sends(&server).await, READ_ATTEMPTS as usize);
+    }
+
+    // X8: inside `resend_read` the `Retry-After` resends and the resends
+    // of an answer that did not arrive share the one `READ_ATTEMPTS`.
+    #[tokio::test]
+    async fn a_resent_read_s_attempts_count_every_resend() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(busy(503, Some("0")))
+            .mount(&server)
+            .await;
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let refused = resend_read(|| client.get_raw("alice/proj", None, "a.md", Some("1"), None))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                CliError::Api {
+                    status: Some(503),
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(sends(&server).await, READ_ATTEMPTS as usize);
+    }
+
+    // X8: a write is sent once, whatever it is answered.
+    #[tokio::test]
+    async fn a_write_answered_busy_is_not_sent_again() {
+        for verb in ["POST", "PUT", "PATCH", "DELETE"] {
+            let server = MockServer::start().await;
+            Mock::given(method(verb))
+                .respond_with(busy(503, Some("0")))
+                .mount(&server)
+                .await;
+            let url = format!("{}/w", server.uri());
+            let client = api_client(&url).unwrap();
+            let request =
+                client.request(reqwest::Method::from_bytes(verb.as_bytes()).unwrap(), &url);
+            let response = request
+                .send_json_bounded(&serde_json::json!({}))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 503, "{verb}");
+            assert_eq!(sends(&server).await, 1, "{verb}");
+        }
+    }
+
+    // X8: a refusal naming no wait, or a wait as a date, and every other
+    // status, is answered as it came, sent once.
+    #[tokio::test]
+    async fn a_refusal_naming_no_wait_in_seconds_is_not_sent_again() {
+        for (status, retry_after) in [
+            (503, None),
+            (429, None),
+            (503, Some("Wed, 21 Oct 2026 07:28:00 GMT")),
+            (500, Some("0")),
+            (502, Some("0")),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(busy(status, retry_after))
+                .mount(&server)
+                .await;
+            let client = api_client(&server.uri()).unwrap();
+            let response = send_bounded(client.get(server.uri()), 0).await.unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(sends(&server).await, 1, "{status} {retry_after:?}");
+        }
+    }
+
+    // X8 (review m1): a wait the cap admits is waited; a longer one is not
+    // waited at all, and the answer is the run's, sent once.
+    #[tokio::test]
+    async fn a_retry_after_past_the_cap_is_not_resent() {
+        for (value, waited) in [("10", Some(RETRY_AFTER_CAP)), ("11", None), ("3600", None)] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(busy(503, Some(value)))
+                .mount(&server)
+                .await;
+            let response = reqwest::get(server.uri()).await.unwrap();
+            assert_eq!(retry_after(&response), waited, "{value}");
+        }
+        assert_eq!(RETRY_AFTER_CAP, std::time::Duration::from_secs(10));
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(busy(429, Some("60")))
+            .mount(&server)
+            .await;
+        let client = api_client(&server.uri()).unwrap();
+        let started = std::time::Instant::now();
+        let response = send_bounded(client.get(server.uri()), 0).await.unwrap();
+        assert_eq!(response.status(), 429);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(sends(&server).await, 1);
     }
 }

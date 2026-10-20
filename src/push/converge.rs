@@ -22,7 +22,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::client::{EntryType, PushResponse, SynsClient};
+// Issue 268, roadmap 277: a raw read's resends are `client::resend_read`'s.
+use crate::client::{EntryType, PushResponse, SynsClient, resend_read};
 use crate::errors::{ApiErrorContext, CliError};
 use crate::push::collector::{
     CollectOptions, CollectResult, CollectedFile, HELD_BYTES_BUDGET, HeldBytes, Hold,
@@ -71,26 +72,6 @@ pub(crate) const READ_CONCURRENCY: usize = 16;
 /// The most a retrieval's outstanding raw reads may weigh: their count
 /// times the largest tree size among them (`unregistered`, `D-090`).
 pub(crate) const READ_BYTES_BOUND: u64 = 67_108_864;
-
-/// How many times a retrieval sends one raw read whose answer did not
-/// arrive whole before the walk gives up (issue 268).
-pub(crate) const READ_ATTEMPTS: u32 = 4;
-
-/// The pause before a raw read is sent again, doubled at each resend.
-const RESEND_PAUSE: Duration = if cfg!(test) {
-    Duration::from_millis(5)
-} else {
-    Duration::from_secs(1)
-};
-
-/// How long after its first send a raw read is still sent again: one
-/// request's ceiling, so a read that failed by outliving it — which the
-/// same file over the same link does again — is not (CR1-1).
-const RESEND_WITHIN: Duration = if cfg!(test) {
-    Duration::from_secs(1)
-} else {
-    crate::client::REQUEST_CEILING
-};
 
 /// What a run is asked to do with the head.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -803,10 +784,9 @@ async fn read_one(
             // The answer is read into a buffer of the size its hold
             // counted, allocated before its first byte arrives (`D-094`).
             let capacity = usize::try_from(counted).unwrap_or(usize::MAX);
-            let raw = resend_unreachable(|| {
-                client.get_raw(repo_id, token, path, Some(at), Some(capacity))
-            })
-            .await?;
+            let raw =
+                resend_read(|| client.get_raw(repo_id, token, path, Some(at), Some(capacity)))
+                    .await?;
             let actual = blob_sha1(&raw.bytes);
             if actual != hash {
                 return Err(crate::client::hash_mismatch(path, hash, &actual));
@@ -841,7 +821,7 @@ async fn read_one(
             Ok(Blob::Held(bytes, hold))
         }
         (None, Some(dest)) => {
-            let staged = resend_unreachable(|| async {
+            let staged = resend_read(|| async {
                 // A resend stages its answer afresh, over whatever part
                 // of the last one arrived.
                 let _ = std::fs::remove_file(&dest);
@@ -859,31 +839,6 @@ async fn read_one(
             message: format!("could not read {path}: no room was made for it"),
         }),
     }
-}
-
-/// `read` sent until it answers anything but `SERVER_UNREACHABLE`, at most
-/// `READ_ATTEMPTS` times and only while `RESEND_WITHIN` has not passed
-/// since its first send, pausing `RESEND_PAUSE` doubled at each resend: a
-/// raw read at a pinned commit, its answer checked against the tree's
-/// hash, writes the same bytes however often it is sent, so one answer
-/// that did not arrive costs one request rather than the walk (issue 268).
-async fn resend_unreachable<T, F, Fut>(mut read: F) -> Result<T, CliError>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, CliError>>,
-{
-    let first_sent = std::time::Instant::now();
-    let mut pause = RESEND_PAUSE;
-    for _ in 1..READ_ATTEMPTS {
-        match read().await {
-            Err(CliError::ServerUnreachable { .. }) if first_sent.elapsed() < RESEND_WITHIN => {
-                tokio::time::sleep(pause).await;
-                pause *= 2;
-            }
-            answered => return answered,
-        }
-    }
-    read().await
 }
 
 // ---- the folder ------------------------------------------------------
@@ -1726,7 +1681,7 @@ async fn retrieval_wrote_root_identity(
     };
     // As content reads are: a brief outage is resent, not the run's end.
     let repo = repo_id(copy);
-    match resend_unreachable(|| client.get_raw(&repo, token, &path, Some(at), None)).await {
+    match resend_read(|| client.get_raw(&repo, token, &path, Some(at), None)).await {
         Ok(raw) => Ok(text_names_root_identity(
             &raw.bytes,
             &copy.owner,
@@ -4412,6 +4367,7 @@ pub async fn working_copy_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::{READ_ATTEMPTS, RESEND_PAUSE, RESEND_WITHIN};
     use crate::push::collector::SkipReason;
     use std::cell::RefCell;
 

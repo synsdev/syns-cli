@@ -12,14 +12,10 @@ pub async fn cmd_logout(config: &Config, output: &Output) -> Result<(), CliError
     let store = TokenStore::new(config.credentials_path());
     let token = store.read().ok().flatten();
 
+    // Roadmap 277: sent through the one client every request shares, held
+    // to its own short bound.
     if let Some(token) = &token
-        && let Ok(tls) = crate::tls::tls_config()
-        && let Ok(client) = reqwest::Client::builder()
-            .tls_backend_preconfigured(tls)
-            .user_agent(crate::client::USER_AGENT)
-            .timeout(Duration::from_secs(SIGN_OUT_TIMEOUT_SECS))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
+        && let Ok(client) = crate::client::api_client(config.server_url())
     {
         let url = format!("{}{SIGN_OUT_PATH}", config.server_url());
         // better-auth's sign-out route declares a body schema and answers a
@@ -27,6 +23,7 @@ pub async fn cmd_logout(config: &Config, output: &Output) -> Result<(), CliError
         let _ = client
             .post(&url)
             .bearer_auth(token)
+            .timeout(Duration::from_secs(SIGN_OUT_TIMEOUT_SECS))
             .json(&json!({}))
             .send()
             .await;

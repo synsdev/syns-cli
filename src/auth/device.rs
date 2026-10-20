@@ -134,7 +134,7 @@ impl DeviceAuthFlow {
 
         // 2. The client every request to `BND-public-api` is built as
         // (SPEC u280 `SynsClient::new`).
-        let client = api_client()?;
+        let client = api_client(server_url)?;
 
         // 3. Request device code
         let code_url = format!("{server_url}{DEVICE_CODE_PATH}");

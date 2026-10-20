@@ -236,6 +236,12 @@ struct FakeRepo {
     /// Issue 270 M2: the next raw read of this path is closed unanswered,
     /// a brief outage the read is resent over.
     drop_next_raw: Option<String>,
+    /// Roadmap 277: the next requests of this method whose route ends in
+    /// a tail starting with this prefix are refused `503 engine_busy`
+    /// with `Retry-After: 1`, this many of them (`D-230`).
+    busy: Option<(String, String, usize)>,
+    /// Roadmap 277: when each request of `requests` arrived.
+    arrived: Vec<std::time::Instant>,
 }
 
 /// A writer landing in the folder while a run reads the head: each raw
@@ -248,12 +254,14 @@ struct RacingWriter {
     writes: usize,
 }
 
-/// One answer the fake writes: its status, body, content type and `ETag`.
+/// One answer the fake writes: its status, body, content type, `ETag`
+/// and `Retry-After`.
 struct Answer {
     status: u16,
     body: Vec<u8>,
     content_type: &'static str,
     etag: Option<String>,
+    retry_after: Option<u32>,
 }
 
 impl Answer {
@@ -263,6 +271,7 @@ impl Answer {
             body: body.into_bytes(),
             content_type: "application/json",
             etag: None,
+            retry_after: None,
         }
     }
 }
@@ -288,6 +297,7 @@ impl FakeRepo {
             .push((req.method.clone(), req.target.clone(), req.body.clone()));
         self.lanes
             .push((req.method.clone(), req.target.clone(), req.lane.clone()));
+        self.arrived.push(std::time::Instant::now());
         let (route, query) = req.target.split_once('?').unwrap_or((&req.target, ""));
         let params: HashMap<String, String> = query
             .split('&')
@@ -298,6 +308,16 @@ impl FakeRepo {
             .strip_prefix("/api/v1/repos/")
             .and_then(|rest| rest.splitn(3, '/').nth(2))
             .unwrap_or("");
+        if let Some((method, prefix, left)) = self.busy.as_mut()
+            && *left > 0
+            && *method == req.method
+            && tail.starts_with(prefix.as_str())
+        {
+            *left -= 1;
+            let mut answer = Answer::json(503, error_body("engine_busy"));
+            answer.retry_after = Some(1);
+            return Some(answer);
+        }
         match (req.method.as_str(), tail) {
             // SPEC u302 `cmd_pull` 2: the record a retrieval naming its
             // repository reads, marking no shared folder.
@@ -437,6 +457,7 @@ impl FakeRepo {
                 body: content.clone(),
                 content_type: "application/octet-stream",
                 etag: Some(blob_sha1(content)),
+                retry_after: None,
             },
             None => Answer::json(404, error_body("not_found")),
         }
@@ -571,8 +592,12 @@ impl Fake {
                             .etag
                             .map(|etag| format!("etag: \"{etag}\"\r\n"))
                             .unwrap_or_default();
+                        let retry_after = answer
+                            .retry_after
+                            .map(|seconds| format!("retry-after: {seconds}\r\n"))
+                            .unwrap_or_default();
                         let mut response = format!(
-                            "HTTP/1.1 {} FAKE\r\ncontent-type: {}\r\n{etag}content-length: {}\r\n\r\n",
+                            "HTTP/1.1 {} FAKE\r\ncontent-type: {}\r\n{etag}{retry_after}content-length: {}\r\n\r\n",
                             answer.status,
                             answer.content_type,
                             answer.body.len()
@@ -679,6 +704,24 @@ impl Fake {
         } else {
             repo.lanes.clone()
         }
+    }
+
+    /// Refuse the next `times` requests of `method` whose route tail
+    /// starts with `tail` as `503 engine_busy` with `Retry-After: 1`
+    /// (roadmap 277, `D-230`).
+    pub(crate) fn busy_next(&self, method: &str, tail: &str, times: usize) {
+        self.repo.lock().unwrap().busy = Some((method.to_string(), tail.to_string(), times));
+    }
+
+    /// Every request received so far, its method, target and when it
+    /// arrived (roadmap 277).
+    pub(crate) fn arrivals(&self) -> Vec<(String, String, std::time::Instant)> {
+        let repo = self.repo.lock().unwrap();
+        repo.requests
+            .iter()
+            .zip(&repo.arrived)
+            .map(|((method, target, _), at)| (method.clone(), target.clone(), *at))
+            .collect()
     }
 
     /// Close the next raw read of `path` unanswered (issue 270 M2).

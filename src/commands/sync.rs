@@ -1035,12 +1035,12 @@ mod tests {
 
         assert_eq!(env(&[]), None);
         assert_eq!(
-            env(&[("SYNS_INTEGRATION", "codex"), ("SYNS_RUN", "r1")]),
+            env(&[("SYNS_INTEGRATION", "tool-b"), ("SYNS_RUN", "r1")]),
             None
         );
         assert_eq!(
             env(&[
-                ("SYNS_INTEGRATION", "codex"),
+                ("SYNS_INTEGRATION", "tool-b"),
                 ("SYNS_RUN", "   "),
                 ("SYNS_TRIGGER", "stop")
             ]),
@@ -1048,13 +1048,13 @@ mod tests {
         );
         assert_eq!(
             env(&[
-                ("SYNS_INTEGRATION", " codex "),
+                ("SYNS_INTEGRATION", " tool-b "),
                 ("SYNS_RUN", "r1"),
                 ("SYNS_TRIGGER", "stop"),
                 ("SYNS_TASK", "  ")
             ]),
             Some(PushProvenance {
-                integration: "codex".into(),
+                integration: "tool-b".into(),
                 run: "r1".into(),
                 trigger: "stop".into(),
                 task_ref: None,
@@ -1062,7 +1062,7 @@ mod tests {
         );
         assert_eq!(
             env(&[
-                ("SYNS_INTEGRATION", "codex"),
+                ("SYNS_INTEGRATION", "tool-b"),
                 ("SYNS_RUN", "r1"),
                 ("SYNS_TRIGGER", "stop"),
                 ("SYNS_TASK", "T-9")

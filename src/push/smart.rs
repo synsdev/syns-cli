@@ -3251,7 +3251,7 @@ mod tests {
         opts.excludes = vec![".syns.yaml".into()];
         opts.reference = Some(HashMap::new());
         opts.provenance = Some(PushProvenance {
-            integration: "codex".into(),
+            integration: "tool-b".into(),
             run: "run-7".into(),
             trigger: "stop".into(),
             task_ref: None,
@@ -3265,7 +3265,7 @@ mod tests {
         for body in &bodies {
             assert_eq!(
                 body["provenance"],
-                serde_json::json!({"integration": "codex", "run": "run-7", "trigger": "stop"})
+                serde_json::json!({"integration": "tool-b", "run": "run-7", "trigger": "stop"})
             );
         }
     }
@@ -3850,7 +3850,7 @@ mod u280_publication_tests {
             status: None,
             visibility: None,
             provenance: Some(PushProvenance {
-                integration: "codex".into(),
+                integration: "tool-b".into(),
                 run: "r".into(),
                 trigger: "manual".into(),
                 task_ref: None,

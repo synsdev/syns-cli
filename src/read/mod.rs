@@ -193,6 +193,17 @@ pub async fn resolve_read_target(
     // inside a folder bound to it, or through `--repo` where the record
     // marks one — pins the identity's newest listed version, reading no
     // version after it.
+    let pinned = |entry: crate::client::VersionEntry, folder| {
+        Ok(Some(ReadTarget {
+            repo_id: repo_id.clone(),
+            token: token.clone(),
+            reference: ResolvedRef {
+                version: entry.version,
+                commit_sha: entry.sha,
+            },
+            folder,
+        }))
+    };
     let reference = match opts.version.as_deref() {
         Some(value) => {
             refuse_reference_spelling(value)?;
@@ -203,32 +214,29 @@ pub async fn resolve_read_target(
                 Some(scope) => scope.identity.is_some(),
                 None => false,
             };
-            let commit_sha = if through_identity {
-                None
-            } else {
-                let repo = client.get_repo(&repo_id, token.as_deref()).await?;
-                if repo.shared_folder {
-                    None
-                } else {
-                    Some(repo.commit_sha.ok_or_else(no_commit)?)
-                }
-            };
-            match commit_sha {
-                Some(sha) => sha,
-                None => {
-                    let newest = identity_head(&client, token.as_deref(), &repo_id)
-                        .await?
-                        .ok_or_else(no_commit)?;
-                    return Ok(Some(ReadTarget {
-                        repo_id,
-                        token,
-                        reference: ResolvedRef {
-                            version: newest.version,
-                            commit_sha: newest.sha,
-                        },
-                        folder,
-                    }));
-                }
+            if through_identity {
+                let newest = identity_head(&client, token.as_deref(), &repo_id)
+                    .await?
+                    .ok_or_else(no_commit)?;
+                return pinned(newest, folder);
+            }
+            // Roadmap 277 (LAT-21): the record and the newest version are
+            // asked at once. The newest answers the head wherever its hash
+            // is the head's, and the head is looked up by its hash only
+            // where it is not; the newest is the reference itself where the
+            // record marks a shared folder.
+            let (repo, newest) = tokio::join!(
+                client.get_repo(&repo_id, token.as_deref()),
+                identity_head(&client, token.as_deref(), &repo_id),
+            );
+            let repo = repo?;
+            if repo.shared_folder {
+                return pinned(newest?.ok_or_else(no_commit)?, folder);
+            }
+            let sha = repo.commit_sha.ok_or_else(no_commit)?;
+            match newest {
+                Ok(Some(newest)) if newest.sha == sha => return pinned(newest, folder),
+                _ => sha,
             }
         }
     };
@@ -245,15 +253,7 @@ pub async fn resolve_read_target(
         })?;
 
     // 4 — pin the pair.
-    Ok(Some(ReadTarget {
-        repo_id,
-        token,
-        reference: ResolvedRef {
-            version: entry.version,
-            commit_sha: entry.sha,
-        },
-        folder,
-    }))
+    pinned(entry, folder)
 }
 
 /// Binds the repository and the folder a read runs against (SPEC u290
