@@ -367,7 +367,7 @@ impl RawHead {
     }
 }
 
-fn etag_of(response: &reqwest::Response) -> Option<String> {
+pub(crate) fn etag_of(response: &reqwest::Response) -> Option<String> {
     response
         .headers()
         .get(reqwest::header::ETAG)
@@ -967,7 +967,9 @@ pub(crate) async fn send_bounded(
         match (resend, retry_after(&response)) {
             (Some(next), Some(wait)) if more => {
                 drop(response);
-                tokio::time::sleep(wait).await;
+                // Roadmap 279 (D-243 §3): 0–50 % more, so parallel runs
+                // answered `503` together spread their resends.
+                tokio::time::sleep(jittered(wait)).await;
                 request = next;
             }
             _ => return Ok(response),
@@ -1003,6 +1005,38 @@ async fn send_once(
     }
 }
 
+/// A uniform draw in `[0, 1)`, from the process's hash keys and a
+/// counter: enough to keep parallel resends out of step, with no crate
+/// of its own (roadmap 279, D-243 §3).
+pub(crate) fn uniform() -> f64 {
+    use std::hash::{BuildHasher, Hasher};
+    static DRAWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or_default();
+    hasher.write_u32(nanos);
+    (hasher.finish() >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// `wait` plus a uniform random 0–50 % of it (D-243 §3): every
+/// `Retry-After` wait and every resend pause.
+pub(crate) fn jittered(wait: std::time::Duration) -> std::time::Duration {
+    wait + wait.mul_f64(uniform() * 0.5)
+}
+
+/// One send of `request` and no resend, whatever it is answered: the
+/// bulk reads of roadmap 279 keep their own budgets (D-243 §3).
+pub(crate) async fn send_unretried(
+    request: reqwest::RequestBuilder,
+    body_len: usize,
+) -> Result<reqwest::Response, CliError> {
+    let (client, request) = request.build_split();
+    send_once(&client, request?, body_len).await
+}
+
 /// `read` sent until it answers anything but `SERVER_UNREACHABLE`, its
 /// sends — every `Retry-After` resend `send_bounded` makes inside it
 /// among them — at most `READ_ATTEMPTS`, and resent only while
@@ -1029,7 +1063,7 @@ where
                     Err(CliError::ServerUnreachable { .. })
                         if sent < READ_ATTEMPTS && first_sent.elapsed() < RESEND_WITHIN =>
                     {
-                        tokio::time::sleep(pause).await;
+                        tokio::time::sleep(jittered(pause)).await;
                         pause *= 2;
                     }
                     answered => return answered,
@@ -1206,7 +1240,9 @@ pub(crate) fn hash_mismatch(path: &str, expected: &str, actual: &str) -> CliErro
     }
 }
 
-async fn check_response(response: reqwest::Response) -> Result<reqwest::Response, CliError> {
+pub(crate) async fn check_response(
+    response: reqwest::Response,
+) -> Result<reqwest::Response, CliError> {
     let status = response.status();
     if status == reqwest::StatusCode::UNAUTHORIZED {
         return Err(CliError::AuthRequired);
@@ -1433,6 +1469,10 @@ pub struct SynsClient {
     /// Its `EP-tree` and `EP-file-read-bytes` requests carry `Syns-Lane:
     /// bulk` (roadmap 271, C-1): a pull's and a sync's client.
     bulk_reads: bool,
+    /// Roadmap 279: the run's v2 reads — the store, the names this run
+    /// read, the v1 switch and the wait window. None reads v1 alone, as
+    /// every client did before.
+    v2: Option<std::sync::Arc<crate::read::run::RunReads>>,
 }
 
 impl SynsClient {
@@ -1451,7 +1491,65 @@ impl SynsClient {
             client,
             base_url,
             bulk_reads: false,
+            v2: None,
         })
+    }
+
+    /// This client, reading through `/api/v2` where the server answers it
+    /// (roadmap 279): a pull's, a sync's and a status run's.
+    pub fn with_v2(mut self, reads: crate::read::run::RunReads) -> SynsClient {
+        self.v2 = Some(std::sync::Arc::new(reads));
+        self
+    }
+
+    /// The run's v2 reads, none where the run reads v1 alone or a v2
+    /// `404` sent it to v1 (D-243 §7).
+    pub(crate) fn v2(&self) -> Option<&std::sync::Arc<crate::read::run::RunReads>> {
+        self.v2.as_ref().filter(|reads| !reads.on_v1())
+    }
+
+    /// Whether this client's reads carry `Syns-Lane: bulk`.
+    pub(crate) fn is_bulk(&self) -> bool {
+        self.bulk_reads
+    }
+
+    /// A `GET` of `/api/v2/repos/{address}/{tail}` with `query`, in this
+    /// client's read lane (roadmap 279).
+    pub(crate) fn v2_get(
+        &self,
+        address: &str,
+        tail: &str,
+        query: &[(&str, &str)],
+        token: Option<&str>,
+    ) -> reqwest::RequestBuilder {
+        let url = format!("{}/api/v2/repos/{address}/{tail}", self.base_url);
+        let mut req = self.in_read_lane(self.client.get(&url));
+        if !query.is_empty() {
+            req = req.query(query);
+        }
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        req
+    }
+
+    /// The `POST …/read` of `body` (`EP-v2-read`), in this client's read
+    /// lane: the lane C-1 gives a pull's raw reads (D-243 §3).
+    pub(crate) fn v2_read(
+        &self,
+        address: &str,
+        token: Option<&str>,
+        body: Vec<u8>,
+    ) -> reqwest::RequestBuilder {
+        let url = format!("{}/api/v2/repos/{address}/read", self.base_url);
+        let mut req = self
+            .in_read_lane(self.client.post(&url))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body);
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        req
     }
 
     /// This client, its tree and content reads (`EP-tree`,
@@ -5443,7 +5541,13 @@ mod r277_tests {
     }
 
     fn routes(requests: &[wiremock::Request]) -> Vec<String> {
-        let mut routes: Vec<String> = requests.iter().map(|r| r.url.path().to_string()).collect();
+        // Roadmap 279: a server answering no v2 is asked the v2 head first,
+        // its `404` sending the run down these v1 reads (D-243 §7).
+        let mut routes: Vec<String> = requests
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .filter(|p| !p.starts_with("/api/v2/"))
+            .collect();
         routes.sort();
         routes
     }

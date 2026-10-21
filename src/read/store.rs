@@ -3,9 +3,14 @@
 //! One store per OS user, server and account, under
 //! `<cache root>/store/<server key>/<account key>/`: `blobs/<sha>` holds
 //! the bytes a blob hash names, `hints/<owner>/<name>` the last verified
-//! hash and media type per path, `size` the bytes of `blobs/`, and `lock`
-//! the exclusive lock every change of `size`, of a hint file and every
-//! sweep takes (D-242 §1–5, § Amended).
+//! hash and media type per path, `size` the bytes of `blobs/`, `trees/`
+//! and `views/`, and `lock` the exclusive lock every change of `size`, of
+//! a hint file and every sweep takes (D-242 §1–5, § Amended). Roadmap 279
+//! adds `trees/<id>` (one tree's closure lines, admitted only from a
+//! closure that verified whole), `views/1/<owner>/<name>/<scope key>/
+//! <commit>` (at most `VIEWS_PER_SCOPE` per address and scope) and
+//! `heads/<owner>/<name>`; `blobs/`, `trees/` and `views/` count against
+//! the cap and are swept together (D-243 §4).
 //!
 //! A blob is checked on the way in — admitted only where the hash derived
 //! from its bytes equals the `ETag` the server named — and again on the
@@ -45,6 +50,17 @@ pub const DEFAULT_CACHE_MAX_BYTES: u64 = 2_147_483_648;
 /// removes it: younger, it is a concurrent run's admission in flight
 /// (D-242 Amended §2).
 pub const TEMPORARY_AGE: Duration = Duration::from_secs(3600);
+
+/// The most views one address and scope keeps: writing one more removes
+/// the oldest (D-243 §4).
+pub const VIEWS_PER_SCOPE: usize = 8;
+
+/// How many fast placements are counted into `size` at once.
+const FLUSH_EVERY: u64 = 128;
+
+/// The view format this build reads and writes; a view under any other
+/// version is never read (D-212, D-243 §4).
+pub const VIEW_FORMAT: &str = "1";
 
 #[cfg(unix)]
 const DIR_MODE: u32 = 0o700;
@@ -195,6 +211,49 @@ enum HintUpdate {
 
 type HintMap = BTreeMap<String, Hint>;
 
+/// Where one server's and account's store stands, opened only once a
+/// run needs it (roadmap 279): a lookup finding no store creates none.
+#[derive(Debug, Clone)]
+pub struct StoreSpot {
+    root: PathBuf,
+    server: String,
+    account: String,
+    max_bytes: u64,
+}
+
+impl StoreSpot {
+    /// The spot `Store::open` would open for `token`.
+    pub fn of(config: &Config, token: Option<&str>) -> StoreSpot {
+        let username = crate::auth::token::TokenStore::new(config.credentials_path())
+            .read_username()
+            .ok()
+            .flatten();
+        StoreSpot {
+            root: config.cache_dir().to_path_buf(),
+            server: server_key(config.server_url()),
+            account: account_key(token, username.as_deref()),
+            max_bytes: max_bytes_from_env(),
+        }
+    }
+
+    /// The store, made where absent when `create` holds; with `create`
+    /// unset, none where the account's directory does not stand yet.
+    pub fn open(&self, create: bool) -> Option<Store> {
+        let dir = self
+            .root
+            .join("store")
+            .join(&self.server)
+            .join(&self.account);
+        if !create && std::fs::symlink_metadata(&dir).is_err() {
+            return None;
+        }
+        if create {
+            remove_standing(&self.root.join("blobs"));
+        }
+        Store::open_at(&self.root, &self.server, &self.account, self.max_bytes)
+    }
+}
+
 /// The run's open store.
 #[derive(Debug)]
 pub struct Store {
@@ -203,6 +262,14 @@ pub struct Store {
     hints: PathBuf,
     max_bytes: u64,
     admitted: AtomicBool,
+    /// Bytes this run placed in `blobs/` and `trees/` by the fast path,
+    /// counted into `size` once, at `finish` (roadmap 279).
+    pending: std::sync::atomic::AtomicU64,
+    /// Whether `size` was seen standing before the fast path's first
+    /// placement.
+    counted: AtomicBool,
+    /// The fast path's placements so far.
+    placed: std::sync::atomic::AtomicU64,
     /// A stored blob this run found short or altered and removed: the
     /// length `size` counted for it is unknown, so `finish` recomputes
     /// `size` from `blobs/` (VERIFY.md F-1, REVIEW-delta-2 finding 2).
@@ -387,6 +454,9 @@ impl Store {
             hints,
             max_bytes,
             admitted: AtomicBool::new(false),
+            pending: std::sync::atomic::AtomicU64::new(0),
+            counted: AtomicBool::new(false),
+            placed: std::sync::atomic::AtomicU64::new(0),
             resync: AtomicBool::new(false),
             walks: std::sync::atomic::AtomicUsize::new(0),
             loaded: Mutex::new(None),
@@ -428,8 +498,9 @@ impl Store {
         }
     }
 
-    /// The blobs of `blobs/` (their total, and each one's mtime, length
-    /// and path) and every other name there with its mtime.
+    /// The counted files of `blobs/`, `trees/` and `views/` (their total,
+    /// and each one's mtime, length and path) and every other name there
+    /// with its mtime: a temporary, or a name no area holds (roadmap 279).
     #[allow(clippy::type_complexity)]
     fn walk(
         &self,
@@ -442,18 +513,29 @@ impl Store {
         let mut total = 0;
         let mut entries = Vec::new();
         let mut others = Vec::new();
-        let Ok(dir) = std::fs::read_dir(&self.blobs) else {
-            return (0, entries, others);
-        };
-        for entry in dir.flatten() {
-            let Ok(meta) = entry.metadata() else { continue };
-            let touched = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-            let name = entry.file_name();
-            if meta.is_file() && name.to_str().is_some_and(is_blob_hash) {
-                total += meta.len();
-                entries.push((touched, meta.len(), entry.path()));
-            } else {
-                others.push((touched, entry.path()));
+        let mut pending = vec![
+            (self.blobs.clone(), false),
+            (self.dir.join("trees"), false),
+            (self.dir.join("views"), true),
+        ];
+        while let Some((dir, deep)) = pending.pop() {
+            let Ok(listing) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in listing.flatten() {
+                let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+                    continue;
+                };
+                let touched = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                let name = entry.file_name();
+                if deep && meta.is_dir() {
+                    pending.push((entry.path(), true));
+                } else if meta.is_file() && name.to_str().is_some_and(is_blob_hash) {
+                    total += meta.len();
+                    entries.push((touched, meta.len(), entry.path()));
+                } else {
+                    others.push((touched, entry.path()));
+                }
             }
         }
         (total, entries, others)
@@ -540,6 +622,336 @@ impl Store {
         }
     }
 
+    /// The directory `rel` under the account's, each step confined as
+    /// it is reached (made at `0700` where absent).
+    fn confined(&self, rel: &[&str]) -> Option<PathBuf> {
+        let mut dir = self.dir.clone();
+        for step in rel {
+            dir = dir.join(step);
+            if !confined_dir(&dir) {
+                return None;
+            }
+        }
+        Some(dir)
+    }
+
+    /// Writes `bytes` at `dir/name` through a temporary in `dir`, under
+    /// the lock, counting the change in `size`: kept where a file stands
+    /// there and `replace` is unset (roadmap 279, D-243 §4).
+    fn put_counted(&self, dir: &Path, name: &str, bytes: &[u8], replace: bool) -> bool {
+        let dest = dir.join(name);
+        if !replace && dest.is_file() {
+            return true;
+        }
+        let Ok(mut tmp) = tempfile::Builder::new().prefix(".tmp-").tempfile_in(dir) else {
+            return false;
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if tmp
+                .as_file()
+                .set_permissions(std::fs::Permissions::from_mode(FILE_MODE))
+                .is_err()
+            {
+                return false;
+            }
+        }
+        if tmp.write_all(bytes).and_then(|()| tmp.flush()).is_err() {
+            return false;
+        }
+        let Some(_lock) = self.lock() else {
+            return false;
+        };
+        let standing = std::fs::symlink_metadata(&dest).ok();
+        if standing.as_ref().is_some_and(|m| !m.is_file()) {
+            return false;
+        }
+        if !replace && standing.is_some() {
+            return true;
+        }
+        let size = self.read_size();
+        let placed = if replace {
+            tmp.persist(&dest).is_ok()
+        } else {
+            tmp.persist_noclobber(&dest).is_ok()
+        };
+        if placed {
+            let before = standing.map(|m| m.len()).unwrap_or(0);
+            self.write_size(
+                size.saturating_sub(before)
+                    .saturating_add(bytes.len() as u64),
+            );
+            self.admitted.store(true, Ordering::Relaxed);
+        }
+        placed
+    }
+
+    /// Removes a counted file, under the lock, its length subtracted only
+    /// where this run's own removal succeeded.
+    fn remove_counted(&self, path: &Path) {
+        let Some(_lock) = self.lock() else { return };
+        let Ok(meta) = std::fs::symlink_metadata(path) else {
+            return;
+        };
+        let size = self.read_size();
+        if meta.is_file() && std::fs::remove_file(path).is_ok() {
+            self.write_size(size.saturating_sub(meta.len()));
+        }
+    }
+
+    /// One tree's lines as `trees/` holds them, none where none stands.
+    /// The caller checks them against `id` before using them.
+    pub fn tree(&self, id: &str) -> Option<Vec<u8>> {
+        if !is_blob_hash(id) {
+            return None;
+        }
+        let path = self.dir.join("trees").join(id);
+        let bytes = std::fs::read(&path).ok()?;
+        touch(&path);
+        Some(bytes)
+    }
+
+    /// Admits one tree's lines under `id`; the caller verified the
+    /// closure they came from whole (D-243 §6).
+    pub fn admit_tree(&self, id: &str, lines: &[u8]) {
+        if !is_blob_hash(id) {
+            return;
+        }
+        if let Some(dir) = self.confined(&["trees"]) {
+            self.place(&dir, id, lines);
+        }
+    }
+
+    /// Places `bytes` at `dir/name` through a temporary, never replacing
+    /// one standing there, its length counted into `size` at `finish`: the
+    /// many admissions of one pull take no lock each (roadmap 279).
+    fn place(&self, dir: &Path, name: &str, bytes: &[u8]) {
+        let dest = dir.join(name);
+        if std::fs::symlink_metadata(&dest).is_ok() {
+            return;
+        }
+        // `size` stands before this run's first placement: a walk made
+        // after it would count bytes this run then adds again.
+        if !self.counted.swap(true, Ordering::Relaxed)
+            && std::fs::symlink_metadata(self.dir.join("size")).is_err()
+            && let Some(_lock) = self.lock()
+            && std::fs::symlink_metadata(self.dir.join("size")).is_err()
+        {
+            self.write_size(self.walk().0);
+        }
+        // A temporary is made at `0600` (tempfile's own mode).
+        let Ok(mut tmp) = tempfile::Builder::new().prefix(".tmp-").tempfile_in(dir) else {
+            return;
+        };
+        if tmp.write_all(bytes).is_err() {
+            return;
+        }
+        if tmp.persist_noclobber(&dest).is_ok() {
+            self.pending
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            self.admitted.store(true, Ordering::Relaxed);
+            // Counted every `FLUSH_EVERY` placements, so a run killed
+            // part-way leaves at most that many uncounted (REVIEW-syns-cli
+            // minor 3); the next sweep's walk corrects any drift.
+            if self.placed.fetch_add(1, Ordering::Relaxed) % FLUSH_EVERY == FLUSH_EVERY - 1 {
+                self.flush_pending();
+            }
+        }
+    }
+
+    /// Adds the fast path's bytes to `size`, under the lock; a missing
+    /// `size` is the walk's true total, which already holds them.
+    fn flush_pending(&self) {
+        let Some(_lock) = self.lock() else { return };
+        self.flush_pending_locked();
+    }
+
+    fn flush_pending_locked(&self) {
+        let pending = self.pending.swap(0, Ordering::Relaxed);
+        if pending == 0 {
+            return;
+        }
+        match std::fs::read_to_string(self.dir.join("size"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+        {
+            Some(size) => self.write_size(size.saturating_add(pending)),
+            None => self.write_size(self.walk().0),
+        }
+    }
+
+    /// `admit` for the many frames of a batch: checked against `sha` as
+    /// `admit` checks, placed without the lock, counted at `finish`.
+    pub fn admit_many(&self, sha: &str, bytes: &[u8]) {
+        if !is_blob_hash(sha) || blob_sha1(bytes) != sha {
+            return;
+        }
+        let blobs = self.blobs.clone();
+        self.place(&blobs, sha, bytes);
+    }
+
+    /// Removes a tree whose lines failed their check.
+    pub fn remove_tree(&self, id: &str) {
+        if is_blob_hash(id) {
+            self.remove_counted(&self.dir.join("trees").join(id));
+        }
+    }
+
+    /// The directory of one address's and scope's views, none where the
+    /// address cannot name one.
+    fn view_dir(&self, address: &str, scope_key: &str, create: bool) -> Option<PathBuf> {
+        let (owner, name) = address.split_once('/')?;
+        if !is_name(owner) || !is_name(name) || !scope_key.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let rel = ["views", VIEW_FORMAT, owner, name, scope_key];
+        if create {
+            return self.confined(&rel);
+        }
+        let dir = rel
+            .iter()
+            .fold(self.dir.clone(), |dir, step| dir.join(step));
+        std::fs::symlink_metadata(&dir)
+            .ok()
+            .filter(|m| m.is_dir() && !foreign_or_link(m))
+            .map(|_| dir)
+    }
+
+    /// The bytes of the view of `commit`, none where none stands.
+    pub fn view(&self, address: &str, scope_key: &str, commit: &str) -> Option<Vec<u8>> {
+        if !is_blob_hash(commit) {
+            return None;
+        }
+        let path = self.view_dir(address, scope_key, false)?.join(commit);
+        let meta = std::fs::symlink_metadata(&path).ok()?;
+        if !meta.is_file() {
+            return None;
+        }
+        let bytes = std::fs::read(&path).ok()?;
+        touch(&path);
+        Some(bytes)
+    }
+
+    /// The commits whose views stand for one address and scope, newest
+    /// first by mtime.
+    pub fn views_of(&self, address: &str, scope_key: &str) -> Vec<String> {
+        let Some(dir) = self.view_dir(address, scope_key, false) else {
+            return Vec::new();
+        };
+        let mut found: Vec<(SystemTime, String)> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_str()?.to_string();
+                let meta = std::fs::symlink_metadata(entry.path()).ok()?;
+                (meta.is_file() && is_blob_hash(&name))
+                    .then(|| (meta.modified().unwrap_or(SystemTime::UNIX_EPOCH), name))
+            })
+            .collect();
+        found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        found.into_iter().map(|(_, name)| name).collect()
+    }
+
+    /// Writes the view of `commit` whole, replacing one standing there,
+    /// then removes the oldest past `VIEWS_PER_SCOPE` (D-243 §1, §4).
+    pub fn write_view(&self, address: &str, scope_key: &str, commit: &str, bytes: &[u8]) {
+        if !is_blob_hash(commit) {
+            return;
+        }
+        let Some(dir) = self.view_dir(address, scope_key, true) else {
+            return;
+        };
+        if !self.put_counted(&dir, commit, bytes, true) {
+            return;
+        }
+        let standing = self.views_of(address, scope_key);
+        for old in standing.iter().skip(VIEWS_PER_SCOPE) {
+            if old != commit {
+                self.remove_counted(&dir.join(old));
+            }
+        }
+    }
+
+    /// Removes the view of `commit`: it contradicted an answer, failed its
+    /// check, or named a path the server no longer serves (D-243 §1, §2).
+    pub fn remove_view(&self, address: &str, scope_key: &str, commit: &str) {
+        if let Some(dir) = self.view_dir(address, scope_key, false)
+            && is_blob_hash(commit)
+        {
+            self.remove_counted(&dir.join(commit));
+        }
+    }
+
+    /// The commit and Version Number the last v2 `head` answered for
+    /// `address` (D-243 §9).
+    pub fn head(&self, address: &str) -> Option<(String, u32)> {
+        let (owner, name) = address.split_once('/')?;
+        if !is_name(owner) || !is_name(name) {
+            return None;
+        }
+        let text = std::fs::read_to_string(self.dir.join("heads").join(owner).join(name)).ok()?;
+        let (commit, version) = text.trim().split_once(' ')?;
+        (is_blob_hash(commit))
+            .then(|| version.parse().ok().map(|v| (commit.to_string(), v)))
+            .flatten()
+    }
+
+    /// Records the head `address` answered; `heads/` is not counted.
+    pub fn write_head(&self, address: &str, commit: &str, version: u32) {
+        let Some((owner, name)) = address.split_once('/') else {
+            return;
+        };
+        if !is_name(owner) || !is_name(name) || !is_blob_hash(commit) {
+            return;
+        }
+        let Some(dir) = self.confined(&["heads", owner]) else {
+            return;
+        };
+        let Ok(mut tmp) = tempfile::Builder::new().prefix(".tmp-").tempfile_in(&dir) else {
+            return;
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = tmp
+                .as_file()
+                .set_permissions(std::fs::Permissions::from_mode(FILE_MODE));
+        }
+        if tmp
+            .write_all(format!("{commit} {version}\n").as_bytes())
+            .is_ok()
+        {
+            let _ = tmp.persist(dir.join(name));
+        }
+    }
+
+    /// Admits `bytes` already checked against `sha` by the caller and
+    /// reports whether the blob stands afterwards.
+    pub fn admit_checked(&self, sha: &str, bytes: &[u8]) -> bool {
+        self.admit(sha, bytes);
+        self.blobs.join(sha).is_file()
+    }
+
+    /// Admits the staged file at `path`, whose blob hash the caller
+    /// derived as `sha` while writing it.
+    pub fn admit_file(&self, sha: &str, path: &Path) {
+        if !is_blob_hash(sha) || self.blobs.join(sha).is_file() {
+            return;
+        }
+        if let Ok(bytes) = std::fs::read(path)
+            && blob_sha1(&bytes) == sha
+        {
+            self.admit(sha, &bytes);
+        }
+    }
+
+    /// Whether a blob is stored under `sha`, unread.
+    pub fn holds(&self, sha: &str) -> bool {
+        is_blob_hash(sha) && self.blobs.join(sha).is_file()
+    }
+
     /// The hint file of `repo_id`, where its sides can address one.
     fn hint_file(&self, repo_id: &str) -> Option<(PathBuf, PathBuf)> {
         let (owner, name) = repo_id.split_once('/')?;
@@ -622,6 +1034,8 @@ impl Store {
             return;
         }
         let Some(_lock) = self.lock() else { return };
+        // The fast path's bytes, counted once.
+        self.flush_pending_locked();
         self.merge(updates);
         if resync {
             // The true total: a blob truncated or removed by hand was
@@ -705,7 +1119,31 @@ impl Store {
         }
         let low_water = self.max_bytes / 10 * 9 + (self.max_bytes % 10) * 9 / 10;
         if total > low_water {
-            entries.sort_by_key(|(touched, _, _)| *touched);
+            // D-246 Ruling 5: first every view that is not the newest of its
+            // address and scope, oldest first; then blobs, trees and the
+            // newest views together, oldest mtime first. A view weighs
+            // about a quarter of its repository's blobs, so a cap a few
+            // views fill would otherwise evict the blobs a fresh checkout
+            // reads before the views no run reads again (VERIFY D2).
+            let views = self.dir.join("views");
+            let mut newest: std::collections::HashMap<PathBuf, SystemTime> =
+                std::collections::HashMap::new();
+            for (touched, _, path) in &entries {
+                if path.starts_with(&views)
+                    && let Some(dir) = path.parent()
+                {
+                    let at = newest.entry(dir.to_path_buf()).or_insert(*touched);
+                    *at = (*at).max(*touched);
+                }
+            }
+            let superseded = |touched: &SystemTime, path: &Path| {
+                path.starts_with(&views)
+                    && path
+                        .parent()
+                        .and_then(|dir| newest.get(dir))
+                        .is_some_and(|at| touched < at)
+            };
+            entries.sort_by_key(|(touched, _, path)| (!superseded(touched, path), *touched));
             for (_, len, path) in entries {
                 if total <= low_water {
                     break;

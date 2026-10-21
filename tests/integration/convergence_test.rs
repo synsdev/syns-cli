@@ -293,6 +293,11 @@ fn lossy(tree: &BTreeMap<String, Vec<u8>>) -> BTreeMap<String, String> {
 
 impl FakeRepo {
     fn answer(&mut self, req: &RawRequest) -> Option<Answer> {
+        // Roadmap 279: a server answering no v2, as every route here is
+        // v1's; the v2 reads it refuses go unrecorded (D-243 §7).
+        if req.target.starts_with("/api/v2/") {
+            return Some(Answer::json(404, error_body("not_found")));
+        }
         self.requests
             .push((req.method.clone(), req.target.clone(), req.body.clone()));
         self.lanes

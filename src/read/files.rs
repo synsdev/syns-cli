@@ -650,3 +650,279 @@ mod tests {
         }
     }
 }
+
+// ---- many paths over `POST …/read` (roadmap 279, D-243 §8) ---------------
+
+/// What reading many paths over the batch came to: each distinct path's
+/// result (`NotRun` for one the batch left to be read alone), those
+/// paths, the header of the first answer, and the `--max-bytes` cut.
+#[derive(Debug)]
+pub struct BatchMany {
+    pub results: Vec<PathResult>,
+    pub alone: Vec<usize>,
+    pub header: Option<crate::read::batch::Header>,
+    pub cut: Option<usize>,
+}
+
+/// The `--max-bytes` ledger over frames, decided in the order asked from
+/// each frame's size, a path refused before any request counting 0.
+struct FrameLedger {
+    budget: u64,
+    entries: Vec<Option<usize>>,
+    first: Vec<usize>,
+    sizes: Vec<Option<u64>>,
+    sum: u64,
+    decided: usize,
+    cut: Option<usize>,
+}
+
+impl FrameLedger {
+    fn report(&mut self, distinct: usize, size: u64) -> bool {
+        if self.sizes[distinct].is_none() {
+            self.sizes[distinct] = Some(size);
+        }
+        while self.cut.is_none() && self.decided < self.entries.len() {
+            let size = match self.entries[self.decided] {
+                None => 0,
+                Some(d) => match self.sizes[d] {
+                    Some(size) => size,
+                    None => break,
+                },
+            };
+            if self.sum.saturating_add(size) > self.budget {
+                self.cut = Some(self.decided);
+            } else {
+                self.sum += size;
+                self.decided += 1;
+            }
+        }
+        self.cut.is_none_or(|cut| self.first[distinct] < cut)
+    }
+}
+
+/// The batch's sink for `syns cat --json`: per-file classes, the store's
+/// bytes for an `unchanged` frame, and the ledger.
+struct CatSink<'a> {
+    repo_id: &'a str,
+    store: Option<&'a Store>,
+    distinct: &'a [Distinct],
+    results: Mutex<Vec<PathResult>>,
+    alone: Mutex<Vec<usize>>,
+    ledger: Option<Mutex<FrameLedger>>,
+}
+
+impl crate::read::batch::Sink for CatSink<'_> {
+    fn frame(&self, index: usize, frame: crate::read::batch::Frame) -> Result<(), CliError> {
+        use crate::read::batch::Frame;
+        let result = match frame {
+            Frame::Ok { sha, bytes, .. } => {
+                if let Some(store) = self.store {
+                    store.admit_many(&sha, &bytes);
+                    store.note_seen(self.repo_id, &self.distinct[index].mapped, &sha);
+                }
+                PathResult::Read(Answer {
+                    bytes,
+                    sha,
+                    media_type: None,
+                    not_modified: false,
+                })
+            }
+            Frame::Unchanged { sha, .. } => {
+                match self.store.and_then(|store| store.verified(&sha)) {
+                    Some(bytes) => PathResult::Read(Answer {
+                        bytes,
+                        sha,
+                        media_type: None,
+                        not_modified: true,
+                    }),
+                    None => {
+                        self.alone
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push(index);
+                        return Ok(());
+                    }
+                }
+            }
+            Frame::NotFound => PathResult::Failed(CliError::Api {
+                status: Some(404),
+                error: "not_found".to_string(),
+                context: None,
+            }),
+            Frame::TooLarge { .. } => {
+                self.alone
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(index);
+                return Ok(());
+            }
+            Frame::Mismatch { expected, actual } => PathResult::Failed(hash_mismatch(
+                &self.distinct[index].typed,
+                &expected,
+                &actual,
+            )),
+        };
+        self.results.lock().unwrap_or_else(PoisonError::into_inner)[index] = result;
+        Ok(())
+    }
+
+    fn gave_up(&self, indices: &[usize]) {
+        if let Some(ledger) = &self.ledger {
+            let mut ledger = ledger.lock().unwrap_or_else(PoisonError::into_inner);
+            for index in indices {
+                ledger.report(*index, 0);
+            }
+        }
+    }
+
+    fn admit(&self, index: usize, size: u64) -> bool {
+        match &self.ledger {
+            Some(ledger) => ledger
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .report(index, size),
+            None => true,
+        }
+    }
+}
+
+/// Reads every distinct path at `at` (`"head"` or a commit) over the
+/// batch, `have` the hint's hash where the stored blob verifies, under
+/// `budget` one chunk at a time (D-243 §8). Answers `None` where the
+/// server answers no v2: the run then reads as 278 does.
+#[allow(clippy::too_many_arguments)]
+pub async fn read_many_batch(
+    client: &SynsClient,
+    repo_id: &str,
+    token: Option<&str>,
+    at: &str,
+    store: Option<&Store>,
+    distinct: &[Distinct],
+    entries: &[Option<usize>],
+    budget: Option<u64>,
+) -> Result<Option<BatchMany>, CliError> {
+    use crate::read::batch::{Ask, IN_FLIGHT, read_chunks_with};
+    let n = distinct.len();
+    let mut first = vec![usize::MAX; n];
+    for (place, entry) in entries.iter().enumerate() {
+        if let Some(d) = entry
+            && first[*d] == usize::MAX
+        {
+            first[*d] = place;
+        }
+    }
+    let asks: Vec<Ask> = distinct
+        .iter()
+        .map(|d| Ask {
+            path: d.mapped.clone(),
+            have: store
+                .and_then(|store| store.held(repo_id, &d.mapped))
+                .map(|held| held.sha),
+            expect: None,
+            size: Some(0),
+        })
+        .collect();
+    let sink = CatSink {
+        repo_id,
+        store,
+        distinct,
+        results: Mutex::new((0..n).map(|_| PathResult::NotRun).collect()),
+        alone: Mutex::new(Vec::new()),
+        ledger: budget.map(|budget| {
+            let mut ledger = FrameLedger {
+                budget,
+                entries: entries.to_vec(),
+                first: first.clone(),
+                sizes: vec![None; n],
+                sum: 0,
+                decided: 0,
+                cut: None,
+            };
+            // Places refused before any request decide at once.
+            if n == 0 {
+                ledger.report_none();
+            }
+            Mutex::new(ledger)
+        }),
+    };
+    let in_flight = if budget.is_some() { 1 } else { IN_FLIGHT };
+    let read = match read_chunks_with(
+        client, None, repo_id, token, at, &asks, in_flight, &sink, true,
+    )
+    .await
+    {
+        Ok(read) => read,
+        Err(err) if crate::read::v2::is_absent(&err) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    if read
+        .failed
+        .iter()
+        .any(|(_, err)| crate::read::v2::is_absent(err))
+    {
+        return Ok(None);
+    }
+    let mut results = sink
+        .results
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner);
+    for (left, err) in read.failed {
+        for i in left {
+            results[i] = PathResult::Failed(copy_error(&err));
+        }
+    }
+    let cut = sink.ledger.and_then(|ledger| {
+        ledger
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner)
+            .cut
+    });
+    if let Some(cut) = cut {
+        for (d, result) in results.iter_mut().enumerate() {
+            if first[d] >= cut {
+                *result = PathResult::Deferred;
+            }
+        }
+    }
+    Ok(Some(BatchMany {
+        results,
+        alone: sink
+            .alone
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner),
+        header: read.header,
+        cut,
+    }))
+}
+
+impl FrameLedger {
+    /// Decides the places that need no frame.
+    fn report_none(&mut self) {
+        while self.cut.is_none() && self.decided < self.entries.len() {
+            if self.entries[self.decided].is_some() {
+                break;
+            }
+            self.decided += 1;
+        }
+    }
+}
+
+/// The same failure again, for each path of a chunk that gave up.
+fn copy_error(err: &CliError) -> CliError {
+    match err {
+        CliError::ServerUnreachable { url } => CliError::ServerUnreachable { url: url.clone() },
+        CliError::Api {
+            status,
+            error,
+            context,
+        } => CliError::Api {
+            status: *status,
+            error: error.clone(),
+            context: context.clone(),
+        },
+        CliError::AuthRequired => CliError::AuthRequired,
+        other => CliError::Io {
+            message: other.to_string(),
+        },
+    }
+}

@@ -46,7 +46,9 @@ pub async fn cmd_status(config: &Config, output: &Output, if_repo: bool) -> Resu
         .read()
         .ok()
         .flatten();
-    let client = SynsClient::new(config.server_url())?;
+    // Roadmap 279: the working copy's head through v2 where served.
+    let client = SynsClient::new(config.server_url())?
+        .with_v2(crate::read::run::RunReads::new(config, token.as_deref()));
 
     let mut response = client.get_repo(&repo_id, token.as_deref()).await?;
     // SPEC u302 `cmd_status` 1: inside a folder bound to its identity, the

@@ -107,8 +107,13 @@ impl Deployment {
     }
 
     fn requests(&self) -> Vec<Request> {
+        // Roadmap 279: a server answering no v2 is asked v2 first, its `404`
+        // sending the run down these v1 reads (D-243 §7): left out here.
         self.rt
             .block_on(async { self.server.received_requests().await.expect("requests") })
+            .into_iter()
+            .filter(|r| !r.url.path().starts_with("/api/v2/"))
+            .collect()
     }
 
     /// Every request whose address ends with `suffix`.

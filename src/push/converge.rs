@@ -317,6 +317,12 @@ fn read_failed(path: &Path, err: std::io::Error) -> CliError {
     }
 }
 
+// Roadmap 279: the head, the holder's `.synsignore` and the blobs read
+// through `/api/v2` where the run's client reads it.
+#[path = "v2reads.rs"]
+mod v2reads;
+pub(crate) use v2reads::snapshot_head;
+
 // ---- reading the head ------------------------------------------------
 
 #[derive(Debug, Clone, Default)]
@@ -535,17 +541,27 @@ async fn read_head(
     reading: HeadReading,
     has_base: bool,
 ) -> Result<Head, CliError> {
-    // SPEC u302 `converge` 1: a copy bound to an identity stands on the
-    // newest version the identity lists, its tree read at that hash; the
-    // tip's tree where it lists none.
-    if copy.folder.as_ref().is_some_and(|s| s.identity.is_some())
-        && let Some(newest) = identity_head(client, token, &repo_id(copy)).await?
-    {
-        let mut head = read_tree(client, token, copy, Some(&newest.sha)).await?;
-        head.commit = Some(newest.sha);
-        return Ok(head);
-    }
-    match read_tree(client, token, copy, None).await {
+    read_head_collected(client, token, copy, reading, has_base, None).await
+}
+
+/// `read_head`, a changed path the collected folder already holds asked
+/// with `have` on a v2 read (roadmap 279, D-243 §2).
+async fn read_head_collected(
+    client: &SynsClient,
+    token: Option<&str>,
+    copy: &WorkingCopy,
+    reading: HeadReading,
+    has_base: bool,
+    collected: Option<&BTreeMap<String, String>>,
+) -> Result<Head, CliError> {
+    // Roadmap 279: the head through v2 where the run reads it, its
+    // refusals read as v1's are below.
+    let read = match v2reads::read_head_v2(client, token, copy, collected).await {
+        Ok(Some(head)) => Ok(head),
+        Ok(None) => read_head_v1(client, token, copy).await,
+        Err(err) => Err(err),
+    };
+    match read {
         Ok(head) => Ok(head),
         Err(err)
             if reading == HeadReading::State && is_empty_repository(&err)
@@ -558,6 +574,26 @@ async fn read_head(
         }
         Err(err) => Err(err),
     }
+}
+
+/// The head through v1: the identity's newest version where the copy is
+/// bound to one, else the tip.
+async fn read_head_v1(
+    client: &SynsClient,
+    token: Option<&str>,
+    copy: &WorkingCopy,
+) -> Result<Head, CliError> {
+    // SPEC u302 `converge` 1: a copy bound to an identity stands on the
+    // newest version the identity lists, its tree read at that hash; the
+    // tip's tree where it lists none.
+    if copy.folder.as_ref().is_some_and(|s| s.identity.is_some())
+        && let Some(newest) = identity_head(client, token, &repo_id(copy)).await?
+    {
+        let mut head = read_tree(client, token, copy, Some(&newest.sha)).await?;
+        head.commit = Some(newest.sha);
+        return Ok(head);
+    }
+    read_tree(client, token, copy, None).await
 }
 
 fn reading_for(mode: ConvergeMode) -> HeadReading {
@@ -592,6 +628,16 @@ pub(crate) async fn read_blobs(
 ) -> Result<BTreeMap<String, Blob>, CliError> {
     // 1 — every path checked before any request.
     check_server_paths(wanted.keys())?;
+
+    // Roadmap 279: from the store where this run named the hash, else in
+    // chunks of `POST …/read`, where the run reads v2.
+    if let Some((blobs, _)) = v2reads::read_blobs_v2(
+        client, token, repo_id, folder, at, wanted, held, staging, false,
+    )
+    .await?
+    {
+        return Ok(blobs);
+    }
 
     let mut staged: Vec<PathBuf> = Vec::new();
     let mut set: tokio::task::JoinSet<Result<(String, u64, Blob), CliError>> =
@@ -724,6 +770,15 @@ async fn read_base_blobs(
     held: &Arc<HeldBytes>,
     staging: &Staging,
 ) -> Result<(BTreeMap<String, Blob>, BTreeSet<String>), CliError> {
+    // Roadmap 279: one batch at the base commit, a path it does not hold
+    // at the hash the base names unheld, with no per-path re-read.
+    if let Some((blobs, unheld)) = v2reads::read_blobs_v2(
+        client, token, repo_id, folder, at, wanted, held, staging, true,
+    )
+    .await?
+    {
+        return Ok((blobs, unheld.into_iter().collect()));
+    }
     match read_blobs(client, token, repo_id, folder, at, wanted, held, staging).await {
         Ok(blobs) => return Ok((blobs, BTreeSet::new())),
         Err(err) if base_unheld(&err, folder, wanted) => {}
@@ -954,6 +1009,11 @@ pub(crate) async fn folder_root(
     };
     if scope.checkout.is_some() {
         return Ok(FolderRoot::of_scope(&copy.root, scope, None));
+    }
+    // Roadmap 279: from the base commit's view where it records the file
+    // (D-243 §10).
+    if let Some(holder) = v2reads::holder_synsignore_v2(client, token, copy, scope).await? {
+        return Ok(FolderRoot::of_scope(&copy.root, scope, holder));
     }
     let based = folder_base(copy.stores(), scope).and_then(|b| b.commit_sha().map(String::from));
     // SPEC u302 `converge` 2: through an identity, the holder's file at the
@@ -2163,7 +2223,7 @@ async fn prepare_candidate(
         }
     }
 
-    'passes: for _ in 0..MAX_PASSES {
+    'passes: for pass in 0..MAX_PASSES {
         // `converge` 1: the run's own collection on the first pass, a
         // fresh one on every pass after the run wrote the folder or after
         // a pass refused on a file changed since its collection.
@@ -2275,7 +2335,7 @@ async fn prepare_candidate(
         let mut head_blobs = if head_wanted.is_empty() {
             BTreeMap::new()
         } else {
-            read_blobs(
+            match read_blobs(
                 client,
                 token,
                 &repo,
@@ -2285,7 +2345,18 @@ async fn prepare_candidate(
                 &held,
                 staging,
             )
-            .await?
+            .await
+            {
+                Ok(blobs) => blobs,
+                // Roadmap 279: only the first pass, before any write, reads
+                // its head again (D-243 §2).
+                Err(err) => {
+                    if pass > 0 {
+                        v2reads::take_restart(client);
+                    }
+                    return Err(err);
+                }
+            }
         };
         let base_blobs = match (&candidate.base_commit, base_wanted.is_empty()) {
             (Some(base_commit), false) => {
@@ -3081,16 +3152,58 @@ async fn converge_from_resolution(
         }
     }
 
+    // 5 to 12, read again from the closure once where a path the head's
+    // view carried was answered `not_found` before anything was written
+    // (roadmap 279, D-243 §2).
+    let first = converge_from_head(
+        client,
+        token,
+        copy,
+        mode,
+        opts.clone(),
+        staging,
+        folder,
+        root,
+        resolution.clone(),
+    )
+    .await;
+    match first {
+        Err(_) if v2reads::take_restart(client) => {
+            v2reads::drop_view_head(client);
+            converge_from_head(
+                client, token, copy, mode, opts, staging, None, root, resolution,
+            )
+            .await
+        }
+        other => other,
+    }
+}
+
+/// `converge` 5 to 12 under a lock the caller holds, `resolution` the one
+/// step 4 read.
+#[allow(clippy::too_many_arguments)]
+async fn converge_from_head(
+    client: &SynsClient,
+    token: Option<&str>,
+    copy: &WorkingCopy,
+    mode: ConvergeMode,
+    opts: SmartPushOptions,
+    staging: &Staging,
+    folder: Option<Folder>,
+    root: &FolderRoot,
+    resolution: Option<Resolution>,
+) -> Result<SyncOutcome, CliError> {
     // 5 — the one base read, held as its manifest for the written test
     // and as the `Base` every comparison reads.
     let base_manifest = base_of(copy);
     let base = base_from(base_manifest.as_ref());
-    let head = read_head(
+    let head = read_head_collected(
         client,
         token,
         copy,
         reading_for(mode),
         base.commit.is_some(),
+        folder.as_ref().map(|f| &f.hashes),
     )
     .await?;
     if head.truncated {

@@ -7,8 +7,14 @@
 //! time-travel read never pays the commit walk a full content hash costs
 //! (`issues/148-ref-by-content-hash-resolved-by-scanning-every-commit`).
 
+pub mod batch;
+pub mod closure;
 pub mod files;
+pub mod listing;
+pub mod run;
 pub mod store;
+pub mod v2;
+pub mod view;
 
 use crate::auth::token::TokenStore;
 use crate::client::SynsClient;
@@ -148,6 +154,15 @@ pub fn refuse_empty_path(typed: &str) -> Result<(), CliError> {
 
 /// Whether ECMAScript's `String.prototype.trim` takes `c` off an end:
 /// its WhiteSpace and LineTerminator productions.
+/// A tree path as the server reads it (276 row 17, `queryPath`): every
+/// trailing `/` taken off, then what ECMAScript's `trim` takes off its
+/// ends (`filePathSchema`). The closure's first block, and so the view's
+/// scope, name the path so read (roadmap 279, REVIEW-syns-cli I1).
+pub fn as_server_reads(path: &str) -> &str {
+    path.trim_end_matches('/')
+        .trim_matches(trimmed_by_the_file_path_field_kind)
+}
+
 fn trimmed_by_the_file_path_field_kind(c: char) -> bool {
     matches!(
         c,
@@ -175,6 +190,18 @@ pub async fn resolve_read_target(
     config: &Config,
     output: &Output,
     opts: &ReadOptions,
+) -> Result<Option<ReadTarget>, CliError> {
+    resolve_read_target_through(config, output, opts, true).await
+}
+
+/// `resolve_read_target`, an unpinned reference resolved by one v2 `head`
+/// with `If-None-Match` from the store's `heads/` where `v2` holds and the
+/// server answers it, else as today (roadmap 279, D-243 §9).
+pub async fn resolve_read_target_through(
+    config: &Config,
+    output: &Output,
+    opts: &ReadOptions,
+    v2: bool,
 ) -> Result<Option<ReadTarget>, CliError> {
     // 1 — bind the repository and the folder (SPEC u290).
     let Some((repo_id, folder)) = bind_repository(opts.repo.as_deref(), opts.if_repo, output)?
@@ -216,6 +243,19 @@ pub async fn resolve_read_target(
             value.to_string()
         }
         None => {
+            // Roadmap 279: one v2 head, the held commit sent as
+            // `If-None-Match`; a `404` reads the head as today.
+            if v2
+                && let Some(reference) =
+                    v2_head(config, &client, token.as_deref(), &repo_id).await?
+            {
+                return Ok(Some(ReadTarget {
+                    repo_id: repo_id.clone(),
+                    token: token.clone(),
+                    reference,
+                    folder,
+                }));
+            }
             let through_identity = match &folder {
                 Some(scope) => scope.identity.is_some(),
                 None => false,
@@ -260,6 +300,53 @@ pub async fn resolve_read_target(
 
     // 4 — pin the pair.
     pinned(entry, folder)
+}
+
+/// The head of `repo_id` through one v2 `head` (D-243 §9): a `304` to
+/// the commit `heads/` holds answers the held commit and number with no
+/// further lookup; `{"commit":null}` today's empty-repository refusal;
+/// none where the server answers no v2, or names no number.
+async fn v2_head(
+    config: &Config,
+    client: &SynsClient,
+    token: Option<&str>,
+    repo_id: &str,
+) -> Result<Option<ResolvedRef>, CliError> {
+    let spot = store::StoreSpot::of(config, token);
+    let held = spot.open(false).and_then(|store| store.head(repo_id));
+    match v2::head(
+        client,
+        repo_id,
+        token,
+        held.as_ref().map(|(c, _)| c.as_str()),
+    )
+    .await
+    {
+        Ok(v2::HeadAnswer::NotModified) => Ok(held.map(|(commit_sha, version)| ResolvedRef {
+            version,
+            commit_sha,
+        })),
+        Ok(v2::HeadAnswer::Head {
+            commit: Some(commit_sha),
+            version: Some(version),
+        }) => {
+            if let Some(store) = spot.open(true) {
+                store.write_head(repo_id, &commit_sha, version);
+            }
+            Ok(Some(ResolvedRef {
+                version,
+                commit_sha,
+            }))
+        }
+        Ok(v2::HeadAnswer::Head { commit: None, .. }) => Err(CliError::Api {
+            status: Some(422),
+            error: "validation_error".to_string(),
+            context: None,
+        }),
+        Ok(v2::HeadAnswer::Head { version: None, .. }) => Ok(None),
+        Err(err) if v2::is_absent(&err) => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 /// Binds the repository and the folder a read runs against (SPEC u290

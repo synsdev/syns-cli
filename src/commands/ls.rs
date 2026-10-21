@@ -34,16 +34,34 @@ pub async fn cmd_ls(
 
     // 3 — read the tree at that reference under the mapped path.
     let version_ref = target.version_ref();
-    let (mut response, mut raw) = match client
-        .get_tree(
-            &target.repo_id,
-            target.token.as_deref(),
-            mapped.as_deref(),
-            recursive,
-            Some(&version_ref),
-        )
-        .await
+    // Roadmap 279: the closure at the resolved commit, a `304` read from
+    // the store's trees; v1's listing where the server answers no v2.
+    let listed = match crate::read::listing::list(
+        &client,
+        &crate::read::store::StoreSpot::of(config, target.token.as_deref()),
+        &target.repo_id,
+        target.token.as_deref(),
+        &target.reference.commit_sha,
+        mapped.as_deref(),
+        recursive,
+    )
+    .await
     {
+        Ok(Some(listed)) => Ok(listed),
+        Ok(None) => {
+            client
+                .get_tree(
+                    &target.repo_id,
+                    target.token.as_deref(),
+                    mapped.as_deref(),
+                    recursive,
+                    Some(&version_ref),
+                )
+                .await
+        }
+        Err(err) => Err(err),
+    };
+    let (mut response, mut raw) = match listed {
         Ok(tuple) => tuple,
         Err(e) => {
             if let Some(p) = named.as_ref() {

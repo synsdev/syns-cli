@@ -10,6 +10,7 @@ use crate::push::converge::{
     read_blobs, replace_file_whole,
 };
 use crate::push::working_copy::{WorkingCopy, holds_in_root_home};
+use crate::read::run::RunReads;
 use crate::repo::folder::{
     FolderScope, enclosing_folders, folder_checkout, lies_under, resolve_folder_scope,
 };
@@ -386,7 +387,10 @@ pub async fn cmd_pull(
         .read()
         .ok()
         .flatten();
-    let client = SynsClient::new(config.server_url())?.bulk_reads();
+    // Roadmap 279: the head and the blobs through v2 where served.
+    let client = SynsClient::new(config.server_url())?
+        .bulk_reads()
+        .with_v2(RunReads::new(config, token.as_deref()));
 
     if let Some(version) = version {
         return pull_snapshot(
@@ -492,7 +496,9 @@ async fn pull_into_folder(
         .read()
         .ok()
         .flatten();
-    let client = SynsClient::new(config.server_url())?.bulk_reads();
+    let client = SynsClient::new(config.server_url())?
+        .bulk_reads()
+        .with_v2(RunReads::new(config, token.as_deref()));
     let copy = WorkingCopy::open_folder(config.stores(), &scope)?;
 
     let retrieved = match version.as_deref() {
@@ -697,8 +703,18 @@ async fn pull_snapshot(
             .filter(|s| s.identity.is_none())
             .map(|s| s.path.clone())
     });
-    let (commit_sha, server_files): (String, Vec<ServedFile>) = match &recorded {
-        None => {
+    // Roadmap 279: the closure at that version where the run reads v2,
+    // the blobs read at the commit its tag names (D-243 §7).
+    let snapshot =
+        crate::push::converge::snapshot_head(client, token, repo_id, recorded.as_deref(), version)
+            .await?;
+    let read_at = snapshot
+        .as_ref()
+        .map(|(commit, _)| commit.clone())
+        .unwrap_or_else(|| version.to_string());
+    let (commit_sha, server_files): (String, Vec<ServedFile>) = match (snapshot, &recorded) {
+        (Some(snapshot), _) => snapshot,
+        (None, None) => {
             let (tree_response, _raw) = client
                 .get_tree(repo_id, token, None, true, Some(version))
                 .await?;
@@ -712,7 +728,7 @@ async fn pull_snapshot(
                     .collect(),
             )
         }
-        Some(folder) => {
+        (None, Some(folder)) => {
             let (tree_response, _raw) = client
                 .get_tree(repo_id, token, Some(folder), true, Some(version))
                 .await?;
@@ -791,7 +807,7 @@ async fn pull_snapshot(
         token,
         repo_id,
         recorded.as_deref(),
-        version,
+        &read_at,
         &wanted,
         &held,
         &staging,

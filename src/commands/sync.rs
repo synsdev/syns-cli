@@ -25,6 +25,7 @@ use crate::push::converge::{
 use crate::push::reconcile::{CONFLICT_MARKERS, CollisionKind};
 use crate::push::smart::SmartPushOptions;
 use crate::push::working_copy::{Resolution, WorkingCopy};
+use crate::read::run::RunReads;
 use crate::repo::folder::{FolderScope, resolve_scoped_or_skip};
 use crate::repo::identity::return_to_holder;
 use crate::repo::root::push_scope;
@@ -545,7 +546,10 @@ pub async fn cmd_sync(config: &Config, output: &Output, if_repo: bool) -> Result
         // 3
         let token = load_token(config)?;
         // 4
-        let client = SynsClient::new(config.server_url())?.bulk_reads();
+        // Roadmap 279: the head and the blobs through v2 where served.
+        let client = SynsClient::new(config.server_url())?
+            .bulk_reads()
+            .with_v2(RunReads::new(config, Some(&token)));
         ensure_copy_identity(&copy, &owner, &name)?;
         let converged = converge(
             &client,

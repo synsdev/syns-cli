@@ -51,9 +51,14 @@ impl Deployment {
     }
 
     pub(crate) fn requests(&self) -> Vec<Request> {
+        // Roadmap 279: a server answering no v2 is asked v2 first, its `404`
+        // sending the run down these v1 reads (D-243 §7): left out here.
         self.rt
             .block_on(self.server.received_requests())
             .unwrap_or_default()
+            .into_iter()
+            .filter(|r| !r.url.path().starts_with("/api/v2/"))
+            .collect()
     }
 
     /// Run the binary in `cwd` with `config` as its configuration

@@ -274,6 +274,141 @@ fn base64_slice<S: serde::Serializer>(
     }
 }
 
+/// What reading the `files` answer over the batch came to.
+enum Batched {
+    /// `--if-repo` skipped the run.
+    Skipped,
+    /// The server answers no v2: the target where it was resolved.
+    NoV2(Option<crate::read::ReadTarget>),
+    Read(Arc<crate::read::ReadTarget>, crate::read::files::Many),
+}
+
+/// The `files` answer's reads over `POST …/read` (roadmap 279, D-243 §8):
+/// unpinned, the first chunk asks `head` and its header pins the run; with
+/// `--version`, today's resolution, then every chunk at that commit. A
+/// path the batch leaves out twice, or whose stored blob is gone, is read
+/// alone through 278's raw read. None where the server answers no v2.
+async fn cat_many_batch(
+    config: &Config,
+    output: &Output,
+    opts: &ReadOptions,
+    distinct: &[Distinct],
+    slots: &[Option<usize>],
+    budget: Option<u64>,
+) -> Result<Option<Batched>, CliError> {
+    use crate::read::{ReadTarget, files::read_many_batch};
+    let client = SynsClient::new(config.server_url())?;
+    let (target, at, repo_id, folder) = match &opts.version {
+        Some(_) => {
+            let Some(target) =
+                crate::read::resolve_read_target_through(config, output, opts, false).await?
+            else {
+                return Ok(Some(Batched::Skipped));
+            };
+            let at = target.reference.commit_sha.clone();
+            let (repo_id, folder) = (target.repo_id.clone(), target.folder.clone());
+            (Some(target), at, repo_id, folder)
+        }
+        None => {
+            let Some((repo_id, folder)) =
+                bind_repository(opts.repo.as_deref(), opts.if_repo, output)?
+            else {
+                return Ok(Some(Batched::Skipped));
+            };
+            (None, "head".to_string(), repo_id, folder)
+        }
+    };
+    let token = match &target {
+        Some(target) => target.token.clone(),
+        None => crate::auth::token::TokenStore::new(config.credentials_path())
+            .read()
+            .ok()
+            .flatten(),
+    };
+    let store = Store::open(config, token.as_deref());
+    let Some(batch) = read_many_batch(
+        &client,
+        &repo_id,
+        token.as_deref(),
+        &at,
+        store.as_ref(),
+        distinct,
+        slots,
+        budget,
+    )
+    .await?
+    else {
+        if let Some(store) = &store {
+            store.finish();
+        }
+        return Ok(Some(Batched::NoV2(target)));
+    };
+    let target = match target {
+        Some(target) => target,
+        // The first chunk gave up before any answer named the head: the
+        // reference from one v2 head, each path the chunk's class.
+        None if batch.header.is_none() => {
+            match crate::read::resolve_read_target_through(config, output, opts, true).await? {
+                Some(target) => target,
+                None => return Ok(Some(Batched::Skipped)),
+            }
+        }
+        None => {
+            let Some(header) = &batch.header else {
+                return Ok(None);
+            };
+            let version = match header.version {
+                Some(version) => version,
+                None => {
+                    client
+                        .get_version(&repo_id, token.as_deref(), &header.commit)
+                        .await?
+                        .0
+                        .version
+                }
+            };
+            ReadTarget {
+                repo_id,
+                token,
+                reference: ResolvedRef {
+                    version,
+                    commit_sha: header.commit.clone(),
+                },
+                folder,
+            }
+        }
+    };
+    let mut results = batch.results;
+    for index in batch.alone {
+        let path = &distinct[index];
+        results[index] = match read_path(
+            &client,
+            &target,
+            store.as_ref(),
+            &path.mapped,
+            &path.typed,
+            Policy::default(),
+            None,
+        )
+        .await
+        {
+            Ok(Outcome::Read(answer)) => PathResult::Read(answer),
+            Ok(Outcome::Deferred) => PathResult::Deferred,
+            Err(err) => PathResult::Failed(err),
+        };
+    }
+    if let Some(store) = &store {
+        store.finish();
+    }
+    Ok(Some(Batched::Read(
+        Arc::new(target),
+        crate::read::files::Many {
+            results,
+            cut: batch.cut,
+        },
+    )))
+}
+
 /// `syns cat PATH…` past one path (roadmap 278).
 async fn cmd_cat_many(
     config: &Config,
@@ -330,34 +465,63 @@ async fn cmd_cat_many(
         }
     }
 
-    // 3 — resolve the one reference every path is read at.
-    let Some(target) = resolve_read_target(config, output, &opts).await? else {
-        return Ok(());
-    };
-    let client = Arc::new(SynsClient::new(config.server_url())?);
-    let store = Store::open(config, target.token.as_deref()).map(Arc::new);
-    let target = Arc::new(target);
-
-    // 4 — read them.
+    // 3 and 4 — under `--json`, the `files` answer over `POST …/read`
+    // (roadmap 279, D-243 §8): unpinned, the first chunk at `head` names
+    // the one reference every path is read at.
     let slots: Vec<Option<usize>> = entries.iter().map(|e| e.as_ref().ok().copied()).collect();
-    let stop = if output.is_json() {
-        Stop::RunWide
+    let batched = if output.is_json() && !distinct.is_empty() {
+        cat_many_batch(config, output, &opts, &distinct, &slots, request.max_bytes).await?
     } else {
-        Stop::InOrder
+        None
     };
-    let many = read_many(
-        client,
-        target.clone(),
-        store.clone(),
-        distinct,
-        &slots,
-        request.max_bytes,
-        stop,
-    )
-    .await;
-    if let Some(store) = &store {
-        store.finish();
-    }
+    let (target, many) = match batched {
+        Some(Batched::Skipped) => return Ok(()),
+        Some(Batched::Read(target, many)) => (target, many),
+        unread => {
+            // 3 — resolve the one reference every path is read at; a
+            // server answering no v2 for the batch is asked v1 alone.
+            let target = match unread {
+                Some(Batched::NoV2(Some(target))) => target,
+                _ => {
+                    let Some(target) = crate::read::resolve_read_target_through(
+                        config,
+                        output,
+                        &opts,
+                        unread.is_none(),
+                    )
+                    .await?
+                    else {
+                        return Ok(());
+                    };
+                    target
+                }
+            };
+            let client = Arc::new(SynsClient::new(config.server_url())?);
+            let store = Store::open(config, target.token.as_deref()).map(Arc::new);
+            let target = Arc::new(target);
+
+            // 4 — read them.
+            let stop = if output.is_json() {
+                Stop::RunWide
+            } else {
+                Stop::InOrder
+            };
+            let many = read_many(
+                client,
+                target.clone(),
+                store.clone(),
+                distinct,
+                &slots,
+                request.max_bytes,
+                stop,
+            )
+            .await;
+            if let Some(store) = &store {
+                store.finish();
+            }
+            (target, many)
+        }
+    };
     let reference = &target.reference;
 
     // 5 — the byte stream: each file in order, stopping at the first that
