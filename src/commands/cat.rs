@@ -279,7 +279,7 @@ enum Batched {
     /// `--if-repo` skipped the run.
     Skipped,
     /// The server answers no v2: the target where it was resolved.
-    NoV2(Option<crate::read::ReadTarget>),
+    NoV2(Option<Box<crate::read::ReadTarget>>),
     Read(Arc<crate::read::ReadTarget>, crate::read::files::Many),
 }
 
@@ -341,7 +341,7 @@ async fn cat_many_batch(
         if let Some(store) = &store {
             store.finish();
         }
-        return Ok(Some(Batched::NoV2(target)));
+        return Ok(Some(Batched::NoV2(target.map(Box::new))));
     };
     let target = match target {
         Some(target) => target,
@@ -481,7 +481,7 @@ async fn cmd_cat_many(
             // 3 — resolve the one reference every path is read at; a
             // server answering no v2 for the batch is asked v1 alone.
             let target = match unread {
-                Some(Batched::NoV2(Some(target))) => target,
+                Some(Batched::NoV2(Some(target))) => *target,
                 _ => {
                     let Some(target) = crate::read::resolve_read_target_through(
                         config,
