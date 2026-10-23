@@ -1,10 +1,10 @@
-use crate::client::{EntryType, SynsClient};
+use crate::client::{EntryType, SynsClient, TreeResponse};
 use crate::config::Config;
 use crate::errors::{CliError, partial_truncated_tree};
 use crate::output::Output;
 use crate::read::{
-    ReadOptions, bind_read_folder, counted_from, mark_partial, read_not_found, report_reference,
-    repository_argument, resolve_read_target, with_reference,
+    ReadOptions, ReadTarget, bind_read_folder, counted_from, mark_partial, read_not_found,
+    report_reference, repository_argument, resolve_read_target, with_reference,
 };
 
 /// `syns ls [PATH]` — the listing's columns and its ordering stand as
@@ -32,34 +32,18 @@ pub async fn cmd_ls(
     };
     let client = SynsClient::new(config.server_url())?;
 
-    // 3 — read the tree at that reference under the mapped path.
-    let version_ref = target.version_ref();
-    // Roadmap 279: the closure at the resolved commit, a `304` read from
-    // the store's trees; v1's listing where the server answers no v2.
-    let listed = match crate::read::listing::list(
-        &client,
-        &crate::read::store::StoreSpot::of(config, target.token.as_deref()),
-        &target.repo_id,
-        target.token.as_deref(),
-        &target.reference.commit_sha,
-        mapped.as_deref(),
-        recursive,
-    )
-    .await
-    {
-        Ok(Some(listed)) => Ok(listed),
-        Ok(None) => {
-            client
-                .get_tree(
-                    &target.repo_id,
-                    target.token.as_deref(),
-                    mapped.as_deref(),
-                    recursive,
-                    Some(&version_ref),
-                )
-                .await
+    // 3 — read the tree at that reference under the mapped path; a
+    // path the tree read refuses as `not_found` answers the file of that
+    // name its parent lists at the same commit, where one stands there
+    // (issue 359).
+    let listed = match list_tree(config, &client, &target, mapped.as_deref(), recursive).await {
+        Err(e) if is_not_found(&e) => {
+            match file_entry(config, &client, &target, mapped.as_deref()).await {
+                Some(file) => Ok(file),
+                None => Err(e),
+            }
         }
-        Err(err) => Err(err),
+        other => other,
     };
     let (mut response, mut raw) = match listed {
         Ok(tuple) => tuple,
@@ -155,6 +139,101 @@ pub async fn cmd_ls(
     }
 
     Ok(())
+}
+
+/// The tree at the run's reference under `path`: the closure at the
+/// resolved commit, a `304` read from the store's trees; v1's listing
+/// where the server answers no v2 (roadmap 279).
+async fn list_tree(
+    config: &Config,
+    client: &SynsClient,
+    target: &ReadTarget,
+    path: Option<&str>,
+    recursive: bool,
+) -> Result<(TreeResponse, serde_json::Value), CliError> {
+    let listed = crate::read::listing::list(
+        client,
+        &crate::read::store::StoreSpot::of(config, target.token.as_deref()),
+        &target.repo_id,
+        target.token.as_deref(),
+        &target.reference.commit_sha,
+        path,
+        recursive,
+    )
+    .await?;
+    match listed {
+        Some(listed) => Ok(listed),
+        None => {
+            client
+                .get_tree(
+                    &target.repo_id,
+                    target.token.as_deref(),
+                    path,
+                    recursive,
+                    Some(&target.version_ref()),
+                )
+                .await
+        }
+    }
+}
+
+/// A `404` whose code is `not_found`: the answer the tree read gives a
+/// path naming a file and a path naming nothing alike (`EP-tree`,
+/// `EP-v2-tree`); `repo_not_found` and every other refusal stand.
+fn is_not_found(err: &CliError) -> bool {
+    matches!(err, CliError::Api { status: Some(404), error, .. } if error == "not_found")
+}
+
+/// The one entry of the file `path` names, from its parent's listing at
+/// the run's commit, as `ls FILE` prints the file (issue 359); `--recursive`
+/// answers it alike. None where the parent lists no file of that name, or
+/// refuses, so the tree read's refusal stands. A path typed with a
+/// trailing `/` asks for a folder and names no file.
+async fn file_entry(
+    config: &Config,
+    client: &SynsClient,
+    target: &ReadTarget,
+    path: Option<&str>,
+) -> Option<(TreeResponse, serde_json::Value)> {
+    let typed = path?;
+    if typed.ends_with('/') {
+        return None;
+    }
+    let path = crate::read::as_server_reads(typed);
+    let (parent, name) = match path.rsplit_once('/') {
+        Some((parent, name)) => (Some(parent), name),
+        None => (None, path),
+    };
+    if name.is_empty() {
+        return None;
+    }
+    let (response, mut raw) = list_tree(config, client, target, parent, false)
+        .await
+        .ok()?;
+    let entry = response
+        .entries
+        .into_iter()
+        .find(|e| e.name == name && matches!(e.entry_type, EntryType::File))?;
+    let served = raw
+        .get("entries")
+        .and_then(|e| e.as_array())
+        .and_then(|entries| {
+            entries.iter().find(|e| {
+                e.get("name").and_then(|n| n.as_str()) == Some(name)
+                    && e.get("type").and_then(|t| t.as_str()) == Some("file")
+            })
+        })
+        .cloned()?;
+    raw["entries"] = serde_json::Value::Array(vec![served]);
+    raw["truncated"] = serde_json::Value::Bool(false);
+    Some((
+        TreeResponse {
+            entries: vec![entry],
+            commit_sha: response.commit_sha,
+            truncated: false,
+        },
+        raw,
+    ))
 }
 
 #[cfg(test)]
