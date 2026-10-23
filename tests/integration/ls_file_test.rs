@@ -190,13 +190,28 @@ fn a_hidden_file_stays_absent() {
 #[test]
 fn a_trailing_slash_asks_for_a_folder() {
     for (v2, env, dir) in envs() {
-        let out = env.run(&dir, &["ls", "a.md/"]);
-        assert_eq!(out.status.code(), Some(1), "v2={v2}");
-        assert_eq!(
-            String::from_utf8_lossy(&out.stderr),
-            "error: path not found: a.md/\n",
-            "v2={v2}"
-        );
+        let q3 = env.dir("q3");
+        ok(&env.run(&q3, &["pull", "alice/notes", ".", "--path", "clients/q3"]));
+        for (cwd, path) in [
+            (&dir, "a.md/"),
+            (&dir, "./a.md/"),
+            (&dir, "a.md/."),
+            (&dir, "docs/guide.md/"),
+            (&dir, "a.md/ "),
+            (&q3, "a.md/"),
+            (&q3, "a.md/."),
+        ] {
+            let out = env.run(cwd, &["ls", path]);
+            assert_eq!(out.status.code(), Some(1), "v2={v2} {path}");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stderr),
+                format!("error: path not found: {path}\n"),
+                "v2={v2} {path}"
+            );
+        }
+        // A trailing `/` on a folder lists it as today.
+        ok(&env.run(&dir, &["ls", "docs/"]));
+        ok(&env.run(&q3, &["ls", "b/"]));
     }
 }
 
@@ -267,21 +282,26 @@ fn inside_a_scoped_folder_the_path_counts_from_the_folder() {
 #[test]
 fn a_file_costs_one_listing_of_its_parent_and_a_folder_nothing_more() {
     for (v2, env, dir) in envs() {
+        let reads = |r: &&String| r.contains("tree");
         ok(&env.run(&dir, &["ls", "docs"]));
         env.fake.clear();
         ok(&env.run(&dir, &["ls", "docs"]));
-        let folder = env.fake.routes().len();
+        // A folder: its own read alone, the closure, or v2's refusal and v1.
+        let folder = env.fake.routes();
+        assert_eq!(
+            folder.iter().filter(reads).count(),
+            if v2 { 1 } else { 2 },
+            "v2={v2}: {folder:?}"
+        );
         env.fake.clear();
         ok(&env.run(&dir, &["ls", "docs/guide.md"]));
         let file = env.fake.routes();
         // The file's own read refused (v2, then v1), then the parent's
         // listing: over v2 the closure; with no v2, v2's refusal and v1.
-        let reads = |r: &&String| r.contains("tree");
         assert_eq!(
             file.iter().filter(reads).count(),
             if v2 { 3 } else { 4 },
             "v2={v2}: {file:?}"
         );
-        assert!(folder <= file.len(), "v2={v2}");
     }
 }

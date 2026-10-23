@@ -37,7 +37,7 @@ pub async fn cmd_ls(
     // name its parent lists at the same commit, where one stands there
     // (issue 359).
     let listed = match list_tree(config, &client, &target, mapped.as_deref(), recursive).await {
-        Err(e) if is_not_found(&e) => {
+        Err(e) if is_not_found(&e) && !path.as_deref().is_some_and(asks_for_a_folder) => {
             match file_entry(config, &client, &target, mapped.as_deref()).await {
                 Some(file) => Ok(file),
                 None => Err(e),
@@ -184,22 +184,25 @@ fn is_not_found(err: &CliError) -> bool {
     matches!(err, CliError::Api { status: Some(404), error, .. } if error == "not_found")
 }
 
+/// Whether the path as typed asks for a folder, as POSIX `ls FILE/` and
+/// `ls FILE/.` refuse a file: it ends in `/` or in a `.` segment, before
+/// the dot segments resolve or a scoped folder maps it.
+fn asks_for_a_folder(typed: &str) -> bool {
+    let typed = typed.trim_end();
+    typed.ends_with('/') || typed.rsplit('/').next() == Some(".")
+}
+
 /// The one entry of the file `path` names, from its parent's listing at
 /// the run's commit, as `ls FILE` prints the file (issue 359); `--recursive`
 /// answers it alike. None where the parent lists no file of that name, or
-/// refuses, so the tree read's refusal stands. A path typed with a
-/// trailing `/` asks for a folder and names no file.
+/// refuses, so the tree read's refusal stands.
 async fn file_entry(
     config: &Config,
     client: &SynsClient,
     target: &ReadTarget,
     path: Option<&str>,
 ) -> Option<(TreeResponse, serde_json::Value)> {
-    let typed = path?;
-    if typed.ends_with('/') {
-        return None;
-    }
-    let path = crate::read::as_server_reads(typed);
+    let path = crate::read::as_server_reads(path?);
     let (parent, name) = match path.rsplit_once('/') {
         Some((parent, name)) => (Some(parent), name),
         None => (None, path),
