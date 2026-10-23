@@ -366,7 +366,7 @@ pub async fn resolve_read_target_through(
 /// the commit `heads/` holds answers the held commit and number with no
 /// further lookup; `{"commit":null}` today's empty-repository refusal;
 /// none where the server answers no v2, or names no number.
-async fn v2_head(
+pub(crate) async fn v2_head(
     config: &Config,
     client: &SynsClient,
     token: Option<&str>,

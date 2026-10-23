@@ -339,7 +339,8 @@ pub struct Changes {
     pub entries: Vec<Change>,
 }
 
-/// `GET …/changes?from=…&to=…`, under the bulk budgets.
+/// `GET …/changes?from=…&to=…`, and `&path=…` where `path` is given
+/// (roadmap 224), under the bulk budgets.
 pub async fn changes(
     client: &SynsClient,
     reads: Option<&RunReads>,
@@ -347,9 +348,14 @@ pub async fn changes(
     token: Option<&str>,
     from: &str,
     to: &str,
+    path: Option<&str>,
 ) -> Result<Changes, CliError> {
     bulk(reads, || async {
-        let request = client.v2_get(address, "changes", &[("from", from), ("to", to)], token);
+        let mut query = vec![("from", from), ("to", to)];
+        if let Some(path) = path {
+            query.push(("path", path));
+        }
+        let request = client.v2_get(address, "changes", &query, token);
         let response = match send_unretried(request, 0).await {
             Ok(response) => response,
             Err(err) => return unsent(err),

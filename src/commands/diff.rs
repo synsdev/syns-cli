@@ -1,12 +1,14 @@
 use crate::client::{DiffStatus, SynsClient, VersionListResponse, undecodable};
+use crate::commands::diff_since::{self, Wants, trimmed};
 use crate::commands::history::folder_history;
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
 use crate::read::{
-    RepoScope, RepoScopeArgs, reference_refusal, repository_read_refusal, resolve_scoped_repo_scope,
+    RepoScope, RepoScopeArgs, reference_refusal, repository_argument, repository_read_refusal,
+    resolve_scoped_repo_scope, v2_head,
 };
-use crate::repo::folder::FolderScope;
+use crate::repo::folder::{FolderScope, lies_under};
 use console::style;
 
 fn style_status(status: &DiffStatus) -> console::StyledObject<&'static str> {
@@ -102,6 +104,73 @@ fn version_not_found(err: CliError, repo_id: &str, from: &str, to: &str) -> CliE
     }
 }
 
+/// The flags roadmap 224 adds to `syns diff`: `--provenance` and
+/// `--content` switch to the answer `diff_since` builds; `--path` stands
+/// in both modes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiffFlags {
+    pub provenance: bool,
+    pub content: bool,
+    pub path: Option<String>,
+}
+
+/// `CS-diff-str-to-needs-from`.
+pub const TO_NEEDS_FROM: &str = "--to needs --from: name the older version too, or drop --to";
+
+/// Whether `path` is `under` itself or lies beneath it.
+fn at_or_under(path: &str, under: &str) -> bool {
+    path == under || lies_under(path, under)
+}
+
+/// A typed `--path` in the plain mode, counted as the run prints its
+/// entries: from the folder inside a folder bound to its holder (after
+/// today's narrowing, SPEC_REVIEW_R2's builder note), as served
+/// otherwise; none where it narrows nothing (row 27).
+fn plain_path(folder: Option<&FolderScope>, typed: &str) -> Result<Option<String>, CliError> {
+    let mapped = repository_argument(folder, Some(typed))?;
+    let counted = match (folder, mapped) {
+        (_, None) => None,
+        (Some(folder), Some(mapped)) if folder.identity.is_none() => {
+            if mapped == folder.path {
+                None
+            } else {
+                folder.folder_path(&mapped)
+            }
+        }
+        (_, Some(mapped)) => Some(mapped),
+    };
+    Ok(counted.and_then(trimmed))
+}
+
+/// The head's number, resolved once for `--from` alone in the plain mode:
+/// one v2 `head` at the run's address, else a one-entry page of its whole
+/// list (D-254 §4).
+async fn head_version(
+    config: &Config,
+    client: &SynsClient,
+    token: Option<&str>,
+    repo_id: &str,
+) -> Result<u32, CliError> {
+    if let Some(head) = v2_head(config, client, token, repo_id)
+        .await
+        .map_err(|e| repository_read_refusal(e, repo_id))?
+    {
+        return Ok(head.version);
+    }
+    let (page, _raw) = client
+        .list_versions(repo_id, token, 1, 0, None)
+        .await
+        .map_err(|e| repository_read_refusal(e, repo_id))?;
+    page.data
+        .first()
+        .map(|newest| newest.version)
+        .ok_or_else(|| CliError::Api {
+            status: Some(422),
+            error: "validation_error".to_string(),
+            context: None,
+        })
+}
+
 pub async fn cmd_diff(
     config: &Config,
     output: &Output,
@@ -109,22 +178,63 @@ pub async fn cmd_diff(
     to: Option<String>,
     scope: RepoScopeArgs,
 ) -> Result<(), CliError> {
+    cmd_diff_with(config, output, from, to, DiffFlags::default(), scope).await
+}
+
+pub async fn cmd_diff_with(
+    config: &Config,
+    output: &Output,
+    from: Option<String>,
+    to: Option<String>,
+    flags: DiffFlags,
+    scope: RepoScopeArgs,
+) -> Result<(), CliError> {
     // 1 — the repository and the folder (SPEC u290), bound as `syns
     // history` binds them: a `--repo` value outright with no folder, the
     // identity ladder from the directory otherwise (issue 160).
-    let Some(RepoScope {
+    let Some(bound) = resolve_scoped_repo_scope(config, output, &scope).await? else {
+        return Ok(());
+    };
+    if from.is_none() && to.is_some() {
+        return Err(CliError::Config {
+            message: TO_NEEDS_FROM.to_string(),
+        });
+    }
+    if flags.provenance || flags.content {
+        let wants = Wants {
+            provenance: flags.provenance,
+            content: flags.content,
+        };
+        return diff_since::run(
+            config,
+            output,
+            bound,
+            from,
+            to,
+            flags.path.as_deref(),
+            wants,
+        )
+        .await;
+    }
+    let RepoScope {
         repo_id,
         token,
         folder,
-    }) = resolve_scoped_repo_scope(config, output, &scope).await?
-    else {
-        return Ok(());
+    } = bound;
+    let kept_under = match flags.path.as_deref() {
+        Some(typed) => plain_path(folder.as_ref(), typed)?,
+        None => None,
     };
     let client = SynsClient::new(config.server_url())?;
 
     // 2 — the endpoints.
     let (from_val, to_val) = match (from, to, &folder) {
         (Some(f), Some(t), _) => (f, t),
+        // Roadmap 224: `--from` alone, the head resolved once.
+        (Some(f), None, _) => {
+            let head = head_version(config, &client, token.as_deref(), &repo_id).await?;
+            (f, head.to_string())
+        }
         // SPEC u329 `cmd_diff` 2–3: inside a folder with neither endpoint,
         // the two newest versions the scope's list carries — the
         // identity's own list through an identity, the folder's history
@@ -166,9 +276,9 @@ pub async fn cmd_diff(
                 context: None,
             })?
         }
-        _ => {
+        (None, Some(_), _) => {
             return Err(CliError::Config {
-                message: "both --from and --to must be specified, or neither".to_string(),
+                message: TO_NEEDS_FROM.to_string(),
             });
         }
     };
@@ -196,6 +306,34 @@ pub async fn cmd_diff(
             .map_err(|e| undecodable(reqwest::StatusCode::OK, e))?;
         if let Some(map) = raw.as_object_mut() {
             map.insert("files".to_string(), serde_json::Value::Array(scoped));
+        }
+    }
+
+    // 5 — under `--path`, the entries whose `path` or `oldPath` lies at or
+    // under it, each whole (row 27).
+    if let Some(under) = kept_under.as_deref() {
+        let kept: Vec<serde_json::Value> = raw
+            .get("files")
+            .and_then(|f| f.as_array())
+            .map(|files| {
+                files
+                    .iter()
+                    .filter(|entry| {
+                        ["path", "oldPath"].iter().any(|key| {
+                            entry
+                                .get(*key)
+                                .and_then(|p| p.as_str())
+                                .is_some_and(|p| at_or_under(p, under))
+                        })
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        response.files = serde_json::from_value(serde_json::Value::Array(kept.clone()))
+            .map_err(|e| undecodable(reqwest::StatusCode::OK, e))?;
+        if let Some(map) = raw.as_object_mut() {
+            map.insert("files".to_string(), serde_json::Value::Array(kept));
         }
     }
 
@@ -374,17 +512,24 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
+        // Roadmap 224 admits `--from` alone (the head as the newer end);
+        // `--to` alone stays refused, under its new line, before any
+        // request.
         let result = cmd_diff(
             &config,
             &output,
-            Some("1".to_string()),
             None,
+            Some("1".to_string()),
             if_repo(false),
         )
         .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
-        assert!(matches!(result, Err(CliError::Config { .. })));
+        assert!(
+            matches!(&result, Err(CliError::Config { message }) if message == TO_NEEDS_FROM),
+            "{result:?}"
+        );
+        assert!(mock_server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

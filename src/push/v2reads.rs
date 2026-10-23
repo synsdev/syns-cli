@@ -264,6 +264,7 @@ async fn by_changes(
         token,
         &view.commit,
         "head",
+        None,
     )
     .await
     {

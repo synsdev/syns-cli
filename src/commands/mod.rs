@@ -3,6 +3,7 @@ pub mod collaborators;
 pub mod commit;
 pub mod delete;
 pub mod diff;
+pub mod diff_since;
 pub mod edit;
 pub mod enable_checks;
 pub mod explore;

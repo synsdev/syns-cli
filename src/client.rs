@@ -482,6 +482,14 @@ pub struct RepoListResponse {
     pub offset: u32,
 }
 
+/// Where `EP-version-place` puts a version in the address's whole list:
+/// `position` the offset answering it first, `total` that list's count.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct VersionPlace {
+    pub position: u32,
+    pub total: u32,
+}
+
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct VersionListResponse {
@@ -1935,6 +1943,31 @@ impl SynsClient {
         }
         let response = req.send_empty_bounded().await?;
         process_response_raw(response).await
+    }
+
+    /// Places one version in the address's whole list (`EP-version-place`,
+    /// roadmap 224): the `offset` at which `EP-versions` with no `path`
+    /// answers it first. Served at a shared folder's identity and to a
+    /// masked reader; every other caller is answered `NOT_FOUND`, the list
+    /// then numbering densely from 1 (INTERFACES `EP-get-version` row 2).
+    pub async fn get_version_place(
+        &self,
+        repo_id: &str,
+        token: Option<&str>,
+        reference: &str,
+    ) -> Result<VersionPlace, CliError> {
+        let url = format!(
+            "{}/api/v1/repos/{}/versions/{}/place",
+            self.base_url,
+            repo_id,
+            encode_path_segments(reference)?
+        );
+        let mut req = self.client.get(&url);
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        let response = req.send_empty_bounded().await?;
+        process_response(response).await
     }
 
     pub async fn get_file_history(

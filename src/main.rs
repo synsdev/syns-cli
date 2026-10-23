@@ -303,12 +303,21 @@ enum Commands {
     },
     /// Show changes between versions
     Diff {
-        /// Starting version (number or SHA)
+        /// Starting version (number or SHA); given alone, compared with the head
         #[arg(long)]
         from: Option<String>,
-        /// Ending version (number or SHA)
+        /// Ending version (number or SHA), only beside --from
         #[arg(long)]
         to: Option<String>,
+        /// Give each changed path the provenance of the newest version after --from that changed it
+        #[arg(long)]
+        provenance: bool,
+        /// Give each changed path still standing its whole text at the newer end (needs --json)
+        #[arg(long)]
+        content: bool,
+        /// Only paths at or under PATH at either end
+        #[arg(long, value_name = "PATH")]
+        path: Option<String>,
         #[command(flatten)]
         scope: RepoScopeArgs,
     },
@@ -548,6 +557,22 @@ fn refuse_max_bytes_without_json() -> ! {
     .exit()
 }
 
+/// Ends the process with the parser's refusal of `syns diff --content`
+/// given without `--json` (roadmap 224, D-254 §2): the texts stand only in
+/// the JSON answer. Exit `2`, as every parser refusal.
+fn refuse_content_without_json() -> ! {
+    let mut command = Cli::command();
+    command.build();
+    let diff = command
+        .find_subcommand_mut("diff")
+        .expect("the diff subcommand is declared");
+    diff.error(
+        clap::error::ErrorKind::MissingRequiredArgument,
+        "--content needs --json: the texts are carried only in the JSON answer",
+    )
+    .exit()
+}
+
 /// `--paths-from`'s one value (D-242 §6): `-`, standard input. A file
 /// path can be admitted later under the same flag.
 fn parse_paths_from(value: &str) -> Result<String, String> {
@@ -598,6 +623,11 @@ async fn run_cli() {
         && !cli.json
     {
         refuse_max_bytes_without_json();
+    }
+    if let Commands::Diff { content: true, .. } = &cli.command
+        && !cli.json
+    {
+        refuse_content_without_json();
     }
     let output = output::Output::new(cli.json);
 
@@ -762,8 +792,20 @@ async fn run(
                 commands::history::cmd_history(config, output, file, limit, offset, scope).await?
             }
         },
-        Commands::Diff { from, to, scope } => {
-            commands::diff::cmd_diff(config, output, from, to, scope).await?
+        Commands::Diff {
+            from,
+            to,
+            provenance,
+            content,
+            path,
+            scope,
+        } => {
+            let flags = commands::diff::DiffFlags {
+                provenance,
+                content,
+                path,
+            };
+            commands::diff::cmd_diff_with(config, output, from, to, flags, scope).await?
         }
         Commands::Revert {
             path,

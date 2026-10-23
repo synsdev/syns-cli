@@ -7,6 +7,7 @@ mod client_identity_test;
 mod collaborators_add_json_test;
 mod common;
 mod convergence_test;
+mod diff_since_test;
 mod explore_test;
 mod folder_scope_test;
 mod folder_working_copy_test;
