@@ -273,12 +273,20 @@ pub struct ReorderUserLinksRequest {
     pub order: Vec<String>,
 }
 
+/// `EP-revert-file`'s body. Issue 160 (D-250 §3): the parent the revert
+/// is written at and the provenance it records, each on `EP-push`'s
+/// terms — `parentSha` a full commit hash, a moved head answered `409`
+/// `conflict` naming `currentSha`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RevertFileRequest {
     pub to: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_sha: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<PushProvenance>,
 }
 
 // --- Response Types ---
@@ -1354,6 +1362,14 @@ pub(crate) async fn check_response(
                 .map(|message| ApiErrorContext::Reason {
                     message: message.to_string(),
                 }),
+            // Issue 160: a `404`'s served string `message` crosses, so a
+            // read verb tells `Repository not found` from a version or a
+            // path it lacks without a second request.
+            (404, _, Some(body)) => body.get("message").and_then(|v| v.as_str()).map(|message| {
+                ApiErrorContext::NotFoundMessage {
+                    message: message.to_string(),
+                }
+            }),
             _ => None,
         };
         return Err(CliError::Api {

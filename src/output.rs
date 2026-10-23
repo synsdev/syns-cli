@@ -49,14 +49,12 @@ impl Output {
     pub(crate) fn format_error(&self, error: &CliError) -> String {
         if self.json_mode {
             // SPEC § 7 binds specific structured shapes for some error
-            // variants (PUSH_EMPTY, PUSH_PARTIAL). Route through
-            // `CliError::json_value` so those variants emit the
-            // SPEC-mandated wire form; fall back to the generic
-            // `{"error": "<Display>"}` envelope otherwise.
-            if let Some(v) = error.json_value() {
-                return v.to_string();
-            }
-            serde_json::json!({"error": error.to_string()}).to_string()
+            // variants (PUSH_EMPTY, PUSH_PARTIAL), routed through
+            // `CliError::json_value`; every other variant takes the
+            // generic `{"error": "<Display>"}` envelope. Issue 160
+            // (D-250 §2): each carries the cause's stable `code` beside
+            // `error`.
+            error.json_document().to_string()
         } else {
             format!("error: {error}")
         }

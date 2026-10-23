@@ -347,7 +347,9 @@ fn render_resolution_instruction(
 }
 
 fn failure_document(key: &str, repo_id: Option<&str>, err: &CliError) -> Value {
-    let mut document = json!({"outcome": key, "repo": repo_id, "error": err.to_string()});
+    // Issue 160 (D-250 §2): the cause's code beside `error`.
+    let mut document =
+        json!({"outcome": key, "repo": repo_id, "error": err.to_string(), "code": err.code()});
     if let Some(detail) = err.json_value() {
         document["detail"] = detail;
     }

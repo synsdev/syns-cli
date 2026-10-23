@@ -339,6 +339,7 @@ fn lone_path_refusal_in_json_mode_is_one_document() {
 
     assert_eq!(output.status.code(), Some(2));
     let expected = json!({
+        "code": "repo_identity_unknown",
         "error": format!(
             "cannot determine repo identity for {} \u{2014} {POSITIONAL_AND_PATH_LINE}",
             elsewhere.display()
@@ -452,7 +453,10 @@ fn positional_repository_refuses_a_path_whose_identity_file_names_another_reposi
     assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
     let document: serde_json::Value =
         serde_json::from_str(stdout(&output).trim()).expect("one JSON document");
-    assert_eq!(document, json!({ "error": line }));
+    assert_eq!(
+        document,
+        json!({ "code": "path_belongs_to_another_repo", "error": line })
+    );
 
     assert!(env.request_paths().is_empty(), "{:?}", env.request_paths());
     let mut standing: Vec<_> = fs::read_dir(&target)

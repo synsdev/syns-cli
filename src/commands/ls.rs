@@ -3,7 +3,7 @@ use crate::config::Config;
 use crate::errors::{CliError, partial_truncated_tree};
 use crate::output::Output;
 use crate::read::{
-    ReadOptions, ReadTarget, bind_read_folder, counted_from, mark_partial, read_not_found,
+    PathLine, ReadOptions, ReadTarget, bind_read_folder, counted_from, mark_partial, path_refusal,
     report_reference, repository_argument, resolve_read_target, with_reference,
 };
 
@@ -47,16 +47,13 @@ pub async fn cmd_ls(
     };
     let (mut response, mut raw) = match listed {
         Ok(tuple) => tuple,
+        // Issue 160 (`Boundary B`): the path named in both output
+        // modes, and a `404` naming the repository naming it instead.
         Err(e) => {
-            if let Some(p) = named.as_ref() {
-                if opts.version.is_some() {
-                    return Err(read_not_found(e, &opts, &target.reference, p));
-                }
-                if !output.is_json() {
-                    return Err(e.with_ls_path_context(p.clone()));
-                }
-            }
-            return Err(e);
+            return Err(match named.as_ref() {
+                Some(p) => path_refusal(e, &opts, &target, p, PathLine::Path),
+                None => e.repo_or(&target.repo_id),
+            });
         }
     };
 
@@ -402,7 +399,9 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn ls_404_repo_not_found_preserves_generic_display() {
+    // Issue 160: a `404` naming the repository answers the repository-
+    // not-found refusal of its own.
+    async fn ls_404_repo_not_found_names_the_repository() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(".syns.yaml"),
@@ -438,13 +437,16 @@ mod tests {
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         let err = result.unwrap_err();
-        assert_eq!(err.to_string(), "server error (404): repo_not_found");
+        assert_eq!(err.to_string(), "repository not found: alice/my-project");
+        assert_eq!(err.code(), "repo_not_found");
         assert_eq!(err.exit_code(), 1);
     }
 
     #[tokio::test]
     #[serial]
-    async fn ls_404_not_found_in_json_mode_preserves_generic_display() {
+    // Issue 160 (`Boundary B`): under `--json` too, the refusal names
+    // the path the run asked for, code `not_found`.
+    async fn ls_404_not_found_in_json_mode_names_the_path() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(".syns.yaml"),
@@ -480,7 +482,11 @@ mod tests {
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         let err = result.unwrap_err();
-        assert_eq!(err.to_string(), "server error (404): not_found");
+        assert_eq!(err.to_string(), "path not found: does/not/exist");
+        assert_eq!(
+            err.json_document(),
+            serde_json::json!({"code": "not_found", "error": "path not found: does/not/exist"})
+        );
         assert_eq!(err.exit_code(), 1);
     }
 

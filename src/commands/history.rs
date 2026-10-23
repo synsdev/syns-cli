@@ -4,8 +4,8 @@ use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
 use crate::read::{
-    RepoScope, RepoScopeArgs, refuse_reference_spelling, repository_argument,
-    resolve_scoped_repo_scope, version_not_found_refusal,
+    RepoScope, RepoScopeArgs, reference_refusal, refuse_reference_spelling, repository_argument,
+    repository_read_refusal, resolve_scoped_repo_scope,
 };
 use crate::repo::folder::{FolderScope, lies_under};
 
@@ -75,7 +75,7 @@ pub async fn cmd_history_show(
     let (mut entry, mut raw) = client
         .get_version(&scope.repo_id, scope.token.as_deref(), &reference)
         .await
-        .map_err(|e| e.with_versioned_read_context(version_not_found_refusal(&reference)))?;
+        .map_err(|e| reference_refusal(e, &scope.repo_id, &reference))?;
 
     // 3 — inside a folder, narrow the changed paths to those under it,
     // counted from it; then render the record, or write the served body.
@@ -239,7 +239,8 @@ pub async fn cmd_history(
     let Some(path) = repository_argument(folder.as_ref(), typed.as_deref())? else {
         let (response, raw) = client
             .list_versions(&repo_id, token.as_deref(), limit, offset, None)
-            .await?;
+            .await
+            .map_err(|e| repository_read_refusal(e, &repo_id))?;
         if output.is_json() {
             output.json(&raw);
         } else {
@@ -253,7 +254,8 @@ pub async fn cmd_history(
     if file.is_some() {
         let (response, mut raw) = client
             .get_file_history(&repo_id, token.as_deref(), &path, limit, offset)
-            .await?;
+            .await
+            .map_err(|e| e.repo_or(&repo_id))?;
         if response.total > 0 {
             if output.is_json() {
                 // SPEC u302 `cmd_history` 1: through an identity every

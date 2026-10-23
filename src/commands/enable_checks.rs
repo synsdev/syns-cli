@@ -17,8 +17,8 @@ use crate::push::working_copy::{WorkingCopy, folder_base};
 use crate::repo::folder::{FolderScope, current_dir, place_under, resolve_folder_scope};
 use crate::repo::syns_yaml::{declared_checks, enable_checks_text, template_origin};
 use crate::write::{
-    Changeset, ProvenanceOptions, WriteOptions, checkout_guard_refusal, classify_content,
-    publish_changeset, resolve_write_target,
+    Changeset, ProvenanceOptions, WriteOptions, classify_content, publish_changeset,
+    resolve_write_target,
 };
 
 use super::place::{counted_from, placement_path};
@@ -200,8 +200,9 @@ pub async fn cmd_enable_checks(
     let parent = folder_base(cache, &turned_scope)
         .and_then(|base| base.commit_sha().map(str::to_string))
         .filter(|sha| !sha.is_empty())
-        .ok_or_else(|| CliError::Io {
-            message: checkout_guard_refusal(&turned_scope.dir, &holder),
+        .ok_or_else(|| CliError::CheckoutDirty {
+            root: turned_scope.dir.clone(),
+            repo_id: holder.clone(),
         })?;
 
     // 6 — the write target from the folder's directory.

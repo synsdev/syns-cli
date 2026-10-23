@@ -331,9 +331,10 @@ fn users_carries_the_rate_refusal() {
     let document = document(&output);
     assert_eq!(
         document.as_object().unwrap().keys().collect::<Vec<_>>(),
-        vec!["error"],
-        "one document whose single key is `error`"
+        vec!["code", "error"],
+        "one document whose keys are `code` and `error` (issue 160)"
     );
+    assert_eq!(document["code"], serde_json::json!("rate_limited"));
     let refusal = document["error"].as_str().unwrap();
     assert!(refusal.contains("429"), "{refusal}");
     assert!(refusal.contains("rate_limited"), "{refusal}");
@@ -483,9 +484,10 @@ fn links_add_carries_the_cap_refusal() {
 
     assert_eq!(output.status.code(), Some(1));
     let document = document(&output);
+    // Issue 160: the cause's `code` beside `error`.
     assert_eq!(
         document.as_object().unwrap().keys().collect::<Vec<_>>(),
-        vec!["error"]
+        vec!["code", "error"]
     );
     let refusal = document["error"].as_str().unwrap();
     assert!(refusal.contains("409"), "{refusal}");

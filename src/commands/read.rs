@@ -13,7 +13,7 @@ use crate::push::collector::is_text;
 use crate::read::files::{Outcome, Policy, read_path};
 use crate::read::store::Store;
 use crate::read::{
-    ReadOptions, bind_read_folder, counted_from, read_not_found, report_reference,
+    PathLine, ReadOptions, bind_read_folder, counted_from, path_refusal, report_reference,
     repository_argument, resolve_read_target,
 };
 
@@ -80,15 +80,8 @@ pub async fn cmd_read(
     let answer = match read {
         Ok(Outcome::Read(answer)) => answer,
         Ok(Outcome::Deferred) => unreachable!("a read with no budget is never deferred"),
-        Err(e) => {
-            if opts.version.is_some() {
-                return Err(read_not_found(e, &opts, &target.reference, &path));
-            }
-            if !output.is_json() {
-                return Err(e.with_cat_path_context(path.clone()));
-            }
-            return Err(e);
-        }
+        // Issue 160 (`Boundary B`): the path named in both output modes.
+        Err(e) => return Err(path_refusal(e, &opts, &target, &path, PathLine::File)),
     };
 
     // 3 — the text test applied to the bytes, then a text content split

@@ -424,7 +424,9 @@ pub async fn cmd_place(
             let (entry, _) = client
                 .get_version(&template, Some(&token), typed)
                 .await
-                .map_err(|err| err.with_versioned_read_context(version_not_found_refusal(typed)))?;
+                .map_err(|err| {
+                    err.with_version_not_found_context(version_not_found_refusal(typed))
+                })?;
             (entry.version, entry.sha)
         }
         None => {

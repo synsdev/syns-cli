@@ -15,8 +15,8 @@ use crate::read::files::{
 };
 use crate::read::store::Store;
 use crate::read::{
-    ReadOptions, ResolvedRef, bind_read_folder, bind_repository, listed_argument, read_not_found,
-    report_reference, repository_argument, resolve_read_target,
+    PathLine, ReadOptions, ResolvedRef, bind_read_folder, bind_repository, listed_argument,
+    path_refusal, report_reference, repository_argument, resolve_read_target,
 };
 
 /// The generic byte type, which a `--json` document never names.
@@ -114,15 +114,10 @@ pub async fn cmd_cat(
     // entry in either mode, sending the pinned ordinal: its bytes are the
     // stored ones exactly (SPEC u280 `cmd_cat` 1, SPEC u283 `cmd_cat` 2),
     // the ones the `ETag` names (step 3), or none is printed.
-    let refused = |e: CliError| -> CliError {
-        if opts.version.is_some() {
-            return read_not_found(e, &opts, &target.reference, &path);
-        }
-        if !output.is_json() {
-            return e.with_cat_path_context(path.clone());
-        }
-        e
-    };
+    // Issue 160 (`Boundary B`): the refusal names the path in both
+    // output modes, and a `404` naming the repository names it instead.
+    let refused =
+        |e: CliError| -> CliError { path_refusal(e, &opts, &target, &path, PathLine::File) };
     let policy = Policy {
         identity: false,
         want_type: output.is_json(),
@@ -551,10 +546,7 @@ async fn cmd_cat_many(
             if let Err(err) = lock.flush() {
                 panic!("failed printing to stdout: {err}");
             }
-            if opts.version.is_some() {
-                return Err(read_not_found(failure, &opts, reference, path));
-            }
-            return Err(failure.with_cat_path_context(path.clone()));
+            return Err(path_refusal(failure, &opts, &target, path, PathLine::File));
         }
         if let Err(err) = lock.flush() {
             panic!("failed printing to stdout: {err}");
@@ -830,7 +822,9 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn cat_404_repo_not_found_preserves_generic_display() {
+    // Issue 160: a `404` naming the repository answers the repository-
+    // not-found refusal of its own, whatever path the run asked for.
+    async fn cat_404_repo_not_found_names_the_repository() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(".syns.yaml"),
@@ -861,13 +855,16 @@ mod tests {
         unsafe { std::env::remove_var("SYNS_CACHE_DIR") };
 
         let err = result.unwrap_err();
-        assert_eq!(err.to_string(), "server error (404): repo_not_found");
+        assert_eq!(err.to_string(), "repository not found: alice/my-project");
+        assert_eq!(err.code(), "repo_not_found");
         assert_eq!(err.exit_code(), 1);
     }
 
     #[tokio::test]
     #[serial]
-    async fn cat_404_not_found_in_json_mode_preserves_generic_display() {
+    // Issue 160 (`Boundary B`): under `--json` too, the refusal names
+    // the path the run asked for, code `not_found`.
+    async fn cat_404_not_found_in_json_mode_names_the_path() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(".syns.yaml"),
@@ -898,7 +895,11 @@ mod tests {
         unsafe { std::env::remove_var("SYNS_CACHE_DIR") };
 
         let err = result.unwrap_err();
-        assert_eq!(err.to_string(), "server error (404): not_found");
+        assert_eq!(err.to_string(), "file not found: src/missing.ts");
+        assert_eq!(
+            err.json_document(),
+            serde_json::json!({"code": "not_found", "error": "file not found: src/missing.ts"})
+        );
         assert_eq!(err.exit_code(), 1);
     }
 

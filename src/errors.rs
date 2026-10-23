@@ -200,6 +200,44 @@ pub enum CliError {
         path: String,
         size: u64,
     },
+    /// Issue 160 (D-250 §2): `syns edit`'s `--old` matching no content.
+    /// It renders as the configuration refusal it was, `message` after
+    /// `configuration error: `, and its document carries `no_match`.
+    NoMatch {
+        message: String,
+    },
+    /// Issue 160: `syns edit`'s `--old` matching `count` times with no
+    /// `--replace-all`, rendered as `NoMatch` is; its document carries
+    /// `many_matches` and the count under `count`.
+    ManyMatches {
+        count: usize,
+        message: String,
+    },
+    /// Issue 160: a pattern or glob of `syns grep` or `syns glob` that
+    /// does not compile, rendered as `NoMatch` is, code `bad_pattern`.
+    BadPattern {
+        message: String,
+    },
+    /// Issue 160: a `syns commit` changeset document that does not parse
+    /// or whose entries its keys do not admit, rendered as `NoMatch` is,
+    /// code `invalid_changeset`.
+    InvalidChangeset {
+        message: String,
+    },
+    /// Issue 160: the checkout guard (`CHECKOUT_UNPUBLISHED_WORK`) — the
+    /// checkout at `root` holds unpublished local work for `repo_id`.
+    /// Its line is `crate::write::checkout_guard_refusal`'s, code
+    /// `checkout_dirty`, exit `1`.
+    CheckoutDirty {
+        root: std::path::PathBuf,
+        repo_id: String,
+    },
+    /// Issue 160: a path the run named that the tree it addressed does
+    /// not hold, found without a `404` — `syns rm PATH` whose one
+    /// deletion changed no file. `line` names the path; code `not_found`.
+    PathNotFound {
+        line: String,
+    },
 }
 
 /// Which of the two not-text wordings a refused content takes (SPEC
@@ -314,6 +352,40 @@ pub enum ApiErrorContext {
     ConflictReason {
         reason: String,
     },
+    /// Issue 160: the string `message` a `404` served, kept so a read
+    /// verb can tell a repository that stands nowhere (or that the caller
+    /// may not read) from a version or a path it lacks. It renders as a
+    /// refusal carrying no context renders.
+    NotFoundMessage {
+        message: String,
+    },
+    /// Issue 160 (D-250 §2): the refusal line of a `404` that named the
+    /// repository — absent and unreadable alike — rendered in place of
+    /// the registered line, code `repo_not_found`.
+    RepoNotFound {
+        line: String,
+    },
+    /// Issue 160: the version-not-found refusal line a read chose for a
+    /// `404` `not_found` answering a reference the caller typed, rendered
+    /// in place of the registered line, code `version_not_found`.
+    VersionNotFound {
+        line: String,
+    },
+}
+
+/// The repository-not-found refusal (issue 160): the repository the run
+/// addressed, whether it stands nowhere or the caller may not read it.
+pub fn repo_not_found_refusal(repo_id: &str) -> String {
+    format!("repository not found: {repo_id}")
+}
+
+/// Whether `error` is a wire code the server spells: lower snake case,
+/// led by a letter.
+fn is_wire_code(error: &str) -> bool {
+    error.starts_with(|c: char| c.is_ascii_lowercase())
+        && error
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -401,7 +473,170 @@ impl CliError {
                 "error": self.to_string(),
                 "currentSha": current_sha,
             })),
+            // Issue 160 (D-250 §2): the count stands in a key of its own.
+            CliError::ManyMatches { count, .. } => Some(serde_json::json!({
+                "error": self.to_string(),
+                "count": count,
+            })),
             _ => None,
+        }
+    }
+
+    /// The stable lower snake_case code a machine-readable refusal
+    /// document carries beside `error` (issue 160, D-250 §2): one value
+    /// per cause, held across releases. A server refusal carrying no
+    /// context the binary chose takes the wire code it served.
+    pub fn code(&self) -> String {
+        let fixed = match self {
+            CliError::Api {
+                status,
+                error,
+                context,
+            } => return api_code(*status, error, context.as_ref()),
+            CliError::AuthRequired => "auth_required",
+            CliError::RepoIdentityUnknown { .. } => "repo_identity_unknown",
+            CliError::PathBelongsToAnotherRepository { .. } => "path_belongs_to_another_repo",
+            CliError::HolderActing { .. } => "holder_root_required",
+            CliError::FolderVisibilityRedirect { .. } => "folder_visibility_redirect",
+            CliError::FolderNotShared { .. } => "folder_not_shared",
+            CliError::FolderMoved { .. } => "folder_out_of_place",
+            CliError::FolderInAnotherCheckout { .. } => "folder_in_another_checkout",
+            CliError::ServerUnreachable { .. } => "server_unreachable",
+            CliError::TlsRefused { .. } => "tls_refused",
+            CliError::Io { .. } => "io_error",
+            CliError::Config { .. } => "config_error",
+            CliError::Upgrade(e) => e.wire_form(),
+            CliError::PayloadTooLarge { .. } => "payload_too_large",
+            CliError::PushEmpty { .. } => "push_empty",
+            CliError::PushPartial { .. } => "push_partial",
+            CliError::CollectedSetChanged { .. } => "collected_set_changed",
+            CliError::SyncRefusal { document, .. } => {
+                return ["code", "outcome"]
+                    .iter()
+                    .find_map(|key| document.get(*key).and_then(|v| v.as_str()))
+                    .filter(|value| is_wire_code(value))
+                    .unwrap_or("sync_refused")
+                    .to_string();
+            }
+            CliError::PartialAnswer { .. } => "partial_answer",
+            CliError::NotText { .. } => "content_not_text",
+            CliError::WriteConflict { .. } => "write_conflict",
+            CliError::FolderWriteUnsupported { .. } => "folder_write_unsupported",
+            CliError::FolderVisibilityUnsupported { .. } => "folder_visibility_unsupported",
+            CliError::ChangesetEmpty => "changeset_empty",
+            CliError::LeftOut { .. } => "left_out",
+            CliError::FileTooLarge { .. } => "file_too_large",
+            CliError::NoMatch { .. } => "no_match",
+            CliError::ManyMatches { .. } => "many_matches",
+            CliError::BadPattern { .. } => "bad_pattern",
+            CliError::InvalidChangeset { .. } => "invalid_changeset",
+            CliError::CheckoutDirty { .. } => "checkout_dirty",
+            CliError::PathNotFound { .. } => "not_found",
+        };
+        fixed.to_string()
+    }
+
+    /// The one document machine-readable mode writes for this refusal:
+    /// the shape `json_value` binds, or `{"error": <line>}`, with `code`
+    /// beside `error` wherever the document does not already carry one
+    /// (issue 160, D-250 §2).
+    pub fn json_document(&self) -> serde_json::Value {
+        let mut document = self
+            .json_value()
+            .unwrap_or_else(|| serde_json::json!({"error": self.to_string()}));
+        if let Some(map) = document.as_object_mut()
+            && !map.contains_key("code")
+        {
+            map.insert("code".to_string(), serde_json::Value::from(self.code()));
+        }
+        document
+    }
+
+    /// Whether this is a `404` naming the repository itself rather than
+    /// a version or a path in it (issue 160): the engine's preserved
+    /// `repo_not_found`, or the server's `not_found` served with the
+    /// message `Repository not found`, which an absent repository and one
+    /// the caller may not read answer alike.
+    pub fn names_missing_repository(&self) -> bool {
+        match self {
+            CliError::Api {
+                status: Some(404),
+                error,
+                context,
+            } => {
+                error == "repo_not_found"
+                    || matches!(
+                        context,
+                        Some(ApiErrorContext::NotFoundMessage { message })
+                            if message.eq_ignore_ascii_case("repository not found")
+                    )
+                    || matches!(context, Some(ApiErrorContext::RepoNotFound { .. }))
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether this is a `404` naming a reference the request sent rather
+    /// than the repository or a path (issue 160, REVIEW-syns-cli M2): the
+    /// engine's `ref_not_found`, or the server's `not_found` served with
+    /// `Version not found` or `Ref not found`.
+    pub fn names_missing_version(&self) -> bool {
+        match self {
+            CliError::Api {
+                status: Some(404),
+                error,
+                context,
+            } => {
+                error == "ref_not_found"
+                    || matches!(
+                        context,
+                        Some(ApiErrorContext::NotFoundMessage { message })
+                            if message.eq_ignore_ascii_case("version not found")
+                                || message.eq_ignore_ascii_case("ref not found")
+                    )
+            }
+            _ => false,
+        }
+    }
+
+    /// Puts the repository-not-found line on a `404` (issue 160); every
+    /// other variant and status passes through unchanged.
+    pub fn with_repo_not_found_context(self, line: String) -> CliError {
+        match self {
+            CliError::Api {
+                status: Some(404),
+                error,
+                ..
+            } => CliError::Api {
+                status: Some(404),
+                error,
+                context: Some(ApiErrorContext::RepoNotFound { line }),
+            },
+            other => other,
+        }
+    }
+
+    /// The repository-not-found refusal for `repo_id` where this `404`
+    /// names the repository, and this refusal unchanged otherwise.
+    pub fn repo_or(self, repo_id: &str) -> CliError {
+        if self.names_missing_repository() {
+            self.with_repo_not_found_context(repo_not_found_refusal(repo_id))
+        } else {
+            self
+        }
+    }
+
+    /// Puts a version-not-found line on an `Api` error, so a `404`
+    /// `not_found` renders it in place of the registered line (issue
+    /// 160: as `with_versioned_read_context`, under `version_not_found`).
+    pub fn with_version_not_found_context(self, line: String) -> CliError {
+        match self {
+            CliError::Api { status, error, .. } => CliError::Api {
+                status,
+                error,
+                context: Some(ApiErrorContext::VersionNotFound { line }),
+            },
+            other => other,
         }
     }
 
@@ -470,9 +705,53 @@ impl CliError {
     }
 }
 
+/// `CliError::code` of a server refusal (issue 160): the cause a read
+/// verb chose where it chose one, the served wire code otherwise.
+fn api_code(status: Option<u16>, error: &str, context: Option<&ApiErrorContext>) -> String {
+    let Some(status) = status else {
+        return "network_error".to_string();
+    };
+    let chosen = match (status, error, context) {
+        (404, _, Some(ApiErrorContext::RepoNotFound { .. })) => Some("repo_not_found"),
+        (404, "not_found", Some(ApiErrorContext::VersionNotFound { .. })) => {
+            Some("version_not_found")
+        }
+        (
+            404,
+            "not_found",
+            Some(
+                ApiErrorContext::CatPath { .. }
+                | ApiErrorContext::LsPath { .. }
+                | ApiErrorContext::VersionedRead { .. },
+            ),
+        ) => Some("not_found"),
+        _ => None,
+    };
+    if let Some(code) = chosen {
+        return code.to_string();
+    }
+    if is_wire_code(error) {
+        return error.to_string();
+    }
+    if status == 200 && error.starts_with("invalid response body") {
+        return "response_undecodable".to_string();
+    }
+    "unknown_refusal".to_string()
+}
+
 impl std::fmt::Display for CliError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            CliError::Api {
+                status: Some(404),
+                context: Some(ApiErrorContext::RepoNotFound { line }),
+                ..
+            } => write!(f, "{line}"),
+            CliError::Api {
+                status: Some(404),
+                error,
+                context: Some(ApiErrorContext::VersionNotFound { line }),
+            } if error == "not_found" => write!(f, "{line}"),
             CliError::Api {
                 status: Some(404),
                 error,
@@ -728,6 +1007,16 @@ impl std::fmt::Display for CliError {
                 "payload_too_large: {path} holds {size} bytes, past the {} one file may hold; nothing was sent",
                 crate::push::collector::file_bound_label()
             ),
+            CliError::NoMatch { message }
+            | CliError::ManyMatches { message, .. }
+            | CliError::BadPattern { message }
+            | CliError::InvalidChangeset { message } => {
+                write!(f, "configuration error: {message}")
+            }
+            CliError::CheckoutDirty { root, repo_id } => {
+                write!(f, "{}", crate::write::checkout_guard_refusal(root, repo_id))
+            }
+            CliError::PathNotFound { line } => write!(f, "{line}"),
         }
     }
 }
@@ -924,7 +1213,9 @@ mod tests {
         );
         let rendered = crate::output::Output::new(true).format_error(&err);
         let doc: serde_json::Value = serde_json::from_str(&rendered).unwrap();
-        assert_eq!(doc.as_object().map(|m| m.len()), Some(1));
+        // Issue 160: `code` beside `error`, and nothing else.
+        assert_eq!(doc.as_object().map(|m| m.len()), Some(2));
+        assert_eq!(doc["code"], serde_json::json!("changeset_empty"));
         assert!(doc.get("path").is_none());
         assert!(doc.get("cause").is_none());
         assert!(doc.get("totalWalked").is_none());
@@ -1097,8 +1388,9 @@ mod tests {
         assert!(err.json_value().is_none());
         let rendered = crate::output::Output::new(true).format_error(&err);
         let doc: serde_json::Value = serde_json::from_str(&rendered).unwrap();
-        assert_eq!(doc.as_object().map(|m| m.len()), Some(1));
+        assert_eq!(doc.as_object().map(|m| m.len()), Some(2));
         assert_eq!(doc["error"], serde_json::json!(err.to_string()));
+        assert_eq!(doc["code"], serde_json::json!("file_too_large"));
     }
 
     // SPEC u309 Tests, `path_belongs_line_names_the_refused_commands_move`:
@@ -1661,5 +1953,262 @@ mod tests {
         let err = CliError::AuthRequired;
         let rewrapped = err.with_ls_path_context("foo".into());
         assert!(matches!(rewrapped, CliError::AuthRequired));
+    }
+
+    fn api(status: u16, error: &str, context: Option<ApiErrorContext>) -> CliError {
+        CliError::Api {
+            status: Some(status),
+            error: error.to_string(),
+            context,
+        }
+    }
+
+    // Issue 160 (D-250 §2): the values Q-0171 names, each its cause's,
+    // carried beside `error` in the one document `--json` writes.
+    #[test]
+    fn every_named_refusal_carries_its_fixed_code_beside_error() {
+        let cases: Vec<(CliError, &str)> = vec![
+            (
+                api(404, "not_found", None).with_cat_path_context("a.md".into()),
+                "not_found",
+            ),
+            (
+                api(404, "not_found", None).with_ls_path_context("docs".into()),
+                "not_found",
+            ),
+            (
+                api(404, "not_found", None)
+                    .with_versioned_read_context("path not found at version 3: a.md".into()),
+                "not_found",
+            ),
+            (
+                CliError::PathNotFound {
+                    line: "path not found at version 21: gone.md".into(),
+                },
+                "not_found",
+            ),
+            (
+                api(404, "not_found", None)
+                    .with_version_not_found_context("version not found: 9999".into()),
+                "version_not_found",
+            ),
+            (api(404, "not_found", None).repo_or("alice/x"), "not_found"),
+            (
+                api(
+                    404,
+                    "not_found",
+                    Some(ApiErrorContext::NotFoundMessage {
+                        message: "Repository not found".into(),
+                    }),
+                )
+                .repo_or("alice/x"),
+                "repo_not_found",
+            ),
+            (
+                api(404, "repo_not_found", None).repo_or("alice/x"),
+                "repo_not_found",
+            ),
+            (
+                CliError::CheckoutDirty {
+                    root: "/w".into(),
+                    repo_id: "alice/x".into(),
+                },
+                "checkout_dirty",
+            ),
+            (CliError::AuthRequired, "auth_required"),
+            (
+                CliError::NoMatch {
+                    message: "m".into(),
+                },
+                "no_match",
+            ),
+            (
+                CliError::ManyMatches {
+                    count: 3,
+                    message: "m".into(),
+                },
+                "many_matches",
+            ),
+            (
+                CliError::BadPattern {
+                    message: "m".into(),
+                },
+                "bad_pattern",
+            ),
+            (
+                CliError::InvalidChangeset {
+                    message: "m".into(),
+                },
+                "invalid_changeset",
+            ),
+            (
+                CliError::WriteConflict {
+                    parent: "a".repeat(40),
+                    current_sha: "c".repeat(40),
+                },
+                "write_conflict",
+            ),
+        ];
+        for (err, code) in cases {
+            let rendered = crate::output::Output::new(true).format_error(&err);
+            let doc: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+            assert_eq!(doc["code"], serde_json::json!(code), "{err:?}");
+            assert_eq!(doc["error"], serde_json::json!(err.to_string()), "{err:?}");
+        }
+    }
+
+    // Issue 160: the three not-found causes answer three lines of their
+    // own, the repository's naming the repository.
+    #[test]
+    fn the_three_not_found_causes_answer_lines_of_their_own() {
+        let path = api(404, "not_found", None).with_cat_path_context("a.md".into());
+        let version = api(404, "not_found", None)
+            .with_version_not_found_context("version not found: 9999".into());
+        let repo = api(
+            404,
+            "not_found",
+            Some(ApiErrorContext::NotFoundMessage {
+                message: "Repository not found".into(),
+            }),
+        )
+        .repo_or("alice/x");
+        assert_eq!(path.to_string(), "file not found: a.md");
+        assert_eq!(version.to_string(), "version not found: 9999");
+        assert_eq!(repo.to_string(), "repository not found: alice/x");
+        // A `404` whose message names no repository is not one.
+        assert!(
+            !api(
+                404,
+                "not_found",
+                Some(ApiErrorContext::NotFoundMessage {
+                    message: "Version not found".into(),
+                }),
+            )
+            .names_missing_repository()
+        );
+        // The served message renders as no context renders.
+        assert_eq!(
+            api(
+                404,
+                "not_found",
+                Some(ApiErrorContext::NotFoundMessage {
+                    message: "Team not found".into(),
+                }),
+            )
+            .to_string(),
+            "server error (404): not_found"
+        );
+    }
+
+    // Issue 160: the many-matches count stands in a key of its own, and
+    // the split configuration refusals keep their lines byte for byte.
+    #[test]
+    fn many_matches_carries_its_count_and_the_split_refusals_keep_their_lines() {
+        let err = CliError::ManyMatches {
+            count: 4,
+            message:
+                "--old matched 4 times in a.md; pass --replace-all to replace every occurrence"
+                    .into(),
+        };
+        let doc = err.json_document();
+        assert_eq!(doc["count"], serde_json::json!(4));
+        assert_eq!(doc["code"], serde_json::json!("many_matches"));
+        assert_eq!(
+            err.to_string(),
+            "configuration error: --old matched 4 times in a.md; pass --replace-all to replace every occurrence"
+        );
+        for err in [
+            CliError::NoMatch {
+                message: "x".into(),
+            },
+            CliError::BadPattern {
+                message: "x".into(),
+            },
+            CliError::InvalidChangeset {
+                message: "x".into(),
+            },
+        ] {
+            assert_eq!(err.to_string(), "configuration error: x");
+            assert_eq!(err.exit_code(), 1);
+        }
+        let guard = CliError::CheckoutDirty {
+            root: "/w".into(),
+            repo_id: "alice/x".into(),
+        };
+        assert_eq!(
+            guard.to_string(),
+            crate::write::checkout_guard_refusal(std::path::Path::new("/w"), "alice/x")
+        );
+        assert_eq!(guard.exit_code(), 1);
+    }
+
+    // Issue 160 (D-250 §2): a structured document keeps every key and
+    // adds `code`; a document already carrying one keeps it.
+    #[test]
+    fn structured_documents_keep_their_keys_and_add_code() {
+        let empty = CliError::PushEmpty {
+            path: "/p".into(),
+            total_walked: 2,
+            cause: "c".into(),
+        }
+        .json_document();
+        assert_eq!(empty["error"], serde_json::json!("push_empty"));
+        assert_eq!(empty["code"], serde_json::json!("push_empty"));
+        assert_eq!(empty["totalWalked"], serde_json::json!(2));
+        let large = CliError::PayloadTooLarge {
+            bytes_sent: 1,
+            file_count: 1,
+            rejecter: EdgeRejecter::Server,
+        }
+        .json_document();
+        assert_eq!(large["code"], large["error"]);
+        let partial = CliError::PartialAnswer {
+            document: serde_json::json!({"version": 3, "error": "partial answer: x"}),
+            line: "partial answer: x".into(),
+        }
+        .json_document();
+        assert_eq!(partial["code"], serde_json::json!("partial_answer"));
+        assert_eq!(partial["version"], serde_json::json!(3));
+        let sync = CliError::SyncRefusal {
+            document: serde_json::json!({"outcome": "resolution_required"}),
+            line: "l".into(),
+            exit: 4,
+        }
+        .json_document();
+        assert_eq!(sync["code"], serde_json::json!("resolution_required"));
+        let carried = CliError::SyncRefusal {
+            document: serde_json::json!({"outcome": "retryable_failure", "code": "server_unreachable"}),
+            line: "l".into(),
+            exit: 3,
+        }
+        .json_document();
+        assert_eq!(carried["code"], serde_json::json!("server_unreachable"));
+    }
+
+    // Issue 160: a server refusal the binary chose no cause for carries
+    // the wire code it served; one naming none carries `unknown_refusal`.
+    #[test]
+    fn a_server_refusal_carries_its_wire_code() {
+        assert_eq!(api(403, "forbidden", None).code(), "forbidden");
+        assert_eq!(
+            api(422, "validation_error", None).code(),
+            "validation_error"
+        );
+        assert_eq!(api(429, "rate_limited", None).code(), "rate_limited");
+        assert_eq!(api(502, "unknown error", None).code(), "unknown_refusal");
+        assert_eq!(
+            api(200, "invalid response body: x", None).code(),
+            "response_undecodable"
+        );
+        let network = CliError::Api {
+            status: None,
+            error: "boom".into(),
+            context: None,
+        };
+        assert_eq!(network.code(), "network_error");
+        assert_eq!(
+            CliError::ServerUnreachable { url: "u".into() }.code(),
+            "server_unreachable"
+        );
     }
 }

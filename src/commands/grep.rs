@@ -22,7 +22,7 @@ use crate::errors::{CliError, partial_truncated_tree, partial_unread_paths};
 use crate::output::Output;
 use crate::read::store::{BlobContent, Store, get_or_fetch};
 use crate::read::{
-    ReadOptions, ReadTarget, bind_read_folder, counted_from, mark_partial, read_not_found,
+    PathLine, ReadOptions, ReadTarget, bind_read_folder, counted_from, mark_partial, path_refusal,
     report_reference, repository_argument, resolve_read_target,
 };
 
@@ -172,7 +172,7 @@ pub fn build_matcher(pattern: &str, ignore_case: bool) -> Result<RegexMatcher, C
         .case_insensitive(ignore_case)
         .line_terminator(Some(b'\n'))
         .build(pattern)
-        .map_err(|e| CliError::Config {
+        .map_err(|e| CliError::BadPattern {
             message: format!("invalid pattern {pattern}: {e}"),
         })
 }
@@ -191,7 +191,7 @@ pub fn compile_glob(value: &str) -> Result<GlobRule, CliError> {
     let matcher = GlobBuilder::new(value)
         .literal_separator(true)
         .build()
-        .map_err(|e| CliError::Config {
+        .map_err(|e| CliError::BadPattern {
             message: format!("invalid glob {value}: {e}"),
         })?
         .compile_matcher();
@@ -384,16 +384,13 @@ pub async fn grep_document(
         .await
     {
         Ok(tuple) => tuple,
+        // Issue 160 (`Boundary B`): the path named in both output
+        // modes, and a `404` naming the repository naming it instead.
         Err(e) => {
-            if let Some(p) = named.as_ref() {
-                if opts.version.is_some() {
-                    return Err(read_not_found(e, &opts, &target.reference, p));
-                }
-                if !output.is_json() {
-                    return Err(e.with_ls_path_context(p.clone()));
-                }
-            }
-            return Err(e);
+            return Err(match named.as_ref() {
+                Some(p) => path_refusal(e, &opts, &target, p, PathLine::Path),
+                None => e.repo_or(&target.repo_id),
+            });
         }
     };
     let tree_truncated = response.truncated;
@@ -560,12 +557,20 @@ pub async fn grep_document(
         "output": args.output.wire(),
         "truncated": truncated,
         "nextOffset": next_offset,
+        // Issue 160 (D-250 §1): set below where `--head-limit` cut the
+        // answer; `truncated` keeps D-156's meaning.
+        "limited": false,
         "skipped": skipped
             .iter()
             .map(|(path, reason)| serde_json::json!({ "path": path, "reason": reason }))
             .collect::<Vec<_>>(),
     });
 
+    // Issue 160 (D-250 §1 as amended): the limit cut the answer where it
+    // dropped a row found, or ended the search before every kept path of
+    // the window was searched — the fan-out closes only on the limit.
+    let ended_early = attempted < pool;
+    let cut = |found: usize| limit.is_some_and(|l| found > l) || ended_early;
     match args.output {
         GrepOutput::Content => {
             let mut flat: Vec<(String, MatchRow)> = Vec::new();
@@ -574,6 +579,7 @@ pub async fn grep_document(
                     flat.push((path.clone(), row.clone()));
                 }
             }
+            document["limited"] = serde_json::Value::Bool(cut(flat.len()));
             if let Some(limit) = limit {
                 flat.truncate(limit);
             }
@@ -598,6 +604,7 @@ pub async fn grep_document(
         }
         GrepOutput::Files => {
             let mut paths: Vec<String> = hits.iter().map(|(path, _)| path.clone()).collect();
+            document["limited"] = serde_json::Value::Bool(cut(paths.len()));
             if let Some(limit) = limit {
                 paths.truncate(limit);
             }
@@ -618,6 +625,7 @@ pub async fn grep_document(
                 .iter()
                 .map(|(path, rows)| (path.clone(), rows.len()))
                 .collect();
+            document["limited"] = serde_json::Value::Bool(cut(counts.len()));
             if let Some(limit) = limit {
                 counts.truncate(limit);
             }
@@ -1335,6 +1343,9 @@ mod tests {
             .expect("a document");
         assert_eq!(files_of(&met).len(), 400);
         assert_eq!(met["nextOffset"], serde_json::json!(400));
+        // Issue 160 (D-250 §1 as amended): the window searched whole and
+        // no row dropped — the limit cut nothing.
+        assert_eq!(met["limited"], serde_json::json!(false));
         let cut = answers
             .next()
             .unwrap()
@@ -1342,6 +1353,7 @@ mod tests {
             .expect("a document");
         assert_eq!(files_of(&cut).len(), 399);
         assert_eq!(cut["nextOffset"], serde_json::Value::Null);
+        assert_eq!(cut["limited"], serde_json::json!(true));
     }
 
     // D-156, "never skips a path inside a window": `--head-limit` met
@@ -1376,6 +1388,81 @@ mod tests {
         );
         assert_eq!(document["nextOffset"], serde_json::Value::Null);
         assert_eq!(document["truncated"], serde_json::json!(true));
+        // Issue 160 (D-250 §1 as amended, REVIEW-syns-cli L3): rows
+        // exactly at the limit, the search ended before the window's
+        // last paths — the answer reads as cut.
+        assert_eq!(document["limited"], serde_json::json!(true));
+    }
+
+    // Issue 160 (D-250 §1): `--head-limit` dropping a row the run found
+    // marks the answer `limited`, while `truncated` keeps D-156's meaning
+    // — the twelve paths stand in one window of an untruncated tree.
+    #[tokio::test]
+    #[serial]
+    async fn a_head_limit_dropping_a_found_row_marks_the_answer_limited() {
+        let env = fan_out_env(12).await;
+        let output = Output::new(true);
+        let mut answers = Vec::new();
+        for (mode, limit) in [
+            (GrepOutput::Content, Some(3)),
+            (GrepOutput::Files, Some(3)),
+            (GrepOutput::Count, Some(11)),
+        ] {
+            answers.push(
+                grep_document(
+                    &env.config,
+                    &output,
+                    "fn ".to_string(),
+                    GrepArgs {
+                        head_limit: limit,
+                        ..args(mode)
+                    },
+                    named(),
+                )
+                .await,
+            );
+        }
+        env.release();
+
+        for answer in answers {
+            let document = answer.expect("exit 0").expect("a document");
+            assert_eq!(document["limited"], serde_json::json!(true), "{document}");
+            assert_eq!(document["truncated"], serde_json::json!(false));
+            assert_eq!(document["nextOffset"], serde_json::Value::Null);
+        }
+    }
+
+    // Issue 160 (D-250 §1): rows equal to the limit with nothing dropped
+    // and every kept path searched, and no limit at all, leave `limited`
+    // false — the key always stands.
+    #[tokio::test]
+    #[serial]
+    async fn rows_equal_to_the_limit_leave_the_answer_unlimited() {
+        let env = fan_out_env(12).await;
+        let output = Output::new(true);
+        let mut answers = Vec::new();
+        for limit in [Some(12), Some(13), None] {
+            answers.push(
+                grep_document(
+                    &env.config,
+                    &output,
+                    "fn ".to_string(),
+                    GrepArgs {
+                        head_limit: limit,
+                        ..args(GrepOutput::Files)
+                    },
+                    named(),
+                )
+                .await,
+            );
+        }
+        env.release();
+
+        for answer in answers {
+            let document = answer.expect("exit 0").expect("a document");
+            assert_eq!(files_of(&document).len(), 12);
+            assert_eq!(document["limited"], serde_json::json!(false), "{document}");
+        }
     }
 
     // D-156: a kept set inside one window names no next offset.

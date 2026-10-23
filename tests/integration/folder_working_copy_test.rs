@@ -245,6 +245,17 @@ impl Respond for Server {
         {
             let _ = file;
             let (sha, _) = &state.commits[state.head];
+            // Issue 160 (REVIEW-syns-cli M1): a revert claiming a parent
+            // the head no longer stands at is refused as a push is.
+            let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+            if let Some(parent) = body["parentSha"].as_str()
+                && (state.advance || state.pin_head)
+                && parent != sha
+            {
+                return ResponseTemplate::new(409).set_body_json(json!({
+                    "error": "conflict", "message": "Head mismatch", "currentSha": sha,
+                }));
+            }
             return ResponseTemplate::new(200).set_body_json(json!({
                 "commitSha": sha, "version": state.head + 1, "filesChanged": 1, "created": false,
             }));
@@ -464,6 +475,14 @@ fn push_answer(state: &mut State, request: &Request) -> ResponseTemplate {
         "commitSha": sha, "version": state.commits.len(),
         "filesChanged": changed, "created": false,
     }))
+}
+
+/// Puts `path` in every commit the mock holds, so a version's changed
+/// paths stay as they were (issue 160: a removal needs a path to remove).
+fn hold_in_every_commit(state: &mut State, path: &str) {
+    for (_, tree) in &mut state.commits {
+        tree.insert(path.to_string(), b"noted\n".to_vec());
+    }
 }
 
 /// One mock deployment, one config directory, one cache directory, and
@@ -939,6 +958,9 @@ fn write_verbs_inside_a_folder_take_paths_counted_from_it() {
         state
             .file_answers
             .insert(in_folder(".page/board.json"), "a".to_string());
+        // Issue 160: `syns rm` of a path the tree lacks is refused, so
+        // the one removed here stands in every commit.
+        hold_in_every_commit(&mut state, &in_folder("notes.md"));
     }
     let parent = h(1);
     let mark = d.mark();
@@ -962,7 +984,17 @@ fn write_verbs_inside_a_folder_take_paths_counted_from_it() {
             vec!["commit", "--parent", &parent],
             &br#"{"files":[{"path":"a.md","content":"x"}],"deletions":[{"path":"b.md"}]}"#[..],
         ),
-        (vec!["revert", ".page/board.json", "--to", "1"], &b""[..]),
+        (
+            vec![
+                "revert",
+                ".page/board.json",
+                "--to",
+                "1",
+                "--parent",
+                &parent,
+            ],
+            &b""[..],
+        ),
     ] {
         let out = d.run_in(&d.folder(), stdin, &args);
         assert_eq!(exit_of(&out), 0, "{args:?}: {}", stderr_of(&out));
@@ -989,6 +1021,15 @@ fn write_verbs_inside_a_folder_take_paths_counted_from_it() {
         reverts,
         vec![format!("{PREFIX}/files/{FOLDER}/.page/board.json/revert")]
     );
+    // Issue 160: the revert claims the pinned parent as a write does.
+    let revert_body: Value = d
+        .requests_since(mark)
+        .into_iter()
+        .find(|r| r.method.as_str() == "POST")
+        .expect("the revert")
+        .body_json()
+        .expect("a JSON body");
+    assert_eq!(revert_body["parentSha"], json!(parent));
 
     let mark = d.mark();
     let leaving = d.run_in(
@@ -1576,9 +1617,35 @@ fn the_plugin_and_hook_invocations_answer_inside_a_folder() {
         &folder,
         &envs,
         b"",
-        &["revert", "--to=1", "--json", "--", ".page/board.json"],
+        &[
+            "revert",
+            "--to=1",
+            parent.as_str(),
+            "--json",
+            "--",
+            ".page/board.json",
+        ],
     );
     assert_eq!(exit_of(&revert), 0, "{}", stderr_of(&revert));
+    // Issue 160: the hook's environment names the revert's provenance as
+    // it names a write's.
+    let revert_body: Value = d
+        .requests_since(revert_mark)
+        .into_iter()
+        .find(|r| r.method.as_str() == "POST")
+        .expect("the revert")
+        .body_json()
+        .expect("a JSON body");
+    assert_eq!(
+        revert_body["provenance"],
+        json!({"integration": "tool-a", "run": "s1", "trigger": "trigger-a"})
+    );
+    // Issue 160 (REVIEW-syns-cli L1): the revert names the checkout it
+    // left one version behind, as a write does.
+    assert_eq!(
+        one_document(&revert)["checkoutBehind"],
+        json!(folder.display().to_string())
+    );
     let reverts: Vec<String> = d
         .requests_since(revert_mark)
         .into_iter()
@@ -2027,6 +2094,9 @@ fn every_write_verb_inside_a_folder_lands_over_a_push_outside_it() {
     d.state()
         .file_answers
         .insert(in_folder("board.json"), "a".to_string());
+    // Issue 160: the path `syns rm` removes stands in every commit, the
+    // folder's history unchanged by it.
+    hold_in_every_commit(&mut d.state(), &in_folder("notes.md"));
     let png = png_bytes();
     let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
     let changeset = json!({
@@ -2087,6 +2157,36 @@ fn every_write_verb_inside_a_folder_lands_over_a_push_outside_it() {
         assert_eq!(query(&lists[0], "limit").as_deref(), Some("1"));
         assert_eq!(query(&lists[0], "offset").as_deref(), Some("0"));
     }
+
+    // Issue 160 (REVIEW-syns-cli M1): a revert inside the folder lands
+    // over the push outside it as the write verbs do — one folder check
+    // since the pinned parent, then the one revert at the named head.
+    let mark = d.mark();
+    let out = d.run_in(
+        &d.folder(),
+        b"",
+        &[
+            "revert",
+            "board.json",
+            "--to",
+            "1",
+            "--parent",
+            "1",
+            "--json",
+        ],
+    );
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    let reverts: Vec<Value> = d
+        .requests_since(mark)
+        .into_iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path().ends_with("/revert"))
+        .map(|r| r.body_json().expect("a JSON body"))
+        .collect();
+    assert_eq!(reverts.len(), 1, "{reverts:?}");
+    assert_eq!(reverts[0]["parentSha"], json!(h(2)));
+    let lists = d.version_lists_since(mark);
+    assert_eq!(lists.len(), 1);
+    assert_eq!(query(&lists[0], "path").as_deref(), Some(FOLDER));
 }
 
 #[test]
@@ -2678,7 +2778,7 @@ fn reading_verbs_naming_an_empty_path_inside_a_folder_are_refused_before_any_req
         vec!["glob", "*", "--path", ""],
         vec!["grep", "x", "--path", ""],
         vec!["history", "--file", ""],
-        vec!["revert", "", "--to", "1"],
+        vec!["revert", "", "--to", "1", "--parent", "1"],
     ];
     for args in runs {
         let mark = d.mark();

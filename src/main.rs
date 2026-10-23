@@ -72,8 +72,8 @@ impl From<ReadOpts> for read::ReadOptions {
 
 /// The options every write verb carries, spelt and bound identically on
 /// each (SPEC u271 Contract Surface, `WriteOptions`). `--parent` is
-/// required by the parser on all four and carries no single-letter
-/// alias.
+/// required by the parser on all of them — `syns revert` among them since
+/// issue 160 — and carries no single-letter alias.
 #[derive(clap::Args, Clone)]
 struct WriteOpts {
     /// Write to another repository, as OWNER/NAME
@@ -230,7 +230,7 @@ enum Commands {
         /// What the search answers with
         #[arg(long, value_enum, default_value = "content")]
         output: GrepOutput,
-        /// Carry at most this many rows
+        /// Carry at most this many rows; the JSON answer's limited is true where it cut the answer
         #[arg(long, value_name = "NUM")]
         head_limit: Option<u32>,
         #[arg(long, value_name = "NUM", default_value_t = 0, help = syns_cli::commands::grep::offset_help())]
@@ -309,11 +309,10 @@ enum Commands {
         /// Ending version (number or SHA)
         #[arg(long)]
         to: Option<String>,
-        /// Silently skip (exit 0) when no Syns repo identity resolves
-        #[arg(long)]
-        if_repo: bool,
+        #[command(flatten)]
+        scope: RepoScopeArgs,
     },
-    /// Revert a file to a previous version
+    /// Revert a file to a previous version, published as one commit against --parent
     Revert {
         /// File path to revert
         #[arg()]
@@ -321,12 +320,11 @@ enum Commands {
         /// Target version (number or SHA) to restore
         #[arg(long)]
         to: String,
-        /// Custom commit message
-        #[arg(long, short = 'm')]
-        message: Option<String>,
-        /// Silently skip (exit 0) when no Syns repo identity resolves
+        /// Silently skip (exit 0) when no Syns repo identity resolves and no --repo is given
         #[arg(long)]
         if_repo: bool,
+        #[command(flatten)]
+        write: WriteOpts,
     },
     /// Repository management
     Repo {
@@ -764,15 +762,15 @@ async fn run(
                 commands::history::cmd_history(config, output, file, limit, offset, scope).await?
             }
         },
-        Commands::Diff { from, to, if_repo } => {
-            commands::diff::cmd_diff(config, output, from, to, if_repo).await?
+        Commands::Diff { from, to, scope } => {
+            commands::diff::cmd_diff(config, output, from, to, scope).await?
         }
         Commands::Revert {
             path,
             to,
-            message,
             if_repo,
-        } => commands::revert::cmd_revert(config, output, path, to, message, if_repo).await?,
+            write,
+        } => commands::revert::cmd_revert(config, output, path, to, if_repo, write.into()).await?,
         Commands::Repo {
             description,
             status,

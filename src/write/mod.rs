@@ -36,7 +36,7 @@ use crate::push::folder_check::{FOLDER_SEND_BOUND, FolderCheck, named_head};
 use crate::push::hash::blob_sha1;
 use crate::push::manifest::Manifest;
 use crate::push::working_copy::{WorkingCopy, folder_base};
-use crate::read::file_argument;
+use crate::read::{file_argument, reference_refusal, repository_read_refusal};
 use crate::repo::folder::{FolderScope, lies_under, resolve_folder_scope};
 use crate::repo::identity::identity_head;
 use crate::repo::if_repo::resolve_full_or_skip;
@@ -335,8 +335,9 @@ fn agrees_with_base(
 /// alone, the one test the working-copy state also judges it by (SPEC
 /// u305 Contract Surface, `guard_root`).
 fn guard_root(config: &Config, root: &Path, repo_id: &str) -> Result<PathBuf, CliError> {
-    let refuse = || CliError::Io {
-        message: checkout_guard_refusal(root, repo_id),
+    let refuse = || CliError::CheckoutDirty {
+        root: root.to_path_buf(),
+        repo_id: repo_id.to_string(),
     };
     let (owner, name) = repo_id.split_once('/').unwrap_or((repo_id, ""));
 
@@ -395,8 +396,9 @@ async fn guard_folder(
     client: &SynsClient,
     token: &str,
 ) -> Result<PathBuf, CliError> {
-    let refuse = || CliError::Io {
-        message: checkout_guard_refusal(&scope.dir, repo_id),
+    let refuse = || CliError::CheckoutDirty {
+        root: scope.dir.clone(),
+        repo_id: repo_id.to_string(),
     };
     // 2
     if let Ok(Some(copy)) = WorkingCopy::open_existing_folder(config.stores(), scope)
@@ -584,7 +586,17 @@ async fn resolve_parent(
             version: None,
         });
     }
-    let (entry, _raw) = client.get_version(repo_id, Some(token), spelling).await?;
+    // Issue 160 (REVIEW-syns-cli M2): an unknown parent is the
+    // version-not-found refusal, an unreachable repository its own.
+    let (entry, _raw) = client
+        .get_version(repo_id, Some(token), spelling)
+        .await
+        .map_err(|e| match e {
+            CliError::Api {
+                status: Some(404), ..
+            } => reference_refusal(e, repo_id, spelling),
+            other => other,
+        })?;
     Ok(ParentRef {
         commit_sha: entry.sha,
         version: Some(entry.version),
@@ -659,16 +671,19 @@ pub async fn resolve_write_target(
     // 4 — read the repository, so no push of this run can be the request
     // that creates one (`issues/069`), keeping the head it names (SPEC
     // u292 `WriteTarget.head`).
+    // Issue 160 (REVIEW-syns-cli M2): a `404` there names the repository.
     let head = client
         .get_repo(&repo_id, Some(&token))
-        .await?
+        .await
+        .map_err(|e| repository_read_refusal(e, &repo_id))?
         .commit_sha
         .filter(|sha| !sha.is_empty());
     // SPEC u302 `resolve_write_target` 1: through an identity, the head is
     // its newest listed version, the record's `commitSha` unread.
     let head = match folder.as_ref().filter(|scope| scope.identity.is_some()) {
         Some(_) => identity_head(&client, Some(&token), &repo_id)
-            .await?
+            .await
+            .map_err(|e| repository_read_refusal(e, &repo_id))?
             .map(|newest| newest.sha),
         None => head,
     };
@@ -693,12 +708,20 @@ pub async fn resolve_write_target(
 
 /// The caption this run's commit carries (`commit_changeset` 1).
 fn caption(opts: &WriteOptions, default: &str) -> Result<String, CliError> {
+    Ok(given_message(opts)?.unwrap_or_else(|| default.to_string()))
+}
+
+/// The `--message` the caller gave, none where none stood, and the
+/// empty-message refusal before any publication where it is empty once
+/// trimmed (`commit_changeset` 1; `syns revert`, issue 160, whose default
+/// caption the server writes).
+pub(crate) fn given_message(opts: &WriteOptions) -> Result<Option<String>, CliError> {
     match opts.message.as_deref() {
         Some(given) if given.trim().is_empty() => Err(CliError::Config {
             message: "--message cannot be empty".to_string(),
         }),
-        Some(given) => Ok(given.to_string()),
-        None => Ok(default.to_string()),
+        Some(given) => Ok(Some(given.to_string())),
+        None => Ok(None),
     }
 }
 
@@ -764,7 +787,7 @@ fn push_body(
 /// An answer carrying `currentSha` becomes the conflict refusal at exit
 /// `7`; a `CONFLICT` carrying none keeps exit `1`, so one inbound answer
 /// never takes two exits in one run.
-fn fold_conflict(err: CliError, parent: &str) -> CliError {
+pub(crate) fn fold_conflict(err: CliError, parent: &str) -> CliError {
     match err {
         CliError::Api {
             status: Some(409),
@@ -902,20 +925,52 @@ pub(crate) fn with_parent_sha(body: bytes::Bytes, head: &str) -> bytes::Bytes {
     bytes::Bytes::from(fresh)
 }
 
-/// One `EP-push` of `body`, a handle to it kept across the send and
-/// answered beside the send's own answer, so the next send takes the
-/// buffer back where the server read it whole.
-async fn send_keeping(
-    client: &SynsClient,
-    target: &WriteTarget,
+/// One publication a folder run sends, at the parent it is handed (issue
+/// 160, REVIEW-syns-cli M1): `EP-push`'s body or `EP-revert-file`'s
+/// request, sent through `send_inside_folder` alike.
+pub(crate) trait FolderSend {
+    type Answer;
+    /// Sends the publication claiming `parent`, a full commit hash.
+    async fn send(
+        &mut self,
+        client: &SynsClient,
+        target: &WriteTarget,
+        parent: &str,
+    ) -> Result<Self::Answer, CliError>;
+}
+
+/// `EP-push`'s one serialised body, a handle to it kept across each send
+/// so the next send takes the buffer back where the server read it
+/// whole, its parent rewritten in its own bytes (SPEC u292).
+struct PushSend {
     body: bytes::Bytes,
-) -> (
-    Result<(PushResponse, serde_json::Value), CliError>,
-    bytes::Bytes,
-) {
-    let kept = body.clone();
-    let answer = client.push_body(&target.repo_id, &target.token, body).await;
-    (answer, kept)
+    claims: String,
+}
+
+impl FolderSend for PushSend {
+    type Answer = (PushResponse, serde_json::Value);
+
+    async fn send(
+        &mut self,
+        client: &SynsClient,
+        target: &WriteTarget,
+        parent: &str,
+    ) -> Result<Self::Answer, CliError> {
+        if self.claims != parent {
+            self.body = with_parent_sha(std::mem::take(&mut self.body), parent);
+            self.claims = parent.to_string();
+        }
+        let kept = self.body.clone();
+        let answer = client
+            .push_body(
+                &target.repo_id,
+                &target.token,
+                std::mem::take(&mut self.body),
+            )
+            .await;
+        self.body = kept;
+        answer
+    }
 }
 
 /// A landed publication: the served result, its body, and the full hash
@@ -924,26 +979,25 @@ async fn send_keeping(
 pub type Published = (PushResponse, serde_json::Value, String);
 
 /// SPEC u292 Behaviour, `commit_changeset` 1 to 5 inside a folder: the
-/// one serialised body sent at the pinned parent — or, where the
-/// repository read named another head, at none until the folder check
-/// answers — and then at each head a refusal names while no version
-/// after the pinned parent changed the folder, at most
-/// `FOLDER_SEND_BOUND` sends in all. SPEC u293: the landing send's
-/// claimed parent is answered beside its answer — the pinned parent on a
-/// first send, and the named head after it.
-async fn send_inside_folder(
+/// one publication sent at the pinned parent — or, where the repository
+/// read named another head, at none until the folder check answers — and
+/// then at each head a refusal names while no version after the pinned
+/// parent changed the folder, at most `FOLDER_SEND_BOUND` sends in all.
+/// SPEC u293: the landing send's claimed parent is answered beside its
+/// answer — the pinned parent on a first send, and the named head after
+/// it. Issue 160: a revert inside a folder is sent the same way.
+pub(crate) async fn send_inside_folder<S: FolderSend>(
     client: &SynsClient,
     target: &WriteTarget,
     folder: &FolderScope,
-    body: bytes::Bytes,
-) -> Result<Published, CliError> {
+    sender: &mut S,
+) -> Result<(S::Answer, String), CliError> {
     let pinned = &target.parent.commit_sha;
     let conflict = |head: &str| CliError::WriteConflict {
         parent: pinned.clone(),
         current_sha: head.to_string(),
     };
     let mut sends: u32 = 0;
-    let mut body = body;
 
     // 1 — the first send at the pinned parent, unless the repository
     // read already named another head.
@@ -951,10 +1005,8 @@ async fn send_inside_folder(
         Some(head) if head != pinned => head.to_string(),
         _ => {
             sends += 1;
-            let (answer, kept) = send_keeping(client, target, body).await;
-            body = kept;
-            match answer {
-                Ok((response, raw)) => return Ok((response, raw, pinned.clone())),
+            match sender.send(client, target, pinned).await {
+                Ok(answer) => return Ok((answer, pinned.clone())),
                 Err(err) => match named_head(&err) {
                     Some(head) => head.to_string(),
                     None => return Err(fold_conflict(err, pinned)),
@@ -996,12 +1048,9 @@ async fn send_inside_folder(
             return Err(conflict(&named));
         }
         // 5
-        body = with_parent_sha(body, &named);
         sends += 1;
-        let (answer, kept) = send_keeping(client, target, body).await;
-        body = kept;
-        match answer {
-            Ok((response, raw)) => return Ok((response, raw, named)),
+        match sender.send(client, target, &named).await {
+            Ok(answer) => return Ok((answer, named)),
             Err(err) => match named_head(&err) {
                 Some(head) => named = head.to_string(),
                 None => return Err(fold_conflict(err, pinned)),
@@ -1021,6 +1070,31 @@ pub async fn commit_changeset(
     opts: &WriteOptions,
     default_message: &str,
 ) -> Result<(), CliError> {
+    commit_changeset_or(
+        config,
+        output,
+        target,
+        changeset,
+        opts,
+        default_message,
+        None,
+    )
+    .await
+}
+
+/// `commit_changeset`, an answer counting no changed file refused with
+/// `unchanged` where one is given in place of the nothing-changed report
+/// (issue 160: `syns rm PATH` of a path the parent's tree does not hold,
+/// whose one deletion the server answers by publishing no version).
+pub async fn commit_changeset_or(
+    config: &Config,
+    output: &Output,
+    target: &WriteTarget,
+    changeset: Changeset,
+    opts: &WriteOptions,
+    default_message: &str,
+    unchanged: Option<CliError>,
+) -> Result<(), CliError> {
     // The paths the run sends, as typed: `checkout_path` stands only where
     // `--repo` named the holder, so no folder maps them.
     let written: Vec<String> = match target.checkout_path {
@@ -1034,6 +1108,11 @@ pub async fn commit_changeset(
     };
     let (response, raw, _claimed) =
         publish_changeset(config, target, changeset, opts, default_message).await?;
+    if response.files_changed == 0
+        && let Some(refusal) = unchanged
+    {
+        return Err(refusal);
+    }
 
     // 4 and 5 — compose the run's one answer and render it.
     report(output, target, &response, raw, &written);
@@ -1098,7 +1177,15 @@ pub async fn publish_changeset(
                 .map_err(|err| fold_conflict(err, &target.parent.commit_sha))?;
             Ok((response, raw, target.parent.commit_sha.clone()))
         }
-        Some(folder) => send_inside_folder(&client, target, folder, body).await,
+        Some(folder) => {
+            let mut sender = PushSend {
+                body,
+                claims: target.parent.commit_sha.clone(),
+            };
+            let ((response, raw), claimed) =
+                send_inside_folder(&client, target, folder, &mut sender).await?;
+            Ok((response, raw, claimed))
+        }
     }
 }
 

@@ -1460,7 +1460,10 @@ async fn binary_push_naming_another_repository_prints_the_refusal() {
 
     let json = machine.run(&["push", "-n", "other", "--json"]).await;
     assert_eq!(json.status.code(), Some(2), "{}", stderr(&json));
-    assert_eq!(document(&json), json!({"error": line}));
+    assert_eq!(
+        document(&json),
+        json!({"code": "path_belongs_to_another_repo", "error": line})
+    );
 
     assert!(server.received_requests().await.unwrap().is_empty());
 }

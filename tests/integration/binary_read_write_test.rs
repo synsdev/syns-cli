@@ -532,6 +532,8 @@ fn cat_json_refuses_a_hash_mismatch() {
 
 #[test]
 #[serial]
+// Issue 160 (`Boundary B`): the bare read names the path under `--json`
+// as it does outside it, each refusal carrying its `code`.
 fn cat_json_keeps_its_not_found_refusals() {
     let d = Deployment::new();
     mount_reference(&d);
@@ -547,7 +549,7 @@ fn cat_json_keeps_its_not_found_refusals() {
     assert_eq!(exit_of(&bare), 1);
     assert_eq!(
         one_document(&bare),
-        json!({"error": "server error (404): not_found"})
+        json!({"code": "not_found", "error": "file not found: gone.md"})
     );
 
     let versioned = d.run(
@@ -557,7 +559,7 @@ fn cat_json_keeps_its_not_found_refusals() {
     assert_eq!(exit_of(&versioned), 1);
     assert_eq!(
         one_document(&versioned),
-        json!({"error": "path not found at version 7: gone.md"})
+        json!({"code": "not_found", "error": "path not found at version 7: gone.md"})
     );
 }
 
@@ -599,7 +601,7 @@ fn every_repo_taking_verb_names_repo() {
         assert_eq!(exit_of(&json_run), 2, "{invocation:?}");
         assert_eq!(
             one_document(&json_run),
-            json!({ "error": line }),
+            json!({ "code": "repo_identity_unknown", "error": line }),
             "{invocation:?}"
         );
     }
@@ -649,7 +651,7 @@ fn an_empty_reference_reaches_no_request() {
         assert_eq!(exit_of(&json_run), 1, "{invocation:?}");
         assert_eq!(
             one_document(&json_run),
-            json!({ "error": line }),
+            json!({ "code": "config_error", "error": line }),
             "{invocation:?}"
         );
     }

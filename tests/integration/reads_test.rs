@@ -1302,7 +1302,7 @@ fn registered_short_aliases_parse() {
     );
 
     let invocations: Vec<Vec<&str>> = vec![
-        vec!["revert", "a.md", "--to", "1", "-m", "msg"],
+        vec!["revert", "a.md", "--to", "1", "--parent", "1", "-m", "msg"],
         vec!["fork", REPO, "-n", "copy"],
         vec!["repo", "-t", "x"],
         vec!["explore", "-t", "x"],
@@ -1651,9 +1651,10 @@ fn a_served_tree_reaches_the_refusal_on_its_truncated_key_alone() {
     );
 
     // The two documents differ in the flipped key and the refusal it
-    // raised, and in nothing else.
+    // raised, its code beside it (issue 160), and in nothing else.
     whole_document["truncated"] = json!(true);
     whole_document["error"] = json!(TRUNCATED_REFUSAL);
+    whole_document["code"] = json!("partial_answer");
     assert_eq!(partial_document, whole_document);
 }
 

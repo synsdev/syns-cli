@@ -1475,9 +1475,12 @@ fn r14_run_wide_failures() {
 
     let out = env.run(&["--json", "cat", "--version=999999", "--", "a.md", "b.md"]);
     assert_eq!(code(&out), 1);
-    assert_eq!(doc(&out), json!({"error": "version not found: 999999"}));
+    assert_eq!(
+        doc(&out),
+        json!({"code": "version_not_found", "error": "version not found: 999999"})
+    );
 
-    for (act, exit, line) in [
+    for (act, exit, line, wire) in [
         (
             Act::Refuse {
                 status: 401,
@@ -1486,6 +1489,7 @@ fn r14_run_wide_failures() {
             },
             1,
             "authentication required \u{2014} run 'syns login' first".to_string(),
+            "auth_required",
         ),
         (
             Act::Refuse {
@@ -1495,6 +1499,7 @@ fn r14_run_wide_failures() {
             },
             1,
             "server error (404): repo_not_found".to_string(),
+            "repo_not_found",
         ),
         (
             Act::Refuse {
@@ -1504,12 +1509,14 @@ fn r14_run_wide_failures() {
             },
             1,
             "server error (403): forbidden \u{2014} forbidden".to_string(),
+            "forbidden",
         ),
     ] {
         env.fake.always("b.md", act);
         let out = env.run(&["--json", "cat", "--", "a.md", "b.md"]);
         assert_eq!(code(&out), exit, "{}", stdout(&out));
-        assert_eq!(doc(&out), json!({"error": line}));
+        // Issue 160: the cause's code beside `error`.
+        assert_eq!(doc(&out), json!({"code": wire, "error": line}));
     }
 
     env.fake.with(|s| s.reference_closes = true);

@@ -164,9 +164,10 @@ fn a_path_naming_nothing_keeps_todays_refusal() {
             );
             let out = env.run(&dir, &["--json", "ls", path]);
             assert_eq!(out.status.code(), Some(1), "v2={v2} {path}");
+            // Issue 160 (`Boundary B`): the path named under `--json` too.
             assert_eq!(
                 String::from_utf8_lossy(&out.stdout).trim(),
-                r#"{"error":"server error (404): not_found"}"#,
+                format!(r#"{{"code":"not_found","error":"path not found: {path}"}}"#),
                 "v2={v2} {path}"
             );
         }
@@ -179,9 +180,10 @@ fn a_hidden_file_stays_absent() {
         env.fake.with(|s| s.hidden = vec!["private".into()]);
         let out = env.run(&dir, &["--json", "ls", "private/secret.md"]);
         assert_eq!(out.status.code(), Some(1), "v2={v2}");
+        // Issue 160 (`Boundary B`): a hidden file reads as any absent path.
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).trim(),
-            r#"{"error":"server error (404): not_found"}"#,
+            r#"{"code":"not_found","error":"path not found: private/secret.md"}"#,
             "v2={v2}"
         );
     }

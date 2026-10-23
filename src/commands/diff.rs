@@ -1,11 +1,12 @@
-use crate::auth::token::TokenStore;
 use crate::client::{DiffStatus, SynsClient, VersionListResponse, undecodable};
 use crate::commands::history::folder_history;
 use crate::config::Config;
 use crate::errors::CliError;
 use crate::output::Output;
-use crate::read::version_not_found_refusal;
-use crate::repo::folder::{FolderScope, current_dir, resolve_scoped_or_skip};
+use crate::read::{
+    RepoScope, RepoScopeArgs, reference_refusal, repository_read_refusal, resolve_scoped_repo_scope,
+};
+use crate::repo::folder::FolderScope;
 use console::style;
 
 fn style_status(status: &DiffStatus) -> console::StyledObject<&'static str> {
@@ -78,7 +79,12 @@ fn listed_pair(page: &VersionListResponse) -> Option<(String, String)> {
 /// diff entry answers names the versions the run asked for, both where they
 /// differ since the answer does not say which end it lacks; every other
 /// refusal passes through as it renders.
-fn version_not_found(err: CliError, from: &str, to: &str) -> CliError {
+/// Issue 160: a `404` naming the repository — absent and unreadable
+/// alike — is the repository-not-found refusal in its place.
+fn version_not_found(err: CliError, repo_id: &str, from: &str, to: &str) -> CliError {
+    if err.names_missing_repository() {
+        return err.repo_or(repo_id);
+    }
     match &err {
         CliError::Api {
             status: Some(404),
@@ -90,7 +96,7 @@ fn version_not_found(err: CliError, from: &str, to: &str) -> CliError {
             } else {
                 format!("{from} or {to}")
             };
-            err.with_versioned_read_context(version_not_found_refusal(&asked))
+            reference_refusal(err, repo_id, &asked)
         }
         _ => err,
     }
@@ -101,18 +107,19 @@ pub async fn cmd_diff(
     output: &Output,
     from: Option<String>,
     to: Option<String>,
-    if_repo: bool,
+    scope: RepoScopeArgs,
 ) -> Result<(), CliError> {
-    // 1 — the repository and the folder (SPEC u290).
-    let Some((owner, name, folder)) = resolve_scoped_or_skip(&current_dir()?, if_repo, output)?
+    // 1 — the repository and the folder (SPEC u290), bound as `syns
+    // history` binds them: a `--repo` value outright with no folder, the
+    // identity ladder from the directory otherwise (issue 160).
+    let Some(RepoScope {
+        repo_id,
+        token,
+        folder,
+    }) = resolve_scoped_repo_scope(config, output, &scope).await?
     else {
         return Ok(());
     };
-    let repo_id = format!("{owner}/{name}");
-    let token = TokenStore::new(config.credentials_path())
-        .read()
-        .ok()
-        .flatten();
     let client = SynsClient::new(config.server_url())?;
 
     // 2 — the endpoints.
@@ -127,7 +134,8 @@ pub async fn cmd_diff(
                 Some(_) => {
                     client
                         .list_versions(&repo_id, token.as_deref(), 2, 0, None)
-                        .await?
+                        .await
+                        .map_err(|e| repository_read_refusal(e, &repo_id))?
                         .0
                 }
                 None => {
@@ -150,7 +158,8 @@ pub async fn cmd_diff(
         (None, None, None) => {
             let (response, _raw) = client
                 .list_versions(&repo_id, token.as_deref(), 2, 0, None)
-                .await?;
+                .await
+                .map_err(|e| repository_read_refusal(e, &repo_id))?;
             listed_pair(&response).ok_or_else(|| CliError::Api {
                 status: None,
                 error: "repository has fewer than 2 versions — cannot diff".to_string(),
@@ -168,7 +177,7 @@ pub async fn cmd_diff(
     let (mut response, mut raw) = client
         .get_diff(&repo_id, token.as_deref(), &from_val, &to_val)
         .await
-        .map_err(|e| version_not_found(e, &from_val, &to_val))?;
+        .map_err(|e| version_not_found(e, &repo_id, &from_val, &to_val))?;
 
     // 4 — inside a folder, the scoped diff entries alone; through an
     // identity every entry as served (SPEC u302 `cmd_diff` 1).
@@ -214,6 +223,13 @@ pub async fn cmd_diff(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn if_repo(if_repo: bool) -> RepoScopeArgs {
+        RepoScopeArgs {
+            repo: None,
+            if_repo,
+        }
+    }
     use serial_test::serial;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -263,7 +279,7 @@ mod tests {
             &output,
             Some("1".to_string()),
             Some("3".to_string()),
-            false,
+            if_repo(false),
         )
         .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
@@ -336,7 +352,7 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_diff(&config, &output, None, None, false).await;
+        let result = cmd_diff(&config, &output, None, None, if_repo(false)).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
@@ -358,7 +374,14 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_diff(&config, &output, Some("1".to_string()), None, false).await;
+        let result = cmd_diff(
+            &config,
+            &output,
+            Some("1".to_string()),
+            None,
+            if_repo(false),
+        )
+        .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(matches!(result, Err(CliError::Config { .. })));
@@ -397,7 +420,7 @@ mod tests {
             &output,
             Some("1".to_string()),
             Some("3".to_string()),
-            true,
+            if_repo(true),
         )
         .await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
@@ -416,7 +439,7 @@ mod tests {
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
 
-        let result = cmd_diff(&config, &output, None, None, true).await;
+        let result = cmd_diff(&config, &output, None, None, if_repo(true)).await;
         unsafe { std::env::remove_var("SYNS_CONFIG_DIR") };
 
         assert!(result.is_ok());
@@ -471,16 +494,22 @@ mod tests {
             .await;
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
-        let two = cmd_diff(&config, &output, Some("1".into()), Some("99".into()), false)
-            .await
-            .unwrap_err();
+        let two = cmd_diff(
+            &config,
+            &output,
+            Some("1".into()),
+            Some("99".into()),
+            if_repo(false),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(two.to_string(), "version not found: 1 or 99");
         let one = cmd_diff(
             &config,
             &output,
             Some("99".into()),
             Some("99".into()),
-            false,
+            if_repo(false),
         )
         .await
         .unwrap_err();
@@ -507,9 +536,15 @@ mod tests {
             .await;
         let config = Config::new(Some(&mock_server.uri())).unwrap();
         let output = Output::new(false);
-        let err = cmd_diff(&config, &output, Some("1".into()), Some("2".into()), false)
-            .await
-            .unwrap_err();
+        let err = cmd_diff(
+            &config,
+            &output,
+            Some("1".into()),
+            Some("2".into()),
+            if_repo(false),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(
             err.to_string(),
             "server error (403): forbidden \u{2014} Read access required"

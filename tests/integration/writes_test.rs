@@ -552,26 +552,26 @@ fn rm_publishes_a_delete_only_push() {
 
 #[test]
 #[serial]
-fn rm_of_a_path_the_parent_lacks_moves_no_head() {
+fn rm_of_a_path_the_parent_lacks_is_refused_as_not_found() {
+    // Issue 160: the head standing still is refused under `not_found` at
+    // exit `1`, naming the path and the parent as `syns edit` names them,
+    // in place of the nothing-changed report at exit `0`.
     let d = Deployment::new();
     mount_repo(&d, REPO, HEAD_SHA);
     mount_push(&d, REPO, push_body(HEAD_SHA, HEAD_VERSION, 0));
 
     let out = d.run(&["rm", "ghost.md", "--parent", HEAD_SHA, "--repo", REPO]);
 
-    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(exit_of(&out), 1, "{}", stderr_of(&out));
     let pushes = d.pushes();
     assert_eq!(pushes.len(), 1);
     assert_eq!(pushes[0]["deletions"], json!([{"path": "ghost.md"}]));
     let line = stderr_of(&out);
-    assert!(
-        line.contains(&format!(
-            "nothing changed; the head is still version {HEAD_VERSION}, commit {HEAD_SHA}"
-        )),
-        "{line}"
+    assert_eq!(
+        line,
+        format!("error: path not found at version {HEAD_SHA}: ghost.md\n")
     );
-    assert!(!line.contains("wrote version"), "{line}");
-    assert!(!line.contains("one version behind"), "{line}");
+    assert!(!line.contains("nothing changed"), "{line}");
 }
 
 // ---- commit ------------------------------------------------------------

@@ -47,12 +47,13 @@ pub fn replaced(
 ) -> Result<String, CliError> {
     let count = content.matches(old).count();
     if count == 0 {
-        return Err(CliError::Config {
+        return Err(CliError::NoMatch {
             message: old_matched_nothing(parent, path),
         });
     }
     if count > 1 && !replace_all {
-        return Err(CliError::Config {
+        return Err(CliError::ManyMatches {
+            count,
             message: old_matched_more_than_once(count, path),
         });
     }
@@ -116,7 +117,17 @@ pub async fn cmd_edit(
         )
         .await
         .map_err(|e| {
-            e.with_versioned_read_context(path_not_found_at_parent(&opts.parent, &path))
+            // Issue 160 (REVIEW-syns-cli M2): a `404` naming the
+            // repository or the parent is told from the path.
+            if e.names_missing_repository() {
+                e.repo_or(&target.repo_id)
+            } else if e.names_missing_version() {
+                e.with_version_not_found_context(crate::read::version_not_found_refusal(
+                    &opts.parent,
+                ))
+            } else {
+                e.with_versioned_read_context(path_not_found_at_parent(&opts.parent, &path))
+            }
         })?;
 
     // 3 — classify the answered content. A content the store already

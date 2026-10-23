@@ -1053,7 +1053,10 @@ fn a_moved_folder_is_refused_naming_both_paths() {
     }
     let json_run = d.run_in(&moved, b"", &["--json", "ls"]);
     assert_eq!(exit_of(&json_run), 2);
-    assert_eq!(one_document(&json_run), json!({ "error": line }));
+    assert_eq!(
+        one_document(&json_run),
+        json!({ "code": "folder_out_of_place", "error": line })
+    );
     assert!(d.requests().is_empty());
 }
 

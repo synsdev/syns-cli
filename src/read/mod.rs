@@ -98,6 +98,64 @@ pub fn read_not_found(
     }
 }
 
+/// Which registered line a read verb's missing path takes where no
+/// `--version` stood: `syns cat` and `syns read` name a file, `syns ls`,
+/// `syns glob` and `syns grep` a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathLine {
+    File,
+    Path,
+}
+
+/// The refusal a read verb's path read raises (issue 160, `Boundary B`):
+/// a `404` naming the repository becomes the repository-not-found
+/// refusal, and any other names the path the run asked for — at the
+/// pinned version where `--version` stood — in both output modes alike.
+pub fn path_refusal(
+    err: CliError,
+    opts: &ReadOptions,
+    target: &ReadTarget,
+    path: &str,
+    line: PathLine,
+) -> CliError {
+    if err.names_missing_repository() {
+        return err.repo_or(&target.repo_id);
+    }
+    if opts.version.is_some() {
+        return read_not_found(err, opts, &target.reference, path);
+    }
+    match line {
+        PathLine::File => err.with_cat_path_context(path.to_string()),
+        PathLine::Path => err.with_ls_path_context(path.to_string()),
+    }
+}
+
+/// A refusal of the repository's own read — its record, its head, its
+/// version list (issue 160): any `404` there names the repository,
+/// absent and unreadable alike.
+pub fn repository_read_refusal(err: CliError, repo_id: &str) -> CliError {
+    match &err {
+        CliError::Api {
+            status: Some(404),
+            error,
+            ..
+        } if error == "not_found" || error == "repo_not_found" => {
+            err.with_repo_not_found_context(crate::errors::repo_not_found_refusal(repo_id))
+        }
+        _ => err,
+    }
+}
+
+/// A refusal of a read naming a reference the caller typed (issue 160):
+/// the repository-not-found refusal where the `404` names the
+/// repository, and the version-not-found refusal for `asked` otherwise.
+pub fn reference_refusal(err: CliError, repo_id: &str, asked: &str) -> CliError {
+    if err.names_missing_repository() {
+        return err.repo_or(repo_id);
+    }
+    err.with_version_not_found_context(version_not_found_refusal(asked))
+}
+
 /// The `--repo OWNER/NAME` value parser. A value lacking exactly one
 /// `/`, or carrying a side outside the registered repository spelling
 /// `D-025` fixes, ends the run through the argument parser at exit `2`
@@ -262,7 +320,8 @@ pub async fn resolve_read_target_through(
             };
             if through_identity {
                 let newest = identity_head(&client, token.as_deref(), &repo_id)
-                    .await?
+                    .await
+                    .map_err(|e| repository_read_refusal(e, &repo_id))?
                     .ok_or_else(no_commit)?;
                 return pinned(newest, folder);
             }
@@ -275,9 +334,10 @@ pub async fn resolve_read_target_through(
                 client.get_repo(&repo_id, token.as_deref()),
                 identity_head(&client, token.as_deref(), &repo_id),
             );
-            let repo = repo?;
+            let repo = repo.map_err(|e| repository_read_refusal(e, &repo_id))?;
             if repo.shared_folder {
-                return pinned(newest?.ok_or_else(no_commit)?, folder);
+                let newest = newest.map_err(|e| repository_read_refusal(e, &repo_id))?;
+                return pinned(newest.ok_or_else(no_commit)?, folder);
             }
             let sha = repo.commit_sha.ok_or_else(no_commit)?;
             match newest {
@@ -294,8 +354,8 @@ pub async fn resolve_read_target_through(
         .get_version(&repo_id, token.as_deref(), &reference)
         .await
         .map_err(|e| match opts.version.as_deref() {
-            Some(typed) => e.with_versioned_read_context(version_not_found_refusal(typed)),
-            None => e,
+            Some(typed) => reference_refusal(e, &repo_id, typed),
+            None => e.repo_or(&repo_id),
         })?;
 
     // 4 — pin the pair.

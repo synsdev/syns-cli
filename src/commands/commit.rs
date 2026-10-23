@@ -80,13 +80,15 @@ pub fn content_base64_undecodable(path: &str) -> String {
     format!("the contentBase64 of {path} is not standard padded base64")
 }
 
-fn config_error(message: String) -> CliError {
-    CliError::Config { message }
+/// Issue 160: every refusal of the changeset document's own shape is
+/// `invalid_changeset` under `--json`, its line unchanged.
+fn invalid_changeset(message: String) -> CliError {
+    CliError::InvalidChangeset { message }
 }
 
 /// Parses the document, refusing every shape the five keys do not admit.
 pub fn parse_changeset_document(bytes: &[u8]) -> Result<ChangesetDocument, CliError> {
-    serde_json::from_slice(bytes).map_err(|e| CliError::Config {
+    serde_json::from_slice(bytes).map_err(|e| CliError::InvalidChangeset {
         message: format!("the changeset document does not parse: {e}"),
     })
 }
@@ -107,14 +109,14 @@ pub fn classify_changeset(document: ChangesetDocument) -> Result<Changeset, CliE
     let mut previous: Option<&str> = None;
     for file in &files {
         if deletions.contains(&file.path) {
-            return Err(config_error(path_in_both_members(&file.path)));
+            return Err(invalid_changeset(path_in_both_members(&file.path)));
         }
         if previous == Some(file.path.as_str()) {
-            return Err(config_error(path_named_twice(&file.path)));
+            return Err(invalid_changeset(path_named_twice(&file.path)));
         }
         match (&file.content, &file.content_base64) {
-            (Some(_), Some(_)) => return Err(config_error(both_content_members(&file.path))),
-            (None, None) => return Err(config_error(neither_content_member(&file.path))),
+            (Some(_), Some(_)) => return Err(invalid_changeset(both_content_members(&file.path))),
+            (None, None) => return Err(invalid_changeset(neither_content_member(&file.path))),
             _ => {}
         }
         previous = Some(file.path.as_str());
@@ -131,7 +133,7 @@ pub fn classify_changeset(document: ChangesetDocument) -> Result<Changeset, CliE
             (None, Some(sent)) => {
                 let decoded = STANDARD
                     .decode(sent.as_bytes())
-                    .map_err(|_| config_error(content_base64_undecodable(&file.path)))?;
+                    .map_err(|_| invalid_changeset(content_base64_undecodable(&file.path)))?;
                 classify_content(&file.path, decoded, Some(sent))?
             }
             _ => unreachable!("step 2 refused an entry carrying both members or neither"),

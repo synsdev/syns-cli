@@ -13,8 +13,8 @@ use crate::config::Config;
 use crate::errors::{CliError, partial_truncated_tree};
 use crate::output::Output;
 use crate::read::{
-    ReadOptions, bind_read_folder, counted_from, mark_partial, read_not_found, report_reference,
-    repository_argument, resolve_read_target,
+    PathLine, ReadOptions, bind_read_folder, counted_from, mark_partial, path_refusal,
+    report_reference, repository_argument, resolve_read_target,
 };
 
 /// Compiles one pattern against a whole repository-relative path:
@@ -28,7 +28,7 @@ fn build(pattern: &str) -> Result<Glob, CliError> {
     GlobBuilder::new(pattern)
         .literal_separator(true)
         .build()
-        .map_err(|e| CliError::Config {
+        .map_err(|e| CliError::BadPattern {
             message: format!("invalid pattern {pattern}: {e}"),
         })
 }
@@ -86,16 +86,13 @@ pub async fn cmd_glob(
     };
     let (response, _raw) = match listed {
         Ok(tuple) => tuple,
+        // Issue 160 (`Boundary B`): the path named in both output
+        // modes, and a `404` naming the repository naming it instead.
         Err(e) => {
-            if let Some(p) = named.as_ref() {
-                if opts.version.is_some() {
-                    return Err(read_not_found(e, &opts, &target.reference, p));
-                }
-                if !output.is_json() {
-                    return Err(e.with_ls_path_context(p.clone()));
-                }
-            }
-            return Err(e);
+            return Err(match named.as_ref() {
+                Some(p) => path_refusal(e, &opts, &target, p, PathLine::Path),
+                None => e.repo_or(&target.repo_id),
+            });
         }
     };
 

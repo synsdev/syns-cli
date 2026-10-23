@@ -327,7 +327,13 @@ fn refusal_holds_under_every_mode_and_option() {
             stderr(&output)
         );
         if args[0] == "--json" {
-            assert_eq!(stdout(&output), format!("{}\n", json!({ "error": line })));
+            assert_eq!(
+                stdout(&output),
+                format!(
+                    "{}\n",
+                    json!({ "code": "path_belongs_to_another_repo", "error": line })
+                )
+            );
         } else {
             assert_eq!(stderr(&output), format!("error: {line}\n"), "{args:?}");
         }

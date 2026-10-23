@@ -14,6 +14,7 @@ mod history_file_test;
 mod identifier_segment_test;
 mod identity_checkout_test;
 mod if_repo_test;
+mod issue_160_test;
 mod lane_header_test;
 mod ls_file_test;
 mod machine_local_test;
