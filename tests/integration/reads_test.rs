@@ -1104,7 +1104,9 @@ fn a_capped_grep_names_the_offset_to_continue_from_on_stderr() {
     assert_eq!(stdout_of(&last).lines().count(), 50);
 }
 
-// D-156: the cap stands where callers plan — `syns grep --help`.
+// D-156, roadmap 215 (D-251): the page and the cap stand where callers
+// plan — `syns grep --help` names rows, 1000 a call, and the fallback's
+// kept paths, 400 a call.
 #[test]
 fn grep_help_states_the_fan_out_cap_and_the_offset() {
     let d = Deployment::new();
@@ -1112,12 +1114,20 @@ fn grep_help_states_the_fan_out_cap_and_the_offset() {
     assert_eq!(help.status.code(), Some(0), "{}", stderr_of(&help));
     let text = stdout_of(&help);
     assert!(text.contains("--offset <NUM>"), "help: {text}");
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let page = syns_cli::commands::grep::SEARCH_PAGE;
     let cap = syns_cli::commands::grep::FAN_OUT_CAP;
+    assert!(flat.contains("Skip this many rows"), "help: {text}");
     assert!(
-        text.contains(&format!("at most {cap} files")),
+        flat.contains(&format!("One call answers at most {page};")),
         "help: {text}"
     );
-    assert!(text.contains("matching paths"), "help: {text}");
+    assert!(
+        flat.contains(&format!(
+            "Against a server without the search, this counts the paths --path and --glob keep, at most {cap} a call."
+        )),
+        "help: {text}"
+    );
 }
 
 // An `--offset` value no count spells is refused by the argument parser

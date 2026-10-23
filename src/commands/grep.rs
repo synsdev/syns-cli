@@ -1,12 +1,15 @@
 //! `syns grep PATTERN …` — the search over one repository at one
 //! version (SPEC u270).
 //!
-//! The search is the client's own: the tree names the paths, the cache
-//! answers the content, and the matcher runs here. Server-side search is
-//! deferred by `roadmap/213-cli-repository-reads`, whose revisit
-//! condition is a cold search past ten seconds at eight requests in
-//! flight — the fan-out cap and the in-flight count below are sized from
-//! `units/cli/u270/PROTOTYPE.md`'s figures against that condition.
+//! Where the server answers the search (`EP-v2-search`, roadmap 215), the
+//! run sends that one request and renders its rows: `--offset` and
+//! `nextOffset` page over rows, at most `SEARCH_PAGE` a call (D-251), and
+//! `--head-limit` goes as the page's limit (D-252 §3). Where it does not —
+//! a `404` of any body, a `405`, or a `200` that is not JSON (D-252 §1) —
+//! the search is the client's own, as before: the tree names the paths,
+//! the cache answers the content, and the matcher runs here, in windows of
+//! `FAN_OUT_CAP` kept paths (D-156). The fan-out cap and the in-flight
+//! count below are sized from `units/cli/u270/PROTOTYPE.md`'s figures.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -16,15 +19,21 @@ use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkMatch};
 use tokio::task::JoinSet;
 
-use crate::client::{EntryType, SynsClient};
+use serde::Deserialize;
+
+use crate::client::{
+    ANSWER_STALL, EntryType, SynsClient, check_response, send_bounded, undecodable,
+};
 use crate::config::Config;
-use crate::errors::{CliError, partial_truncated_tree, partial_unread_paths};
+use crate::errors::{ApiErrorContext, CliError, partial_truncated_tree, partial_unread_paths};
 use crate::output::Output;
 use crate::read::store::{BlobContent, Store, get_or_fetch};
+use crate::read::v2::is_shaped;
 use crate::read::{
     PathLine, ReadOptions, ReadTarget, bind_read_folder, counted_from, mark_partial, path_refusal,
     report_reference, repository_argument, resolve_read_target,
 };
+use crate::repo::folder::FolderScope;
 
 /// The grep fan-out cap: the count of kept paths whose content is
 /// fetched, taken from `--offset` in the ascending path order. A kept set
@@ -34,14 +43,19 @@ use crate::read::{
 /// refusal, and `D-156` pages past it.
 pub const FAN_OUT_CAP: usize = 400;
 
-/// The `--offset` help, naming the cap from `FAN_OUT_CAP` so the two
-/// cannot drift apart.
+/// The most rows one `EP-v2-search` call answers (`LIM-search-rows`,
+/// D-251): the page's `limit` where `--head-limit` names none or more.
+pub const SEARCH_PAGE: u32 = 1000;
+
+/// The `--offset` help, naming the page and the cap from `SEARCH_PAGE`
+/// and `FAN_OUT_CAP` so the three cannot drift apart (roadmap 215).
 pub fn offset_help() -> String {
     format!(
-        "Skip this many of the matching paths (the files --path and --glob keep), \
-         in ascending path order. One call searches at most {FAN_OUT_CAP} files; \
-         where more remain, the JSON answer's nextOffset names the offset to continue from, \
-         at the same --version"
+        "Skip this many rows: matches, or files under --output files and count. \
+         One call answers at most {SEARCH_PAGE}; where more remain, the JSON answer's \
+         nextOffset names the offset to continue from, at the same --version. \
+         Against a server without the search, this counts the paths --path and --glob \
+         keep, at most {FAN_OUT_CAP} a call."
     )
 }
 
@@ -68,6 +82,15 @@ impl GrepOutput {
             GrepOutput::Count => "count",
         }
     }
+
+    /// The one result key a document under this mode carries.
+    fn result_key(self) -> &'static str {
+        match self {
+            GrepOutput::Content => "matches",
+            GrepOutput::Files => "files",
+            GrepOutput::Count => "counts",
+        }
+    }
 }
 
 /// Everything the search takes beside its pattern and the shared read
@@ -83,8 +106,9 @@ pub struct GrepArgs {
     pub context: Option<u32>,
     pub output: GrepOutput,
     pub head_limit: Option<u32>,
-    /// The count of kept paths, in ascending path order, the window
-    /// starts past (`D-156`).
+    /// The count of rows the page starts past where the server answers
+    /// the search (D-251), and of kept paths, in ascending path order,
+    /// the window starts past on the fallback (`D-156`).
     pub offset: u32,
 }
 
@@ -321,6 +345,413 @@ fn rows_of(outcome: &PathOutcome, mode: GrepOutput) -> usize {
     }
 }
 
+// ---- the server's search (roadmap 215, `EP-v2-search`) ---------------------
+
+/// The `EP-v2-search` body a run sends: the version it resolved, the
+/// mapped `--path`, each `--glob` — one holding `/` anchored at the
+/// scoped folder where the run addresses the holder from inside one — and
+/// `--head-limit` as the page's limit, at most `SEARCH_PAGE` (FEATURE_SPEC
+/// § `syns grep`, D-252 §3).
+pub fn search_request(
+    pattern: &str,
+    args: &GrepArgs,
+    scope: Option<&FolderScope>,
+    mapped: Option<&str>,
+    version: u32,
+    (before, after): (usize, usize),
+) -> serde_json::Value {
+    let anchor = scope
+        .filter(|folder| folder.identity.is_none())
+        .map(|folder| format!("{}/", globset::escape(&folder.path)));
+    let glob: Vec<String> = args
+        .glob
+        .iter()
+        .map(|value| match &anchor {
+            Some(anchor) if value.contains('/') => format!("{anchor}{value}"),
+            _ => value.clone(),
+        })
+        .collect();
+    let limit = args.head_limit.map_or(SEARCH_PAGE, |n| n.min(SEARCH_PAGE));
+    serde_json::json!({
+        "at": version,
+        "pattern": pattern,
+        "ignoreCase": args.ignore_case,
+        "before": before,
+        "after": after,
+        "output": args.output.wire(),
+        "path": mapped.unwrap_or_default(),
+        "glob": glob,
+        "offset": args.offset,
+        "limit": limit,
+    })
+}
+
+/// One path the server passed over, and why.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SkippedPath {
+    pub path: String,
+    pub reason: String,
+}
+
+/// One `matches` row of the server's answer.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnsweredMatch {
+    pub path: String,
+    pub line: u64,
+    pub text: String,
+    #[serde(default)]
+    pub context: Vec<AnsweredContext>,
+    /// The row was trimmed to fit the page's 8 MiB (D-252 §12): context
+    /// dropped, then the match line cut. Absent on every whole row.
+    #[serde(default)]
+    pub cut: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnsweredContext {
+    pub line: u64,
+    pub text: String,
+}
+
+/// One `counts` row of the server's answer.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnsweredCount {
+    pub path: String,
+    pub count: u64,
+}
+
+/// The server's answer to one search (`EP-v2-search`): its page of rows
+/// under the one result key the mode names, the count behind it, and the
+/// paths its span passed over (D-252 §9). Every other key it carries
+/// (`commit`, `version`) is read past.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchAnswer {
+    pub total: u64,
+    pub truncated: bool,
+    pub next_offset: Option<u64>,
+    pub skipped: Vec<SkippedPath>,
+    pub skipped_total: u64,
+    #[serde(default)]
+    pub matches: Option<Vec<AnsweredMatch>>,
+    #[serde(default)]
+    pub files: Option<Vec<String>>,
+    #[serde(default)]
+    pub counts: Option<Vec<AnsweredCount>>,
+}
+
+impl SearchAnswer {
+    /// The rows the page carries under `mode`, none where its key is
+    /// absent.
+    fn rows(&self, mode: GrepOutput) -> Option<usize> {
+        match mode {
+            GrepOutput::Content => self.matches.as_ref().map(Vec::len),
+            GrepOutput::Files => self.files.as_ref().map(Vec::len),
+            GrepOutput::Count => self.counts.as_ref().map(Vec::len),
+        }
+    }
+}
+
+/// Whether a search answer of `status` sends the run down the fallback:
+/// a `404` of any body or a `405` (D-252 §1, D-243 §7). Every other
+/// refusal is the run's own.
+pub fn search_is_absent(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+    )
+}
+
+/// The refusal a `200` whose body did not arrive whole, or does not read
+/// as a search answer, takes: `RESPONSE_UNDECODABLE`, never a fallback
+/// (D-252 §8).
+fn cut_answer(e: impl std::fmt::Display) -> CliError {
+    undecodable(reqwest::StatusCode::OK, e)
+}
+
+/// The search answer's body, read whole: a body stalled past
+/// `ANSWER_STALL` is the server unreachable, as every read's is, and one
+/// cut or failing mid-way — the server's stream ended after its `200`
+/// began — is `RESPONSE_UNDECODABLE` (D-252 §8).
+async fn search_body(mut response: reqwest::Response) -> Result<Vec<u8>, CliError> {
+    let url = response.url().to_string();
+    let declared = response.content_length();
+    let mut body = Vec::with_capacity(declared.unwrap_or(0).min(1 << 20) as usize);
+    loop {
+        match tokio::time::timeout(ANSWER_STALL, response.chunk()).await {
+            Err(_elapsed) => return Err(CliError::ServerUnreachable { url }),
+            Ok(Err(e)) => return Err(cut_answer(format!("the search answer was cut: {e}"))),
+            Ok(Ok(None)) => break,
+            Ok(Ok(Some(chunk))) => body.extend_from_slice(&chunk),
+        }
+    }
+    if declared.is_some_and(|declared| declared != body.len() as u64) {
+        return Err(cut_answer("the search answer was cut"));
+    }
+    Ok(body)
+}
+
+/// A search's `422 validation_error` with its served `message` shown
+/// (VERIFY O6): the engine's `invalid_pattern`, relayed as
+/// `validation_error` with `invalid pattern <pattern>: <reason>` or
+/// `invalid glob <value>: <reason>` — a pattern or globs past 4 KiB among
+/// them — renders that reason after the code, as `search_too_costly`
+/// does, and `code` stays the one served. Every other refusal is as
+/// `check_response` words it.
+fn with_served_reason(err: CliError) -> CliError {
+    match err {
+        CliError::Api {
+            status: Some(422),
+            error,
+            context: Some(ApiErrorContext::Refusal { message }),
+        } if error == "validation_error" && !message.trim().is_empty() => CliError::Api {
+            status: Some(422),
+            error,
+            context: Some(ApiErrorContext::Reason {
+                message: message.trim().to_string(),
+            }),
+        },
+        other => other,
+    }
+}
+
+/// One `POST …/search`, sent once and never resent (D-252 §6): the
+/// server's answer where it gave one, carrying the result key `mode`
+/// names, and `None` where it answers no search (D-252 §1). A `413`,
+/// `422`, `429` or `5xx` is refused as every API refusal is — `503
+/// engine_busy` as `ENGINE_BUSY` — and a `200` cut or not shaped as a
+/// search answer as `RESPONSE_UNDECODABLE`.
+async fn search(
+    client: &SynsClient,
+    target: &ReadTarget,
+    request: &serde_json::Value,
+    mode: GrepOutput,
+) -> Result<Option<SearchAnswer>, CliError> {
+    let body = serde_json::to_vec(request).map_err(|e| CliError::Io {
+        message: format!("could not write the search request: {e}"),
+    })?;
+    let length = body.len();
+    let sent = client.v2_search(&target.repo_id, target.token.as_deref(), body);
+    let response = send_bounded(sent, length).await?;
+    let status = response.status();
+    if search_is_absent(status) {
+        return Ok(None);
+    }
+    let response = check_response(response).await.map_err(with_served_reason)?;
+    if status != reqwest::StatusCode::OK {
+        return Err(undecodable(status, "an unexpected status"));
+    }
+    if !is_shaped(&response, "application/json") {
+        return Ok(None);
+    }
+    let bytes = search_body(response).await?;
+    let answer: SearchAnswer = serde_json::from_slice(&bytes).map_err(cut_answer)?;
+    // `truncated` and `nextOffset` say one thing or the answer is no
+    // search answer: a cut page names where it continues, a whole one
+    // names nothing (D-250 §1, D-251). This also refuses an absent
+    // `nextOffset`, which serde reads as `null`.
+    if answer.truncated != answer.next_offset.is_some() {
+        return Err(cut_answer(
+            "the search answer's truncated and nextOffset disagree",
+        ));
+    }
+    if answer.rows(mode).is_none() {
+        return Err(cut_answer(format!(
+            "the search answer carries no {}",
+            mode.result_key()
+        )));
+    }
+    Ok(Some(answer))
+}
+
+/// The stderr line a page carrying `nextOffset` writes after the
+/// reference line (D-252 §3): it names the bound that cut the page —
+/// the server's (`limited` false, the byte cut among it) or the caller's
+/// `--head-limit` — and how many rows are left.
+pub fn rows_continue_line(
+    output: GrepOutput,
+    offset: u32,
+    next: u64,
+    total: u64,
+    limited: Option<u32>,
+    version: u32,
+) -> String {
+    let noun = match output {
+        GrepOutput::Content => "matches",
+        GrepOutput::Files | GrepOutput::Count => "files",
+    };
+    let bound = match limited {
+        Some(n) => format!("cut at --head-limit {n}"),
+        None => format!("at most {SEARCH_PAGE} a call"),
+    };
+    format!(
+        "this call took {noun} {first} to {next} of the {total}, in path order ({bound}); \
+         {left} left, continue with --offset {next} --version {version}",
+        first = u64::from(offset) + 1,
+        left = total.saturating_sub(next),
+    )
+}
+
+/// The run's answer where the server answered the search: the render and
+/// the reference report outside `--json`, and the one document, today's
+/// keys beside `total` and `skippedTotal` (FEATURE_SPEC § `syns grep`).
+/// Paths count from the scoped folder where the run addresses the holder
+/// from inside one. No partial answer arises here.
+fn answered_document(
+    output: &Output,
+    pattern: String,
+    args: &GrepArgs,
+    target: &ReadTarget,
+    answer: SearchAnswer,
+    context_stands: bool,
+) -> serde_json::Value {
+    let scope = target.folder.as_ref();
+    let shown = |path: &str| counted_from(scope, path);
+    let rows = answer.rows(args.output).unwrap_or(0);
+    // D-252 §12: the rows the server trimmed to fit the page.
+    let cut_rows = answer
+        .matches
+        .as_ref()
+        .map_or(0, |matches| matches.iter().filter(|m| m.cut).count());
+    // Issue 160 (D-250 §1), D-252 §3: the caller's bound cut the page
+    // where it ended a truncated page at exactly `--head-limit` rows.
+    let limited = args
+        .head_limit
+        .filter(|&n| answer.truncated && rows == n as usize);
+
+    let mut document = serde_json::json!({
+        "version": target.reference.version,
+        "commitSha": target.reference.commit_sha,
+        "pattern": pattern,
+        "output": args.output.wire(),
+        "truncated": answer.truncated,
+        "nextOffset": answer.next_offset,
+        "limited": limited.is_some(),
+        "skipped": answer
+            .skipped
+            .iter()
+            .map(|s| serde_json::json!({ "path": shown(&s.path), "reason": s.reason }))
+            .collect::<Vec<_>>(),
+        "total": answer.total,
+        "skippedTotal": answer.skipped_total,
+    });
+
+    match args.output {
+        GrepOutput::Content => {
+            let matches = answer.matches.unwrap_or_default();
+            let cut: Vec<bool> = matches.iter().map(|m| m.cut).collect();
+            let flat: Vec<(String, MatchRow)> = matches
+                .into_iter()
+                .map(|m| {
+                    (
+                        shown(&m.path),
+                        MatchRow {
+                            line: m.line,
+                            text: m.text,
+                            context: m
+                                .context
+                                .into_iter()
+                                .map(|c| ContextRow {
+                                    line: c.line,
+                                    text: c.text,
+                                })
+                                .collect(),
+                        },
+                    )
+                })
+                .collect();
+            document["matches"] = serde_json::Value::Array(
+                flat.iter()
+                    .zip(&cut)
+                    .map(|((path, row), &cut)| {
+                        let mut value = serde_json::json!({
+                            "path": path,
+                            "line": row.line,
+                            "text": row.text,
+                            "context": row.context
+                                .iter()
+                                .map(|c| serde_json::json!({ "line": c.line, "text": c.text }))
+                                .collect::<Vec<_>>(),
+                        });
+                        // Additive, and only on a trimmed row (D-252 §12).
+                        if cut {
+                            value["cut"] = serde_json::Value::Bool(true);
+                        }
+                        value
+                    })
+                    .collect(),
+            );
+            if !output.is_json() {
+                render_content(&flat, args.line_number, context_stands);
+            }
+        }
+        GrepOutput::Files => {
+            let paths: Vec<String> = answer
+                .files
+                .unwrap_or_default()
+                .iter()
+                .map(|p| shown(p))
+                .collect();
+            document["files"] = serde_json::json!(paths);
+            if !output.is_json() {
+                for path in &paths {
+                    println!("{path}");
+                }
+            }
+        }
+        GrepOutput::Count => {
+            let counts: Vec<(String, u64)> = answer
+                .counts
+                .unwrap_or_default()
+                .into_iter()
+                .map(|c| (shown(&c.path), c.count))
+                .collect();
+            document["counts"] = serde_json::Value::Array(
+                counts
+                    .iter()
+                    .map(|(path, count)| serde_json::json!({ "path": path, "count": count }))
+                    .collect(),
+            );
+            if !output.is_json() {
+                for (path, count) in &counts {
+                    println!("{path}:{count}");
+                }
+            }
+        }
+    }
+
+    if !output.is_json() {
+        report_reference(output, &target.reference);
+        if let Some(next) = answer.next_offset {
+            eprintln!(
+                "{}",
+                rows_continue_line(
+                    args.output,
+                    args.offset,
+                    next,
+                    answer.total,
+                    limited,
+                    target.reference.version,
+                )
+            );
+        }
+        if cut_rows > 0 {
+            eprintln!("{}", rows_cut_line(cut_rows, rows));
+        }
+    }
+    document
+}
+
+/// The stderr line a page carrying rows the server trimmed to fit its
+/// 8 MiB writes, after the reference and continuation lines (D-252 §12):
+/// how many of the page's rows were cut, and where to read them whole.
+pub fn rows_cut_line(cut: usize, rows: usize) -> String {
+    format!(
+        "this call cut {cut} of its {rows} matches to fit the page (at most 8 MiB a call); \
+         --json marks each with cut: true, and syns cat PATH prints the file whole"
+    )
+}
+
 pub async fn cmd_grep(
     config: &Config,
     output: &Output,
@@ -371,7 +802,30 @@ pub async fn grep_document(
     };
     let client = SynsClient::new(config.server_url())?;
 
-    // 3 — read the tree recursively at that reference under `--path`.
+    // 3 — one `EP-v2-search` (roadmap 215): where the server answers it,
+    // its page is the run's whole answer; a server without it sends the
+    // run down today's path, unchanged (D-252 §1).
+    let request = search_request(
+        &pattern,
+        &args,
+        target.folder.as_ref(),
+        mapped.as_deref(),
+        target.reference.version,
+        (before, after),
+    );
+    if let Some(answer) = search(&client, &target, &request, args.output).await? {
+        return Ok(Some(answered_document(
+            output,
+            pattern,
+            &args,
+            &target,
+            answer,
+            before > 0 || after > 0,
+        )));
+    }
+
+    // 4 — the fallback (D-156): read the tree recursively at that
+    // reference under `--path`.
     let version_ref = target.version_ref();
     let (response, _raw) = match client
         .get_tree(
@@ -1485,6 +1939,138 @@ mod tests {
         assert_eq!(document["counts"].as_array().map(Vec::len), Some(12));
         assert_eq!(document["nextOffset"], serde_json::Value::Null);
         assert_eq!(document["truncated"], serde_json::json!(false));
+    }
+
+    fn scope(path: &str, identity: Option<&str>) -> FolderScope {
+        FolderScope {
+            dir: std::path::PathBuf::from("/w").join(path),
+            owner: "alice".into(),
+            name: "notes".into(),
+            path: path.into(),
+            checkout: None,
+            enclosing: Vec::new(),
+            identity: identity.map(str::to_string),
+        }
+    }
+
+    // Roadmap 215, FEATURE_SPEC § `syns grep`: the body carries the
+    // resolved version, the mapped path, the context window, and
+    // `--head-limit` as the page's limit, at most `SEARCH_PAGE`.
+    #[test]
+    fn the_search_request_carries_the_run_as_resolved() {
+        let a = GrepArgs {
+            ignore_case: true,
+            head_limit: Some(50),
+            offset: 1000,
+            glob: vec!["*.md".into(), "docs/*.md".into()],
+            ..args(GrepOutput::Count)
+        };
+        let body = search_request("fn", &a, None, Some("src"), 7, (2, 3));
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "at": 7, "pattern": "fn", "ignoreCase": true, "before": 2, "after": 3,
+                "output": "count", "path": "src", "glob": ["*.md", "docs/*.md"],
+                "offset": 1000, "limit": 50,
+            })
+        );
+        let unlimited = search_request("fn", &args(GrepOutput::Content), None, None, 3, (0, 0));
+        assert_eq!(unlimited["limit"], serde_json::json!(SEARCH_PAGE));
+        assert_eq!(unlimited["path"], serde_json::json!(""));
+        let past = GrepArgs {
+            head_limit: Some(5000),
+            ..args(GrepOutput::Files)
+        };
+        assert_eq!(
+            search_request("fn", &past, None, None, 3, (0, 0))["limit"],
+            serde_json::json!(1000)
+        );
+    }
+
+    // Roadmap 215: inside a scoped folder addressed through its holder, a
+    // `--glob` holding `/` is anchored at the folder, its path escaped;
+    // one with no `/`, and every value at a folder identity, goes as typed.
+    #[test]
+    fn a_separator_glob_is_anchored_at_the_holders_folder_escaped() {
+        let a = GrepArgs {
+            glob: vec!["notes/*.md".into(), "*.ts".into()],
+            ..args(GrepOutput::Files)
+        };
+        let holder = scope("docs/q[3]{x}*", None);
+        let body = search_request("fn", &a, Some(&holder), Some("docs/q[3]{x}*"), 7, (0, 0));
+        assert_eq!(
+            body["glob"],
+            serde_json::json!(["docs/q[[]3[]][{]x[}][*]/notes/*.md", "*.ts"])
+        );
+        let rules: Vec<GlobRule> = body["glob"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| compile_glob(v.as_str().unwrap()).unwrap())
+            .collect();
+        assert!(glob_admits(&rules, "docs/q[3]{x}*/notes/b.md"));
+        assert!(!glob_admits(&rules, "docs/q3x/notes/b.md"));
+
+        let identity = scope("docs/handbook", Some("notes_handbook"));
+        let typed = search_request("fn", &a, Some(&identity), None, 7, (0, 0));
+        assert_eq!(typed["glob"], serde_json::json!(["notes/*.md", "*.ts"]));
+    }
+
+    // D-252 §1: a `404` of any body and a `405` send the run down the
+    // fallback; nothing else does.
+    #[test]
+    fn only_a_404_or_a_405_reads_as_a_server_without_the_search() {
+        use reqwest::StatusCode;
+        assert!(search_is_absent(StatusCode::NOT_FOUND));
+        assert!(search_is_absent(StatusCode::METHOD_NOT_ALLOWED));
+        for status in [200, 400, 401, 403, 413, 422, 429, 500, 502, 503, 504] {
+            assert!(
+                !search_is_absent(StatusCode::from_u16(status).unwrap()),
+                "{status}"
+            );
+        }
+    }
+
+    // D-252 §3: the line names the bound that cut the page.
+    #[test]
+    fn the_rows_continuation_line_names_the_bound() {
+        assert_eq!(
+            rows_continue_line(GrepOutput::Content, 0, 1000, 3412, None, 4384),
+            "this call took matches 1 to 1000 of the 3412, in path order (at most 1000 a call); \
+             2412 left, continue with --offset 1000 --version 4384"
+        );
+        assert_eq!(
+            rows_continue_line(GrepOutput::Files, 1000, 1050, 3412, Some(50), 9),
+            "this call took files 1001 to 1050 of the 3412, in path order (cut at --head-limit 50); \
+             2362 left, continue with --offset 1050 --version 9"
+        );
+        assert_eq!(
+            rows_continue_line(GrepOutput::Count, 0, 7, 9, Some(7), 2),
+            "this call took files 1 to 7 of the 9, in path order (cut at --head-limit 7); \
+             2 left, continue with --offset 7 --version 2"
+        );
+    }
+
+    // D-252 §12: the line counting the rows cut to fit the page.
+    #[test]
+    fn the_rows_cut_line_counts_the_cut_rows() {
+        assert_eq!(
+            rows_cut_line(2, 1000),
+            "this call cut 2 of its 1000 matches to fit the page (at most 8 MiB a call); \
+             --json marks each with cut: true, and syns cat PATH prints the file whole"
+        );
+    }
+
+    // FEATURE_SPEC § `syns grep`, the `--offset` help text verbatim.
+    #[test]
+    fn the_offset_help_names_rows_and_the_fallbacks_paths() {
+        assert_eq!(
+            offset_help(),
+            "Skip this many rows: matches, or files under --output files and count. One call \
+             answers at most 1000; where more remain, the JSON answer's nextOffset names the \
+             offset to continue from, at the same --version. Against a server without the \
+             search, this counts the paths --path and --glob keep, at most 400 a call."
+        );
     }
 
     // The window bounds over a kept count: `[start, end)` and whether

@@ -206,7 +206,7 @@ enum Commands {
         /// Regular expression to search for
         #[arg(value_name = "PATTERN")]
         pattern: String,
-        /// Narrow the tree read to a subdirectory
+        /// Search only under this path
         #[arg(long)]
         path: Option<String>,
         /// Only search paths matching this glob (repeatable)

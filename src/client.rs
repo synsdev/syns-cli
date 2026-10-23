@@ -1359,6 +1359,18 @@ pub(crate) async fn check_response(
                 .map(|message| ApiErrorContext::Refusal {
                     message: message.to_string(),
                 }),
+            // Roadmap 215 (D-252 §13): a search the engine stopped at its
+            // scan deadline keeps its served message, which names
+            // `--path` and `--glob` as the way to narrow it, and renders
+            // it after the code.
+            (422, "search_too_costly", Some(body)) => body
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+                .map(|message| ApiErrorContext::Reason {
+                    message: message.to_string(),
+                }),
             // Issue 199 (D-132): a `forbidden` keeps its served string
             // `message` where it is not blank, so a ceiling reads apart
             // from a missing grant.
@@ -1568,6 +1580,27 @@ impl SynsClient {
         let url = format!("{}/api/v2/repos/{address}/read", self.base_url);
         let mut req = self
             .in_read_lane(self.client.post(&url))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body);
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        req
+    }
+
+    /// The `POST …/search` of `body` (`EP-v2-search`, roadmap 215). It
+    /// carries no `Syns-Lane`: the engine runs every search in its own
+    /// search lane (D-252 §6).
+    pub(crate) fn v2_search(
+        &self,
+        address: &str,
+        token: Option<&str>,
+        body: Vec<u8>,
+    ) -> reqwest::RequestBuilder {
+        let url = format!("{}/api/v2/repos/{address}/search", self.base_url);
+        let mut req = self
+            .client
+            .post(&url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body);
         if let Some(t) = token {

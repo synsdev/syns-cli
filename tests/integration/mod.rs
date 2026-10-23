@@ -11,6 +11,7 @@ mod diff_since_test;
 mod explore_test;
 mod folder_scope_test;
 mod folder_working_copy_test;
+mod grep_search_test;
 mod history_file_test;
 mod identifier_segment_test;
 mod identity_checkout_test;
