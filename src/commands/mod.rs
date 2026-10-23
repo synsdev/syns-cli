@@ -16,6 +16,7 @@ pub mod links;
 pub mod login;
 pub mod logout;
 pub mod ls;
+pub mod mv;
 pub mod place;
 pub mod pull;
 pub mod push;

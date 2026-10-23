@@ -225,6 +225,7 @@ pub async fn cmd_enable_checks(
     let changeset = Changeset {
         files: vec![(at.clone(), content)],
         deletions: Vec::new(),
+        members: Vec::new(),
     };
     let (response, raw, claimed) = publish_changeset(
         config,

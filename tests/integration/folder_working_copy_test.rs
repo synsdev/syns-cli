@@ -453,11 +453,53 @@ fn push_answer(state: &mut State, request: &Request) -> ResponseTemplate {
         let path = deletion["path"].as_str().expect("path");
         tree.retain(|p, _| p != path && !p.starts_with(&format!("{path}/")));
     }
+    // Roadmap 228: each member carries the entries at or under `from` to
+    // `to`, a move also leaving `from`, and is echoed in the answer.
+    let mut echoes = serde_json::Map::new();
+    for key in ["moves", "copies"] {
+        let Some(members) = body[key].as_array() else {
+            continue;
+        };
+        let mut echoed = Vec::new();
+        for member in members {
+            let from = member["from"].as_str().expect("from");
+            let to = member["to"].as_str().expect("to");
+            let carried: Vec<(String, Vec<u8>)> = tree
+                .iter()
+                .filter(|(p, _)| p.as_str() == from || p.starts_with(&format!("{from}/")))
+                .map(|(p, b)| (p.clone(), b.clone()))
+                .collect();
+            if carried.is_empty() {
+                return ResponseTemplate::new(404).set_body_json(json!({
+                    "error": "not_found", "reason": "source_not_found", "path": from,
+                }));
+            }
+            let kind = if carried.len() == 1 && carried[0].0 == from {
+                "file"
+            } else {
+                "dir"
+            };
+            for (path, bytes) in &carried {
+                if key == "moves" {
+                    tree.remove(path);
+                }
+                tree.insert(format!("{to}{}", &path[from.len()..]), bytes.clone());
+            }
+            echoed.push(json!({"from": from, "to": to, "type": kind, "files": carried.len()}));
+        }
+        echoes.insert(key.to_string(), Value::from(echoed));
+    }
+    let answered = |mut answer: Value| {
+        for (key, members) in &echoes {
+            answer[key] = members.clone();
+        }
+        answer
+    };
     if tree == head_tree {
-        return ResponseTemplate::new(200).set_body_json(json!({
+        return ResponseTemplate::new(200).set_body_json(answered(json!({
             "commitSha": head_sha, "version": state.head + 1,
             "filesChanged": 0, "created": false,
-        }));
+        })));
     }
     let changed = tree
         .keys()
@@ -471,10 +513,10 @@ fn push_answer(state: &mut State, request: &Request) -> ResponseTemplate {
     if state.advance && !state.pin_head {
         state.head = state.commits.len() - 1;
     }
-    ResponseTemplate::new(200).set_body_json(json!({
+    ResponseTemplate::new(200).set_body_json(answered(json!({
         "commitSha": sha, "version": state.commits.len(),
         "filesChanged": changed, "created": false,
-    }))
+    })))
 }
 
 /// Puts `path` in every commit the mock holds, so a version's changed
@@ -2187,6 +2229,58 @@ fn every_write_verb_inside_a_folder_lands_over_a_push_outside_it() {
     let lists = d.version_lists_since(mark);
     assert_eq!(lists.len(), 1);
     assert_eq!(query(&lists[0], "path").as_deref(), Some(FOLDER));
+}
+
+// Roadmap 228, FEATURE_SPEC row 30: inside a folder bound to its holder
+// `syns mv` sends holder paths, reports the paths as typed, and lands at
+// the head over a version changing only paths outside the folder; a path
+// leaving the folder is refused before any request (row 41's CLI side).
+#[test]
+#[serial]
+fn a_move_inside_a_folder_sends_holder_paths_and_lands_over_a_push_outside_it() {
+    let d = behind_outside();
+    let mark = d.mark();
+    let out = d.run_in(
+        &d.folder(),
+        b"",
+        &["mv", "board.json", "boards/q3.json", "--parent", "1"],
+    );
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    let pushes = d.pushes_since(mark);
+    assert_eq!(pushes.len(), 1, "{pushes:?}");
+    assert_eq!(pushes[0]["parentSha"], json!(h(2)));
+    assert_eq!(
+        pushes[0]["moves"],
+        json!([{"from": in_folder("board.json"), "to": in_folder("boards/q3.json")}])
+    );
+    assert!(pushes[0].get("files").is_none(), "{}", pushes[0]);
+    assert!(
+        stderr_of(&out).contains("moved 1 file: board.json \u{2192} boards/q3.json\n"),
+        "{}",
+        stderr_of(&out)
+    );
+    let lists = d.version_lists_since(mark);
+    assert_eq!(lists.len(), 1);
+    assert_eq!(query(&lists[0], "path").as_deref(), Some(FOLDER));
+    {
+        // The mock keeps its head pinned; the landed commit is its last.
+        let state = d.state();
+        let landed = &state.commits.last().expect("a landed commit").1;
+        assert!(landed.contains_key(&in_folder("boards/q3.json")));
+        assert!(!landed.contains_key(&in_folder("board.json")));
+    }
+
+    let mark = d.mark();
+    for (from, to) in [("../x", "y"), ("x", "../y")] {
+        let out = d.run_in(&d.folder(), b"", &["cp", from, to, "--parent", "1"]);
+        assert_eq!(exit_of(&out), 1, "{from} {to}: {}", stderr_of(&out));
+        assert!(
+            stderr_of(&out).contains("names no path inside the folder"),
+            "{}",
+            stderr_of(&out)
+        );
+    }
+    assert!(d.requests_since(mark).is_empty());
 }
 
 #[test]

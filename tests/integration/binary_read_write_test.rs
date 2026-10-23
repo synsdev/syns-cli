@@ -585,6 +585,8 @@ fn every_repo_taking_verb_names_repo() {
         vec!["write", "a.md", "--parent", &head],
         vec!["rm", "a.md", "--parent", &head],
         vec!["commit", "--parent", &head],
+        vec!["mv", "a.md", "b.md", "--parent", &head],
+        vec!["cp", "a.md", "b.md", "--parent", &head],
     ];
     for invocation in &invocations {
         let bare = d.run_in(nowhere.path(), b"", invocation);

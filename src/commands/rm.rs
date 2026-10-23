@@ -47,6 +47,7 @@ pub async fn cmd_rm(
     let changeset = Changeset {
         files: Vec::new(),
         deletions: vec![path.clone()],
+        members: Vec::new(),
     };
 
     // Commit it; an answer counting no changed file means the parent's

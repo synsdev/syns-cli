@@ -2,7 +2,10 @@
 //! document read on standard input (SPEC u271, u283).
 //!
 //! The whole changeset lands as one commit or none of it lands at all:
-//! every refusal below is raised before any request leaves.
+//! every refusal below is raised before any request leaves. Roadmap 228:
+//! the document is read, parsed and checked ahead of the write target's
+//! requests, so a document refused for its own shape, its members' paths
+//! or their overlaps (D-253 §1) leaves nothing on the wire.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -10,16 +13,20 @@ use base64::engine::general_purpose::STANDARD;
 use crate::config::Config;
 use crate::errors::{CliError, NotTextSurface};
 use crate::output::Output;
+use crate::read::{as_server_reads, resolve_lexically};
+use crate::repo::folder::FolderScope;
 use crate::write::{
-    Changeset, FileContent, WriteOptions, classify_content, commit_changeset, default_message,
-    read_standard_input, refuse_terminal_standard_input, resolve_write_target, text_or_refuse,
+    Changeset, FileContent, Member, MemberKind, WriteOptions, bind_write_target, classify_content,
+    commit_changeset, default_message, finish_write_target, guard_write_target, member_path,
+    read_standard_input, refuse_overlaps, refuse_terminal_standard_input, text_or_refuse,
 };
 
 /// The changeset document: `{ files: [{ path, content }` or
-/// `{ path, contentBase64 }], deletions: [{ path }] }`.
+/// `{ path, contentBase64 }], deletions: [{ path }], moves: [{ from, to
+/// }], copies: [{ from, to }] }` (roadmap 228 adds the last two).
 ///
-/// Both members are optional and absent reads as empty, and a key
-/// outside the five refuses the document. Each file entry carries
+/// Every member is optional and absent reads as empty, and a key
+/// outside the eight refuses the document. Each file entry carries
 /// exactly one of its two content members, which `classify_changeset`
 /// checks rather than the parse, so the refusal names the path. A string escape naming an
 /// unpaired surrogate is refused by the parse itself rather than by a
@@ -32,6 +39,21 @@ pub struct ChangesetDocument {
     pub files: Vec<ChangesetFile>,
     #[serde(default)]
     pub deletions: Vec<ChangesetDeletion>,
+    /// Roadmap 228: each path the commit moves, a file or a whole folder.
+    #[serde(default)]
+    pub moves: Vec<ChangesetMember>,
+    /// Roadmap 228: each path the commit copies, alike.
+    #[serde(default)]
+    pub copies: Vec<ChangesetMember>,
+}
+
+/// One `moves` or `copies` entry: the path left or read, and the new path
+/// itself.
+#[derive(serde::Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ChangesetMember {
+    pub from: String,
+    pub to: String,
 }
 
 #[derive(serde::Deserialize, Debug, PartialEq, Eq)]
@@ -86,7 +108,90 @@ fn invalid_changeset(message: String) -> CliError {
     CliError::InvalidChangeset { message }
 }
 
-/// Parses the document, refusing every shape the five keys do not admit.
+/// Whether the document names `copies` ahead of `moves` at its top level,
+/// so the report lists its members in the order the document gives them
+/// (D-253 §9). A document that does not read as a map answers no.
+pub fn copies_named_first(bytes: &[u8]) -> bool {
+    struct Keys(Vec<String>);
+    impl<'de> serde::Deserialize<'de> for Keys {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct Visitor;
+            impl<'de> serde::de::Visitor<'de> for Visitor {
+                type Value = Keys;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a changeset document")
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<Keys, A::Error> {
+                    let mut keys = Vec::new();
+                    while let Some(key) = map.next_key::<String>()? {
+                        map.next_value::<serde::de::IgnoredAny>()?;
+                        keys.push(key);
+                    }
+                    Ok(Keys(keys))
+                }
+            }
+            deserializer.deserialize_map(Visitor)
+        }
+    }
+    let Ok(Keys(keys)) = serde_json::from_slice::<Keys>(bytes) else {
+        return false;
+    };
+    let at = |name: &str| keys.iter().position(|key| key == name);
+    matches!((at("copies"), at("moves")), (Some(copies), Some(moves)) if copies < moves)
+}
+
+/// Roadmap 228: the document's moves and copies as members, in the order
+/// the document gives them, each path resolved lexically counted from
+/// `folder` (`member_path`), then every overlap D-253 §1 refuses among
+/// them and the document's files and deletions — each refusal
+/// `invalid_changeset`, before any request.
+pub fn changeset_members(
+    document: &ChangesetDocument,
+    copies_first: bool,
+    folder: Option<&FolderScope>,
+) -> Result<Vec<Member>, CliError> {
+    let resolve = |kind: MemberKind, entry: &ChangesetMember| -> Result<Member, CliError> {
+        let lexical = |typed: &str| {
+            member_path(folder, typed).map_err(|err| match err {
+                CliError::Config { message } => invalid_changeset(message),
+                other => other,
+            })
+        };
+        Ok(Member {
+            kind,
+            from: lexical(&entry.from)?,
+            to: lexical(&entry.to)?,
+        })
+    };
+    let moves = document.moves.iter().map(|m| resolve(MemberKind::Move, m));
+    let copies = document.copies.iter().map(|m| resolve(MemberKind::Copy, m));
+    let members: Vec<Member> = if copies_first {
+        copies.chain(moves).collect::<Result<_, _>>()?
+    } else {
+        moves.chain(copies).collect::<Result<_, _>>()?
+    };
+    let lexical = |path: &str| {
+        let read = as_server_reads(as_server_reads(path));
+        resolve_lexically(read).unwrap_or_else(|| read.to_string())
+    };
+    let files: Vec<String> = document.files.iter().map(|f| lexical(&f.path)).collect();
+    let deletions: Vec<String> = document
+        .deletions
+        .iter()
+        .map(|d| lexical(&d.path))
+        .collect();
+    let files: Vec<&str> = files.iter().map(String::as_str).collect();
+    let deletions: Vec<&str> = deletions.iter().map(String::as_str).collect();
+    match refuse_overlaps(&members, &files, &deletions) {
+        Some(line) => Err(invalid_changeset(line)),
+        None => Ok(members),
+    }
+}
+
+/// Parses the document, refusing every shape the eight keys do not admit.
 pub fn parse_changeset_document(bytes: &[u8]) -> Result<ChangesetDocument, CliError> {
     serde_json::from_slice(bytes).map_err(|e| CliError::InvalidChangeset {
         message: format!("the changeset document does not parse: {e}"),
@@ -143,6 +248,7 @@ pub fn classify_changeset(document: ChangesetDocument) -> Result<Changeset, CliE
     Ok(Changeset {
         files: classified,
         deletions,
+        members: Vec::new(),
     })
 }
 
@@ -151,29 +257,48 @@ pub async fn cmd_commit(
     output: &Output,
     opts: WriteOptions,
 ) -> Result<(), CliError> {
-    // 2's refusal, raised ahead of step 1: a run whose standard input
-    // is a terminal makes no request at all.
+    // 2's refusal: a run whose standard input is a terminal makes no
+    // request at all.
     refuse_terminal_standard_input("the changeset document")?;
 
-    // 1 — resolve the write target.
+    // 1 — bind the repository, the folder and the credential: every
+    // refusal of the write target that needs no request.
     let cwd = std::env::current_dir().map_err(|e| CliError::Io {
         message: format!("could not determine current directory: {e}"),
     })?;
-    let target = resolve_write_target(config, &cwd, &opts).await?;
+    let bound = bind_write_target(config, &cwd, &opts)?;
 
-    // 2 — read standard input to end-of-input and parse the document.
+    // The checkout guard, ahead of the document as `cli-commands/commit`
+    // orders them (D-256 §5).
+    let guarded = guard_write_target(config, &cwd, &opts, bound).await?;
+
+    // 2 — read standard input to end-of-input and parse the document,
+    // ahead of the write target's requests (roadmap 228).
     let bytes = read_standard_input("the changeset document")?;
     let document = parse_changeset_document(&bytes)?;
 
-    // 3 — refuse a changeset naming neither a file nor a deletion,
+    // 3 — refuse a changeset naming no file, deletion, move or copy,
     // before any request.
-    if document.files.is_empty() && document.deletions.is_empty() {
+    if document.files.is_empty()
+        && document.deletions.is_empty()
+        && document.moves.is_empty()
+        && document.copies.is_empty()
+    {
         return Err(CliError::ChangesetEmpty);
     }
 
+    // Roadmap 228 — the moves and copies, their paths and their
+    // overlaps, counted from the folder the target binds.
+    let members = changeset_members(&document, copies_named_first(&bytes), guarded.folder())?;
+    drop(bytes);
+
     // 2 to 4 — check each entry's shape, then decode and classify each
     // content in path order.
-    let changeset = classify_changeset(document)?;
+    let mut changeset = classify_changeset(document)?;
+    changeset.members = members;
+
+    // 1, continued — the repository read and the parent.
+    let target = finish_write_target(config, &opts, guarded).await?;
 
     // 5 — commit the whole changeset.
     let message = default_message("commit", None);
@@ -183,6 +308,75 @@ pub async fn cmd_commit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Roadmap 228: `moves` and `copies` parse as `{ from, to }` entries,
+    // a key outside the two refusing the document.
+    #[test]
+    fn moves_and_copies_parse_and_refuse_an_unknown_key() {
+        let document = parse_changeset_document(
+            br#"{"moves":[{"from":"a","to":"b"}],"copies":[{"from":"t","to":"u"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            document.moves,
+            vec![ChangesetMember {
+                from: "a".to_string(),
+                to: "b".to_string()
+            }]
+        );
+        assert_eq!(document.copies.len(), 1);
+        for refused in [
+            br#"{"moves":[{"from":"a","to":"b","keep":true}]}"#.as_slice(),
+            br#"{"copies":[{"from":"a"}]}"#.as_slice(),
+            br#"{"renames":[]}"#.as_slice(),
+        ] {
+            let err = parse_changeset_document(refused).unwrap_err();
+            assert_eq!(err.code(), "invalid_changeset");
+        }
+    }
+
+    // D-253 §9: the report follows the document's own key order.
+    #[test]
+    fn the_key_order_of_the_document_is_read() {
+        assert!(copies_named_first(br#"{"copies":[],"moves":[]}"#));
+        assert!(!copies_named_first(br#"{"moves":[],"copies":[]}"#));
+        assert!(!copies_named_first(br#"{"copies":[]}"#));
+        assert!(!copies_named_first(b"[1]"));
+    }
+
+    // Roadmap 228: a member path refused lexically is `invalid_changeset`
+    // on `syns commit`, its line the one `syns mv` gives; members keep
+    // the document's order.
+    #[test]
+    fn member_paths_resolve_and_refuse_as_invalid_changeset() {
+        let document = parse_changeset_document(
+            br#"{"copies":[{"from":"t/","to":"./u"}],"moves":[{"from":"a","to":"b"}]}"#,
+        )
+        .unwrap();
+        let members = changeset_members(&document, true, None).unwrap();
+        assert_eq!(
+            members,
+            vec![
+                Member {
+                    kind: MemberKind::Copy,
+                    from: "t".to_string(),
+                    to: "u".to_string()
+                },
+                Member {
+                    kind: MemberKind::Move,
+                    from: "a".to_string(),
+                    to: "b".to_string()
+                },
+            ]
+        );
+        let document = parse_changeset_document(br#"{"moves":[{"from":"..","to":"b"}]}"#).unwrap();
+        let err = changeset_members(&document, false, None).unwrap_err();
+        assert_eq!(err.code(), "invalid_changeset");
+        assert_eq!(
+            err.to_string(),
+            "configuration error: .. names no path inside the repository; name one counted from its root"
+        );
+    }
 
     // SPEC u271 Contract Surface, the changeset document: both members
     // are optional and absent reads as empty.
@@ -296,6 +490,7 @@ mod tests {
             Changeset {
                 files: vec![("b.md".to_string(), FileContent::Text("b\n".to_string()))],
                 deletions: vec!["c.md".to_string()],
+                members: Vec::new(),
             }
         );
     }

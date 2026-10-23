@@ -155,6 +155,7 @@ pub async fn cmd_edit(
     let changeset = Changeset {
         files: vec![(path.clone(), FileContent::Text(edited))],
         deletions: Vec::new(),
+        members: Vec::new(),
     };
     let message = default_message("edit", Some(&path));
     commit_changeset(config, output, &target, changeset, &opts, &message).await

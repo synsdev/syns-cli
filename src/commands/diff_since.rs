@@ -740,6 +740,8 @@ mod tests {
                 trigger: None,
                 task_ref: None,
             }),
+            path: None,
+            moved_from: None,
         }
     }
 

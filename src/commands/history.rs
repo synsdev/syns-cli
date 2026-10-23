@@ -137,9 +137,47 @@ fn write_count_line(output: &Output, shown: usize, total: u32) {
     }
 }
 
+/// A path a history answer names, as the run shows it (roadmap 228,
+/// D-253 §9): inside a scoped folder bound to its holder, counted from the
+/// folder where it lies under it and whole otherwise; through an identity,
+/// and with no folder, as served.
+fn shown_path(folder: Option<&FolderScope>, path: &str) -> String {
+    match folder {
+        Some(folder) if folder.identity.is_none() => {
+            folder.folder_path(path).unwrap_or_else(|| path.to_string())
+        }
+        _ => path.to_string(),
+    }
+}
+
+/// A history row's `Message` cell (roadmap 228, `CS-history-str-moved`):
+/// `(moved from {path}) {message}` on the entry of the version that moved
+/// the path, the message alone elsewhere.
+fn moved_message(folder: Option<&FolderScope>, moved_from: Option<&str>, message: &str) -> String {
+    match moved_from {
+        Some(from) => format!("(moved from {}) {message}", shown_path(folder, from)),
+        None => message.to_string(),
+    }
+}
+
+/// Roadmap 228: each served entry's `path` and `movedFrom` as
+/// `shown_path` shows them, inside a scoped folder bound to its holder;
+/// every other key as served.
+fn rebase_followed_paths(folder: &FolderScope, entries: &mut [serde_json::Value]) {
+    for entry in entries {
+        for key in ["path", "movedFrom"] {
+            if let Some(value) = entry.get_mut(key)
+                && let Some(path) = value.as_str()
+            {
+                *value = serde_json::Value::from(shown_path(Some(folder), path));
+            }
+        }
+    }
+}
+
 /// `CS-history-blk-versions` over a version list — the whole list's and
 /// a folder's page alike, `Files` counting each entry's changed paths.
-fn render_version_list(output: &Output, entries: &[VersionEntry]) {
+fn render_version_list(output: &Output, entries: &[VersionEntry], folder: Option<&FolderScope>) {
     let rows = entries
         .iter()
         .map(|entry| {
@@ -147,7 +185,7 @@ fn render_version_list(output: &Output, entries: &[VersionEntry]) {
             vec![
                 entry.version.to_string(),
                 entry.sha[..entry.sha.len().min(8)].to_string(),
-                entry.message.clone(),
+                moved_message(folder, entry.moved_from.as_deref(), &entry.message),
                 entry.author.clone(),
                 entry.created_at.clone(),
                 if n == 1 {
@@ -178,6 +216,8 @@ fn render_version_list(output: &Output, entries: &[VersionEntry]) {
 /// and `offset`, reading no whole version list (`D-103`). A page on which
 /// a version names no changed path equal to the folder or under it is
 /// refused as undecodable, as a server dropping the query answers.
+/// Roadmap 228: a version carrying `path` — the path a recorded move left
+/// it matched at — is weighed against that path in the folder's place.
 pub async fn folder_history(
     client: &SynsClient,
     repo_id: &str,
@@ -193,10 +233,11 @@ pub async fn folder_history(
 
     // 2 — every version on it changed the folder.
     if let Some(stray) = page.data.iter().find(|entry| {
+        let matched = entry.path.as_deref().unwrap_or(folder);
         !entry
             .files_changed
             .iter()
-            .any(|p| p == folder || lies_under(p, folder))
+            .any(|p| p == matched || lies_under(p, matched))
     }) {
         return Err(undecodable(
             reqwest::StatusCode::OK,
@@ -244,7 +285,7 @@ pub async fn cmd_history(
         if output.is_json() {
             output.json(&raw);
         } else {
-            render_version_list(output, &response.data);
+            render_version_list(output, &response.data, None);
             write_count_line(output, response.data.len(), response.total);
         }
         return Ok(());
@@ -265,7 +306,7 @@ pub async fn cmd_history(
                 }
                 output.json(&raw);
             } else {
-                render_file_history(output, &response.data);
+                render_file_history(output, &response.data, folder.as_ref());
                 write_count_line(output, response.data.len(), response.total);
             }
             return Ok(());
@@ -278,31 +319,54 @@ pub async fn cmd_history(
 
     // 6 — the paths counted from the folder inside one, then the block or
     // the folder history document.
+    // Roadmap 228: a path a version was matched at outside the folder —
+    // one a recorded move carried into it — stands whole.
     if let Some(folder) = &folder {
         for entry in &mut page.data {
-            entry.files_changed = counted_paths(folder, &entry.files_changed);
+            let matched = entry.path.clone();
+            entry.files_changed = entry
+                .files_changed
+                .iter()
+                .filter_map(|p| {
+                    folder.served_path(p).or_else(|| {
+                        matched
+                            .as_deref()
+                            .filter(|m| p == m || lies_under(p, m))
+                            .map(|_| p.clone())
+                    })
+                })
+                .collect();
         }
     }
     if output.is_json() {
+        let mut data = serde_json::to_value(&page.data).unwrap_or_default();
+        if let (Some(folder), Some(entries)) = (
+            folder.as_ref().filter(|f| f.identity.is_none()),
+            data.as_array_mut(),
+        ) {
+            rebase_followed_paths(folder, entries);
+        }
         output.json(&serde_json::json!({
-            "data": page.data,
+            "data": data,
             "total": page.total,
             "limit": page.limit,
             "offset": page.offset,
         }));
     } else {
-        render_version_list(output, &page.data);
+        render_version_list(output, &page.data, folder.as_ref());
         write_count_line(output, page.data.len(), page.total);
     }
     Ok(())
 }
 
 /// Each served entry's `diff` with its header paths counted from the
-/// folder, every other key as served.
+/// folder, and (roadmap 228) its `path` and `movedFrom` as `shown_path`
+/// shows them, every other key as served.
 fn rebase_file_history(folder: &FolderScope, raw: &mut serde_json::Value) {
     let Some(entries) = raw.get_mut("data").and_then(|d| d.as_array_mut()) else {
         return;
     };
+    rebase_followed_paths(folder, entries);
     for entry in entries {
         if let Some(diff) = entry.get_mut("diff")
             && let Some(text) = diff.as_str()
@@ -313,16 +377,21 @@ fn rebase_file_history(folder: &FolderScope, raw: &mut serde_json::Value) {
 }
 
 /// `CS-history-blk-versions` under `--file`, as `u24` renders it.
-fn render_file_history(output: &Output, entries: &[crate::client::FileVersionEntry]) {
+fn render_file_history(
+    output: &Output,
+    entries: &[crate::client::FileVersionEntry],
+    folder: Option<&FolderScope>,
+) {
     let rows = entries
         .iter()
         .map(|entry| {
             // A removal entry — the commit that removed the path —
-            // serves neither a blob hash nor content.
+            // serves neither a blob hash nor content. Roadmap 228: the
+            // entry of a recorded move names the path it left.
             let message = if entry.blob_sha.is_none() && entry.content.is_none() {
                 format!("(removed) {}", entry.message)
             } else {
-                entry.message.clone()
+                moved_message(folder, entry.moved_from.as_deref(), &entry.message)
             };
             vec![
                 entry.sha[..entry.sha.len().min(8)].to_string(),
@@ -342,6 +411,34 @@ mod tests {
     use serial_test::serial;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Roadmap 228, FEATURE_SPEC row 33: the move's Message cell, its path
+    // counted from a folder bound to its holder where it lies under it.
+    #[test]
+    fn a_moved_entry_names_the_path_it_left() {
+        let folder = FolderScope {
+            dir: std::path::PathBuf::from("/w/q3-review"),
+            owner: "alice".to_string(),
+            name: "notes".to_string(),
+            path: "q3-review".to_string(),
+            checkout: None,
+            enclosing: Vec::new(),
+            identity: None,
+        };
+        assert_eq!(
+            moved_message(None, Some("q3-plan/document.html"), "Retitle: Q3 review"),
+            "(moved from q3-plan/document.html) Retitle: Q3 review"
+        );
+        assert_eq!(
+            moved_message(Some(&folder), Some("q3-review/a.html"), "m"),
+            "(moved from a.html) m"
+        );
+        assert_eq!(
+            moved_message(Some(&folder), Some("q3-plan/a.html"), "m"),
+            "(moved from q3-plan/a.html) m"
+        );
+        assert_eq!(moved_message(Some(&folder), None, "m"), "m");
+    }
 
     #[test]
     fn provenance_cell_names_what_the_commit_asserted() {

@@ -238,6 +238,13 @@ pub enum CliError {
     PathNotFound {
         line: String,
     },
+    /// Roadmap 228 (D-253 §2, §9): a `moves` or `copies` member whose
+    /// destination already stands at the parent — the server's `409`
+    /// `destination_exists`. `line` names the path, the parent and the
+    /// way out; code `path_exists`, exit `1`.
+    PathExists {
+        line: String,
+    },
 }
 
 /// Which of the two not-text wordings a refused content takes (SPEC
@@ -370,6 +377,14 @@ pub enum ApiErrorContext {
     /// in place of the registered line, code `version_not_found`.
     VersionNotFound {
         line: String,
+    },
+    /// Roadmap 228 (D-253 §2): a push refused as `source_not_found`
+    /// (`404`) or `destination_exists` (`409`, no `currentSha`), keeping
+    /// the served `reason` and the `path` the request named. It renders as
+    /// a refusal carrying no context renders until a write verb reads it.
+    PathRefusal {
+        reason: String,
+        path: String,
     },
 }
 
@@ -532,6 +547,7 @@ impl CliError {
             CliError::InvalidChangeset { .. } => "invalid_changeset",
             CliError::CheckoutDirty { .. } => "checkout_dirty",
             CliError::PathNotFound { .. } => "not_found",
+            CliError::PathExists { .. } => "path_exists",
         };
         fixed.to_string()
     }
@@ -1017,6 +1033,7 @@ impl std::fmt::Display for CliError {
                 write!(f, "{}", crate::write::checkout_guard_refusal(root, repo_id))
             }
             CliError::PathNotFound { line } => write!(f, "{line}"),
+            CliError::PathExists { line } => write!(f, "{line}"),
         }
     }
 }

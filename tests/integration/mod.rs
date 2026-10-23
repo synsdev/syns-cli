@@ -20,6 +20,7 @@ mod issue_160_test;
 mod lane_header_test;
 mod ls_file_test;
 mod machine_local_test;
+mod move_copy_test;
 mod place_test;
 mod pull_identity_test;
 mod pull_positionals_test;

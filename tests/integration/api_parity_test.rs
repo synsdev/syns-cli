@@ -726,6 +726,8 @@ const REGISTERED: &[(&str, &[&str])] = &[
             "edit",
             "write",
             "rm",
+            "mv",
+            "cp",
             "commit",
             "status",
             "history",

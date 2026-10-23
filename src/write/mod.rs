@@ -21,7 +21,8 @@ use base64::engine::general_purpose::STANDARD;
 
 use crate::auth::token::TokenStore;
 use crate::client::{
-    PushDeleteEntry, PushFileEntry, PushProvenance, PushRequest, PushResponse, SynsClient,
+    MemberAnswer, PushDeleteEntry, PushFileEntry, PushMember, PushProvenance, PushResponse,
+    SynsClient,
 };
 use crate::commands::sync::provenance_from;
 use crate::config::Config;
@@ -36,7 +37,10 @@ use crate::push::folder_check::{FOLDER_SEND_BOUND, FolderCheck, named_head};
 use crate::push::hash::blob_sha1;
 use crate::push::manifest::Manifest;
 use crate::push::working_copy::{WorkingCopy, folder_base};
-use crate::read::{file_argument, reference_refusal, repository_read_refusal};
+use crate::read::{
+    as_server_reads, file_argument, reference_refusal, refuse_empty_path, repository_read_refusal,
+    resolve_lexically,
+};
 use crate::repo::folder::{FolderScope, lies_under, resolve_folder_scope};
 use crate::repo::identity::identity_head;
 use crate::repo::if_repo::resolve_full_or_skip;
@@ -174,11 +178,241 @@ pub enum FileContent {
 
 /// What one commit carries: every content has already been answered by
 /// `classify_content` or `text_or_refuse`, and no path stands in both
-/// members.
+/// members. Roadmap 228: `members` holds each move and copy in the order
+/// the caller named them, its paths already resolved by `member_path`
+/// and checked by `refuse_overlaps`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Changeset {
     pub files: Vec<(String, FileContent)>,
     pub deletions: Vec<String>,
+    pub members: Vec<Member>,
+}
+
+/// Which of the two path members one entry is (roadmap 228, D-253 §1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberKind {
+    /// `moves`: the entry at `from` placed at `to`, `from` left empty.
+    Move,
+    /// `copies`: the entry at `from` placed at `to`, `from` kept.
+    Copy,
+}
+
+impl MemberKind {
+    /// The verb a refusal names: `move` or `copy`.
+    pub fn verb(self) -> &'static str {
+        match self {
+            MemberKind::Move => "move",
+            MemberKind::Copy => "copy",
+        }
+    }
+
+    /// The word the report opens a member's line with.
+    fn past(self) -> &'static str {
+        match self {
+            MemberKind::Move => "moved",
+            MemberKind::Copy => "copied",
+        }
+    }
+}
+
+/// One move or copy (roadmap 228): `from` and `to` as typed after
+/// lexical resolution (`member_path`), counted from the scoped folder
+/// where the run stands in one — the paths the report names. The paths
+/// the body carries are `WriteTarget::repository_path` of these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Member {
+    pub kind: MemberKind,
+    pub from: String,
+    pub to: String,
+}
+
+/// A typed member path resolved lexically before any request (roadmap
+/// 228, D-253 §1, §2; FEATURE_SPEC row 29): empty once trimmed refused
+/// with the empty-path refusal; every trailing `/` dropped, `q3-plan/`
+/// naming `q3-plan`; `.` and `..` segments resolved, a value naming the
+/// repository's root or the scoped folder itself refused, and one
+/// climbing above the root or out of the folder refused, each as the
+/// write verbs refuse a file path (`file_argument`). Answers the path
+/// counted from the folder where `folder` stands, from the root otherwise.
+pub fn member_path(folder: Option<&FolderScope>, typed: &str) -> Result<String, CliError> {
+    refuse_empty_path(typed)?;
+    // Under every binding alike (D-256 §7): what the server trims taken
+    // off both ends, every trailing `/` dropped.
+    let stripped = as_server_reads(as_server_reads(typed));
+    if stripped.is_empty() {
+        // `/` alone: the root, or a path leaving the folder.
+        return match folder {
+            Some(folder) => file_argument(Some(folder), typed),
+            None => Err(CliError::Config {
+                message: format!(
+                    "{typed} names the repository's root; name a file counted from it"
+                ),
+            }),
+        };
+    }
+    // A leading `/` names no path counted from the root, as it names none
+    // counted from a folder.
+    if folder.is_none() && stripped.starts_with('/') {
+        return Err(CliError::Config {
+            message: format!(
+                "{typed} names no path inside the repository; name one counted from its root"
+            ),
+        });
+    }
+    let resolved = file_argument(folder, stripped)?;
+    // `.`, `..` and empty segments resolved under every binding: `a//b`
+    // and `a/./b` both name `a/b`.
+    Ok(resolve_lexically(stripped).unwrap_or(resolved))
+}
+
+/// How one path stands to another (D-253 §1's overlap rules).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Nesting {
+    Same,
+    Under,
+    Above,
+}
+
+/// How `path` stands to `other`, none where neither holds the other.
+fn nesting(path: &str, other: &str) -> Option<Nesting> {
+    if path == other {
+        Some(Nesting::Same)
+    } else if lies_under(path, other) {
+        Some(Nesting::Under)
+    } else if lies_under(other, path) {
+        Some(Nesting::Above)
+    } else {
+        None
+    }
+}
+
+/// `syns mv FROM TO` and `syns cp FROM TO` (FEATURE_SPEC row 29): a
+/// `to` equal to, under or above its own `from` refused before any
+/// request, naming both paths.
+pub fn refuse_self_overlap(member: &Member) -> Result<(), CliError> {
+    let (verb, from, to) = (member.kind.verb(), &member.from, &member.to);
+    let detail = match nesting(to, from) {
+        None => return Ok(()),
+        Some(Nesting::Same) => "they are the same path".to_string(),
+        Some(Nesting::Under) => format!("{to} lies under {from}"),
+        Some(Nesting::Above) => format!("{to} lies above {from}"),
+    };
+    Err(CliError::Config {
+        message: format!("cannot {verb} {from} to {to}: {detail}"),
+    })
+}
+
+/// The overlap refusal of a changeset: `path` named against `other`, and
+/// the rule it breaks.
+fn overlap_line(path: &str, other: &str, rule: &str) -> String {
+    format!("{path} overlaps {other} in one changeset; {rule}")
+}
+
+/// D-253 §1's overlap rules over one changeset, every path already
+/// resolved lexically: the line naming the first offending path, members
+/// first in the order given, then deletions, then files, each in the
+/// order the document gives them; none where no rule is broken.
+///
+/// Refused: a `to` equal to, under or above its own `from`; two members'
+/// paths equal or nested, but two copies' `from`s; a deletion at, under
+/// or above any `from`, or under any `to`; a file at, under or above any
+/// `from`, or above any `to`. Admitted: a deletion at or above a `to`, and
+/// a file at or under one (a file exactly at the `to` of a member carrying
+/// a folder is the engine's to refuse, which alone tells a folder from a
+/// file).
+pub fn refuse_overlaps(members: &[Member], files: &[&str], deletions: &[&str]) -> Option<String> {
+    for (j, member) in members.iter().enumerate() {
+        if nesting(&member.to, &member.from).is_some() {
+            return Some(overlap_line(
+                &member.to,
+                &member.from,
+                &format!(
+                    "a {}'s destination cannot be, lie under or lie above its own source",
+                    member.kind.verb()
+                ),
+            ));
+        }
+        for earlier in &members[..j] {
+            let both_copies = member.kind == MemberKind::Copy && earlier.kind == MemberKind::Copy;
+            for (path, theirs, sources) in [
+                (&member.from, &earlier.from, true),
+                (&member.from, &earlier.to, false),
+                (&member.to, &earlier.from, false),
+                (&member.to, &earlier.to, false),
+            ] {
+                // Two copies only read their sources.
+                if both_copies && sources {
+                    continue;
+                }
+                if nesting(path, theirs).is_some() {
+                    return Some(overlap_line(
+                        path,
+                        theirs,
+                        "two moves or copies cannot name one path or one inside the other, but for two copies' sources",
+                    ));
+                }
+            }
+        }
+    }
+    for deletion in deletions {
+        for member in members {
+            if nesting(deletion, &member.from).is_some() {
+                return Some(overlap_line(
+                    deletion,
+                    &member.from,
+                    "a deletion cannot be, lie under or lie above the source of a move or a copy",
+                ));
+            }
+            if nesting(deletion, &member.to) == Some(Nesting::Under) {
+                return Some(overlap_line(
+                    deletion,
+                    &member.to,
+                    "a deletion cannot lie under the destination of a move or a copy; delete the destination itself",
+                ));
+            }
+        }
+    }
+    for file in files {
+        for member in members {
+            if nesting(file, &member.from).is_some() {
+                return Some(overlap_line(
+                    file,
+                    &member.from,
+                    "a file cannot be written at, under or above the source of a move or a copy",
+                ));
+            }
+            if nesting(file, &member.to) == Some(Nesting::Above) {
+                return Some(overlap_line(
+                    file,
+                    &member.to,
+                    "a file cannot be written above the destination of a move or a copy",
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// The report's line for one member (roadmap 228, D-253 §9): `moved {n}
+/// files: {from}/ → {to}/` for a folder and `moved 1 file: {from} →
+/// {to}` for a file, `copied` for a copy, the paths as typed after
+/// lexical resolution and the type and count as the answer echoed them.
+pub fn member_line(member: &Member, answer: &MemberAnswer) -> String {
+    let n = answer.files;
+    let noun = if n == 1 { "file" } else { "files" };
+    let past = member.kind.past();
+    let (from, to) = (&member.from, &member.to);
+    if answer.kind == "dir" {
+        format!("{past} {n} {noun}: {from}/ \u{2192} {to}/")
+    } else {
+        format!("{past} {n} {noun}: {from} \u{2192} {to}")
+    }
+}
+
+/// The destination-exists refusal (roadmap 228, D-253 §9; Bart's C1
+/// wording): `path` already stands at the parent the run claimed.
+pub fn path_exists_line(parent: &str, path: &str) -> String {
+    format!("{path} already exists at version {parent}; remove it first in the same commit")
 }
 
 // ---- the constants these verbs write ---------------------------------
@@ -611,6 +845,28 @@ pub async fn resolve_write_target(
     cwd: &Path,
     opts: &WriteOptions,
 ) -> Result<WriteTarget, CliError> {
+    let bound = bind_write_target(config, cwd, opts)?;
+    let guarded = guard_write_target(config, cwd, opts, bound).await?;
+    finish_write_target(config, opts, guarded).await
+}
+
+/// What `resolve_write_target` settles before any request (roadmap 228):
+/// the repository bound, the folder its paths are counted from, and the
+/// stored credential.
+#[derive(Debug, Clone)]
+pub struct BoundWrite {
+    pub repo_id: String,
+    pub folder: Option<FolderScope>,
+    token: String,
+    identity_folder_path: Option<String>,
+}
+
+/// `resolve_write_target` 1 and 2, and 5's own refusals: no request.
+pub fn bind_write_target(
+    config: &Config,
+    cwd: &Path,
+    opts: &WriteOptions,
+) -> Result<BoundWrite, CliError> {
     // 5's own refusals, raised ahead of step 1: no request is made for
     // a spelling the caller alone got wrong.
     refuse_parent_spelling(&opts.parent)?;
@@ -661,12 +917,70 @@ pub async fn resolve_write_target(
     let token = TokenStore::new(config.credentials_path())
         .read()?
         .ok_or(CliError::AuthRequired)?;
+    Ok(BoundWrite {
+        repo_id,
+        folder,
+        token,
+        identity_folder_path,
+    })
+}
 
-    // 3 — the checkout guard against the bound repository, before any
-    // request but the holder's root `.synsignore` a folder standing in no
-    // checkout of its holder reads.
+/// A bound write whose checkout guard has answered (roadmap 228): `syns
+/// commit` reads and checks its document between this and the requests,
+/// in the order `cli-commands/commit` documents — binding, credential,
+/// checkout guard, document, then the repository read and the parent.
+#[derive(Debug, Clone)]
+pub struct GuardedWrite {
+    bound: BoundWrite,
+    checkout: Option<PathBuf>,
+}
+
+impl GuardedWrite {
+    /// The folder the run's paths are counted from.
+    pub fn folder(&self) -> Option<&FolderScope> {
+        self.bound.folder.as_ref()
+    }
+}
+
+/// `resolve_write_target` 3: the checkout guard against the bound
+/// repository, before any request but the holder's root `.synsignore` a
+/// folder standing in no checkout of its holder reads.
+pub async fn guard_write_target(
+    config: &Config,
+    cwd: &Path,
+    opts: &WriteOptions,
+    bound: BoundWrite,
+) -> Result<GuardedWrite, CliError> {
     let client = SynsClient::new(config.server_url())?;
-    let checkout = checkout_of(config, cwd, &repo_id, opts.repo.is_some(), &client, &token).await?;
+    let checkout = checkout_of(
+        config,
+        cwd,
+        &bound.repo_id,
+        opts.repo.is_some(),
+        &client,
+        &bound.token,
+    )
+    .await?;
+    Ok(GuardedWrite { bound, checkout })
+}
+
+/// `resolve_write_target` 4 to 6 over what `guard_write_target` answered.
+pub async fn finish_write_target(
+    config: &Config,
+    opts: &WriteOptions,
+    guarded: GuardedWrite,
+) -> Result<WriteTarget, CliError> {
+    let GuardedWrite {
+        bound:
+            BoundWrite {
+                repo_id,
+                folder,
+                token,
+                identity_folder_path,
+            },
+        checkout,
+    } = guarded;
+    let client = SynsClient::new(config.server_url())?;
 
     // 4 — read the repository, so no push of this run can be the request
     // that creates one (`issues/069`), keeping the head it names (SPEC
@@ -745,21 +1059,63 @@ pub(crate) fn push_file_entry(path: String, content: FileContent) -> PushFileEnt
     }
 }
 
+/// The `EP-push` body the write verbs send: `PushRequest`'s keys these
+/// verbs fill, serialised in its order, so a body carrying no member is
+/// the bytes it always was. Roadmap 228: `moves` and `copies` stand where
+/// the changeset carries one, and `files` is left out of a body carrying
+/// members and no file (FEATURE_SPEC row 26). No author on any branch, so
+/// the server names the session's user (`D-065`).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WriteBody {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    files: Option<Vec<PushFileEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deletions: Option<Vec<PushDeleteEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    moves: Option<Vec<PushMember>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    copies: Option<Vec<PushMember>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_sha: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<PushProvenance>,
+}
+
+/// The members of `kind` as body entries, none where there are none.
+fn body_members(members: &[Member], kind: MemberKind) -> Option<Vec<PushMember>> {
+    let entries: Vec<PushMember> = members
+        .iter()
+        .filter(|m| m.kind == kind)
+        .map(|m| PushMember {
+            from: m.from.clone(),
+            to: m.to.clone(),
+        })
+        .collect();
+    (!entries.is_empty()).then_some(entries)
+}
+
 /// The body this run sends (`commit_changeset` 2 and 3). Each content
 /// is moved into its entry rather than copied, riding as `content` where
 /// it is `Text` and as `contentBase64` where it is `Encoded` (SPEC u283).
+/// The changeset's paths are the ones the body carries.
 fn push_body(
     target: &WriteTarget,
     changeset: Changeset,
     opts: &WriteOptions,
     message: String,
-) -> PushRequest {
-    PushRequest {
-        files: changeset
-            .files
-            .into_iter()
-            .map(|(path, content)| push_file_entry(path, content))
-            .collect(),
+) -> WriteBody {
+    let members_alone = changeset.files.is_empty() && !changeset.members.is_empty();
+    WriteBody {
+        files: (!members_alone).then(|| {
+            changeset
+                .files
+                .into_iter()
+                .map(|(path, content)| push_file_entry(path, content))
+                .collect()
+        }),
         deletions: if changeset.deletions.is_empty() {
             None
         } else {
@@ -771,16 +1127,70 @@ fn push_body(
                     .collect(),
             )
         },
+        moves: body_members(&changeset.members, MemberKind::Move),
+        copies: body_members(&changeset.members, MemberKind::Copy),
         message: Some(message),
-        // No author on any branch, so the server names the session's
-        // user (`D-065`).
-        author: None,
         parent_sha: Some(target.parent.commit_sha.clone()),
-        description: None,
-        tags: None,
-        status: None,
-        visibility: None,
         provenance: opts.provenance.block(),
+    }
+}
+
+/// Roadmap 228 (D-253 §3, §9): an answer to a body carrying members that
+/// does not echo each of them — a server predating them, which drops the
+/// keys and lands whatever else the body carried — is undecodable,
+/// naming the version it published, and never read as success.
+fn refuse_unechoed(members: &[Member], response: &PushResponse) -> Result<(), CliError> {
+    let sent = |kind| members.iter().filter(|m| m.kind == kind).count();
+    let echoed = |answer: &Option<Vec<MemberAnswer>>| answer.as_ref().map_or(0, Vec::len);
+    let unechoed: Vec<&str> = [
+        ("moves", sent(MemberKind::Move), echoed(&response.moves)),
+        ("copies", sent(MemberKind::Copy), echoed(&response.copies)),
+    ]
+    .into_iter()
+    .filter(|(_, sent, echoed)| sent != echoed)
+    .map(|(key, _, _)| key)
+    .collect();
+    if unechoed.is_empty() {
+        return Ok(());
+    }
+    Err(CliError::Api {
+        status: Some(200),
+        error: format!(
+            "invalid response body: version {}, commit {}, was published, but the answer does not echo the {} the push carried, as a server predating them answers",
+            response.version,
+            response.commit_sha,
+            unechoed.join(" and ")
+        ),
+        context: None,
+    })
+}
+
+/// Roadmap 228 (D-253 §2, §9): a push refused as `source_not_found`
+/// becomes the path-not-found refusal and one refused as
+/// `destination_exists` the path-exists refusal, each naming the path
+/// counted from the scoped folder where it lies under it and the parent as
+/// the caller spelt it; every other refusal passes through.
+fn member_refusal(err: CliError, target: &WriteTarget, parent: &str) -> CliError {
+    let CliError::Api {
+        context: Some(crate::errors::ApiErrorContext::PathRefusal { reason, path }),
+        ..
+    } = &err
+    else {
+        return err;
+    };
+    let shown = target
+        .folder
+        .as_ref()
+        .and_then(|folder| folder.served_path(path))
+        .unwrap_or_else(|| path.clone());
+    match reason.as_str() {
+        "source_not_found" => CliError::PathNotFound {
+            line: crate::commands::edit::path_not_found_at_parent(parent, &shown),
+        },
+        "destination_exists" => CliError::PathExists {
+            line: path_exists_line(parent, &shown),
+        },
+        _ => err,
     }
 }
 
@@ -855,6 +1265,7 @@ fn report(
     response: &PushResponse,
     raw: serde_json::Value,
     written: &[String],
+    members: &[Member],
 ) {
     let changed = response.files_changed > 0;
     let behind = checkout_left_behind(target, response, written);
@@ -866,15 +1277,42 @@ fn report(
 
     if changed {
         eprintln!("{}", wrote_line(response.version, &response.commit_sha));
-        if let Some(root) = behind {
-            eprintln!("{}", checkout_behind_line(root));
-        }
     } else {
         eprintln!(
             "{}",
             nothing_changed_line(response.version, &response.commit_sha)
         );
     }
+    // Roadmap 228: one line per member, in the order the caller named
+    // them, ahead of the behind line.
+    // A write that left the tree as it stood (a copy onto the very entry
+    // standing there) reads as the one nothing-changed line (D-256 §3).
+    if changed {
+        for line in member_lines(members, response) {
+            eprintln!("{line}");
+        }
+    }
+    if changed && let Some(root) = behind {
+        eprintln!("{}", checkout_behind_line(root));
+    }
+}
+
+/// Each member's report line in the order the caller named them, paired
+/// with its echo by its place among the members of its kind.
+pub fn member_lines(members: &[Member], response: &PushResponse) -> Vec<String> {
+    let (mut moves, mut copies) = (0, 0);
+    members
+        .iter()
+        .filter_map(|member| {
+            let (answers, at) = match member.kind {
+                MemberKind::Move => (&response.moves, &mut moves),
+                MemberKind::Copy => (&response.copies, &mut copies),
+            };
+            let answer = answers.as_ref().and_then(|a| a.get(*at));
+            *at += 1;
+            answer.map(|answer| member_line(member, answer))
+        })
+        .collect()
 }
 
 /// The key whose one value `with_parent_sha` rewrites, as `serde_json`
@@ -1103,9 +1541,16 @@ pub async fn commit_changeset_or(
             .iter()
             .map(|(path, _)| path.clone())
             .chain(changeset.deletions.iter().cloned())
+            .chain(
+                changeset
+                    .members
+                    .iter()
+                    .flat_map(|m| [m.from.clone(), m.to.clone()]),
+            )
             .collect(),
         None => Vec::new(),
     };
+    let members = changeset.members.clone();
     let (response, raw, _claimed) =
         publish_changeset(config, target, changeset, opts, default_message).await?;
     if response.files_changed == 0
@@ -1115,7 +1560,7 @@ pub async fn commit_changeset_or(
     }
 
     // 4 and 5 — compose the run's one answer and render it.
-    report(output, target, &response, raw, &written);
+    report(output, target, &response, raw, &written, &members);
     Ok(())
 }
 
@@ -1154,7 +1599,20 @@ pub async fn publish_changeset(
             .iter()
             .map(|path| target.repository_path(path))
             .collect::<Result<_, CliError>>()?,
+        // Roadmap 228: each member's two paths alike.
+        members: changeset
+            .members
+            .iter()
+            .map(|member| {
+                Ok(Member {
+                    kind: member.kind,
+                    from: target.repository_path(&member.from)?,
+                    to: target.repository_path(&member.to)?,
+                })
+            })
+            .collect::<Result<_, CliError>>()?,
     };
+    let members = changeset.members.clone();
 
     // 1 and 2 — the caption, and each content's blob hash beside its path.
     let message = caption(opts, default_message)?;
@@ -1169,13 +1627,14 @@ pub async fn publish_changeset(
     drop(request);
     let body = bytes::Bytes::from(body);
     let client = SynsClient::new(config.server_url())?;
-    match &target.folder {
+    let published = match &target.folder {
         None => {
             let (response, raw) = client
                 .push_body(&target.repo_id, &target.token, body)
                 .await
-                .map_err(|err| fold_conflict(err, &target.parent.commit_sha))?;
-            Ok((response, raw, target.parent.commit_sha.clone()))
+                .map_err(|err| fold_conflict(err, &target.parent.commit_sha))
+                .map_err(|err| member_refusal(err, target, &opts.parent))?;
+            (response, raw, target.parent.commit_sha.clone())
         }
         Some(folder) => {
             let mut sender = PushSend {
@@ -1183,10 +1642,14 @@ pub async fn publish_changeset(
                 claims: target.parent.commit_sha.clone(),
             };
             let ((response, raw), claimed) =
-                send_inside_folder(&client, target, folder, &mut sender).await?;
-            Ok((response, raw, claimed))
+                send_inside_folder(&client, target, folder, &mut sender)
+                    .await
+                    .map_err(|err| member_refusal(err, target, &opts.parent))?;
+            (response, raw, claimed)
         }
-    }
+    };
+    refuse_unechoed(&members, &published.0)?;
+    Ok(published)
 }
 
 #[cfg(test)]
@@ -1738,6 +2201,7 @@ mod tests {
                 ),
             ],
             deletions: vec![],
+            members: Vec::new(),
         };
         let request = super::push_body(
             &target_at(None),
@@ -2155,6 +2619,7 @@ mod tests {
                     FileContent::Text("keep two".to_string()),
                 )],
                 deletions: vec![],
+                members: Vec::new(),
             },
             &write_options(HEAD_SHA),
             "edit a.md",
@@ -2191,6 +2656,7 @@ mod tests {
             Changeset {
                 files: vec![],
                 deletions: vec!["a.md".to_string()],
+                members: Vec::new(),
             },
             &write_options(HEAD_SHA),
             "rm a.md",
@@ -2251,6 +2717,7 @@ mod tests {
                     FileContent::Text("keep two".to_string()),
                 )],
                 deletions: vec!["gone.md".to_string()],
+                members: Vec::new(),
             },
             &write_options(HEAD_SHA),
             "edit a.md",
@@ -2338,6 +2805,7 @@ mod tests {
                     FileContent::Text("{}".to_string()),
                 )],
                 deletions: Vec::new(),
+                members: Vec::new(),
             },
             &write_options(HEAD_SHA),
             "write board.json",
@@ -2385,6 +2853,7 @@ mod tests {
             Changeset {
                 files: vec![("a.md".to_string(), FileContent::Text("a".to_string()))],
                 deletions: Vec::new(),
+                members: Vec::new(),
             },
             &write_options(HEAD_SHA),
             "write a.md",
@@ -2459,6 +2928,7 @@ mod tests {
                     FileContent::Text("{}".to_string()),
                 )],
                 deletions: Vec::new(),
+                members: Vec::new(),
             },
             &write_options(HEAD_SHA),
             "write board.json",
@@ -2478,10 +2948,226 @@ mod tests {
         assert_eq!(pushes, 2);
     }
 
+    // ---- roadmap 228: moves and copies --------------------------------
+
+    fn member(kind: MemberKind, from: &str, to: &str) -> Member {
+        Member {
+            kind,
+            from: from.to_string(),
+            to: to.to_string(),
+        }
+    }
+
+    // D-253 §1: what a changeset admits beside its members.
+    #[test]
+    fn the_overlap_rules_admit_what_d253_admits() {
+        let mv = |from, to| member(MemberKind::Move, from, to);
+        let cp = |from, to| member(MemberKind::Copy, from, to);
+        // Two copies sharing a source.
+        assert_eq!(
+            refuse_overlaps(&[cp("t", "x"), cp("t", "y")], &[], &[]),
+            None
+        );
+        // A deletion at or above a destination.
+        assert_eq!(refuse_overlaps(&[mv("r", "docs")], &[], &["docs"]), None);
+        assert_eq!(
+            refuse_overlaps(&[mv("x", "archive/x")], &[], &["archive"]),
+            None
+        );
+        // A file at or under a destination.
+        assert_eq!(refuse_overlaps(&[mv("a.md", "b.md")], &["b.md"], &[]), None);
+        assert_eq!(refuse_overlaps(&[mv("p", "r")], &["r/d.html"], &[]), None);
+        // Unrelated siblings sharing a prefix.
+        assert_eq!(
+            refuse_overlaps(&[mv("docs", "docs-old")], &["docs2"], &["doc"]),
+            None
+        );
+        // A move and a copy whose sources overlap are refused.
+        assert!(refuse_overlaps(&[mv("t", "x"), cp("t", "y")], &[], &[]).is_some());
+        // Two copies' destinations overlapping are refused.
+        assert!(refuse_overlaps(&[cp("t", "x"), cp("u", "x")], &[], &[]).is_some());
+    }
+
+    fn answered(
+        moves: Option<Vec<MemberAnswer>>,
+        copies: Option<Vec<MemberAnswer>>,
+    ) -> PushResponse {
+        let mut response = response(1);
+        response.moves = moves;
+        response.copies = copies;
+        response
+    }
+
+    fn echo(from: &str, to: &str, kind: &str, files: u64) -> MemberAnswer {
+        MemberAnswer {
+            from: from.to_string(),
+            to: to.to_string(),
+            kind: kind.to_string(),
+            files,
+        }
+    }
+
+    // D-253 §9: one line per member in the order named, each paired with
+    // its echo by its place among its kind.
+    #[test]
+    fn member_lines_follow_the_order_named() {
+        let members = [
+            member(MemberKind::Copy, "templates/doc", "docs/new-doc"),
+            member(MemberKind::Move, "a.md", "b.md"),
+            member(MemberKind::Move, "q3-plan", "q3-review"),
+        ];
+        let response = answered(
+            Some(vec![
+                echo("a.md", "b.md", "file", 1),
+                echo("q3-plan", "q3-review", "dir", 3),
+            ]),
+            Some(vec![echo("templates/doc", "docs/new-doc", "dir", 1)]),
+        );
+        assert_eq!(
+            member_lines(&members, &response),
+            vec![
+                "copied 1 file: templates/doc/ \u{2192} docs/new-doc/".to_string(),
+                "moved 1 file: a.md \u{2192} b.md".to_string(),
+                "moved 3 files: q3-plan/ \u{2192} q3-review/".to_string(),
+            ]
+        );
+    }
+
+    // D-253 §3, §9: an answer missing a member's echo is undecodable,
+    // naming the version it published; one echoing every member passes.
+    #[test]
+    fn an_unechoed_member_is_undecodable_naming_the_version() {
+        let members = [member(MemberKind::Move, "a.md", "b.md")];
+        let err = refuse_unechoed(&members, &answered(None, None)).unwrap_err();
+        assert_eq!(err.code(), "response_undecodable");
+        assert_eq!(err.exit_code(), 1);
+        assert!(err.to_string().contains("version 8"), "{err}");
+        assert!(err.to_string().contains("moves"), "{err}");
+        assert!(
+            refuse_unechoed(
+                &members,
+                &answered(Some(vec![echo("a.md", "b.md", "file", 1)]), None)
+            )
+            .is_ok()
+        );
+        assert!(refuse_unechoed(&[], &answered(None, None)).is_ok());
+        let both = [
+            member(MemberKind::Move, "a", "b"),
+            member(MemberKind::Copy, "c", "d"),
+        ];
+        let err = refuse_unechoed(&both, &answered(None, None)).unwrap_err();
+        assert!(err.to_string().contains("moves and copies"), "{err}");
+    }
+
+    // D-253 §2, §9: the two member refusals, the path counted from a
+    // scoped folder where it lies under it.
+    #[test]
+    fn member_refusals_name_the_path_and_the_parent() {
+        let refused = |reason: &str, path: &str, status: u16| CliError::Api {
+            status: Some(status),
+            error: if status == 404 {
+                "not_found"
+            } else {
+                "conflict"
+            }
+            .to_string(),
+            context: Some(crate::errors::ApiErrorContext::PathRefusal {
+                reason: reason.to_string(),
+                path: path.to_string(),
+            }),
+        };
+        let target = target_at(None);
+        let err = member_refusal(refused("source_not_found", "nowhere", 404), &target, "44");
+        assert_eq!(err.to_string(), "path not found at version 44: nowhere");
+        assert_eq!(err.code(), "not_found");
+        let err = member_refusal(refused("destination_exists", "docs", 409), &target, "44");
+        assert_eq!(
+            err.to_string(),
+            "docs already exists at version 44; remove it first in the same commit"
+        );
+        assert_eq!(err.code(), "path_exists");
+        assert_eq!(err.exit_code(), 1);
+
+        let mut inside = target_at(None);
+        inside.folder = Some(FolderScope {
+            dir: PathBuf::from("/w/vela"),
+            owner: "alice".to_string(),
+            name: "notes".to_string(),
+            path: "clients/vela".to_string(),
+            checkout: None,
+            enclosing: Vec::new(),
+            identity: None,
+        });
+        let err = member_refusal(
+            refused("destination_exists", "clients/vela/b.md", 409),
+            &inside,
+            "7",
+        );
+        assert_eq!(
+            err.to_string(),
+            "b.md already exists at version 7; remove it first in the same commit"
+        );
+        let other = CliError::Api {
+            status: Some(404),
+            error: "not_found".to_string(),
+            context: None,
+        };
+        assert!(matches!(
+            member_refusal(other, &target, "7"),
+            CliError::Api {
+                status: Some(404),
+                ..
+            }
+        ));
+    }
+
+    // FEATURE_SPEC row 26: a body of members alone carries no `files`;
+    // one beside a file carries both; one with neither is as it was.
+    #[test]
+    #[serial]
+    fn a_body_of_members_alone_carries_no_files_key() {
+        let _no_provenance = NoProvenanceEnv::new();
+        let alone = Changeset {
+            members: vec![member(MemberKind::Move, "q3-plan", "q3-review")],
+            ..Default::default()
+        };
+        let body = serde_json::to_value(super::push_body(
+            &target_at(None),
+            alone,
+            &write_options(HEAD_SHA),
+            "mv q3-plan q3-review".to_string(),
+        ))
+        .unwrap();
+        assert!(body.get("files").is_none(), "{body}");
+        assert_eq!(
+            body["moves"],
+            serde_json::json!([{"from": "q3-plan", "to": "q3-review"}])
+        );
+        assert!(body.get("copies").is_none(), "{body}");
+
+        let deletion = Changeset {
+            deletions: vec!["a.md".to_string()],
+            ..Default::default()
+        };
+        let body = serde_json::to_vec(&super::push_body(
+            &target_at(None),
+            deletion,
+            &write_options(HEAD_SHA),
+            "rm a.md".to_string(),
+        ))
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            format!(
+                r#"{{"files":[],"deletions":[{{"path":"a.md"}}],"message":"rm a.md","parentSha":"{HEAD_SHA}"}}"#
+            )
+        );
+    }
+
     // SPEC u292 Tests, `a_shared_body_is_copied_once_for_the_next_send`.
     #[test]
     fn a_shared_body_is_copied_once_for_the_next_send() {
-        let mut request = PushRequest {
+        let mut request = crate::client::PushRequest {
             files: vec![PushFileEntry {
                 path: "q3/board.json".to_string(),
                 sha: blob_sha1(b"{}"),
@@ -2534,6 +3220,7 @@ mod tests {
             Changeset {
                 files: vec![],
                 deletions: vec!["a.md".to_string()],
+                members: Vec::new(),
             },
             &opts,
             "rm a.md",

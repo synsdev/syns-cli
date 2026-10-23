@@ -484,6 +484,13 @@ fn resolve_dot_segments(typed: &str) -> Option<Vec<&str>> {
     Some(resolved)
 }
 
+/// `typed` with its `.`, `..` and empty segments resolved lexically
+/// (roadmap 228, a member path as the report names it), none where a
+/// `..` climbs above the start.
+pub fn resolve_lexically(typed: &str) -> Option<String> {
+    resolve_dot_segments(typed).map(|resolved| resolved.join("/"))
+}
+
 /// A typed path argument as a path in the repository (SPEC u290
 /// Contract Surface, `repository_argument`; issue 211, D-134): `.` and
 /// `..` segments resolved lexically under every binding. With no folder

@@ -129,6 +129,8 @@ pub async fn cmd_revert(
         version: response.version,
         files_changed: response.files_changed,
         created: response.created,
+        moves: None,
+        copies: None,
     };
     let written = [path.clone()];
     if output.is_json() {

@@ -33,6 +33,7 @@ pub fn changeset_for(
     Ok(Changeset {
         files: vec![(path.to_string(), content)],
         deletions: Vec::new(),
+        members: Vec::new(),
     })
 }
 

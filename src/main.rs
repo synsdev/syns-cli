@@ -274,6 +274,28 @@ enum Commands {
         #[command(flatten)]
         write: WriteOpts,
     },
+    /// Move a file or a folder to a new path as one commit, sending no content
+    Mv {
+        /// The path the file or folder stands at
+        #[arg(value_name = "FROM")]
+        from: String,
+        /// The new path itself (never a folder to move into)
+        #[arg(value_name = "TO")]
+        to: String,
+        #[command(flatten)]
+        write: WriteOpts,
+    },
+    /// Copy a file or a folder to a new path as one commit, sending no content
+    Cp {
+        /// The path the file or folder stands at
+        #[arg(value_name = "FROM")]
+        from: String,
+        /// The new path itself (never a folder to copy into)
+        #[arg(value_name = "TO")]
+        to: String,
+        #[command(flatten)]
+        write: WriteOpts,
+    },
     /// Publish a changeset read from standard input as one commit
     Commit {
         #[command(flatten)]
@@ -762,6 +784,28 @@ async fn run(
         }
         Commands::Rm { path, write } => {
             commands::rm::cmd_rm(config, output, path, write.into()).await?
+        }
+        Commands::Mv { from, to, write } => {
+            commands::mv::cmd_member(
+                config,
+                output,
+                write::MemberKind::Move,
+                from,
+                to,
+                write.into(),
+            )
+            .await?
+        }
+        Commands::Cp { from, to, write } => {
+            commands::mv::cmd_member(
+                config,
+                output,
+                write::MemberKind::Copy,
+                from,
+                to,
+                write.into(),
+            )
+            .await?
         }
         Commands::Commit { write } => {
             commands::commit::cmd_commit(config, output, write.into()).await?

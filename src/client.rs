@@ -166,6 +166,27 @@ pub struct PushDeleteEntry {
     pub path: String,
 }
 
+/// One `moves` or `copies` member of a push body (roadmap 228, D-253 §1):
+/// the entry, a file or a whole folder, standing at `from` in the parent's
+/// tree placed at `to`, and no byte of its content.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct PushMember {
+    pub from: String,
+    pub to: String,
+}
+
+/// The server's echo of one member it applied (roadmap 228, D-253 §3):
+/// the paths as sent, whether the entry carried was a file or a folder,
+/// and the count of files it carried.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MemberAnswer {
+    pub from: String,
+    pub to: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub files: u64,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ForkRequest {
@@ -298,6 +319,13 @@ pub struct PushResponse {
     pub version: u32,
     pub files_changed: u32,
     pub created: bool,
+    /// Roadmap 228: the echo of each `moves` member, present where the
+    /// body carried one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moves: Option<Vec<MemberAnswer>>,
+    /// Roadmap 228: the echo of each `copies` member, alike.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copies: Option<Vec<MemberAnswer>>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -441,6 +469,14 @@ pub struct FileVersionEntry {
     pub diff: Option<String>,
     #[serde(default)]
     pub provenance: Option<CommitProvenance>,
+    /// Roadmap 228: the path the file stood at in this version, which a
+    /// recorded move may make other than the path asked for.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Roadmap 228: the path this version moved the file from, on the
+    /// move's entry alone.
+    #[serde(default)]
+    pub moved_from: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -522,6 +558,14 @@ pub struct VersionEntry {
     pub files_changed: Vec<String>,
     #[serde(default)]
     pub provenance: Option<CommitProvenance>,
+    /// Roadmap 228: on a page asked with `path`, the path this version
+    /// was matched at; absent on every other page, and so never written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Roadmap 228: on a page asked with `path`, the path the move's
+    /// version carried it from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moved_from: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -1321,7 +1365,19 @@ pub(crate) async fn check_response(
             Some(Ok(known)) => known.error,
             _ => "unknown error".to_string(),
         };
+        // Roadmap 228 (D-253 §2): a member's source standing nowhere, or
+        // its destination standing, keeps the served `reason` and `path` —
+        // never ahead of a moved head's `currentSha`.
+        let member_refusal = match (code, error.as_str(), &parsed) {
+            (404, "not_found", Some(body)) | (409, "conflict", Some(body))
+                if body.get("currentSha").is_none() =>
+            {
+                path_refusal(body)
+            }
+            _ => None,
+        };
         let context = match (code, error.as_str(), &parsed) {
+            _ if member_refusal.is_some() => member_refusal,
             // Issue 253 (D-142): a conflict naming no moved head keeps its
             // served `reason`, so a fork of a source its caller reads no
             // version of reads apart from a name already taken.
@@ -1406,6 +1462,21 @@ pub(crate) async fn check_response(
         });
     }
     Ok(response)
+}
+
+/// Roadmap 228 (D-253 §2): the `source_not_found` and
+/// `destination_exists` refusals a push answers, each naming the path the
+/// request named, read from a served body; none for any other body.
+fn path_refusal(body: &serde_json::Value) -> Option<ApiErrorContext> {
+    let reason = body.get("reason").and_then(|v| v.as_str())?;
+    if reason != "source_not_found" && reason != "destination_exists" {
+        return None;
+    }
+    let path = body.get("path").and_then(|v| v.as_str())?;
+    Some(ApiErrorContext::PathRefusal {
+        reason: reason.to_string(),
+        path: path.to_string(),
+    })
 }
 
 /// The refusal `check_response` folds a `409` `conflict` naming
@@ -3790,6 +3861,78 @@ mod tests {
 
         let result = process_response_raw::<TestShape>(response).await;
         assert!(matches!(result, Err(CliError::AuthRequired)));
+    }
+
+    // Roadmap 228 (D-253 §2): `source_not_found` and `destination_exists`
+    // keep their `reason` and `path`; a moved head's `currentSha` still
+    // wins, and any other `reason` keeps today's context.
+    #[tokio::test]
+    async fn a_member_refusal_keeps_its_reason_and_path() {
+        let mock_server = MockServer::start().await;
+        for (route, status, body) in [
+            (
+                "/source",
+                404,
+                r#"{"error":"not_found","reason":"source_not_found","path":"nowhere","message":"m"}"#,
+            ),
+            (
+                "/destination",
+                409,
+                r#"{"error":"conflict","reason":"destination_exists","path":"docs","message":"m"}"#,
+            ),
+            (
+                "/moved",
+                409,
+                r#"{"error":"conflict","reason":"destination_exists","path":"docs","currentSha":"abc"}"#,
+            ),
+            (
+                "/fork",
+                409,
+                r#"{"error":"conflict","reason":"empty_source"}"#,
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(status).set_body_string(body))
+                .mount(&mock_server)
+                .await;
+        }
+        let context = |route: &str| {
+            let uri = format!("{}{route}", mock_server.uri());
+            async move {
+                let response = reqwest::Client::new().get(uri).send().await.unwrap();
+                match process_response_raw::<TestShape>(response).await {
+                    Err(CliError::Api { context, .. }) => context,
+                    other => panic!("expected a refusal, got {other:?}"),
+                }
+            }
+        };
+        assert_eq!(
+            context("/source").await,
+            Some(ApiErrorContext::PathRefusal {
+                reason: "source_not_found".to_string(),
+                path: "nowhere".to_string(),
+            })
+        );
+        assert_eq!(
+            context("/destination").await,
+            Some(ApiErrorContext::PathRefusal {
+                reason: "destination_exists".to_string(),
+                path: "docs".to_string(),
+            })
+        );
+        assert_eq!(
+            context("/moved").await,
+            Some(ApiErrorContext::HeadMoved {
+                current_sha: "abc".to_string(),
+            })
+        );
+        assert_eq!(
+            context("/fork").await,
+            Some(ApiErrorContext::ConflictReason {
+                reason: "empty_source".to_string(),
+            })
+        );
     }
 
     #[tokio::test]
