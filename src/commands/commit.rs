@@ -10,6 +10,7 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 
+use crate::commands::commit_edits::{apply_edits, plan_edits};
 use crate::config::Config;
 use crate::errors::{CliError, NotTextSurface};
 use crate::output::Output;
@@ -23,10 +24,11 @@ use crate::write::{
 
 /// The changeset document: `{ files: [{ path, content }` or
 /// `{ path, contentBase64 }], deletions: [{ path }], moves: [{ from, to
-/// }], copies: [{ from, to }] }` (roadmap 228 adds the last two).
+/// }], copies: [{ from, to }], edits: [{ path, old, new, replaceAll? }] }`
+/// (roadmap 228 adds moves and copies, roadmap 292 edits).
 ///
-/// Every member is optional and absent reads as empty, and a key
-/// outside the eight refuses the document. Each file entry carries
+/// Every member is optional and absent reads as empty, and a key the
+/// shape does not register refuses the document. Each file entry carries
 /// exactly one of its two content members, which `classify_changeset`
 /// checks rather than the parse, so the refusal names the path. A string escape naming an
 /// unpaired surrogate is refused by the parse itself rather than by a
@@ -45,6 +47,23 @@ pub struct ChangesetDocument {
     /// Roadmap 228: each path the commit copies, alike.
     #[serde(default)]
     pub copies: Vec<ChangesetMember>,
+    /// Roadmap 292: exact-string edits to text the parent holds, each
+    /// edited path riding in the push as a whole file (D-257).
+    #[serde(default)]
+    pub edits: Vec<ChangesetEdit>,
+}
+
+/// One `edits` entry (roadmap 292, D-257): the path as it stands at the
+/// parent, the text replaced and its replacement, and whether every
+/// occurrence is replaced rather than exactly one.
+#[derive(serde::Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ChangesetEdit {
+    pub path: String,
+    pub old: String,
+    pub new: String,
+    #[serde(default, rename = "replaceAll")]
+    pub replace_all: bool,
 }
 
 /// One `moves` or `copies` entry: the path left or read, and the new path
@@ -173,15 +192,15 @@ pub fn changeset_members(
     } else {
         moves.chain(copies).collect::<Result<_, _>>()?
     };
-    let lexical = |path: &str| {
-        let read = as_server_reads(as_server_reads(path));
-        resolve_lexically(read).unwrap_or_else(|| read.to_string())
-    };
-    let files: Vec<String> = document.files.iter().map(|f| lexical(&f.path)).collect();
+    let files: Vec<String> = document
+        .files
+        .iter()
+        .map(|f| lexical_path(&f.path))
+        .collect();
     let deletions: Vec<String> = document
         .deletions
         .iter()
-        .map(|d| lexical(&d.path))
+        .map(|d| lexical_path(&d.path))
         .collect();
     let files: Vec<&str> = files.iter().map(String::as_str).collect();
     let deletions: Vec<&str> = deletions.iter().map(String::as_str).collect();
@@ -189,6 +208,14 @@ pub fn changeset_members(
         Some(line) => Err(invalid_changeset(line)),
         None => Ok(members),
     }
+}
+
+/// A `files` or `deletions` path as the overlap rules compare it: what
+/// the server trims taken off, then its dot segments resolved lexically
+/// (roadmap 228; roadmap 292 compares an edit's paths against them).
+pub fn lexical_path(path: &str) -> String {
+    let read = as_server_reads(as_server_reads(path));
+    resolve_lexically(read).unwrap_or_else(|| read.to_string())
 }
 
 /// Parses the document, refusing every shape the eight keys do not admit.
@@ -277,12 +304,13 @@ pub async fn cmd_commit(
     let bytes = read_standard_input("the changeset document")?;
     let document = parse_changeset_document(&bytes)?;
 
-    // 3 — refuse a changeset naming no file, deletion, move or copy,
-    // before any request.
+    // 3 — refuse a changeset naming no file, deletion, move, copy or
+    // edit, before any request.
     if document.files.is_empty()
         && document.deletions.is_empty()
         && document.moves.is_empty()
         && document.copies.is_empty()
+        && document.edits.is_empty()
     {
         return Err(CliError::ChangesetEmpty);
     }
@@ -292,6 +320,10 @@ pub async fn cmd_commit(
     let members = changeset_members(&document, copies_named_first(&bytes), guarded.folder())?;
     drop(bytes);
 
+    // Roadmap 292 — each edit's own shape, its path and its overlaps
+    // (D-257), before any request.
+    let edits = plan_edits(&document, &members, guarded.folder())?;
+
     // 2 to 4 — check each entry's shape, then decode and classify each
     // content in path order.
     let mut changeset = classify_changeset(document)?;
@@ -299,6 +331,15 @@ pub async fn cmd_commit(
 
     // 1, continued — the repository read and the parent.
     let target = finish_write_target(config, &opts, guarded).await?;
+
+    // Roadmap 292 — read each edited path at the parent and apply its
+    // edits; each edited path then rides as a whole file where it lands
+    // (D-257 §2), in path order beside the document's own files.
+    if !edits.is_empty() {
+        let edited = apply_edits(config, &target, &opts.parent, &edits).await?;
+        changeset.files.extend(edited);
+        changeset.files.sort_by(|a, b| a.0.cmp(&b.0));
+    }
 
     // 5 — commit the whole changeset.
     let message = default_message("commit", None);

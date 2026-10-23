@@ -1,6 +1,7 @@
 pub mod cat;
 pub mod collaborators;
 pub mod commit;
+pub mod commit_edits;
 pub mod delete;
 pub mod diff;
 pub mod diff_since;

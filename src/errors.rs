@@ -260,6 +260,10 @@ pub enum NotTextSurface {
     Commit,
     /// `syns edit PATH` over a parent content that is not text (SPEC u283).
     Edit,
+    /// Roadmap 292 (D-257 §7): the edit of a `syns commit` changeset at
+    /// this index in `edits`, over a parent content that is not text or
+    /// a `new` that would leave none.
+    ChangesetEdit(usize),
 }
 
 /// The partial-answer refusal's truncated-tree arm (SPEC u270 Contract
@@ -993,6 +997,13 @@ impl std::fmt::Display for CliError {
             } => write!(
                 f,
                 "cannot write content that is not text: {path} \u{2014} edit changes text alone; replace it whole with syns write {path} --bytes"
+            ),
+            CliError::NotText {
+                path,
+                surface: NotTextSurface::ChangesetEdit(index),
+            } => write!(
+                f,
+                "edit {index} ({path}): cannot write content that is not text \u{2014} an edit changes text alone; replace the file whole under files with contentBase64"
             ),
             CliError::WriteConflict {
                 parent,

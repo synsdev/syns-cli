@@ -2231,6 +2231,55 @@ fn every_write_verb_inside_a_folder_lands_over_a_push_outside_it() {
     assert_eq!(query(&lists[0], "path").as_deref(), Some(FOLDER));
 }
 
+// Roadmap 292 (D-257 §1): inside a folder an edit's path is counted from
+// the folder, read at the folder's path in the holder and pushed there
+// whole, landing over a push outside the folder as every write does; a
+// path leaving the folder is refused naming the edit, and nothing is
+// pushed.
+#[test]
+#[serial]
+fn an_edit_inside_a_folder_reads_and_pushes_the_holder_path() {
+    let d = behind_outside();
+    d.state()
+        .file_answers
+        .insert(in_folder("board.json"), "{\"cards\":[\"a\"]}\n".to_string());
+    let mark = d.mark();
+    let out = d.run_in(
+        &d.folder(),
+        br#"{"edits":[{"path":"./board.json","old":"\"a\"","new":"\"b\""}]}"#,
+        &["commit", "--parent", "1"],
+    );
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    let pushes = d.pushes_since(mark);
+    assert_eq!(pushes.len(), 1, "{pushes:?}");
+    assert_eq!(pushes[0]["parentSha"], json!(h(2)));
+    assert_eq!(
+        pushes[0]["files"],
+        json!([{
+            "path": in_folder("board.json"),
+            "sha": blob_sha1(b"{\"cards\":[\"b\"]}\n"),
+            "content": "{\"cards\":[\"b\"]}\n",
+        }])
+    );
+
+    let mark = d.mark();
+    let out = d.run_in(
+        &d.folder(),
+        br#"{"edits":[{"path":"../x.md","old":"a","new":"b"}]}"#,
+        &["--json", "commit", "--parent", "1"],
+    );
+    assert_eq!(exit_of(&out), 1, "{}", stderr_of(&out));
+    let refusal: Value = serde_json::from_slice(&out.stdout).expect("one document");
+    assert_eq!(refusal["code"], json!("invalid_changeset"));
+    assert!(
+        refusal["error"].as_str().unwrap().starts_with(
+            "configuration error: edit 0 (../x.md): ../x.md names no path inside the folder "
+        ),
+        "{refusal}"
+    );
+    assert!(d.pushes_since(mark).is_empty());
+}
+
 // Roadmap 228, FEATURE_SPEC row 30: inside a folder bound to its holder
 // `syns mv` sends holder paths, reports the paths as typed, and lands at
 // the head over a version changing only paths outside the folder; a path

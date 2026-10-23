@@ -5,6 +5,7 @@ mod binary_read_write_test;
 mod cat_many_test;
 mod client_identity_test;
 mod collaborators_add_json_test;
+mod commit_edits_test;
 mod common;
 mod convergence_test;
 mod diff_since_test;

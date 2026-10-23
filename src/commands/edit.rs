@@ -34,6 +34,29 @@ pub fn path_not_found_at_parent(parent: &str, path: &str) -> String {
     format!("path not found at version {parent}: {path}")
 }
 
+/// The one matcher `syns edit` and a changeset's `edits` share (roadmap
+/// 292): the content with `old` replaced once, or everywhere where
+/// `replace_all` stands, or the count of occurrences where that count
+/// refuses the replacement — none, or more than one with no
+/// `replace_all`. Occurrences are counted as `str::matches` counts them,
+/// left to right and never overlapping.
+pub fn replace_counted(
+    content: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+) -> Result<String, usize> {
+    let count = content.matches(old).count();
+    if count == 0 || (count > 1 && !replace_all) {
+        return Err(count);
+    }
+    Ok(if replace_all {
+        content.replace(old, new)
+    } else {
+        content.replacen(old, new, 1)
+    })
+}
+
 /// `cmd_edit` 4 and 5: the content with `--old` replaced once, or
 /// everywhere, and the two refusals the count raises — each before any
 /// push is composed, so a refused edit publishes nothing.
@@ -45,22 +68,14 @@ pub fn replaced(
     path: &str,
     parent: &str,
 ) -> Result<String, CliError> {
-    let count = content.matches(old).count();
-    if count == 0 {
-        return Err(CliError::NoMatch {
+    replace_counted(content, old, new, replace_all).map_err(|count| match count {
+        0 => CliError::NoMatch {
             message: old_matched_nothing(parent, path),
-        });
-    }
-    if count > 1 && !replace_all {
-        return Err(CliError::ManyMatches {
+        },
+        count => CliError::ManyMatches {
             count,
             message: old_matched_more_than_once(count, path),
-        });
-    }
-    Ok(if replace_all {
-        content.replace(old, new)
-    } else {
-        content.replacen(old, new, 1)
+        },
     })
 }
 
