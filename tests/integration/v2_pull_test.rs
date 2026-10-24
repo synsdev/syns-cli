@@ -1166,9 +1166,19 @@ fn r31_the_layout() {
             }
         }
     }
+    // The purge walks every root (D-242 §8): each one this run reaches is
+    // the Env's own, never the machine's (issue 364).
+    let marker = Path::new("store/syns.dev/u-alice/marker");
+    for root in [env.default_root(), env.fallback_root()] {
+        std::fs::create_dir_all(root.join(marker).parent().unwrap()).unwrap();
+        std::fs::write(root.join(marker), b"m").unwrap();
+    }
     let out = env.run(&a, &["logout", "--purge"]);
     ok(&out);
     assert!(!env.cache.path().join("store").exists());
+    for root in [env.default_root(), env.fallback_root()] {
+        assert!(!root.join("store").exists(), "{}", root.display());
+    }
 }
 
 #[test]

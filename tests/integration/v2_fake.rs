@@ -1499,6 +1499,10 @@ pub struct Env {
     pub config: TempDir,
     pub cache: TempDir,
     pub root: TempDir,
+    /// The machine's home, cache home and temp directory, so the platform
+    /// default and the fallback store roots every purge walks (D-242 §8)
+    /// stand under the test's own directory (issue 364).
+    pub home: TempDir,
 }
 
 impl Env {
@@ -1512,7 +1516,9 @@ impl Env {
             config: tempfile::tempdir().unwrap(),
             cache: tempfile::tempdir().unwrap(),
             root: tempfile::tempdir().unwrap(),
+            home: tempfile::tempdir().unwrap(),
         };
+        std::fs::create_dir_all(env.home.path().join("tmp")).unwrap();
         env.credential(Some("alice"));
         env
     }
@@ -1548,12 +1554,38 @@ impl Env {
             .join("u-alice")
     }
 
+    /// The platform default store root under the Env's home.
+    pub fn default_root(&self) -> PathBuf {
+        if cfg!(target_os = "macos") {
+            self.home.path().join("Library/Caches/syns")
+        } else {
+            self.home.path().join(".cache/syns")
+        }
+    }
+
+    /// The fallback store root under the Env's temp directory.
+    pub fn fallback_root(&self) -> PathBuf {
+        let temp = self.home.path().join("tmp");
+        #[cfg(unix)]
+        {
+            let euid = unsafe { libc::geteuid() };
+            temp.join(format!("syns-{euid}"))
+        }
+        #[cfg(not(unix))]
+        {
+            temp.join("syns")
+        }
+    }
+
     pub fn command(&self, cwd: &Path, args: &[&str]) -> std::process::Command {
         let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("syns"));
         command
             .current_dir(cwd)
             .env("SYNS_CONFIG_DIR", self.config.path())
             .env("SYNS_CACHE_DIR", self.cache.path())
+            .env("HOME", self.home.path())
+            .env("XDG_CACHE_HOME", self.home.path().join(".cache"))
+            .env("TMPDIR", self.home.path().join("tmp"))
             .env_remove("SYNS_URL")
             .env_remove("SYNS_CACHE_MAX_BYTES")
             .env_remove("SYNS_CALLER")
