@@ -638,6 +638,9 @@ fn main() {
 
 #[tokio::main]
 async fn run_cli() {
+    // The run's start, which a write sibling must be older than to be
+    // swept as a killed run's (issue 368).
+    syns_cli::push::converge::run_started();
     let cli = Cli::parse();
     if let Commands::Cat {
         max_bytes: Some(_), ..

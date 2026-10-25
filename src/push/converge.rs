@@ -1182,24 +1182,12 @@ fn collect_folder(
             no_default_excludes: opts.no_default_excludes,
         });
     }
-    // A write sibling standing at collection is a killed run's: every
-    // caller holds the state lock, so no live write owns it.
     let CollectResult {
         mut files,
         skipped,
         total_walked,
     } = collected;
-    for stray in files
-        .keys()
-        .filter(|path| is_partial_write(path))
-        .cloned()
-        .collect::<Vec<_>>()
-    {
-        if under_lock {
-            remove_folder_file(copy, &stray)?;
-        }
-        files.remove(&stray);
-    }
+    sweep_partial_writes(copy, &mut files, under_lock, run_started())?;
     let hashes = files
         .iter()
         .map(|(path, file)| (path.clone(), file.sha.clone()))
@@ -1343,6 +1331,47 @@ pub(crate) fn is_partial_write(path: &str) -> bool {
                 .bytes()
                 .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
     })
+}
+
+/// How long before the run's start a partial write must have stood still
+/// to be a killed run's, room for a file clock that counts in whole
+/// seconds or two.
+const PARTIAL_SETTLED: Duration = Duration::from_secs(2);
+
+/// When this run started: taken once, by `main` before any command runs,
+/// and otherwise at the first collection that asks.
+pub fn run_started() -> SystemTime {
+    static STARTED: std::sync::OnceLock<SystemTime> = std::sync::OnceLock::new();
+    *STARTED.get_or_init(SystemTime::now)
+}
+
+/// Drop every write sibling from a collection's `files`, so none is ever
+/// sent or read as a local change, and under the state lock remove the
+/// ones a killed run left: last written `PARTIAL_SETTLED` before the run
+/// `started`. A newer one stays on disk, since a copy nested in this one
+/// holds its own lock and may be writing it, or taking its stamp, as this
+/// run collects (issue 368).
+fn sweep_partial_writes(
+    copy: &WorkingCopy,
+    files: &mut HashMap<String, CollectedFile>,
+    under_lock: bool,
+    started: SystemTime,
+) -> Result<(), CliError> {
+    let strays: Vec<String> = files
+        .keys()
+        .filter(|path| is_partial_write(path))
+        .cloned()
+        .collect();
+    for stray in strays {
+        files.remove(&stray);
+        let killed = std::fs::symlink_metadata(copy.root.join(&stray))
+            .and_then(|meta| meta.modified())
+            .is_ok_and(|written| written + PARTIAL_SETTLED < started);
+        if under_lock && killed {
+            remove_folder_file(copy, &stray)?;
+        }
+    }
+    Ok(())
 }
 
 /// Replace a folder file whole: write its sibling, then rename it over the
@@ -5259,6 +5288,57 @@ mod tests {
         assert!(!folder.remote_snapshot_path().exists());
         assert!(folder.resolution().unwrap().is_none());
         assert_eq!(std::fs::read(w.join("f/a.md")).unwrap(), b"a\nlocal\n");
+    }
+
+    // Issue 368: a write sibling is never collected, and is removed only
+    // where a killed run left it, older than this run; a fresh one may be a
+    // live write of a copy nested in this one, which holds its own lock.
+    #[test]
+    fn a_collection_sweeps_only_a_write_sibling_older_than_the_run() {
+        let cache = tempfile::tempdir().unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        let old = ".syns-partial-0123456789abcdef";
+        let fresh = "sub/.syns-partial-fedcba9876543210";
+        std::fs::create_dir(folder.path().join("sub")).unwrap();
+        std::fs::write(folder.path().join("a.md"), "a").unwrap();
+        std::fs::write(folder.path().join(old), "torn").unwrap();
+        std::fs::write(folder.path().join(fresh), "writing").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(folder.path().join(old))
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+        let copy = WorkingCopy::open(
+            &crate::config::StoreRoots::resolve(Some(cache.path()), cache.path(), cache.path()),
+            "alice",
+            "r",
+            folder.path(),
+        )
+        .unwrap();
+
+        let unlocked = collect_folder(
+            &copy,
+            &bare_opts(cache.path()),
+            &[],
+            false,
+            &FolderRoot::whole(&copy.root),
+        )
+        .unwrap();
+        assert_eq!(unlocked.hashes.keys().collect::<Vec<_>>(), vec!["a.md"]);
+        assert!(copy.root.join(old).exists(), "removed without the lock");
+
+        let locked = collect_folder(
+            &copy,
+            &bare_opts(cache.path()),
+            &[],
+            true,
+            &FolderRoot::whole(&copy.root),
+        )
+        .unwrap();
+        assert_eq!(locked.hashes.keys().collect::<Vec<_>>(), vec!["a.md"]);
+        assert!(!copy.root.join(old).exists(), "the killed run's stayed");
+        assert!(copy.root.join(fresh).exists(), "the fresh one was removed");
     }
 
     #[test]

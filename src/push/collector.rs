@@ -827,11 +827,12 @@ pub fn collect_files(
     let mut too_large: HashSet<String> = HashSet::new();
     let mut machine_local: HashSet<String> = HashSet::new();
     let mut reached: HashSet<String> = HashSet::new();
+    let mut gone: HashSet<String> = HashSet::new();
 
     for result in kept_walker {
-        let entry = result.map_err(|err| CliError::Io {
-            message: format!("walk error: {err}"),
-        })?;
+        let Some(entry) = walked(path, result)? else {
+            continue;
+        };
         let file_type = match entry.file_type() {
             Some(ft) => ft,
             None => continue,
@@ -874,57 +875,18 @@ pub fn collect_files(
             }
         }
 
-        let unreadable = |err: std::io::Error| CliError::Io {
-            message: format!("could not read {rel_path_str}: {err}"),
-        };
-
-        // 1 — the size, symbolic links followed, and the size drop.
-        let before = std::fs::metadata(entry.path()).map_err(unreadable)?;
-        if before.len() > MAX_FILE_BYTES {
-            too_large.insert(rel_path_str);
-            continue;
-        }
-
-        // 2 — the hash a trusted record entry answers, no byte read.
-        if let Some(sha) = record
-            .as_deref()
-            .and_then(|r| r.trusted(&rel_path_str, &before))
-        {
-            reached.insert(rel_path_str.clone());
-            kept_files.insert(rel_path_str, CollectedFile { sha, bytes: None });
-            continue;
-        }
-
-        // 3 — one read, held where the budget admits the size.
-        let file = match held.try_hold(before.len()) {
-            Some(hold) => {
-                let bytes = std::fs::read(entry.path()).map_err(unreadable)?;
-                let sha = blob_sha1(&bytes);
-                // The file moved under the read: hold what it now holds,
-                // or keep its hash alone.
-                let hold = if bytes.len() as u64 == before.len() {
-                    Some(hold)
-                } else {
-                    drop(hold);
-                    held.try_hold(bytes.len() as u64)
-                };
-                CollectedFile {
-                    sha,
-                    bytes: hold.map(|hold| (bytes, hold)),
-                }
+        match collect_entry(entry.path(), &rel_path_str, record.as_deref_mut(), held)? {
+            Reached::TooLarge => {
+                too_large.insert(rel_path_str);
             }
-            None => CollectedFile {
-                sha: hash_unheld(entry.path()).map_err(unreadable)?,
-                bytes: None,
-            },
-        };
-        if let Some(record) = record.as_deref_mut()
-            && let Ok(after) = std::fs::metadata(entry.path())
-        {
-            record.observe(&rel_path_str, &before, &after, &file.sha);
+            Reached::Kept(file) => {
+                reached.insert(rel_path_str.clone());
+                kept_files.insert(rel_path_str, file);
+            }
+            Reached::Gone => {
+                gone.insert(rel_path_str);
+            }
         }
-        reached.insert(rel_path_str.clone());
-        kept_files.insert(rel_path_str, file);
     }
 
     // 4 — the record keeps no entry for a path this collection did not
@@ -994,9 +956,9 @@ pub fn collect_files(
     let mut total_walked: usize = 0;
 
     for result in full_walker {
-        let entry = result.map_err(|err| CliError::Io {
-            message: format!("walk error: {err}"),
-        })?;
+        let Some(entry) = walked(path, result)? else {
+            continue;
+        };
 
         let file_type = match entry.file_type() {
             Some(ft) => ft,
@@ -1017,6 +979,12 @@ pub fn collect_files(
             Some(p) => p,
             None => continue,
         };
+
+        // A file gone at its read (issue 368) is absent: neither kept nor
+        // skipped, whatever stands there again by this walk.
+        if gone.contains(&rel_path_str) {
+            continue;
+        }
 
         total_walked += 1;
 
@@ -1077,6 +1045,127 @@ pub fn collect_files(
         skipped,
         total_walked,
     })
+}
+
+/// What one file the kept walk listed answers.
+#[derive(Debug)]
+enum Reached {
+    /// Larger than `MAX_FILE_BYTES`, dropped unread.
+    TooLarge,
+    Kept(CollectedFile),
+    /// Gone between the listing and its stat or read.
+    Gone,
+}
+
+/// Whether a read error says what was listed no longer stands there:
+/// removed, or a folder on its path replaced by a file.
+fn is_gone(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
+/// A read's answer, none where the file no longer stands where it was
+/// listed.
+fn present<T>(read: std::io::Result<T>) -> std::io::Result<Option<T>> {
+    match read {
+        Ok(value) => Ok(Some(value)),
+        Err(err) if is_gone(&err) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// A walk's next entry, none where a folder the walk listed below `root`
+/// is gone by the time the walk reads it, removed or replaced by a file:
+/// what stood in it is absent, as a file gone at its read is (issue 368).
+/// The root's own error, and every other, stays an error.
+fn walked(
+    root: &Path,
+    result: Result<ignore::DirEntry, ignore::Error>,
+) -> Result<Option<ignore::DirEntry>, CliError> {
+    fn listed_at(err: &ignore::Error) -> Option<&Path> {
+        match err {
+            ignore::Error::WithPath { path, .. } => Some(path),
+            ignore::Error::WithDepth { err, .. } => listed_at(err),
+            _ => None,
+        }
+    }
+    match result {
+        Ok(entry) => Ok(Some(entry)),
+        Err(err)
+            if err.io_error().is_some_and(is_gone)
+                && listed_at(&err).is_some_and(|at| at != root && at.starts_with(root)) =>
+        {
+            Ok(None)
+        }
+        Err(err) => Err(CliError::Io {
+            message: format!("walk error: {err}"),
+        }),
+    }
+}
+
+/// Collect one file the kept walk listed at `file`. A file another process
+/// removes or renames between the listing and its stat or read is absent,
+/// as `disk_hash` answers it: neither reached nor kept, so a base path
+/// goes out as a deletion. Every other read error stays an error (issue
+/// 368: a nested copy's stamp probe vanished under the outer copy's walk).
+fn collect_entry(
+    file: &Path,
+    rel_path_str: &str,
+    record: Option<&mut StatRecord>,
+    held: &Arc<HeldBytes>,
+) -> Result<Reached, CliError> {
+    let unreadable = |err: std::io::Error| CliError::Io {
+        message: format!("could not read {rel_path_str}: {err}"),
+    };
+    // 1 — the size, symbolic links followed, and the size drop.
+    let Some(before) = present(std::fs::metadata(file)).map_err(unreadable)? else {
+        return Ok(Reached::Gone);
+    };
+    if before.len() > MAX_FILE_BYTES {
+        return Ok(Reached::TooLarge);
+    }
+
+    // 2 — the hash a trusted record entry answers, no byte read.
+    if let Some(sha) = record
+        .as_deref()
+        .and_then(|r| r.trusted(rel_path_str, &before))
+    {
+        return Ok(Reached::Kept(CollectedFile { sha, bytes: None }));
+    }
+
+    // 3 — one read, held where the budget admits the size.
+    let collected = match held.try_hold(before.len()) {
+        Some(hold) => {
+            let Some(bytes) = present(std::fs::read(file)).map_err(unreadable)? else {
+                return Ok(Reached::Gone);
+            };
+            let sha = blob_sha1(&bytes);
+            // The file moved under the read: hold what it now holds,
+            // or keep its hash alone.
+            let hold = if bytes.len() as u64 == before.len() {
+                Some(hold)
+            } else {
+                drop(hold);
+                held.try_hold(bytes.len() as u64)
+            };
+            CollectedFile {
+                sha,
+                bytes: hold.map(|hold| (bytes, hold)),
+            }
+        }
+        None => match present(hash_unheld(file)).map_err(unreadable)? {
+            Some(sha) => CollectedFile { sha, bytes: None },
+            None => return Ok(Reached::Gone),
+        },
+    };
+    if let Some(record) = record
+        && let Ok(after) = std::fs::metadata(file)
+    {
+        record.observe(rel_path_str, &before, &after, &collected.sha);
+    }
+    Ok(Reached::Kept(collected))
 }
 
 /// The refusal a file taken after its collection answers where it is gone
@@ -2805,5 +2894,96 @@ pub(crate) mod tests {
             serde_json::to_value(SkipReason::MachineLocal).unwrap(),
             serde_json::json!("machine_local")
         );
+    }
+
+    // Issue 368: a file another process removes between the walk's listing
+    // and its stat or read is absent, not an error; every other read error
+    // stays one.
+    #[test]
+    fn a_file_gone_at_its_read_is_collected_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "a").unwrap();
+        let held = HeldBytes::new(HELD_BYTES_BUDGET);
+        let unheld = HeldBytes::new(0);
+        for budget in [&held, &unheld] {
+            let gone = dir.path().join(".syns-partial-0123456789abcdef");
+            assert!(matches!(
+                collect_entry(&gone, "gone", None, budget),
+                Ok(Reached::Gone)
+            ));
+            let under_a_file = dir.path().join("a.md/b.md");
+            assert!(matches!(
+                collect_entry(&under_a_file, "a.md/b.md", None, budget),
+                Ok(Reached::Gone)
+            ));
+            assert!(matches!(
+                collect_entry(&dir.path().join("a.md"), "a.md", None, budget),
+                Ok(Reached::Kept(_))
+            ));
+        }
+        let folder = dir.path().join("sub");
+        std::fs::create_dir(&folder).unwrap();
+        let err = collect_entry(&folder, "sub", None, &held).unwrap_err();
+        assert!(err.to_string().contains("could not read sub"), "{err}");
+    }
+
+    // Issue 368: a folder gone under the walk, below its root, is absent;
+    // the root's own error and every other stay errors.
+    #[test]
+    fn a_folder_gone_under_the_walk_is_absent() {
+        let root = Path::new("/w");
+        let error_at = |path: &str, kind: std::io::ErrorKind| ignore::Error::WithPath {
+            path: PathBuf::from(path),
+            err: Box::new(ignore::Error::Io(std::io::Error::from(kind))),
+        };
+        assert!(matches!(
+            walked(root, Err(error_at("/w/d54", std::io::ErrorKind::NotFound))),
+            Ok(None)
+        ));
+        assert!(matches!(
+            walked(
+                root,
+                Err(error_at("/w/a/d54", std::io::ErrorKind::NotADirectory))
+            ),
+            Ok(None)
+        ));
+        for err in [
+            error_at("/w", std::io::ErrorKind::NotFound),
+            error_at("/elsewhere/d54", std::io::ErrorKind::NotFound),
+            error_at("/w/d54", std::io::ErrorKind::PermissionDenied),
+            ignore::Error::Io(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        ] {
+            let refused = walked(root, Err(err)).unwrap_err().to_string();
+            assert!(refused.contains("walk error"), "{refused}");
+        }
+
+        // The crate's own errors carry the path `walked` reads: the missing
+        // root's own, refused; an unreadable folder's below it.
+        let dir = tempfile::tempdir().unwrap();
+        let none = dir.path().join("none");
+        let missing = WalkBuilder::new(&none)
+            .build()
+            .find_map(Result::err)
+            .expect("a missing root is an error");
+        assert!(missing.io_error().is_some_and(is_gone), "{missing}");
+        assert!(walked(&none, Err(missing)).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let shut = dir.path().join("shut");
+            std::fs::create_dir(&shut).unwrap();
+            std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let unreadable = WalkBuilder::new(dir.path()).build().find_map(Result::err);
+            std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // A root user reads the folder whatever its mode.
+            if let Some(err) = unreadable {
+                assert!(
+                    err.to_string().starts_with(&*shut.to_string_lossy()),
+                    "{err}"
+                );
+                assert!(err.io_error().is_some(), "{err}");
+                assert!(walked(dir.path(), Err(err)).is_err());
+            }
+        }
     }
 }
