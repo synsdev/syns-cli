@@ -1,14 +1,15 @@
 //! Binary-level refusal lines of SPEC u334 Tests: the teams invitation and
 //! revocation refusals naming their next move after the bare
 //! `server error ({status}): {wire form}` line (Q-01), a code with no move
-//! rendered bare, and the one refusal every check of a server address off
+//! rendered bare, a validation refusal naming the message it was served
+//! (issue 374), and the one refusal every check of a server address off
 //! TLS and off the loopback host answers (issues 263 and 264).
 //!
 //! Each test drives a raw HTTP/1.1 listener of its own, copied from
 //! `identifier_segment_test`'s: `GET /api/v1/teams` answers one team `core`
 //! owned by `alice`, and every other request takes the next status and
-//! `{"error": wire form}` body from the queue the row gives it. Every
-//! request is recorded as `METHOD target`.
+//! body (`{"error": wire form}`, or a whole one) from the queue the row
+//! gives it. Every request is recorded as `METHOD target`.
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -89,6 +90,16 @@ struct Listener {
 
 impl Listener {
     fn start(queue: &[(u16, &str)]) -> Listener {
+        let bodies: Vec<(u16, serde_json::Value)> = queue
+            .iter()
+            .map(|(status, error)| (*status, serde_json::json!({ "error": error })))
+            .collect();
+        Listener::serving(&bodies)
+    }
+
+    /// A listener answering each request but the teams list with the
+    /// next status and whole JSON body from `queue`.
+    fn serving(queue: &[(u16, serde_json::Value)]) -> Listener {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -96,7 +107,7 @@ impl Listener {
             .expect("runtime");
         let seen = Arc::new(Mutex::new(Vec::new()));
         let queue: Arc<Mutex<VecDeque<(u16, String)>>> = Arc::new(Mutex::new(
-            queue.iter().map(|(s, e)| (*s, e.to_string())).collect(),
+            queue.iter().map(|(s, b)| (*s, b.to_string())).collect(),
         ));
         let listener = rt
             .block_on(TcpListener::bind("127.0.0.1:0"))
@@ -124,9 +135,7 @@ impl Listener {
                                 (200, TEAMS.to_string())
                             } else {
                                 match queue.lock().expect("queue").pop_front() {
-                                    Some((status, error)) => {
-                                        (status, serde_json::json!({ "error": error }).to_string())
-                                    }
+                                    Some((status, body)) => (status, body),
                                     None => (500, r#"{"error":"internal_error"}"#.to_string()),
                                 }
                             };
@@ -311,6 +320,99 @@ fn an_unmoved_code_renders_bare() {
         stderr_of(&out),
         "error: server error (422): validation_error"
     );
+}
+
+/// The message the server serves refusing a write through a shared
+/// folder that would remove a shared folder's identity file (issue 374's
+/// reproduction).
+const SHARED_FOLDER_REFUSAL: &str =
+    "A write through a shared folder cannot remove a shared folder's .syns.yaml";
+
+// Issue 374: a `422` `validation_error` names the served message after the
+// code, in text and in the `--json` document, so a caller can tell which
+// rule refused the write.
+#[test]
+#[serial]
+fn a_validation_refusal_names_the_served_message() {
+    let refusal = serde_json::json!({
+        "error": "validation_error",
+        "message": SHARED_FOLDER_REFUSAL,
+    });
+    let listener = Listener::serving(&[(422, refusal.clone()), (422, refusal)]);
+    let (home, work) = directories();
+
+    let text = run(
+        home.path(),
+        work.path(),
+        &listener.url,
+        &["teams", "decline", "inv1"],
+    );
+    assert_eq!(text.status.code(), Some(1));
+    assert_eq!(
+        stderr_of(&text),
+        format!("error: server error (422): validation_error \u{2014} {SHARED_FOLDER_REFUSAL}")
+    );
+
+    let json = run(
+        home.path(),
+        work.path(),
+        &listener.url,
+        &["--json", "teams", "decline", "inv1"],
+    );
+    assert_eq!(json.status.code(), Some(1));
+    let streams = format!(
+        "{}{}",
+        String::from_utf8_lossy(&json.stdout),
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let documents: Vec<serde_json::Value> = streams
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("a JSON document"))
+        .collect();
+    assert_eq!(documents.len(), 1, "{streams}");
+    assert_eq!(
+        documents[0]["error"],
+        format!("server error (422): validation_error \u{2014} {SHARED_FOLDER_REFUSAL}")
+    );
+    assert_eq!(documents[0]["code"], "validation_error");
+}
+
+// Issue 374: a `422` `validation_error` whose served message is empty or
+// blank renders bare, as one serving no message does.
+#[test]
+#[serial]
+fn a_validation_refusal_with_a_blank_message_renders_bare() {
+    let listener = Listener::serving(&[
+        (
+            422,
+            serde_json::json!({"error": "validation_error", "message": ""}),
+        ),
+        (
+            422,
+            serde_json::json!({"error": "validation_error", "message": "  \t"}),
+        ),
+        (
+            422,
+            serde_json::json!({"error": "validation_error", "message": 7}),
+        ),
+    ]);
+    let (home, work) = directories();
+
+    for served in ["empty", "blank", "not a string"] {
+        let out = run(
+            home.path(),
+            work.path(),
+            &listener.url,
+            &["teams", "decline", "inv1"],
+        );
+        assert_eq!(out.status.code(), Some(1), "{served}");
+        assert_eq!(
+            stderr_of(&out),
+            "error: server error (422): validation_error",
+            "{served}"
+        );
+    }
 }
 
 // SPEC u334 Tests, the row of this name.

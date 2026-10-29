@@ -338,7 +338,10 @@ pub enum ApiErrorContext {
     },
     /// SPEC u329 `ApiErrorContext::Refusal`: the string `message` a `422`
     /// `validation_error` served, kept so a caller can tell one refusal
-    /// from another. It renders as a refusal carrying no context renders.
+    /// from another. Issue 374: it renders after the wire form and
+    /// ` \u{2014} ` where it is not blank, so the line names the rule that
+    /// refused the write; a blank one renders as a refusal carrying no
+    /// context renders.
     Refusal {
         message: String,
     },
@@ -797,6 +800,15 @@ impl std::fmt::Display for CliError {
                 error,
                 context: Some(ApiErrorContext::Reason { message }),
             } => write!(f, "server error ({s}): {error} \u{2014} {message}"),
+            // Issue 374: a validation refusal names the rule its served
+            // message gave.
+            CliError::Api {
+                status: Some(s),
+                error,
+                context: Some(ApiErrorContext::Refusal { message }),
+            } if !message.trim().is_empty() => {
+                write!(f, "server error ({s}): {error} \u{2014} {}", message.trim())
+            }
             CliError::Api {
                 status: Some(s),
                 error,
@@ -1570,24 +1582,34 @@ mod tests {
         ));
     }
 
-    // SPEC u329 Contract Surface, `ApiErrorContext::Refusal`: a refusal
-    // holding its served message renders as one holding no context.
+    // SPEC u329 Contract Surface, `ApiErrorContext::Refusal`, as issue 374
+    // changes it: a refusal holding its served message renders it after
+    // the wire form, and one holding a blank message as one holding no
+    // context; the exit code and the code are the bare refusal's.
     #[test]
-    fn a_kept_refusal_message_renders_as_a_refusal_with_no_context() {
+    fn a_kept_refusal_message_renders_after_the_wire_form() {
         let bare = CliError::Api {
             status: Some(422),
             error: "validation_error".into(),
             context: None,
         };
-        let kept = CliError::Api {
+        let refusal = |message: &str| CliError::Api {
             status: Some(422),
             error: "validation_error".into(),
             context: Some(ApiErrorContext::Refusal {
-                message: "description is too long".into(),
+                message: message.into(),
             }),
         };
-        assert_eq!(kept.to_string(), bare.to_string());
+        let kept = refusal(" description is too long\n");
+        assert_eq!(
+            kept.to_string(),
+            "server error (422): validation_error \u{2014} description is too long"
+        );
         assert_eq!(kept.exit_code(), bare.exit_code());
+        assert_eq!(kept.code(), bare.code());
+        for blank in ["", " \t\n"] {
+            assert_eq!(refusal(blank).to_string(), bare.to_string(), "{blank:?}");
+        }
     }
 
     #[test]
