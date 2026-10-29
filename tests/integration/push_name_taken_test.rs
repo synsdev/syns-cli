@@ -316,3 +316,32 @@ async fn a_digit_led_taken_name_is_refused() {
     );
     assert_eq!(listing(&m.dir()), vec!["a.md"]);
 }
+
+/// A first attempt failing before any publication — here `--strict`
+/// refusing a too-large file, before any request — takes back the
+/// identity file it wrote, so the retry is still refused rather than
+/// joining (REVIEW-syns-cli.md M1).
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_retry_after_a_failed_first_attempt_is_still_refused() {
+    let fake = Fake::start().await;
+    fake.commit(&[("board/board.json", "{}\n")]);
+    let m = Machine::new(&fake.uri);
+    write(&m.dir(), "a.md", b"a\n");
+    std::fs::File::create(m.dir().join("big.bin"))
+        .unwrap()
+        .set_len(syns_cli::push::collector::MAX_FILE_BYTES + 1)
+        .unwrap();
+
+    let failed = m.run(&["push", "-n", "proj", "--strict"]).await;
+    assert_eq!(failed.status.code(), Some(3), "{}", stderr(&failed));
+    assert_eq!(listing(&m.dir()), vec!["a.md", "big.bin"]);
+    std::fs::remove_file(m.dir().join("big.bin")).unwrap();
+
+    let retry = m.run(&["push", "-n", "proj"]).await;
+
+    assert_eq!(retry.status.code(), Some(1), "{}", stderr(&retry));
+    assert_eq!(stderr(&retry), format!("error: {TAKEN}\n"));
+    assert_eq!(listing(&m.dir()), vec!["a.md"]);
+    assert!(fake.push_bodies().is_empty());
+}

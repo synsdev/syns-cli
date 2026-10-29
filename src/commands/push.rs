@@ -288,11 +288,23 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
     } else {
         converge(&client, Some(&token), &copy, ConvergeMode::Publish, opts).await
     };
-    // The refused run leaves the folder as it found it.
-    if wrote && matches!(converged, Err(CliError::NameTaken { .. })) {
+    // An unlinked run that published nothing — refused, or failed before
+    // any publication — takes back the identity file it wrote, so a retry
+    // is judged unlinked again. One whose publication stands recorded, in
+    // a base, an outbox or a resolution, keeps it.
+    if wrote && unlinked && !links_the_folder(&copy) {
         let _ = std::fs::remove_file(copy.root.join(SYNS_YAML_FILENAME));
     }
     render_bare(output, &repo_id, converged)
+}
+
+/// Whether a run left this copy a record tying the folder to its
+/// repository: a base naming a commit, an outbox or a resolution.
+fn links_the_folder(copy: &WorkingCopy) -> bool {
+    copy.base()
+        .is_some_and(|base| base.commit_sha().is_some_and(|commit| !commit.is_empty()))
+        || !matches!(copy.outbox(), Ok(None))
+        || !matches!(copy.resolution(), Ok(None))
 }
 
 /// A bare publication's one outcome, rendered (SPEC u256 `cmd_push` 4).
