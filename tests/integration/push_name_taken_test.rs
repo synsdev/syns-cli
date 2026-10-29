@@ -108,7 +108,7 @@ fn listing(dir: &Path) -> Vec<String> {
     found
 }
 
-const TAKEN: &str = "alice/proj already exists \u{2014} to work in it here, run syns pull alice/proj .; to start a new repository, push with another name";
+const TAKEN: &str = "alice/proj already exists \u{2014} to start a new repository, push with another name; to work in it here, run syns pull alice/proj .";
 
 /// The issue's Observed run: a fresh folder pushing under a name whose
 /// repository another session made is refused, on the diagnostic stream

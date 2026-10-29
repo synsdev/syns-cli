@@ -1068,7 +1068,7 @@ impl std::fmt::Display for CliError {
             CliError::PathExists { line } => write!(f, "{line}"),
             CliError::NameTaken { repo_id } => write!(
                 f,
-                "{repo_id} already exists \u{2014} to work in it here, run syns pull {repo_id} .; to start a new repository, push with another name"
+                "{repo_id} already exists \u{2014} to start a new repository, push with another name; to work in it here, run syns pull {repo_id} ."
             ),
         }
     }
