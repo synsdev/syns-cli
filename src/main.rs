@@ -30,7 +30,7 @@ credential in the configuration folder (none is sent where it cannot be kept).";
 const COMMIT_HELP: &str = "\
 Changeset (one JSON object on standard input; every member optional):
   files      [{path, content | contentBase64}]  write a file whole (contentBase64: standard padded base64)
-  deletions  [{path}]                           remove a file
+  deletions  [{path}]                           remove a file or folder
   moves      [{from, to}]                       move a file or folder, its history following
   copies     [{from, to}]                       copy a file or folder
   edits      [{path, old, new, replaceAll?}]    replace an exact string in a text file at the parent
