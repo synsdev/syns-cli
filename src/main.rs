@@ -25,6 +25,19 @@ Environment:
 Every request also carries X-Syns-Install-Id, an anonymous random id kept beside the
 credential in the configuration folder (none is sent where it cannot be kept).";
 
+/// The changeset `syns commit` reads, named on its `-h` and `--help`
+/// (issue 376; `cli-commands/commit/COMMAND_SPEC.md` § Stream Composition).
+const COMMIT_HELP: &str = "\
+Changeset (one JSON object on standard input; every member optional):
+  files      [{path, content | contentBase64}]  write a file whole (contentBase64: standard padded base64)
+  deletions  [{path}]                           remove a file
+  moves      [{from, to}]                       move a file or folder, its history following
+  copies     [{from, to}]                       copy a file or folder
+  edits      [{path, old, new, replaceAll?}]    replace an exact string in a text file at the parent
+
+Example:
+  echo '{\"edits\":[{\"path\":\"README.md\",\"old\":\"v1\",\"new\":\"v2\"}]}' | syns commit --parent 12 -m \"Bump to v2\"";
+
 #[derive(Parser)]
 #[command(
     name = "syns",
@@ -297,6 +310,7 @@ enum Commands {
         write: WriteOpts,
     },
     /// Publish a changeset read from standard input as one commit
+    #[command(after_help = COMMIT_HELP)]
     Commit {
         #[command(flatten)]
         write: WriteOpts,
