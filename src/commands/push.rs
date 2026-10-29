@@ -6,9 +6,7 @@ use clap::Args;
 use crate::auth::token::TokenStore;
 use crate::client::{PushResponse, SynsClient};
 use crate::commands::repo::{CliRepoStatus, CliVisibility};
-use crate::commands::sync::{
-    ensure_identity_file, provenance_from_env, render_outcome, render_transfer_lines,
-};
+use crate::commands::sync::{provenance_from_env, render_outcome, render_transfer_lines};
 use crate::config::Config;
 use crate::errors::{CliError, IdentityRemedy};
 use crate::output::Output;
@@ -17,8 +15,8 @@ use crate::push::collector::{
 };
 use crate::push::converge::{
     ConvergeMode, FolderRoot, SyncOutcome, adopt_forced_publication, check_holder,
-    collect_in_place, converge, identity_holder_synsignore, lay_over_enclosing, read_folder_tree,
-    read_holder_synsignore, read_identity_tree, resolution_elsewhere,
+    collect_in_place, converge, converge_unlinked, identity_holder_synsignore, lay_over_enclosing,
+    read_folder_tree, read_holder_synsignore, read_identity_tree, resolution_elsewhere,
 };
 use crate::push::folder_check::{FOLDER_SEND_BOUND, FolderCheck, named_head};
 use crate::push::smart::{PushPipelineMeta, SmartPushOptions, smart_push};
@@ -27,7 +25,10 @@ use crate::repo::folder::{FolderScope, lies_under, place_under, resolve_folder_s
 use crate::repo::identity::identity_head;
 use crate::repo::if_repo::resolve_or_skip;
 use crate::repo::root::{push_scope, refuse_another_repository, resolve_start_path};
-use crate::repo::syns_yaml::refuse_marked_root_identity;
+use crate::repo::syns_yaml::{
+    SYNS_YAML_FILENAME, identity_file_stands, refuse_marked_root_identity,
+    write_syns_yaml_where_none_stands,
+};
 
 /// The message a publication carries where the invocation names none.
 pub(crate) const DEFAULT_COMMIT_MESSAGE: &str = "push";
@@ -272,9 +273,25 @@ pub async fn cmd_push(config: &Config, output: &Output, args: &PushArgs) -> Resu
         return Ok(());
     }
 
-    // `cmd_push` 4 — a bare publication converges.
-    ensure_identity_file(&copy.root, &owner, &name)?;
-    let converged = converge(&client, Some(&token), &copy, ConvergeMode::Publish, opts).await;
+    // `cmd_push` 4 — a bare publication converges. Issue 386: a
+    // `--name` naming a repository no identity file here names refuses,
+    // at the convergence's head read, a repository already holding a
+    // commit this folder records no base at.
+    let named = args
+        .name
+        .as_deref()
+        .is_some_and(|name| !name.trim().is_empty());
+    let unlinked = named && !identity_file_stands(&copy.root, &owner, &name)?;
+    let wrote = write_syns_yaml_where_none_stands(&copy.root, &owner, &name)?;
+    let converged = if unlinked {
+        converge_unlinked(&client, &token, &copy, opts).await
+    } else {
+        converge(&client, Some(&token), &copy, ConvergeMode::Publish, opts).await
+    };
+    // The refused run leaves the folder as it found it.
+    if wrote && matches!(converged, Err(CliError::NameTaken { .. })) {
+        let _ = std::fs::remove_file(copy.root.join(SYNS_YAML_FILENAME));
+    }
     render_bare(output, &repo_id, converged)
 }
 

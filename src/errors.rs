@@ -245,6 +245,14 @@ pub enum CliError {
     PathExists {
         line: String,
     },
+    /// Issue 386: a bare `syns push --name` from a folder this repository
+    /// never stood in — no identity file naming it, no base recorded —
+    /// where `repo_id` already holds a commit, refused before any write,
+    /// so the folder never joins a repository it did not ask for. Code
+    /// `name_taken`, class `CONFLICT`, exit `1`.
+    NameTaken {
+        repo_id: String,
+    },
 }
 
 /// Which of the two not-text wordings a refused content takes (SPEC
@@ -555,6 +563,7 @@ impl CliError {
             CliError::CheckoutDirty { .. } => "checkout_dirty",
             CliError::PathNotFound { .. } => "not_found",
             CliError::PathExists { .. } => "path_exists",
+            CliError::NameTaken { .. } => "name_taken",
         };
         fixed.to_string()
     }
@@ -1057,6 +1066,10 @@ impl std::fmt::Display for CliError {
             }
             CliError::PathNotFound { line } => write!(f, "{line}"),
             CliError::PathExists { line } => write!(f, "{line}"),
+            CliError::NameTaken { repo_id } => write!(
+                f,
+                "{repo_id} already exists \u{2014} to work in it here, run syns pull {repo_id} .; to start a new repository, push with another name"
+            ),
         }
     }
 }

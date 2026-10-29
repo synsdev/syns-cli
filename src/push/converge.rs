@@ -2923,8 +2923,34 @@ pub async fn converge(
     mode: ConvergeMode,
     opts: SmartPushOptions,
 ) -> Result<SyncOutcome, CliError> {
+    converge_run(client, token, copy, mode, opts, false).await
+}
+
+/// Issue 386: a bare publication into a repository the folder's identity
+/// file does not name — `syns push --name` in a fresh folder — refused
+/// with `CliError::NameTaken` where the folder records no base and the
+/// head read holds a commit, before anything is written or sent; a
+/// repository standing nowhere or holding no commit takes the
+/// publication as `converge` does.
+pub async fn converge_unlinked(
+    client: &SynsClient,
+    token: &str,
+    copy: &WorkingCopy,
+    opts: SmartPushOptions,
+) -> Result<SyncOutcome, CliError> {
+    converge_run(client, Some(token), copy, ConvergeMode::Publish, opts, true).await
+}
+
+async fn converge_run(
+    client: &SynsClient,
+    token: Option<&str>,
+    copy: &WorkingCopy,
+    mode: ConvergeMode,
+    opts: SmartPushOptions,
+    unlinked: bool,
+) -> Result<SyncOutcome, CliError> {
     let before = recorded_at_of(copy);
-    let outcome = converge_locked(client, token, copy, mode, opts).await;
+    let outcome = converge_locked(client, token, copy, mode, opts, unlinked).await;
     // SPEC u291 `converge` 6: with the folder copy's lock released, the
     // base the run recorded is laid over every copy enclosing it.
     lay_recorded_base(copy, before, &outcome);
@@ -3056,6 +3082,7 @@ async fn converge_locked(
     copy: &WorkingCopy,
     mode: ConvergeMode,
     opts: SmartPushOptions,
+    unlinked: bool,
 ) -> Result<SyncOutcome, CliError> {
     let _lock = copy.lock()?;
     if mode == ConvergeMode::Publish {
@@ -3114,6 +3141,7 @@ async fn converge_locked(
                 &staging,
                 Some(folder),
                 &root,
+                unlinked,
             )
             .await
         }
@@ -3146,6 +3174,7 @@ async fn converge_from_resolution(
     staging: &Staging,
     folder: Option<Folder>,
     root: &FolderRoot,
+    unlinked: bool,
 ) -> Result<SyncOutcome, CliError> {
     // 4
     let resolution = copy.resolution()?;
@@ -3194,13 +3223,14 @@ async fn converge_from_resolution(
         folder,
         root,
         resolution.clone(),
+        unlinked,
     )
     .await;
     match first {
         Err(_) if v2reads::take_restart(client) => {
             v2reads::drop_view_head(client);
             converge_from_head(
-                client, token, copy, mode, opts, staging, None, root, resolution,
+                client, token, copy, mode, opts, staging, None, root, resolution, unlinked,
             )
             .await
         }
@@ -3221,6 +3251,7 @@ async fn converge_from_head(
     folder: Option<Folder>,
     root: &FolderRoot,
     resolution: Option<Resolution>,
+    unlinked: bool,
 ) -> Result<SyncOutcome, CliError> {
     // 5 — the one base read, held as its manifest for the written test
     // and as the `Base` every comparison reads.
@@ -3235,6 +3266,20 @@ async fn converge_from_head(
         folder.as_ref().map(|f| &f.hashes),
     )
     .await?;
+    // Issue 386: an unlinked folder recording no base joins no repository
+    // already holding a commit.
+    if unlinked
+        && resolution.is_none()
+        && base.commit.as_deref().is_none_or(str::is_empty)
+        && head
+            .commit
+            .as_deref()
+            .is_some_and(|commit| !commit.is_empty())
+    {
+        return Err(CliError::NameTaken {
+            repo_id: repo_id(copy),
+        });
+    }
     if head.truncated {
         return Ok(SyncOutcome::AttentionRequired(resolution));
     }
@@ -4341,6 +4386,7 @@ async fn continue_locked(
             &staging,
             None,
             &root,
+            false,
         )
         .await;
     };
@@ -4357,6 +4403,7 @@ async fn continue_locked(
             &staging,
             None,
             &root,
+            false,
         )
         .await;
     }

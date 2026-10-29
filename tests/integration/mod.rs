@@ -29,6 +29,7 @@ mod pull_positionals_test;
 mod push_base_parent_test;
 mod push_empty_test;
 mod push_manifest_stub_test;
+mod push_name_taken_test;
 mod push_no_parent_ignore_test;
 mod push_skipped_summary_test;
 mod push_strict_test;

@@ -6,7 +6,7 @@ use super::resolve::RepoIdentity;
 use crate::errors::CliError;
 use crate::push::manifest::Manifest;
 
-const SYNS_YAML_FILENAME: &str = ".syns.yaml";
+pub const SYNS_YAML_FILENAME: &str = ".syns.yaml";
 
 #[derive(Deserialize)]
 struct SynsYaml {
@@ -582,14 +582,21 @@ pub fn write_syns_yaml_where_none_stands(
     owner: &str,
     name: &str,
 ) -> Result<bool, CliError> {
-    if dir.join(SYNS_YAML_FILENAME).exists() {
-        return Ok(false);
-    }
-    if nearest_identity(dir)?.is_some_and(|standing| standing.names(owner, name)) {
+    if identity_file_stands(dir, owner, name)? {
         return Ok(false);
     }
     write_syns_yaml(dir, owner, name)?;
     Ok(true)
+}
+
+/// Whether `write_syns_yaml_where_none_stands` would leave `dir` as it
+/// stands: an identity file in `dir` itself, or the nearest one at or
+/// above it naming `owner/name`, read by its local side.
+pub fn identity_file_stands(dir: &Path, owner: &str, name: &str) -> Result<bool, CliError> {
+    if dir.join(SYNS_YAML_FILENAME).exists() {
+        return Ok(true);
+    }
+    Ok(nearest_identity(dir)?.is_some_and(|standing| standing.names(owner, name)))
 }
 
 /// Repoint the root-form identity file standing in `dir` itself from
