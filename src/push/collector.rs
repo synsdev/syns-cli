@@ -4,7 +4,7 @@ use crate::push::machine_local;
 use crate::push::working_copy::StatRecord;
 use crate::repo::root::{path_is_prefix_ancestor, path_within_prefix, to_forward_slash};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use ignore::overrides::OverrideBuilder;
+use ignore::overrides::{Override, OverrideBuilder};
 use ignore::{Match, WalkBuilder};
 use serde::Serialize;
 use std::borrow::Cow;
@@ -828,10 +828,15 @@ pub fn collect_files(
     let mut machine_local: HashSet<String> = HashSet::new();
     let mut reached: HashSet<String> = HashSet::new();
     let mut gone: HashSet<String> = HashSet::new();
+    let mut gone_dirs: HashSet<String> = HashSet::new();
 
     for result in kept_walker {
-        let Some(entry) = walked(path, result)? else {
-            continue;
+        let entry = match walked(path, result)? {
+            Walked::Entry(entry) => entry,
+            Walked::Gone(at) => {
+                gone_dirs.extend(gone_dir(path, &at));
+                continue;
+            }
         };
         let file_type = match entry.file_type() {
             Some(ft) => ft,
@@ -895,6 +900,62 @@ pub fn collect_files(
         record.entries.retain(|path, _| reached.contains(path));
     }
 
+    let kept = Kept {
+        files: kept_files,
+        too_large,
+        machine_local,
+        gone,
+        gone_dirs,
+    };
+    let (skipped, total_walked) = attribute(path, &opts, &user_overrides, &kept)?;
+
+    Ok(CollectResult {
+        files: kept.files,
+        skipped,
+        total_walked,
+    })
+}
+
+/// What the kept walk hands the attribution walk: the files it kept, and
+/// those it left out for a reason of its own.
+#[derive(Default)]
+struct Kept {
+    files: HashMap<String, CollectedFile>,
+    too_large: HashSet<String>,
+    machine_local: HashSet<String>,
+    /// Files gone at their read (issue 368).
+    gone: HashSet<String>,
+    /// Folders gone when the walk read them (issue 368), `/`-separated
+    /// and relative to the walk root.
+    gone_dirs: HashSet<String>,
+}
+
+impl Kept {
+    /// Whether `rel_path` is a folder gone at the kept walk, standing again
+    /// as a file, or lies under one, compared by whole path components.
+    fn under_gone_dir(&self, rel_path: &Path) -> bool {
+        !self.gone_dirs.is_empty()
+            && rel_path
+                .ancestors()
+                .filter_map(to_forward_slash)
+                .any(|folder| self.gone_dirs.contains(&folder))
+    }
+}
+
+/// A gone folder's `Kept::gone_dirs` entry: its path `at`, which `walked`
+/// found below `root`, relative to `root` and `/`-separated.
+fn gone_dir(root: &Path, at: &Path) -> Option<String> {
+    at.strip_prefix(root).ok().and_then(to_forward_slash)
+}
+
+/// Every file below `path` the kept walk did not keep, with the reason it
+/// was left out, sorted, and how many files were walked.
+fn attribute(
+    path: &Path,
+    opts: &CollectOptions,
+    user_overrides: &Override,
+    kept: &Kept,
+) -> Result<(Vec<SkippedFile>, usize), CliError> {
     // 5 — attribution. Walk 2: full enumeration — yields every file
     // regardless of hierarchical filters (only .git is excluded
     // unconditionally). The difference between this set and the kept set
@@ -956,7 +1017,7 @@ pub fn collect_files(
     let mut total_walked: usize = 0;
 
     for result in full_walker {
-        let Some(entry) = walked(path, result)? else {
+        let Walked::Entry(entry) = walked(path, result)? else {
             continue;
         };
 
@@ -981,20 +1042,21 @@ pub fn collect_files(
         };
 
         // A file gone at its read (issue 368) is absent: neither kept nor
-        // skipped, whatever stands there again by this walk.
-        if gone.contains(&rel_path_str) {
+        // skipped, whatever stands there again by this walk; so is every
+        // file under a folder gone when the kept walk read it (issue 392).
+        if kept.gone.contains(&rel_path_str) || kept.under_gone_dir(&rel_path_buf) {
             continue;
         }
 
         total_walked += 1;
 
-        if kept_files.contains_key(&rel_path_str) {
+        if kept.files.contains_key(&rel_path_str) {
             continue;
         }
 
-        let reason = if too_large.contains(&rel_path_str) {
+        let reason = if kept.too_large.contains(&rel_path_str) {
             SkipReason::TooLarge
-        } else if machine_local.contains(&rel_path_str) {
+        } else if kept.machine_local.contains(&rel_path_str) {
             SkipReason::MachineLocal
         } else if !opts.no_default_excludes && in_default_exclude_dir(&rel_path_buf) {
             SkipReason::DefaultExcludeDir
@@ -1040,11 +1102,7 @@ pub fn collect_files(
     // stderr renderer trivial and tests deterministic.
     skipped.sort_by(|a, b| (a.reason as u8, &a.path).cmp(&(b.reason as u8, &b.path)));
 
-    Ok(CollectResult {
-        files: kept_files,
-        skipped,
-        total_walked,
-    })
+    Ok((skipped, total_walked))
 }
 
 /// What one file the kept walk listed answers.
@@ -1076,14 +1134,23 @@ fn present<T>(read: std::io::Result<T>) -> std::io::Result<Option<T>> {
     }
 }
 
-/// A walk's next entry, none where a folder the walk listed below `root`
-/// is gone by the time the walk reads it, removed or replaced by a file:
-/// what stood in it is absent, as a file gone at its read is (issue 368).
+/// What a walk's next result answers.
+#[derive(Debug)]
+enum Walked {
+    Entry(ignore::DirEntry),
+    /// A folder the walk listed below its root, gone by the time the walk
+    /// read it, at this path.
+    Gone(PathBuf),
+}
+
+/// A walk's next entry, or the folder the walk listed below `root` that is
+/// gone by the time the walk reads it, removed or replaced by a file: what
+/// stood in it is absent, as a file gone at its read is (issues 368, 392).
 /// The root's own error, and every other, stays an error.
 fn walked(
     root: &Path,
     result: Result<ignore::DirEntry, ignore::Error>,
-) -> Result<Option<ignore::DirEntry>, CliError> {
+) -> Result<Walked, CliError> {
     fn listed_at(err: &ignore::Error) -> Option<&Path> {
         match err {
             ignore::Error::WithPath { path, .. } => Some(path),
@@ -1092,16 +1159,17 @@ fn walked(
         }
     }
     match result {
-        Ok(entry) => Ok(Some(entry)),
-        Err(err)
-            if err.io_error().is_some_and(is_gone)
-                && listed_at(&err).is_some_and(|at| at != root && at.starts_with(root)) =>
-        {
-            Ok(None)
-        }
-        Err(err) => Err(CliError::Io {
-            message: format!("walk error: {err}"),
-        }),
+        Ok(entry) => Ok(Walked::Entry(entry)),
+        Err(err) => match listed_at(&err) {
+            Some(at)
+                if err.io_error().is_some_and(is_gone) && at != root && at.starts_with(root) =>
+            {
+                Ok(Walked::Gone(at.to_path_buf()))
+            }
+            _ => Err(CliError::Io {
+                message: format!("walk error: {err}"),
+            }),
+        },
     }
 }
 
@@ -2927,8 +2995,9 @@ pub(crate) mod tests {
         assert!(err.to_string().contains("could not read sub"), "{err}");
     }
 
-    // Issue 368: a folder gone under the walk, below its root, is absent;
-    // the root's own error and every other stay errors.
+    // Issue 368: a folder gone under the walk, below its root, is absent,
+    // and issue 392: the walk names it; the root's own error and every
+    // other stay errors.
     #[test]
     fn a_folder_gone_under_the_walk_is_absent() {
         let root = Path::new("/w");
@@ -2938,15 +3007,36 @@ pub(crate) mod tests {
         };
         assert!(matches!(
             walked(root, Err(error_at("/w/d54", std::io::ErrorKind::NotFound))),
-            Ok(None)
+            Ok(Walked::Gone(at)) if at == Path::new("/w/d54")
         ));
         assert!(matches!(
             walked(
                 root,
                 Err(error_at("/w/a/d54", std::io::ErrorKind::NotADirectory))
             ),
-            Ok(None)
+            Ok(Walked::Gone(at)) if at == Path::new("/w/a/d54")
         ));
+        let depth = ignore::Error::WithDepth {
+            depth: 1,
+            err: Box::new(error_at("/w/d54", std::io::ErrorKind::NotFound)),
+        };
+        assert!(matches!(
+            walked(root, Err(depth)),
+            Ok(Walked::Gone(at)) if at == Path::new("/w/d54")
+        ));
+        // The kept walk records it relative to the root it walked.
+        for (root, at, rel) in [
+            ("/w", "/w/a/d54", "a/d54"),
+            ("/w/", "/w/a/d54", "a/d54"),
+            (".", "./a/d54", "a/d54"),
+            ("w", "w/d54", "d54"),
+        ] {
+            assert_eq!(
+                gone_dir(Path::new(root), Path::new(at)).as_deref(),
+                Some(rel),
+                "{at} under {root}"
+            );
+        }
         for err in [
             error_at("/w", std::io::ErrorKind::NotFound),
             error_at("/elsewhere/d54", std::io::ErrorKind::NotFound),
@@ -2985,5 +3075,52 @@ pub(crate) mod tests {
                 assert!(walked(dir.path(), Err(err)).is_err());
             }
         }
+    }
+
+    // Issue 392: a folder gone when the kept walk read it, and back by the
+    // attribution walk, is absent from that walk too: none of its files is
+    // walked or skipped, nor is a file standing where it stood, and a
+    // sibling whose name it begins is attributed.
+    #[test]
+    fn a_folder_gone_at_the_kept_walk_is_absent_from_attribution() {
+        let dir = tempfile::tempdir().unwrap();
+        for file in ["d/x", "d/e/y", "d2/x", "dx"] {
+            let at = dir.path().join(file);
+            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+            std::fs::write(at, "x").unwrap();
+        }
+        let no_overrides = OverrideBuilder::new(dir.path()).build().unwrap();
+        for (gone, attributed) in [
+            ("d", vec!["d2/x", "dx"]),
+            ("d/e", vec!["d/x", "d2/x", "dx"]),
+        ] {
+            let kept = Kept {
+                gone_dirs: HashSet::from([gone.to_string()]),
+                ..Kept::default()
+            };
+            let (skipped, total_walked) =
+                attribute(dir.path(), &CollectOptions::default(), &no_overrides, &kept).unwrap();
+            let paths: Vec<&str> = skipped.iter().map(|s| s.path.as_str()).collect();
+            assert_eq!(paths, attributed, "{gone} gone");
+            assert_eq!(total_walked, attributed.len(), "{gone} gone");
+        }
+
+        let replaced = tempfile::tempdir().unwrap();
+        std::fs::write(replaced.path().join("d"), "a file now").unwrap();
+        std::fs::write(replaced.path().join("dx"), "x").unwrap();
+        let kept = Kept {
+            gone_dirs: HashSet::from(["d".to_string()]),
+            ..Kept::default()
+        };
+        let (skipped, total_walked) = attribute(
+            replaced.path(),
+            &CollectOptions::default(),
+            &no_overrides,
+            &kept,
+        )
+        .unwrap();
+        let paths: Vec<&str> = skipped.iter().map(|s| s.path.as_str()).collect();
+        assert_eq!(paths, vec!["dx"]);
+        assert_eq!(total_walked, 1);
     }
 }
