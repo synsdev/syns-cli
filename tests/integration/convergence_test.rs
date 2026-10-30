@@ -2659,6 +2659,94 @@ async fn guard_refusal_recomputes_against_the_newest_head() {
     assert_eq!(read(&dir, "z.md"), "z2\n");
 }
 
+// Issue 391: a checkout and a folder copy inside it send the same edit at
+// once; the refused send's recomputation against the head finds no local
+// work and no collision, so the run takes in the head's other changes,
+// records the head and answers synced, writing no resolution and sending
+// nothing more.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_send_refused_by_a_head_holding_its_change_ends_synced() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let h0 = e.fake.commit(&[("a.md", "a0\n"), ("b.md", "b0\n")]);
+    checkout(&e.fake, &copy, &h0);
+    write_files(&dir, &[("a.md", "a1\n")]);
+    e.fake
+        .move_head_before_next_push(&[("a.md", Some("a1\n")), ("b.md", Some("b1\n"))]);
+
+    let outcome = converge(
+        &e.fake.client(),
+        Some(TOKEN),
+        &copy,
+        ConvergeMode::Publish,
+        e.opts(),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        matches!(
+            outcome,
+            SyncOutcome::Synced {
+                published: None,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert!(copy.resolution().unwrap().is_none());
+    assert_eq!(read(&dir, "a.md"), "a1\n");
+    assert_eq!(read(&dir, "b.md"), "b1\n");
+    assert_eq!(e.fake.push_bodies().len(), 1, "a send after the refusal");
+    let (h1, _) = e.fake.head();
+    assert_eq!(e.fake.tree_at(&h1).len(), 2);
+
+    // The next run finds nothing to do and publishes nothing.
+    let again = converge(
+        &e.fake.client(),
+        Some(TOKEN),
+        &copy,
+        ConvergeMode::Publish,
+        e.opts(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(again, SyncOutcome::NoChanges), "{again:?}");
+    assert_eq!(e.fake.push_bodies().len(), 1);
+    assert_eq!(e.fake.head().0, h1);
+}
+
+// Issue 391: a refused send whose copy holds local work the head lacks
+// still asks for review, the resolution naming that work alone.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_send_refused_by_a_head_holding_part_of_its_work_names_the_rest() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let h0 = e.fake.commit(&[("a.md", "a0\n"), ("c.md", "c0\n")]);
+    checkout(&e.fake, &copy, &h0);
+    write_files(&dir, &[("a.md", "a1\n"), ("c.md", "c1\n")]);
+    e.fake.move_head_before_next_push(&[("a.md", Some("a1\n"))]);
+
+    let outcome = converge(
+        &e.fake.client(),
+        Some(TOKEN),
+        &copy,
+        ConvergeMode::Publish,
+        e.opts(),
+    )
+    .await
+    .unwrap();
+
+    let resolution = expect_resolution(outcome);
+    assert_eq!(resolution.local_paths, vec!["c.md".to_string()]);
+    assert!(resolution.collisions.is_empty());
+    assert_eq!(e.fake.push_bodies().len(), 1);
+}
+
 // ---- issue 242 (D-148): a review holds across disjoint head moves ------
 
 /// The published commit and its response, or a panic naming the outcome.
@@ -4650,13 +4738,15 @@ async fn a_refused_sync_sending_only_a_written_identity_file_writes_no_resolutio
     );
 }
 
-// u306 CR5-1: a refused sync sending the identity text a retrieval wrote
-// beside other work keeps u256's forced resolution, though the head the
-// recomputation reads took that work alike, since the folder's difference
-// from the refused parent is not the identity text alone.
+// u306 CR5-1, issue 391 (Q-0218): a refused sync sending the identity text
+// a retrieval wrote beside other work the head took alike finds no local
+// work and no collision against that head, so it writes no resolution, as
+// the identity text sent alone does: the head recorded as the base and
+// nothing published, the next publication at the base's commit carrying
+// the file.
 #[tokio::test(flavor = "current_thread")]
 #[serial]
-async fn a_refused_sync_sending_a_written_identity_file_beside_work_the_head_took_writes_a_resolution()
+async fn a_refused_sync_sending_a_written_identity_file_beside_work_the_head_took_writes_no_resolution()
  {
     let e = env().await;
     let fake = Fake::start().await;
@@ -4667,18 +4757,43 @@ async fn a_refused_sync_sending_a_written_identity_file_beside_work_the_head_too
     write_files(folder.path(), &[(".syns.yaml", IDENTITY), ("b.md", "b\n")]);
     fake.move_head_before_next_push(&[("b.md", Some("b\n"))]);
 
-    let resolution = expect_resolution(publish(&fake, &copy, &e).await);
+    let outcome = publish(&fake, &copy, &e).await;
 
-    assert!(resolution.local_paths.is_empty(), "{resolution:?}");
-    assert!(resolution.collisions.is_empty(), "{resolution:?}");
     assert!(
-        !resolution
-            .combined_paths
-            .contains(&".syns.yaml".to_string()),
-        "{resolution:?}"
+        matches!(
+            outcome,
+            SyncOutcome::Synced {
+                published: None,
+                ..
+            }
+        ),
+        "{outcome:?}"
     );
-    assert_ne!(fake.head().0, h0);
+    assert!(copy.resolution().unwrap().is_none());
+    assert_eq!(fake.push_bodies().len(), 1);
+    let (h1, files) = fake.head();
+    assert_ne!(h1, h0);
+    assert!(!files.contains_key(".syns.yaml"), "{files:?}");
+    assert_eq!(copy.base().unwrap().commit_sha(), Some(h1.as_str()));
+    assert_eq!(base_identity_entry(&copy), None);
     assert_eq!(read(folder.path(), ".syns.yaml"), IDENTITY);
+
+    let next = publish(&fake, &copy, &e).await;
+
+    assert!(
+        matches!(
+            next,
+            SyncOutcome::Synced {
+                published: Some(_),
+                ..
+            }
+        ),
+        "{next:?}"
+    );
+    assert_eq!(
+        fake.head().1.get(".syns.yaml").map(String::as_str),
+        Some(IDENTITY)
+    );
 }
 
 // ---- u318: a head at the base's commit naming a path otherwise ------------

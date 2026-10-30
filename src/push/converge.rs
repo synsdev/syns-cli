@@ -2098,12 +2098,13 @@ struct Candidate<'a> {
     /// The resolution a recomputation keeps the recovery id and round of.
     existing: Option<Resolution>,
     /// Write a resolution whatever the reconciliation finds
-    /// (`publish_reviewed` 8), but where the pass holds the root identity
-    /// file out: the held record a retrieval wrote is no local work, so a
-    /// recomputation finding no local path, no collision and no resolution
+    /// (`publish_reviewed` 8), but where the recomputation finds no local
+    /// path: one finding no local path, no collision and no resolution
     /// standing records the head as the base and answers synced, nothing
-    /// published (SPEC u306 `converge` 5, under Q-01) — and that only where
-    /// `sent_identity_alone` holds.
+    /// published — after a send the head already holds (issue 391), or one
+    /// differing from its parent in the root identity file alone while the
+    /// pass holds that file out, the held record a retrieval wrote being no
+    /// local work (SPEC u306 `converge` 5, under Q-01).
     force_resolution: bool,
     /// Whether the refused send's tree differed from the refused parent in
     /// the root identity file alone (`SAGA-cli-converge` step 6, u306
@@ -2536,7 +2537,12 @@ async fn prepare_candidate(
         // root identity file out, after a send differing from its parent
         // in that file alone, is forced to no resolution, so one finding
         // no local path, no collision and none standing records the head.
-        let forced = candidate.force_resolution && !(holding && candidate.sent_identity_alone);
+        // Issue 391: so is one finding no local path at all — the head
+        // already holding what the refused send carried, as when a checkout
+        // and a folder copy inside it send the same edit at once.
+        let forced = candidate.force_resolution
+            && !(holding && candidate.sent_identity_alone)
+            && !(local_paths.is_empty() && rec.local_only.is_empty());
         let resolving = forced
             || resolution.is_some()
             || !collisions.is_empty()
@@ -4233,10 +4239,10 @@ async fn take_in_disjoint_move(
 /// prepare the candidate again over the newest head with the refused
 /// parent standing as the base — forced to a resolution but where the
 /// refused send's tree `sent` differed from that parent in the root
-/// identity file alone and the recomputation holds that file out, which,
-/// finding no other local work, answers synced carrying no publication,
-/// the head recorded as the base (SPEC u306 `converge` 5, under Q-01,
-/// u306 CR5-1).
+/// identity file alone and the recomputation holds that file out, or
+/// where the head already holds what was sent (issue 391), which, finding
+/// no other local work, answers synced carrying no publication, the head
+/// recorded as the base (SPEC u306 `converge` 5, under Q-01, u306 CR5-1).
 #[allow(clippy::too_many_arguments)]
 async fn guard_refused(
     client: &SynsClient,
