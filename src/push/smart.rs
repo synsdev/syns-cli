@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -356,12 +356,23 @@ fn build_push_entries(
 
     let mut deletes = Vec::new();
     if !force {
+        // A file above the scope that a collected file must pass through is
+        // named all the same: the run's file needs a folder where it stands.
+        let passed_through: HashSet<&str> = if prefix.is_some() {
+            local_files
+                .keys()
+                .flat_map(|p| proper_ancestors(p))
+                .collect()
+        } else {
+            HashSet::new()
+        };
         for path in reference_shas.keys() {
             if local_files.contains_key(path) {
                 continue;
             }
             if let Some(prefix) = prefix
                 && !path_within_prefix(path, prefix)
+                && !passed_through.contains(path.as_str())
             {
                 continue;
             }
@@ -372,6 +383,73 @@ fn build_push_entries(
     }
 
     Ok((entries, deletes))
+}
+
+/// Every folder on `path`'s way: each proper prefix ending before a `/`.
+fn proper_ancestors(path: &str) -> impl Iterator<Item = &str> {
+    path.match_indices('/').map(move |(i, _)| &path[..i])
+}
+
+/// What a forced run's files take out of the head `head` holds (its file
+/// paths, counted as the collection is): the folder standing at a collected
+/// file's path, and the file standing where a collected file's folder must
+/// stand, each by its own path, each once, in path order.
+fn type_change_deletions<'a>(
+    collected: impl Iterator<Item = &'a String>,
+    head: &HashMap<String, String>,
+    folder: Option<&str>,
+) -> Vec<PushDeleteEntry> {
+    let head_folders: HashSet<&str> = head.keys().flat_map(|p| proper_ancestors(p)).collect();
+    let mut named: BTreeSet<&str> = BTreeSet::new();
+    for path in collected {
+        if head_folders.contains(path.as_str()) {
+            named.insert(path.as_str());
+        }
+        for above in proper_ancestors(path) {
+            if head.contains_key(above) {
+                named.insert(above);
+            }
+        }
+    }
+    named
+        .into_iter()
+        .map(|path| PushDeleteEntry {
+            path: wire_path(folder, path).into_owned(),
+        })
+        .collect()
+}
+
+/// Where each deletion of a split publication rides, `sent` naming each
+/// request's files (wire paths) in send order: one at or under a file's
+/// path rides the request carrying that file; one at a file whose folder a
+/// sent file needs rides the first request carrying such a file, and no
+/// later one; every other deletion rides the last request.
+fn place_deletions(
+    deletions: &[PushDeleteEntry],
+    sent: &[Vec<String>],
+) -> Vec<Vec<PushDeleteEntry>> {
+    let mut carrying: HashMap<&str, usize> = HashMap::new();
+    let mut beneath: HashMap<&str, usize> = HashMap::new();
+    for (k, files) in sent.iter().enumerate() {
+        for file in files {
+            carrying.entry(file.as_str()).or_insert(k);
+            for above in proper_ancestors(file) {
+                beneath.entry(above).or_insert(k);
+            }
+        }
+    }
+    let last = sent.len().saturating_sub(1);
+    let mut placed: Vec<Vec<PushDeleteEntry>> = vec![Vec::new(); sent.len().max(1)];
+    for deletion in deletions {
+        let path = deletion.path.as_str();
+        let k = std::iter::once(path)
+            .chain(proper_ancestors(path))
+            .find_map(|at| carrying.get(at).copied())
+            .or_else(|| beneath.get(path).copied())
+            .unwrap_or(last);
+        placed[k].push(deletion.clone());
+    }
+    placed
 }
 
 /// The one hash-only entry a run that changes and deletes nothing sends
@@ -780,8 +858,10 @@ async fn publish_pass(
 /// budget or the file bound) and as a 413 fallback (when the wire returns
 /// `PayloadTooLarge`). Only the pending entries are packed: every
 /// hash-only entry rides the first batch's frame and is counted against
-/// its budget, and the deletions ride the last (SPEC u280 `smart_push`
-/// 4, issue 186). Each batch's body is built only as that batch is sent,
+/// its budget, and the deletions ride as `place_deletions` places them: a
+/// type change's with the file it makes way for, every other in the last
+/// (SPEC u280 `smart_push` 4, issue 186; push-of-a-file-over-a-folder-
+/// names-what-it-removes C-b). Each batch's body is built only as that batch is sent,
 /// so no batch's bytes are held before or after it.
 ///
 /// Best-effort: a single entry whose materialised content alone
@@ -804,9 +884,11 @@ async fn publish_pass(
 /// these intermediate snapshots included: seeding them from the
 /// published set alone dropped every out-of-scope path from a scoped
 /// publication large enough to chunk. What an intermediate snapshot
-/// does NOT do is take the run's deletions out — those ride on the
-/// final batch alone, so a run failing before it has deleted nothing.
-/// The final batch's save is left to `smart_push` Phase 6, which lays
+/// does NOT do is take the run's deletions out — every deletion but a
+/// type change's rides on the final batch, so a run failing before it
+/// has deleted nothing else; a type change's deletions an earlier batch
+/// carried stay in that snapshot, which no run reads (`D-166`). The final
+/// batch's save is left to `smart_push` Phase 6, which lays
 /// the full `local_shas` map over the same base and takes the
 /// deletion list out there.
 async fn chunked_push(
@@ -818,6 +900,27 @@ async fn chunked_push(
     let batches = pack_batches(pending, batch_overheads(base_request));
 
     let n = batches.len();
+
+    // Each deletion rides the request carrying the file it makes way for,
+    // the rest the last (FEATURE_SPEC § 3 C-b of
+    // push-of-a-file-over-a-folder-names-what-it-removes).
+    let sent: Vec<Vec<String>> = batches
+        .iter()
+        .enumerate()
+        .map(|(k, batch)| {
+            let hash_only = if k == 0 { &base_request.files[..] } else { &[] };
+            hash_only
+                .iter()
+                .map(|e| e.path.clone())
+                .chain(
+                    batch
+                        .iter()
+                        .map(|e| wire_path(target.folder, &e.path).into_owned()),
+                )
+                .collect()
+        })
+        .collect();
+    let placed = place_deletions(base_request.deletions.as_deref().unwrap_or(&[]), &sent);
 
     // Short-circuit if no chunking actually needed: the one body is the
     // request as it stands with the batch filled beside it. The push is
@@ -896,8 +999,8 @@ async fn chunked_push(
         if k1 == 1 {
             frame.files = base_request.files.clone();
         }
-        if k1 == n {
-            frame.deletions = base_request.deletions.clone();
+        if !placed[k].is_empty() {
+            frame.deletions = Some(placed[k].clone());
         }
         // The batch's body is built only now, as it is sent.
         let body = match fill_batch(
@@ -941,9 +1044,9 @@ async fn chunked_push(
                 }
                 previous_commit_sha = Some(response.commit_sha.clone());
                 // Per-batch manifest save (HIGH-2): only for intermediate
-                // batches, and taking NO deletion out. The deletions ride
-                // on the final batch alone, so a run that fails before it
-                // has not deleted anything yet; a snapshot that dropped
+                // batches, and taking NO deletion out. Every deletion but a
+                // type change's rides on the final batch, so a run that
+                // fails before it has deleted nothing else; a snapshot that dropped
                 // them would leave the next run finding those paths in
                 // neither the record nor its walk, naming no deletion,
                 // and the server keeping them for good. The Phase 6 write
@@ -1101,6 +1204,28 @@ fn holds_no_commit(err: &CliError) -> bool {
             ..
         } => error == "validation_error",
         _ => false,
+    }
+}
+
+/// The server's refusal of a file whose write would take out an entry the
+/// publication names nowhere, as the run reads it (FEATURE_SPEC § 3 C-e):
+/// the path standing, counted from the scoped folder where it lies under
+/// it, code `path_exists`. Every other refusal passes through.
+fn publication_refusal(err: CliError, repo_id: &str, folder: Option<&str>) -> CliError {
+    match &err {
+        CliError::Api {
+            status: Some(409),
+            error,
+            context: Some(ApiErrorContext::PathRefusal { reason, path }),
+        } if error == "conflict" && reason == "destination_exists" => {
+            let shown = counted_back(folder, path).unwrap_or(path);
+            CliError::PathExists {
+                line: format!(
+                    "{shown} already exists in {repo_id}; this publication names nothing that removes it"
+                ),
+            }
+        }
+        _ => err,
     }
 }
 
@@ -1317,7 +1442,7 @@ pub async fn smart_push(
     // write it does not make. A run changing and deleting nothing sends
     // the one entry `standing_head_entry` names, so it is still answered
     // with the standing head.
-    let (pending, deletes) = build_push_entries(
+    let (pending, mut deletes) = build_push_entries(
         path,
         &local_files,
         &reference_shas,
@@ -1325,6 +1450,28 @@ pub async fn smart_push(
         opts.prefix.as_deref(),
         folder.as_deref(),
     )?;
+    // A forced run names, against the head it reads, the entries its files
+    // replace (FEATURE_SPEC § 3 C-d): the read a run with no base already
+    // made, else the folder's tree at its tip, else the repository's.
+    if opts.force {
+        let head: HashMap<String, String> = match (&opts.reference, folder.as_deref()) {
+            (Some(reference), _) => reference.clone(),
+            (None, _) if on_the_head_alone => record_base.clone(),
+            (None, Some(scoped)) if !scoped.is_empty() => {
+                crate::push::converge::read_folder_tree(client, Some(token), repo_id, scoped, None)
+                    .await?
+                    .files
+                    .into_iter()
+                    .collect()
+            }
+            (None, _) => match client.pull(repo_id, Some(token)).await {
+                Ok(tree) => tree_to_sha_map(&tree),
+                Err(err) if holds_no_commit(&err) => HashMap::new(),
+                Err(e) => return Err(e),
+            },
+        };
+        deletes = type_change_deletions(local_files.keys(), &head, folder.as_deref());
+    }
     // `D-166`, ruled on verify: claiming the head stands in for a base
     // the folder does not hold. With no base there is no right parent for
     // the server's head check to refuse, so the run refuses for it: a
@@ -1336,7 +1483,9 @@ pub async fn smart_push(
     // reference set is empty, so it names no update and no deletion here.
     // A run adding only paths the head lacks overwrites nothing and goes
     // on; one changing nothing is answered with the standing head.
-    if let Some(head) = head_read.as_deref() {
+    if let Some(head) = head_read.as_deref()
+        && !opts.force
+    {
         let updates = pending.iter().any(|p| reference_shas.contains_key(&p.path));
         if updates || !deletes.is_empty() {
             return Err(crate::client::head_moved(head));
@@ -1440,11 +1589,19 @@ pub async fn smart_push(
             Err(refusal) => refusal,
         };
         if resent || !refusal.resendable {
-            return Err(refusal.error);
+            return Err(publication_refusal(
+                refusal.error,
+                repo_id,
+                folder.as_deref(),
+            ));
         }
         let named = named_hash_only(&refusal.error, &request.files, folder.as_deref());
         if named.is_empty() {
-            return Err(refusal.error);
+            return Err(publication_refusal(
+                refusal.error,
+                repo_id,
+                folder.as_deref(),
+            ));
         }
         resent = true;
         for named_path in &named {
@@ -2098,11 +2255,22 @@ mod tests {
         assert!(result.is_ok());
 
         let requests = mock_server.received_requests().await.unwrap();
-        // Only PUT requests, no GET (force doesn't fetch tree)
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].method, reqwest::Method::PUT);
+        // One PUT, after the one tree read a forced run makes to name what
+        // its files replace at the head (push-of-a-file-over-a-folder-names-
+        // what-it-removes, C-d).
+        let gets: Vec<_> = requests
+            .iter()
+            .filter(|r| r.method == reqwest::Method::GET)
+            .collect();
+        assert_eq!(gets.len(), 1);
+        assert!(gets[0].url.path().ends_with("/tree"), "{}", gets[0].url);
+        let puts: Vec<_> = requests
+            .iter()
+            .filter(|r| r.method == reqwest::Method::PUT)
+            .collect();
+        assert_eq!(puts.len(), 1);
 
-        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&puts[0].body).unwrap();
         let files = body["files"].as_array().unwrap();
         let a_entry = files.iter().find(|f| f["path"] == "a.txt").unwrap();
         assert!(
@@ -3379,7 +3547,13 @@ mod unclaimed_parent_tests {
         assert_eq!(meta.sent_parent, None, "a forced body claims no parent");
         assert_eq!(meta.unclaimed_parent.as_deref(), Some(RECORDED));
 
-        let body: serde_json::Value = server.received_requests().await.unwrap()[0]
+        let body: serde_json::Value = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.method == reqwest::Method::PUT)
+            .unwrap()
             .body_json()
             .unwrap();
         assert!(
@@ -3460,6 +3634,17 @@ mod unclaimed_parent_tests {
     async fn a_forced_folder_run_names_its_declined_parent() {
         let server = MockServer::start().await;
         mount_push(&server).await;
+        // The folder's tree at its tip, which a forced run reads to name
+        // what its files replace there.
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::path_regex(
+                "^/api/v1/repos/alice/notes/tree",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "entries": [], "commitSha": RECORDED, "truncated": false,
+            })))
+            .mount(&server)
+            .await;
         let folder = tempfile::tempdir().unwrap();
         std::fs::write(folder.path().join("a.md"), "a").unwrap();
         let cache = tempfile::tempdir().unwrap();
@@ -3474,7 +3659,17 @@ mod unclaimed_parent_tests {
         assert_eq!(meta.sent_parent, None);
         assert_eq!(meta.unclaimed_parent.as_deref(), Some("p"));
         let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 1, "a folder run reads no tree");
+        let reads: Vec<_> = requests
+            .iter()
+            .filter(|r| r.method == reqwest::Method::GET)
+            .map(|r| r.url.path().to_string())
+            .collect();
+        assert_eq!(
+            reads,
+            ["/api/v1/repos/alice/notes/tree/clients/q3"],
+            "a forced folder run reads the folder's tree alone"
+        );
+        assert_eq!(requests.len(), 2);
     }
 
     /// SPEC u302 `converge` 3: an empty `folder` sends every path as
@@ -5197,5 +5392,375 @@ mod issue303_tests {
             record.file_sha("sub/new.txt").is_some(),
             "the head still holds it"
         );
+    }
+}
+
+/// work/push-of-a-file-over-a-folder-names-what-it-removes (FEATURE_SPEC
+/// § 3): a publication names what each of its files removes, in the
+/// request carrying the file; `--force` names it against the head it reads;
+/// the server's refusal of one that does not reads as `path_exists`.
+#[cfg(test)]
+mod type_change_tests {
+    use super::*;
+    use crate::push::hash::blob_sha1;
+    use wiremock::matchers::{method, path, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const HEAD: &str = "aa11bb22cc33dd44ee55ff6600778899001122bb";
+
+    fn opts(cache: &Path, force: bool) -> SmartPushOptions {
+        SmartPushOptions {
+            force,
+            message: "push".to_string(),
+            author: None,
+            parent_sha: None,
+            excludes: vec![],
+            stores: crate::config::StoreRoots::resolve(Some(cache), cache, cache),
+            description: None,
+            tags: None,
+            status: None,
+            visibility: None,
+            strict: false,
+            allow_empty: false,
+            debug: false,
+            no_default_excludes: false,
+            prefix: None,
+            reference: None,
+            expected: None,
+            provenance: None,
+            collected: None,
+            held: None,
+            json_output: false,
+            renders_publication_summary: false,
+            folder: None,
+            declined_parent: None,
+            base_record: None,
+        }
+    }
+
+    fn base(files: &[(&str, &str)]) -> Manifest {
+        let mut manifest = Manifest::default();
+        manifest.update(
+            HEAD.to_string(),
+            files
+                .iter()
+                .map(|(p, c)| (p.to_string(), blob_sha1(c.as_bytes())))
+                .collect(),
+        );
+        manifest
+    }
+
+    async fn mount_tree(server: &MockServer, files: &[(&str, &str)]) {
+        let entries: Vec<serde_json::Value> = files
+            .iter()
+            .map(|(p, c)| {
+                serde_json::json!({
+                    "name": p.rsplit('/').next().unwrap(), "path": p,
+                    "type": "file", "size": c.len(), "sha": blob_sha1(c.as_bytes()),
+                })
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path_regex("^/api/v1/repos/alice/repo/tree"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "entries": entries, "commitSha": HEAD, "truncated": false,
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_push(server: &MockServer) {
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/repos/alice/repo/push"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "commitSha": "b".repeat(40), "version": 2,
+                "filesChanged": 1, "created": false,
+            })))
+            .mount(server)
+            .await;
+    }
+
+    fn folder_with(files: &[(&str, &[u8])]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (p, c) in files {
+            let at = dir.path().join(p);
+            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+            std::fs::write(at, c).unwrap();
+        }
+        // The identity file a publication run writes is no part of these rows.
+        std::fs::write(dir.path().join(".synsignore"), ".syns.yaml\n.synsignore\n").unwrap();
+        dir
+    }
+
+    async fn bodies(server: &MockServer) -> Vec<serde_json::Value> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method == reqwest::Method::PUT)
+            .map(|r| r.body_json().unwrap())
+            .collect()
+    }
+
+    fn deletions(body: &serde_json::Value) -> Vec<String> {
+        let mut paths: Vec<String> = body
+            .get("deletions")
+            .and_then(|d| d.as_array())
+            .map(|d| {
+                d.iter()
+                    .map(|e| e["path"].as_str().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        paths.sort();
+        paths
+    }
+
+    fn files_of(body: &serde_json::Value) -> Vec<String> {
+        let mut paths: Vec<String> = body["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["path"].as_str().unwrap().to_string())
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    /// C-b: each type change's deletions ride the request carrying its
+    /// file, the file on the way's in the first such request alone; every
+    /// other deletion rides the last.
+    #[test]
+    fn deletions_are_placed_with_the_file_they_make_way_for() {
+        let del = |paths: &[&str]| -> Vec<PushDeleteEntry> {
+            paths
+                .iter()
+                .map(|p| PushDeleteEntry {
+                    path: p.to_string(),
+                })
+                .collect()
+        };
+        let sent: Vec<Vec<String>> = vec![
+            vec!["x".into(), "d/e.md".into()],
+            vec!["big".into(), "d/f.md".into()],
+            vec!["small".into()],
+        ];
+        let placed = place_deletions(&del(&["x/a.md", "x/sub/c.md", "d", "gone.md", "xy"]), &sent);
+        let paths = |k: usize| -> Vec<&str> { placed[k].iter().map(|d| d.path.as_str()).collect() };
+        assert_eq!(paths(0), ["x/a.md", "x/sub/c.md", "d"]);
+        assert!(
+            paths(1).is_empty(),
+            "no later request names d: {:?}",
+            paths(1)
+        );
+        assert_eq!(paths(2), ["gone.md", "xy"]);
+        // A folder named by its own path rides with the file at it.
+        let placed = place_deletions(&del(&["x", "gone.md"]), &sent);
+        assert_eq!(placed[0].len(), 1);
+        assert_eq!(placed[0][0].path, "x");
+        assert_eq!(placed[2][0].path, "gone.md");
+    }
+
+    /// C2: a split publication: the request carrying `x` names the folder's
+    /// files, the one carrying `d/e.md` names `d`, the plain deletion rides
+    /// the last.
+    #[tokio::test]
+    async fn a_split_publication_carries_each_type_change_whole() {
+        let server = MockServer::start().await;
+        mount_push(&server).await;
+        let big = vec![b'a'; 15 * 1024 * 1024];
+        let big2 = vec![b'b'; 14 * 1024 * 1024];
+        let folder = folder_with(&[("x", &big), ("big2", &big2), ("d/e.md", b"e\n")]);
+        let cache = tempfile::tempdir().unwrap();
+        let client = SynsClient::new(&server.uri()).unwrap();
+        smart_push(
+            &client,
+            "t",
+            "alice/repo",
+            folder.path(),
+            SmartPushOptions {
+                base_record: Some(base(&[
+                    ("x/a.md", "a\n"),
+                    ("x/b.md", "b\n"),
+                    ("d", "d\n"),
+                    ("gone.md", "g\n"),
+                ])),
+                ..opts(cache.path(), false)
+            },
+        )
+        .await
+        .unwrap();
+        let sent = bodies(&server).await;
+        assert_eq!(sent.len(), 2, "two requests");
+        assert_eq!(files_of(&sent[0]), ["x"]);
+        assert_eq!(deletions(&sent[0]), ["x/a.md", "x/b.md"]);
+        assert_eq!(files_of(&sent[1]), ["big2", "d/e.md"]);
+        assert_eq!(deletions(&sent[1]), ["d", "gone.md"]);
+    }
+
+    /// F0, F1, F2, F3: `--force` reads the head and names, as its only
+    /// deletions, the folder at a file's path and the file on a file's way,
+    /// with a base and without one; meeting no type change it names none.
+    #[tokio::test]
+    async fn a_forced_run_names_what_its_files_replace_at_the_head() {
+        for with_base in [false, true] {
+            let server = MockServer::start().await;
+            mount_tree(
+                &server,
+                &[
+                    ("k.md", "k\n"),
+                    ("x/a.md", "a\n"),
+                    ("x/sub/c.md", "c\n"),
+                    ("d", "d\n"),
+                    ("other.md", "o\n"),
+                ],
+            )
+            .await;
+            mount_push(&server).await;
+            let folder = folder_with(&[("x", b"file\n"), ("d/e.md", b"e\n"), ("k.md", b"k2\n")]);
+            let cache = tempfile::tempdir().unwrap();
+            let client = SynsClient::new(&server.uri()).unwrap();
+            smart_push(
+                &client,
+                "t",
+                "alice/repo",
+                folder.path(),
+                SmartPushOptions {
+                    // F2: the base holds neither the folder nor the file.
+                    base_record: with_base.then(|| base(&[("k.md", "k\n")])),
+                    ..opts(cache.path(), true)
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("with base {with_base}: {e}"));
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|r| r.method == reqwest::Method::GET)
+                    .count(),
+                1,
+                "one tree read"
+            );
+            let sent = bodies(&server).await;
+            assert_eq!(sent.len(), 1);
+            assert_eq!(deletions(&sent[0]), ["d", "x"], "with base {with_base}");
+            assert!(sent[0].get("parentSha").is_none());
+        }
+
+        // F3: no type change, no deletions key.
+        let server = MockServer::start().await;
+        mount_tree(&server, &[("k.md", "k\n"), ("x/a.md", "a\n")]).await;
+        mount_push(&server).await;
+        let folder = folder_with(&[("k.md", b"k2\n"), ("x/b.md", b"b\n")]);
+        let cache = tempfile::tempdir().unwrap();
+        let client = SynsClient::new(&server.uri()).unwrap();
+        smart_push(
+            &client,
+            "t",
+            "alice/repo",
+            folder.path(),
+            opts(cache.path(), true),
+        )
+        .await
+        .unwrap();
+        let sent = bodies(&server).await;
+        assert!(sent[0].get("deletions").is_none(), "{}", sent[0]);
+    }
+
+    /// C4, C5: a scoped run names a file above its scope that its files pass
+    /// through; with no base that deletion refuses the run before any push.
+    #[tokio::test]
+    async fn a_scoped_run_names_the_file_its_files_pass_through() {
+        let server = MockServer::start().await;
+        mount_push(&server).await;
+        let folder = folder_with(&[("d/sub/e.md", b"e\n"), ("k.md", b"k\n")]);
+        let cache = tempfile::tempdir().unwrap();
+        let client = SynsClient::new(&server.uri()).unwrap();
+        smart_push(
+            &client,
+            "t",
+            "alice/repo",
+            folder.path(),
+            SmartPushOptions {
+                prefix: Some("d/sub".into()),
+                base_record: Some(base(&[("d", "d\n"), ("k.md", "k\n"), ("gone.md", "g\n")])),
+                ..opts(cache.path(), false)
+            },
+        )
+        .await
+        .unwrap();
+        let sent = bodies(&server).await;
+        assert_eq!(files_of(&sent[0]), ["d/sub/e.md"]);
+        assert_eq!(deletions(&sent[0]), ["d"], "gone.md lies outside the scope");
+
+        // C5: no base.
+        let server = MockServer::start().await;
+        mount_tree(&server, &[("d", "d\n"), ("k.md", "k\n")]).await;
+        mount_push(&server).await;
+        let client = SynsClient::new(&server.uri()).unwrap();
+        let err = smart_push(
+            &client,
+            "t",
+            "alice/repo",
+            folder.path(),
+            SmartPushOptions {
+                prefix: Some("d/sub".into()),
+                ..opts(cache.path(), false)
+            },
+        )
+        .await
+        .expect_err("refused");
+        assert!(
+            crate::push::folder_check::named_head(&err).is_some(),
+            "{err}"
+        );
+        assert!(bodies(&server).await.is_empty());
+    }
+
+    /// C-e: the server's refusal of a type change the publication does not
+    /// name reads as `path_exists`, the path counted from a scoped folder.
+    #[tokio::test]
+    async fn the_refusal_reads_as_path_exists() {
+        for (folder_path, served, shown) in [
+            (None, "x", "x"),
+            (Some("clients/vela"), "clients/vela/x", "x"),
+            (Some("clients/vela"), "clients", "clients"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("PUT"))
+                .and(path("/api/v1/repos/alice/repo/push"))
+                .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                    "error": "conflict", "reason": "destination_exists", "path": served,
+                    "message": format!("Path already exists: {served}"),
+                })))
+                .mount(&server)
+                .await;
+            mount_tree(&server, &[]).await;
+            let folder = folder_with(&[("x", b"file\n")]);
+            let cache = tempfile::tempdir().unwrap();
+            let client = SynsClient::new(&server.uri()).unwrap();
+            let err = smart_push(
+                &client,
+                "t",
+                "alice/repo",
+                folder.path(),
+                SmartPushOptions {
+                    folder: folder_path.map(String::from),
+                    ..opts(cache.path(), true)
+                },
+            )
+            .await
+            .expect_err("refused");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "{shown} already exists in alice/repo; this publication names nothing that removes it"
+                ),
+                "{folder_path:?}"
+            );
+            assert_eq!(err.code(), "path_exists");
+        }
     }
 }

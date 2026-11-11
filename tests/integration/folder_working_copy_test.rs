@@ -1417,13 +1417,24 @@ fn a_scoped_or_forced_push_inside_a_folder_stands_on_the_folder_base() {
     assert!(err.contains("--force claimed no parent"), "{err}");
     assert!(err.contains(&landed), "{err}");
 
-    for request in d.requests_since(mark) {
+    // The scoped run reads no tree; the forced one reads the folder's tree
+    // at its tip alone, to name what its files replace there
+    // (push-of-a-file-over-a-folder-names-what-it-removes, C-d).
+    let all = d.requests_since(mark);
+    let forced_requests = d.requests_since(mark_forced);
+    for request in &all[..all.len() - forced_requests.len()] {
         assert!(
             !decoded(request.url.path()).starts_with(&format!("{PREFIX}/tree")),
             "a tree was read: {}",
             request.url
         );
     }
+    let trees: Vec<String> = forced_requests
+        .iter()
+        .map(|r| decoded(r.url.path()))
+        .filter(|p| p.starts_with(&format!("{PREFIX}/tree")))
+        .collect();
+    assert_eq!(trees, [format!("{PREFIX}/tree/{FOLDER}")], "{trees:?}");
     assert!(!d.local_record().exists(), "a local record was written");
 }
 
