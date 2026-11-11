@@ -18,7 +18,17 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo install --locked cargo-audit
-      - run: cargo audit
+      # Blocks only on an advisory a patched release clears; one with no
+      # patched release is reported by security-report.yml and blocks nothing.
+      - name: cargo audit
+        run: |
+          cargo audit --json > "$RUNNER_TEMP/cargo-audit.json" || true
+          jq -e '.vulnerabilities.list | type == "array"' "$RUNNER_TEMP/cargo-audit.json" > /dev/null
+          jq -r '.vulnerabilities.list[] | "\(.advisory.id) \(.package.name) \(.package.version), patched: \(.versions.patched | if length == 0 then "none" else join(" or ") end)"' "$RUNNER_TEMP/cargo-audit.json"
+          if jq -e '[.vulnerabilities.list[] | select(.versions.patched | length > 0)] | length > 0' "$RUNNER_TEMP/cargo-audit.json" > /dev/null; then
+            cargo audit
+            exit 1
+          fi
       - run: cargo test --workspace --locked
 
   convergence-windows:
