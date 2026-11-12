@@ -195,14 +195,12 @@ pub(crate) fn refuse_reference_spelling(value: &str) -> Result<(), CliError> {
 /// under `syns rm` would name the folder or nothing at all.
 pub const EMPTY_PATH_REFUSAL: &str = "path cannot be empty";
 
-/// Refuses a typed path left empty once every character the `file path`
-/// field kind trims is taken off its ends (SPEC u297 Contract Surface,
-/// `refuse_empty_path`). The set is ECMAScript's `String.prototype.trim`,
-/// which the server applies, rather than Rust's `char::is_whitespace`:
-/// `U+FEFF` is taken off and `U+0085` is not, so the refusal answers
-/// exactly where the server would read the path as empty.
+/// Refuses a typed path that is empty (SPEC u297 Contract Surface,
+/// `refuse_empty_path`). A path is taken as written, as the server takes
+/// it (`INV-30`): white space at either end is part of it, so a path of
+/// white space alone is a name and only the empty string names nothing.
 pub fn refuse_empty_path(typed: &str) -> Result<(), CliError> {
-    if typed.chars().all(trimmed_by_the_file_path_field_kind) {
+    if typed.is_empty() {
         return Err(CliError::Config {
             message: EMPTY_PATH_REFUSAL.to_string(),
         });
@@ -210,32 +208,13 @@ pub fn refuse_empty_path(typed: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Whether ECMAScript's `String.prototype.trim` takes `c` off an end:
-/// its WhiteSpace and LineTerminator productions.
 /// A tree path as the server reads it (276 row 17, `queryPath`): every
-/// trailing `/` taken off, then what ECMAScript's `trim` takes off its
-/// ends (`filePathSchema`). The closure's first block, and so the view's
-/// scope, name the path so read (roadmap 279, REVIEW-syns-cli I1).
+/// trailing `/` taken off, nothing else changed — white space at either
+/// end is part of the path (`INV-30`). The closure's first block, and so
+/// the view's scope, name the path so read (roadmap 279, REVIEW-syns-cli
+/// I1).
 pub fn as_server_reads(path: &str) -> &str {
     path.trim_end_matches('/')
-        .trim_matches(trimmed_by_the_file_path_field_kind)
-}
-
-fn trimmed_by_the_file_path_field_kind(c: char) -> bool {
-    matches!(
-        c,
-        '\u{0009}'..='\u{000D}'
-            | '\u{0020}'
-            | '\u{00A0}'
-            | '\u{1680}'
-            | '\u{2000}'..='\u{200A}'
-            | '\u{2028}'
-            | '\u{2029}'
-            | '\u{202F}'
-            | '\u{205F}'
-            | '\u{3000}'
-            | '\u{FEFF}'
-    )
 }
 
 /// Binds the repository, resolves the reference, and pins the pair as
@@ -534,7 +513,7 @@ pub fn repository_argument(
 
 /// A path typed for the `files` answer of `syns cat PATH…` as a path in
 /// the repository (D-242 Amended §7): `repository_argument`'s mapping,
-/// with a value left empty once trimmed, and every value resolving to
+/// with the empty value, and every value resolving to
 /// the repository's root or to the scoped folder itself (`.`, `a/..`),
 /// refused as the empty path before any request, inside a folder or not.
 pub fn listed_argument(folder: Option<&FolderScope>, typed: &str) -> Result<String, CliError> {
@@ -885,13 +864,20 @@ mod tests {
     #[test]
     fn repository_argument_refuses_an_empty_value_inside_a_folder_alone() {
         let folder = q3();
-        for typed in ["", "  ", "\u{FEFF}"] {
-            let err = repository_argument(Some(&folder), Some(typed)).unwrap_err();
-            assert!(
-                matches!(&err, CliError::Config { message } if message == "path cannot be empty"),
-                "{typed:?} answered {err:?}"
+        let err = repository_argument(Some(&folder), Some("")).unwrap_err();
+        assert!(
+            matches!(&err, CliError::Config { message } if message == "path cannot be empty"),
+            "answered {err:?}"
+        );
+        assert_eq!(err.exit_code(), 1);
+        // White space alone is a name, joined under the folder as typed.
+        for typed in ["  ", "\u{FEFF}"] {
+            assert_eq!(
+                repository_argument(Some(&folder), Some(typed))
+                    .unwrap()
+                    .as_deref(),
+                Some(format!("clients/q3/{typed}").as_str())
             );
-            assert_eq!(err.exit_code(), 1);
         }
         assert_eq!(
             repository_argument(Some(&folder), None).unwrap().as_deref(),
@@ -909,22 +895,30 @@ mod tests {
         );
     }
 
-    // SPEC u297 Contract Surface, `refuse_empty_path`: the set
-    // ECMAScript's `String.prototype.trim` takes off, never `U+0085`.
+    // SPEC u297 Contract Surface, `refuse_empty_path`: only the empty
+    // string names nothing; white space at either end is part of a path.
     #[test]
-    fn refuse_empty_path_takes_off_the_file_path_field_kind_set() {
-        let every_trimmed = "\u{9}\u{A}\u{B}\u{C}\u{D}\u{20}\u{A0}\u{1680}\u{2000}\u{200A}\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}\u{FEFF}";
-        for typed in ["", "\u{3000}\t\u{FEFF}", every_trimmed] {
-            let err = refuse_empty_path(typed).unwrap_err();
-            assert_eq!(
-                err.to_string(),
-                "configuration error: path cannot be empty",
-                "{typed:?}"
-            );
-        }
-        for typed in ["\u{0085}", "a", " a ", "\u{FEFF}a"] {
+    fn refuse_empty_path_refuses_the_empty_string_alone() {
+        let err = refuse_empty_path("").unwrap_err();
+        assert_eq!(err.to_string(), "configuration error: path cannot be empty");
+        for typed in [
+            " ",
+            "\u{3000}\t\u{FEFF}",
+            "\u{0085}",
+            "a",
+            " a ",
+            "\u{FEFF}a",
+        ] {
             assert!(refuse_empty_path(typed).is_ok(), "{typed:?} was refused");
         }
+    }
+
+    #[test]
+    fn as_server_reads_keeps_white_space_at_either_end() {
+        assert_eq!(as_server_reads(" sub/"), " sub");
+        assert_eq!(as_server_reads("trail.md "), "trail.md ");
+        assert_eq!(as_server_reads(" "), " ");
+        assert_eq!(as_server_reads("docs//"), "docs");
     }
     use serial_test::serial;
     use wiremock::matchers::{method, path};

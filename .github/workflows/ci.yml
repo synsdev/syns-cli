@@ -40,6 +40,9 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
       - run: cargo test --locked --test cli_integration convergence
       - run: cargo test --locked --lib push::working_copy
+      # A name Windows cannot hold, judged where it stands on disk: counted
+      # from a folder checked out alone, never by the folder's own name.
+      - run: cargo test --locked --lib push::converge::tests::head_of_judges
       # The name `syns login` sends for this computer, read from Windows itself.
       - run: cargo test --locked --lib syns_machine
       # issue 325: Windows is the only platform whose `syns upgrade` unpacks a

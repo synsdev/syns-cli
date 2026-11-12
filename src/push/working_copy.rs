@@ -78,6 +78,111 @@ pub(crate) fn holds_in_root_home(path: &str) -> bool {
         .any(|seg| seg.eq_ignore_ascii_case(IN_ROOT_HOME))
 }
 
+/// Why Windows cannot hold a served path as a file on disk, none where it
+/// can: a segment ending in a space or a dot, which Windows drops and so
+/// names another file; a reserved device name, with or without an
+/// extension; or a character Windows refuses in a name, `\` among them,
+/// which it reads as a separator. Answered on every platform, so the rule
+/// is tested everywhere; `not_held_here` applies it on Windows alone.
+pub(crate) fn not_held_by_windows(path: &str) -> Option<String> {
+    const RESERVED: [&str; 32] = [
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        "COM0",
+        "COM1",
+        "COM2",
+        "COM3",
+        "COM4",
+        "COM5",
+        "COM6",
+        "COM7",
+        "COM8",
+        "COM9",
+        "LPT0",
+        "LPT1",
+        "LPT2",
+        "LPT3",
+        "LPT4",
+        "LPT5",
+        "LPT6",
+        "LPT7",
+        "LPT8",
+        "LPT9",
+        "COM\u{B9}",
+        "COM\u{B2}",
+        "COM\u{B3}",
+        "LPT\u{B9}",
+        "LPT\u{B2}",
+        "LPT\u{B3}",
+        "CONIN$",
+        "CONOUT$",
+    ];
+    for segment in path.split('/') {
+        if let Some(c) = segment
+            .chars()
+            .find(|c| matches!(c, '<' | '>' | ':' | '"' | '\\' | '|' | '?' | '*'))
+        {
+            return Some(format!("a name holding {c:?}"));
+        }
+        if segment.ends_with(' ') {
+            return Some("a name ending in a space".to_string());
+        }
+        if segment.ends_with('.') {
+            return Some("a name ending in a dot".to_string());
+        }
+        let stem = segment
+            .split('.')
+            .next()
+            .unwrap_or(segment)
+            .trim_end_matches(' ');
+        if RESERVED.iter().any(|name| name.eq_ignore_ascii_case(stem)) {
+            return Some(format!("the reserved name {stem}"));
+        }
+    }
+    None
+}
+
+/// Why this platform's file system cannot hold a served path, none where
+/// it can (`not_held_by_windows`, on Windows alone).
+pub(crate) fn not_held_here(path: &str) -> Option<String> {
+    if cfg!(windows) {
+        not_held_by_windows(path)
+    } else {
+        None
+    }
+}
+
+/// Whether a served path is left out of the folder: `served`, the path as
+/// the request's address names it, in the in-root home, or `local`, the
+/// same path counted from the scope (the place it would take on disk), a
+/// name this platform cannot hold. The scope's own name is never judged:
+/// it stands on disk under whatever directory the run was given. Such a
+/// path reads as absent from every head a convergence or a retrieval
+/// reads, so no run writes, removes, compares or publishes a deletion of
+/// it, and the server keeps it as it stands. A name this platform cannot
+/// hold is named once a run, on stderr, with the reason.
+pub(crate) fn left_out_here(served: &str, local: &str) -> bool {
+    if holds_in_root_home(served) {
+        return true;
+    }
+    let path = local;
+    let Some(reason) = not_held_here(path) else {
+        return false;
+    };
+    static NAMED: std::sync::Mutex<std::collections::BTreeSet<String>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let first = NAMED
+        .lock()
+        .map(|mut named| named.insert(path.to_string()))
+        .unwrap_or(true);
+    if first {
+        eprintln!("  warning: could not write {path:?}: Windows cannot hold {reason}");
+    }
+    true
+}
+
 /// Create the in-root home `dir` where it does not stand, at mode `0700`
 /// holding a `.gitignore` whose one line is `*`, and set its mode to
 /// `0700`; one standing as a link or owned by another account is refused
@@ -1707,6 +1812,58 @@ fn is_unsupported_flush(_err: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A name Windows cannot hold, in any segment: one ending in a space
+    // or a dot, a reserved device name with or without an extension, or
+    // one holding a character Windows refuses; any other name it holds,
+    // white space at a name's start included.
+    #[test]
+    fn not_held_by_windows_names_each_reason() {
+        for (path, reason) in [
+            ("trail.md ", "a name ending in a space"),
+            (" ", "a name ending in a space"),
+            ("d-sp /c.md", "a name ending in a space"),
+            ("notes.", "a name ending in a dot"),
+            ("a/b./c.md", "a name ending in a dot"),
+            ("con.md", "the reserved name con"),
+            ("x/NUL", "the reserved name NUL"),
+            ("Com1.txt", "the reserved name Com1"),
+            ("lpt\u{B9}.md", "the reserved name lpt\u{B9}"),
+            ("x/a:b.md", "a name holding ':'"),
+            ("a\\b.md", "a name holding '\\\\'"),
+            ("q?.md", "a name holding '?'"),
+        ] {
+            assert_eq!(
+                not_held_by_windows(path).as_deref(),
+                Some(reason),
+                "{path:?}"
+            );
+        }
+        for path in [
+            " lead.md",
+            " sub/x.md",
+            "console.md",
+            "con-x.md",
+            "a.b.md",
+            ".env",
+            "\u{3000}a",
+        ] {
+            assert_eq!(not_held_by_windows(path), None, "{path:?}");
+        }
+        assert_eq!(not_held_here("trail.md ").is_some(), cfg!(windows));
+    }
+
+    // The in-root home is judged on the path as served, a name this
+    // platform cannot hold on the path counted from the scope, so a scope
+    // whose own name Windows cannot hold leaves nothing under it out.
+    #[test]
+    fn left_out_here_judges_a_name_where_it_stands_on_disk() {
+        assert!(!left_out_here("d-sp /c.md", "c.md"));
+        assert!(!left_out_here("d-sp /.syns.yaml", ".syns.yaml"));
+        assert_eq!(left_out_here("d-sp /t.md ", "t.md "), cfg!(windows));
+        assert!(left_out_here("d-sp /.syns-state/x", ".syns-state/x"));
+        assert!(left_out_here(".syns-state/x", ".syns-state/x"));
+    }
 
     #[cfg(unix)]
     fn unsupported() -> std::io::Error {

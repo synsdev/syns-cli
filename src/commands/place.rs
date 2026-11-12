@@ -16,7 +16,7 @@ use crate::output::Output;
 use crate::push::converge::check_server_path;
 use crate::push::folder_check::{FolderCheck, folder_unmoved_until, named_head};
 use crate::push::hash::blob_sha1;
-use crate::push::working_copy::{WorkingCopy, holds_in_root_home};
+use crate::push::working_copy::{WorkingCopy, holds_in_root_home, left_out_here, not_held_here};
 use crate::read::{refuse_reference_spelling, version_not_found_refusal};
 use crate::repo::folder::{
     FolderScope, current_dir, folder_checkout, place_under, resolve_folder_scope,
@@ -355,8 +355,14 @@ pub async fn cmd_place(
 ) -> Result<(), CliError> {
     let template = template.to_ascii_lowercase();
 
-    // 1 — the typed path.
+    // 1 — the typed path; a folder this platform cannot hold would stand
+    // on disk under another name (Windows drops a trailing space or dot).
     let path = placement_path(&path)?;
+    if let Some(reason) = not_held_here(&path) {
+        return Err(CliError::Config {
+            message: format!("{path:?} names a folder Windows cannot hold: {reason}"),
+        });
+    }
 
     // 2 — the version spelling.
     if let Some(version) = version.as_deref() {
@@ -461,11 +467,19 @@ pub async fn cmd_place(
         .map(|entry| (entry.path, entry.sha.unwrap_or_default()))
         .collect();
     files.sort();
+    // Each path checked as the holder will store it, under the folder: so
+    // a root `a:b.md`, which Windows reads as a drive prefix on its own,
+    // is checked as a name, published, and left out of the local write
+    // alone, while every other breach still refuses the placement.
     for (served, _) in &files {
-        check_server_path(served)?;
+        if let Err(err) = check_server_path(&format!("{request_path}/{served}")) {
+            return Err(check_server_path(served).err().unwrap_or(err));
+        }
     }
     // SPEC u298 `IN_ROOT_HOME`: a template path in the in-root home is
     // neither written into the folder nor carried into the publication.
+    // One this platform cannot hold is carried, and only its local write
+    // left out (`write_folder`).
     files.retain(|(served, _)| !holds_in_root_home(served));
     if let Some((nested, _)) = files
         .iter()
@@ -702,6 +716,11 @@ fn write_folder(folder: &Path, placed: &[Placed], identity: &str) -> Result<(), 
     let failed = |at: &Path, err: std::io::Error| (at.to_path_buf(), err.to_string());
     std::fs::create_dir_all(folder).map_err(|e| failed(folder, e))?;
     for file in placed {
+        // A name this platform cannot hold is named and not written; the
+        // publication carries it, and every later run holds it out.
+        if left_out_here(&file.path, &file.path) {
+            continue;
+        }
         let at = folder.join(&file.path);
         if let Some(parent) = at.parent() {
             std::fs::create_dir_all(parent).map_err(|e| failed(parent, e))?;

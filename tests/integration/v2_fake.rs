@@ -686,16 +686,13 @@ impl State {
                 _ => error(404, "not_found"),
             },
             // A path segment that names nothing (`tree/`, `tree//`) is no
-            // path the server finds, and one blank once trimmed fails its
-            // schema (`filePathSchema`), as the server answers them.
+            // path the server finds, as the server answers it; any other
+            // path is taken as written, white space at its ends included.
             ("GET", "tree") if rest.contains('/') && after.trim_matches('/').is_empty() => {
                 error(404, "not_found")
             }
-            ("GET", "tree") if rest.contains('/') && after.trim().is_empty() => {
-                error(422, "validation_error")
-            }
             ("GET", "tree") => self.v1_tree(
-                after.trim_end_matches('/').trim(),
+                after.trim_end_matches('/'),
                 at,
                 query.get("recursive").map(String::as_str) == Some("true"),
             ),
@@ -949,10 +946,10 @@ impl State {
             Err(reply) => return reply,
         };
         // The path as 276 reads it (`queryPath`): every trailing `/` off,
-        // then the field kind's trim.
+        // white space at either end kept as part of it.
         let path = query
             .get("path")
-            .map(|p| p.trim_end_matches('/').trim().to_string())
+            .map(|p| p.trim_end_matches('/').to_string())
             .unwrap_or_default();
         let commit = &self.commits[i];
         let tag = format!(

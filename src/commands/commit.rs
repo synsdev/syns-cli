@@ -210,11 +210,12 @@ pub fn changeset_members(
     }
 }
 
-/// A `files` or `deletions` path as the overlap rules compare it: what
-/// the server trims taken off, then its dot segments resolved lexically
-/// (roadmap 228; roadmap 292 compares an edit's paths against them).
+/// A `files` or `deletions` path as the overlap rules compare it: every
+/// trailing `/` taken off, white space at either end kept, then its dot
+/// segments resolved lexically (roadmap 228; roadmap 292 compares an
+/// edit's paths against them).
 pub fn lexical_path(path: &str) -> String {
-    let read = as_server_reads(as_server_reads(path));
+    let read = as_server_reads(path);
     resolve_lexically(read).unwrap_or_else(|| read.to_string())
 }
 

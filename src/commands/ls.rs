@@ -185,7 +185,6 @@ fn is_not_found(err: &CliError) -> bool {
 /// `ls FILE/.` refuse a file: it ends in `/` or in a `.` segment, before
 /// the dot segments resolve or a scoped folder maps it.
 fn asks_for_a_folder(typed: &str) -> bool {
-    let typed = typed.trim_end();
     typed.ends_with('/') || typed.rsplit('/').next() == Some(".")
 }
 

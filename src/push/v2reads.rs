@@ -17,7 +17,7 @@ use crate::client::SynsClient;
 use crate::errors::CliError;
 use crate::push::collector::{HeldBytes, MAX_FILE_BYTES};
 use crate::push::hash::blob_sha1;
-use crate::push::working_copy::{WorkingCopy, folder_base, holds_in_root_home};
+use crate::push::working_copy::{WorkingCopy, folder_base, left_out_here};
 use crate::read::batch::{Ask, FILE_ALONE_BYTES, Frame, IN_FLIGHT, Sink, read_chunks};
 use crate::read::run::{RunReads, ViewHead, now_secs};
 use crate::read::store::{Store, is_blob_hash};
@@ -90,7 +90,7 @@ fn head_from(view: &View, place: &Place) -> Head {
     let mut files = BTreeMap::new();
     let mut sizes = BTreeMap::new();
     for (path, entry) in &view.entries {
-        if !entry.is_file() || holds_in_root_home(&place.remote(path)) {
+        if !entry.is_file() || left_out_here(&place.remote(path), path) {
             continue;
         }
         files.insert(path.clone(), entry.sha.clone());

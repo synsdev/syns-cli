@@ -141,10 +141,9 @@ fn r27_ls_and_glob_equal_v1s() {
             &["--json", "ls", "docs/", "--recursive"],
             &["glob", "*.md", "--path", "docs/"],
             &["--json", "glob", "**", "--path", "docs//"],
-            // A path that names nothing once trimmed keeps v1 (VERIFY D1).
+            // A path that names nothing keeps v1 (VERIFY D1).
             &["ls", ""],
             &["ls", "/"],
-            &["ls", " "],
             &["--json", "ls", ""],
             &["ls", "", "--version", "1"],
             &["glob", "*", "--path", ""],
@@ -404,8 +403,8 @@ fn r30_max_bytes_over_frames() {
     assert!(!env.store().join("blobs").join(blob(&big)).exists());
 }
 
-// VERIFY D1: a typed path naming nothing once trimmed is refused as the
-// base binary refuses it, through v1.
+// VERIFY D1: a typed path naming nothing is refused as the base binary
+// refuses it, through v1.
 #[test]
 fn d1_a_path_naming_nothing_refuses_as_today() {
     let env = Env::new();
@@ -415,7 +414,6 @@ fn d1_a_path_naming_nothing_refuses_as_today() {
         (vec!["ls", ""], "error: path not found: \n"),
         (vec!["ls", "/"], "error: path not found: /\n"),
         (vec!["glob", "*", "--path", ""], "error: path not found: \n"),
-        (vec!["ls", " "], "validation_error"),
     ] {
         env.fake.clear();
         let out = env.run(&dir, &args);
@@ -427,5 +425,52 @@ fn d1_a_path_naming_nothing_refuses_as_today() {
             "{args:?}: {:?}",
             env.fake.routes()
         );
+    }
+}
+
+// A path is taken as written: `ls ' sub'` lists the folder ` sub` and
+// never its sibling `sub`, and `ls 'trail.md '` names that file, not
+// `trail.md`; over v1 and v2 alike.
+#[test]
+fn ls_takes_a_path_with_white_space_at_an_end_as_written() {
+    for v2 in [false, true] {
+        let env = Env::new();
+        env.fake.v2(v2);
+        env.fake.commit(&[
+            (" sub/x.md", b"x\n".as_slice()),
+            ("sub/y.md", b"y\n".as_slice()),
+            ("trail.md ", b"trail space\n".as_slice()),
+            ("trail.md", b"plain trail\n".as_slice()),
+        ]);
+        let dir = work(&env);
+        let out = env.run(&dir, &["--json", "ls", " sub"]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "v2 {v2}: {} {} {:?}",
+            String::from_utf8_lossy(&out.stderr),
+            String::from_utf8_lossy(&out.stdout),
+            env.fake.routes()
+        );
+        let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let names: Vec<&str> = doc["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["x.md"], "v2 {v2}: {doc}");
+        let out = env.run(&dir, &["--json", "ls", "trail.md "]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "v2 {v2}: {} {} {:?}",
+            String::from_utf8_lossy(&out.stderr),
+            String::from_utf8_lossy(&out.stdout),
+            env.fake.routes()
+        );
+        let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(doc["entries"][0]["path"], "trail.md ", "v2 {v2}: {doc}");
+        assert_eq!(doc["entries"][0]["size"], 12, "v2 {v2}: {doc}");
     }
 }

@@ -680,7 +680,6 @@ fn row29_empty_root_and_climbing_paths_are_refused_before_any_request() {
     mount_repo(&d, HEAD_SHA);
     for (args, line) in [
         (["", "b.md"], "error: configuration error: path cannot be empty\n".to_string()),
-        (["a.md", "  "], "error: configuration error: path cannot be empty\n".to_string()),
         (
             [".", "b"],
             "error: configuration error: . names the repository's root; name a file counted from it\n"
@@ -1403,11 +1402,6 @@ fn member_paths_are_cleaned_alike_under_every_binding() {
             "error: configuration error: cannot move a/b to a/b: they are the same path\n",
         ),
         (
-            "a ",
-            "a",
-            "error: configuration error: cannot move a to a: they are the same path\n",
-        ),
-        (
             "/a",
             "b",
             "error: configuration error: /a names no path inside the repository; name one counted from its root\n",
@@ -1443,9 +1437,54 @@ fn member_paths_are_cleaned_alike_under_every_binding() {
             json!([{"from": "a/b", "to": "c", "type": "file", "files": 1}]),
         ),
     );
-    let out = d.run(&["mv", "a//b", "c ", "--parent", HEAD_SHA, "--repo", REPO]);
+    let out = d.run(&["mv", "a//b", "c/", "--parent", HEAD_SHA, "--repo", REPO]);
     assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
     assert_eq!(d.pushes()[0]["moves"], json!([{"from": "a/b", "to": "c"}]));
+}
+
+// A path is taken as written: white space at either end is part of it,
+// so `syns mv ' sub' x` moves ` sub` and never its sibling `sub`, and a
+// path of white space alone is a name.
+#[test]
+#[serial]
+fn member_paths_keep_white_space_at_either_end() {
+    let d = Deployment::new();
+    mount_repo(&d, HEAD_SHA);
+    mount_push_answer(
+        &d,
+        200,
+        member_answer(
+            8,
+            1,
+            "moves",
+            json!([{"from": " sub", "to": "x ", "type": "folder", "files": 1}]),
+        ),
+    );
+    let out = d.run(&["mv", " sub", "x ", "--parent", HEAD_SHA, "--repo", REPO]);
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(
+        d.pushes()[0]["moves"],
+        json!([{"from": " sub", "to": "x "}])
+    );
+
+    let d = Deployment::new();
+    mount_repo(&d, HEAD_SHA);
+    mount_push_answer(
+        &d,
+        200,
+        member_answer(
+            8,
+            1,
+            "copies",
+            json!([{"from": " lead.md", "to": " ", "type": "file", "files": 1}]),
+        ),
+    );
+    let out = d.run(&["cp", " lead.md", " ", "--parent", HEAD_SHA, "--repo", REPO]);
+    assert_eq!(exit_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(
+        d.pushes()[0]["copies"],
+        json!([{"from": " lead.md", "to": " "}])
+    );
 }
 
 // M2 (D-256 §6, the scoped-folder half): inside a folder bound to its

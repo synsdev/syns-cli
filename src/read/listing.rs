@@ -91,7 +91,7 @@ pub async fn list(
     path: Option<&str>,
     recursive: bool,
 ) -> Result<Option<(TreeResponse, serde_json::Value)>, CliError> {
-    // A typed path that names nothing once trimmed (`''`, `/`, `' '`) keeps
+    // A typed path that names nothing once its trailing `/` go (`''`, `/`) keeps
     // today's v1 read, so its refusal is the base binary's (VERIFY D1);
     // only a path naming something goes to v2.
     if path.is_some_and(|typed| crate::read::as_server_reads(typed).is_empty()) {

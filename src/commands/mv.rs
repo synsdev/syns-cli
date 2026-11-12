@@ -108,6 +108,21 @@ mod tests {
         assert_eq!(member.to, "z");
     }
 
+    // A path is taken as written: white space at either end is part of
+    // it, so ` sub` names ` sub` and never its sibling `sub`.
+    #[test]
+    fn member_paths_keep_white_space_at_either_end() {
+        let member = member_for(MemberKind::Move, None, " sub", "x ").unwrap();
+        assert_eq!(member.from, " sub");
+        assert_eq!(member.to, "x ");
+        let member = member_for(MemberKind::Copy, None, " lead.md", " ").unwrap();
+        assert_eq!(member.from, " lead.md");
+        assert_eq!(member.to, " ");
+        let member = member_for(MemberKind::Move, None, "trail /", "\u{3000}a.md").unwrap();
+        assert_eq!(member.from, "trail ");
+        assert_eq!(member.to, "\u{3000}a.md");
+    }
+
     // FEATURE_SPEC row 29: `TO` equal to, under or above `FROM`, naming
     // both.
     #[test]
@@ -147,7 +162,6 @@ mod tests {
     fn empty_root_and_climbing_paths_are_refused() {
         for (from, to, line) in [
             ("", "b", "configuration error: path cannot be empty"),
-            ("a", " ", "configuration error: path cannot be empty"),
             (
                 "/",
                 "b",

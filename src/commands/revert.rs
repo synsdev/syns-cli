@@ -413,7 +413,7 @@ mod tests {
         let server = MockServer::start().await;
         mount_repo(&server).await;
         let s = setup(&server);
-        for typed in ["", "  ", ".", "a/.."] {
+        for typed in ["", ".", "a/.."] {
             let err = cmd_revert(
                 &s.config,
                 &Output::new(true),

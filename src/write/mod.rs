@@ -227,8 +227,9 @@ pub struct Member {
 }
 
 /// A typed member path resolved lexically before any request (roadmap
-/// 228, D-253 §1, §2; FEATURE_SPEC row 29): empty once trimmed refused
-/// with the empty-path refusal; every trailing `/` dropped, `q3-plan/`
+/// 228, D-253 §1, §2; FEATURE_SPEC row 29): the empty path refused with
+/// the empty-path refusal; white space at either end kept as part of the
+/// path (`INV-30`); every trailing `/` dropped, `q3-plan/`
 /// naming `q3-plan`; `.` and `..` segments resolved, a value naming the
 /// repository's root or the scoped folder itself refused, and one
 /// climbing above the root or out of the folder refused, each as the
@@ -236,9 +237,9 @@ pub struct Member {
 /// counted from the folder where `folder` stands, from the root otherwise.
 pub fn member_path(folder: Option<&FolderScope>, typed: &str) -> Result<String, CliError> {
     refuse_empty_path(typed)?;
-    // Under every binding alike (D-256 §7): what the server trims taken
-    // off both ends, every trailing `/` dropped.
-    let stripped = as_server_reads(as_server_reads(typed));
+    // Under every binding alike (D-256 §7): every trailing `/` dropped,
+    // nothing else changed.
+    let stripped = as_server_reads(typed);
     if stripped.is_empty() {
         // `/` alone: the root, or a path leaving the folder.
         return match folder {

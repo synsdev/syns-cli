@@ -41,7 +41,7 @@ use crate::push::smart::{
 };
 use crate::push::working_copy::{
     Outbox, Resolution, Snapshot, SnapshotContent, StatRecord, WorkingCopy, folder_base,
-    holds_in_root_home,
+    left_out_here, not_held_here,
 };
 use crate::repo::folder::{FolderScope, lies_under};
 use crate::repo::identity::identity_head;
@@ -376,16 +376,15 @@ pub(crate) fn check_holder(scope: &FolderScope) -> Option<String> {
 /// A served tree as a head, every path counted from `folder` where one
 /// stands and a path lying outside it left out.
 fn head_of(tree: &crate::client::TreeResponse, folder: Option<&str>) -> Head {
-    // SPEC u298 `IN_ROOT_HOME`: a served path in the in-root home reads
-    // as absent, so a convergence writes and removes none.
+    // SPEC u298 `IN_ROOT_HOME`: a served path in the in-root home, or
+    // one this platform cannot hold, reads as absent, so a convergence
+    // writes and removes none.
     let counted = |path: &str| -> Option<String> {
-        if holds_in_root_home(path) {
-            return None;
-        }
-        match folder {
+        let local = match folder {
             Some(folder) => lies_under(path, folder).then(|| path[folder.len() + 1..].to_string()),
             None => Some(path.to_string()),
-        }
+        }?;
+        (!left_out_here(path, &local)).then_some(local)
     };
     let sizes = tree
         .entries
@@ -1240,9 +1239,13 @@ fn to_hash_map(map: &BTreeMap<String, String>) -> HashMap<String, String> {
 }
 
 /// Refuse a server-named path breaking `INV-30` before any byte of it
-/// reaches the disk: past the length bound, carrying a non-printable
-/// character or surrounding whitespace, rooted, or holding a `.`, `..`
-/// or `.git` segment under either separator.
+/// reaches the disk: empty or past the length bound, carrying a control
+/// character, rooted, or holding a `.`, `..` or `.git` segment under
+/// either separator. White space at either end is part of the path, as
+/// the server takes it: ` lead.md`, `trail.md ` and ` ` are names. The
+/// last guard before a path reaches the disk: a name this platform cannot
+/// hold (`left_out_here`) is left out before it, so on Windows a root
+/// `a:b.md`, which `Path` reads as a drive prefix, never refuses a run.
 pub fn check_server_path(path: &str) -> Result<(), CliError> {
     let refuse = || {
         Err(CliError::Io {
@@ -1252,7 +1255,6 @@ pub fn check_server_path(path: &str) -> Result<(), CliError> {
     let length = path.chars().count();
     if length == 0
         || length > FILE_PATH_MAX
-        || path.trim() != path
         || path.starts_with('/')
         || path.starts_with('\\')
         || path.chars().any(char::is_control)
@@ -1634,7 +1636,12 @@ pub(crate) fn excluded_local_files<'a>(
     names
         .into_iter()
         .filter(|path| {
-            !collected(path) && check_server_path(path).is_ok() && root.join(path).is_file()
+            // A name this platform cannot hold is decided before the
+            // constraint: on Windows a root `a:b.md` reads as a drive
+            // prefix there, and is held out like any other such name.
+            !collected(path)
+                && (not_held_here(path).is_some()
+                    || (check_server_path(path).is_ok() && root.join(path).is_file()))
         })
         .cloned()
         .collect()
@@ -5409,6 +5416,49 @@ mod tests {
         assert!(check_server_path("dir/.hidden/x").is_ok());
     }
 
+    // A name this platform cannot hold is judged where it would stand on
+    // disk, counted from the scope, never by the scope's own name: a
+    // folder `d-sp ` checked out alone writes its `c.md` and identity
+    // file on every platform, and only a name inside it that Windows
+    // cannot hold is left out there (VERIFY V1).
+    #[test]
+    fn head_of_judges_a_name_counted_from_the_scope() {
+        let tree: crate::client::TreeResponse = serde_json::from_value(serde_json::json!({
+            "commitSha": "c1",
+            "truncated": false,
+            "entries": [
+                {"name": "c.md", "path": "d-sp /c.md", "type": "file", "size": 2, "sha": "a1"},
+                {"name": ".syns.yaml", "path": "d-sp /.syns.yaml", "type": "file", "size": 9, "sha": "a2"},
+                {"name": "t.md ", "path": "d-sp /t.md ", "type": "file", "size": 2, "sha": "a3"},
+                {"name": "x", "path": "d-sp /.syns-state/x", "type": "file", "size": 1, "sha": "a4"},
+                {"name": "o.md", "path": "other/o.md", "type": "file", "size": 1, "sha": "a5"}
+            ]
+        }))
+        .unwrap();
+        let head = head_of(&tree, Some("d-sp "));
+        let mut want = vec![".syns.yaml", "c.md"];
+        if !cfg!(windows) {
+            want.push("t.md ");
+        }
+        assert_eq!(head.files.keys().collect::<Vec<_>>(), want);
+    }
+
+    // A path is taken as written: white space at either end is part of it.
+    #[test]
+    fn check_server_path_admits_white_space_at_either_end() {
+        for path in [
+            " a.md",
+            "a.md ",
+            " ",
+            " sub/x.md",
+            "trail /b.md",
+            "a.md\u{3000}",
+            "\u{A0}x",
+        ] {
+            assert!(check_server_path(path).is_ok(), "{path:?} was refused");
+        }
+    }
+
     #[test]
     fn check_server_path_refuses_every_breach_of_the_file_path_constraint() {
         for path in [
@@ -5425,8 +5475,8 @@ mod tests {
             "a\tb",
             "a\nb",
             "a\0b",
-            " a.md",
-            "a.md ",
+            "a.md\n",
+            "\ta.md",
         ] {
             assert!(check_server_path(path).is_err(), "{path:?} was admitted");
         }

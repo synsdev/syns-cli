@@ -6933,3 +6933,218 @@ async fn retrieval_into_a_re_created_directory_past_a_moved_head_takes_every_hea
 async fn retrieval_into_a_re_created_directory_at_an_unmoved_head_takes_every_head_path() {
     re_created_directory_retrieval(false).await;
 }
+
+// ---- a path is taken as written ---------------------------------------------
+
+/// A head's paths with white space at an end, each beside the sibling it
+/// would name trimmed, and a name of white space alone.
+const PATH_ENDS: [(&str, &str); 8] = [
+    (" lead.md", "lead space\n"),
+    ("lead.md", "plain lead\n"),
+    ("trail.md ", "trail space\n"),
+    ("trail.md", "plain trail\n"),
+    (" sub/x.md", "x in space-sub\n"),
+    ("sub/y.md", "y in sub\n"),
+    (" ", "white space alone\n"),
+    ("ok.md", "ok\n"),
+];
+
+/// Whether this platform's file system holds `path`: Windows cannot hold
+/// a name ending in a space.
+fn held_here(path: &str) -> bool {
+    !(cfg!(windows) && path.split('/').any(|segment| segment.ends_with(' ')))
+}
+
+fn tree_of(files: &[(&str, &str)]) -> BTreeMap<String, String> {
+    files
+        .iter()
+        .map(|(p, c)| (p.to_string(), c.to_string()))
+        .collect()
+}
+
+// A retrieval writes each path with white space at an end as its own
+// file, its sibling untouched; a name the platform cannot hold (Windows:
+// one ending in a space) is left out and the rest still written. A
+// publication after it names no deletion, so the server keeps every path.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn convergence_takes_each_path_with_white_space_at_an_end_as_its_own_file() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    e.fake.commit(&PATH_ENDS);
+    let client = e.fake.client();
+
+    let outcome = converge(
+        &client,
+        Some(TOKEN),
+        &copy,
+        ConvergeMode::Retrieve { overwrite: false },
+        e.opts(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, SyncOutcome::Synced { .. }), "{outcome:?}");
+    let held: Vec<(&str, &str)> = PATH_ENDS
+        .into_iter()
+        .filter(|(path, _)| held_here(path))
+        .collect();
+    assert_eq!(lossy_folder(&dir), tree_of(&held));
+
+    std::fs::write(dir.join("ok.md"), "ok again\n").unwrap();
+    let outcome = converge(&client, Some(TOKEN), &copy, ConvergeMode::Publish, e.opts())
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            SyncOutcome::Synced {
+                published: Some(_),
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    let bodies = e.fake.push_bodies();
+    let sent = bodies.last().unwrap();
+    assert!(
+        sent.get("deletions")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty),
+        "{sent}"
+    );
+    let mut want = tree_of(&PATH_ENDS);
+    want.insert("ok.md".into(), "ok again\n".into());
+    assert_eq!(e.fake.head().1, want);
+    assert_eq!(
+        working_copy_state(&client, Some(TOKEN), &copy)
+            .await
+            .unwrap(),
+        WorkingCopyState::Converged
+    );
+}
+
+/// Every file under `dir` and its text, read from disk.
+fn lossy_folder(dir: &Path) -> BTreeMap<String, String> {
+    folder_hashes(dir)
+        .into_keys()
+        .map(|path| {
+            let text = read(dir, &path);
+            (path, text)
+        })
+        .collect()
+}
+
+// A publication sends each local path with white space at an end as
+// written, beside its sibling, and the next retrieval keeps every one.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn convergence_publishes_each_local_path_with_white_space_at_an_end_as_written() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let h0 = e
+        .fake
+        .commit(&[("lead.md", "plain lead\n"), ("sub/y.md", "y in sub\n")]);
+    checkout(&e.fake, &copy, &h0);
+    let local: Vec<(&str, &str)> = PATH_ENDS
+        .into_iter()
+        .filter(|(path, _)| held_here(path))
+        .collect();
+    write_files(&dir, &local);
+    let client = e.fake.client();
+
+    let outcome = converge(&client, Some(TOKEN), &copy, ConvergeMode::Publish, e.opts())
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            SyncOutcome::Synced {
+                published: Some(_),
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(e.fake.head().1, tree_of(&local));
+
+    // Another writer moves the head; the retrieval takes its change and
+    // keeps every path the publication sent.
+    e.fake.commit_changes(&[("more.md", Some("more\n"))]);
+    let outcome = converge(
+        &client,
+        Some(TOKEN),
+        &copy,
+        ConvergeMode::Retrieve { overwrite: false },
+        e.opts(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, SyncOutcome::Synced { .. }), "{outcome:?}");
+    let mut want = tree_of(&local);
+    want.insert("more.md".into(), "more\n".into());
+    assert_eq!(lossy_folder(&dir), want);
+}
+
+// The binary's retrieval of a head holding names Windows cannot hold:
+// on Windows each is named on stderr with its reason and left out, its
+// sibling untouched and the rest written, and the run succeeds; elsewhere
+// every path is written and none is named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn convergence_pull_names_each_file_this_platform_cannot_hold() {
+    let e = env().await;
+    let dir = e.dir();
+    let mut head = PATH_ENDS.to_vec();
+    head.extend([
+        ("con.md", "reserved\n"),
+        ("notes.", "dot\n"),
+        ("x/a:b.md", "colon\n"),
+        ("a:b.md", "root colon\n"),
+        ("d-sp /c.md", "inner\n"),
+    ]);
+    e.fake.commit(&head);
+    let uri = e.fake.uri.clone();
+    let target = dir.join("w");
+    let at = target.display().to_string();
+    let cwd = dir.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        assert_cmd::Command::cargo_bin("syns")
+            .unwrap()
+            .env("SYNS_URL", uri)
+            .current_dir(cwd)
+            .args(["pull", "alice/proj", at.as_str()])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let left_out = [
+        ("trail.md ", "a name ending in a space"),
+        (" ", "a name ending in a space"),
+        ("con.md", "the reserved name con"),
+        ("notes.", "a name ending in a dot"),
+        ("x/a:b.md", "a name holding ':'"),
+        ("a:b.md", "a name holding ':'"),
+        ("d-sp /c.md", "a name ending in a space"),
+    ];
+    for (path, reason) in left_out {
+        let line = format!("  warning: could not write {path:?}: Windows cannot hold {reason}");
+        assert_eq!(
+            stderr.lines().filter(|l| *l == line).count(),
+            usize::from(cfg!(windows)),
+            "{line}\n{stderr}"
+        );
+    }
+    let written: Vec<(&str, &str)> = head
+        .iter()
+        .copied()
+        .filter(|(path, _)| !cfg!(windows) || !left_out.iter().any(|(l, _)| l == path))
+        .collect();
+    let mut on_disk = lossy_folder(&target);
+    on_disk.remove(".syns.yaml");
+    assert_eq!(on_disk, tree_of(&written));
+}

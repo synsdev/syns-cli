@@ -9,7 +9,7 @@ use crate::push::converge::{
     ConvergeMode, FolderRoot, Staging, SyncOutcome, collect_in_place, converge, folder_root,
     read_blobs, replace_file_whole,
 };
-use crate::push::working_copy::{WorkingCopy, holds_in_root_home};
+use crate::push::working_copy::{WorkingCopy, left_out_here};
 use crate::read::run::RunReads;
 use crate::repo::folder::{
     FolderScope, enclosing_folders, folder_checkout, lies_under, resolve_folder_scope,
@@ -753,7 +753,7 @@ async fn pull_snapshot(
     // written into the folder by no retrieval of a named version.
     let server_files: Vec<ServedFile> = server_files
         .into_iter()
-        .filter(|(path, _, _)| !holds_in_root_home(path))
+        .filter(|(path, _, _)| !left_out_here(path, path))
         .collect();
 
     // 1 — every path the version's tree carries checked before anything

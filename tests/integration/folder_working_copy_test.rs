@@ -2852,7 +2852,6 @@ fn rm_of_an_empty_path_is_refused_before_any_request_wherever_it_runs() {
     refused(&q3, &[], &["rm", "", "--parent", &parent]);
     // CR1-1: ahead of the `--parent` spelling refusals.
     refused(&q3, &[], &["rm", "", "--parent", "0"]);
-    refused(&q3, &[], &["rm", " ", "--parent", &parent]);
     refused(&d.w, &[], &["rm", "", "--parent", &parent]);
     refused(
         &e,
@@ -2895,7 +2894,7 @@ fn writes_naming_an_empty_path_inside_a_folder_publish_nothing() {
     let runs: [(Vec<&str>, &[u8]); 4] = [
         (vec!["write", "", "--parent", &parent], b"x"),
         (
-            vec!["edit", " ", "--old", "a", "--new", "b", "--parent", &parent],
+            vec!["edit", "", "--old", "a", "--new", "b", "--parent", &parent],
             b"",
         ),
         (
@@ -2904,7 +2903,7 @@ fn writes_naming_an_empty_path_inside_a_folder_publish_nothing() {
         ),
         (
             vec!["commit", "--parent", &parent],
-            br#"{"files":[{"path":" ","content":"x"}]}"#,
+            br#"{"files":[{"path":"","content":"x"}]}"#,
         ),
     ];
     for (args, stdin) in runs {
@@ -2927,7 +2926,7 @@ fn reading_verbs_naming_an_empty_path_inside_a_folder_are_refused_before_any_req
     let (d, _u_dir, q3) = converged_with_q3();
     let runs: [Vec<&str>; 7] = [
         vec!["cat", ""],
-        vec!["read", " "],
+        vec!["read", ""],
         vec!["ls", ""],
         vec!["glob", "*", "--path", ""],
         vec!["grep", "x", "--path", ""],

@@ -11,7 +11,7 @@
 //! changed file, which is the only answer counting none a deletion-only
 //! commit can take, so the refusal costs no request beyond the push.
 //!
-//! A `PATH` empty once trimmed is refused before any request, credential
+//! An empty `PATH` is refused before any request, credential
 //! read or folder resolution, inside a scoped folder or not and with or
 //! without `--repo`: inside a folder it would name the folder itself, and
 //! outside one it names nothing (SPEC u297 Behaviour, `cmd_rm` 1).
