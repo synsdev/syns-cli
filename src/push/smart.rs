@@ -241,6 +241,20 @@ pub(crate) fn tree_to_sha_map(tree: &TreeResponse) -> HashMap<String, String> {
         .collect()
 }
 
+/// A head read on its own, as the folder at `root` holds it: every
+/// spelling the volume holds as one with another the head holds taken out
+/// and named once, so a publication standing on the head alone names no
+/// deletion and no change of it (`held_as_one`).
+fn held_here(root: &Path, mut files: HashMap<String, String>) -> HashMap<String, String> {
+    let twins =
+        crate::push::working_copy::held_as_one(root, files.keys().map(String::as_str), |_| false);
+    for (path, kept) in &twins {
+        crate::push::working_copy::name_held_as_one(root, path, kept);
+        files.remove(path);
+    }
+    files
+}
+
 /// One entry a request carries bytes for, before its bytes are read into
 /// it: which field `is_text` chose, the file's length in bytes, and the
 /// length the entry serialises to (SPEC u280 `PendingEntry`).
@@ -1386,7 +1400,11 @@ pub async fn smart_push(
             // A head holding a commit is a prior state the run stood on:
             // a publication it answers unchanged is up to date, not the
             // first-publication no-op `format_response` warns about.
-            Ok(tree) => (true, tree_to_sha_map(&tree), Some(tree.commit_sha.clone())),
+            Ok(tree) => (
+                true,
+                held_here(path, tree_to_sha_map(&tree)),
+                Some(tree.commit_sha.clone()),
+            ),
             // SPEC u300 `smart_push` 1: a repository not found, and one
             // created empty — whose tree read answers `422`
             // `validation_error` (issue 220) — read as a head holding no
@@ -1465,7 +1483,7 @@ pub async fn smart_push(
                     .collect()
             }
             (None, _) => match client.pull(repo_id, Some(token)).await {
-                Ok(tree) => tree_to_sha_map(&tree),
+                Ok(tree) => held_here(path, tree_to_sha_map(&tree)),
                 Err(err) if holds_no_commit(&err) => HashMap::new(),
                 Err(e) => return Err(e),
             },

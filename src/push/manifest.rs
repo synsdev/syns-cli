@@ -122,6 +122,11 @@ impl Manifest {
         self.files = files;
     }
 
+    /// Drops every path `keep` refuses.
+    pub fn retain_files(&mut self, keep: impl Fn(&str) -> bool) {
+        self.files.retain(|path, _| keep(path));
+    }
+
     pub fn commit_sha(&self) -> Option<&str> {
         self.commit_sha.as_deref()
     }

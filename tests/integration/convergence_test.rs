@@ -7148,3 +7148,736 @@ async fn convergence_pull_names_each_file_this_platform_cannot_hold() {
     on_disk.remove(".syns.yaml");
     assert_eq!(on_disk, tree_of(&written));
 }
+
+// ---- names one file system holds as one ------------------------------------
+
+/// What the volume holding `dir` does with two spellings of one name,
+/// asked of the volume itself: letter case, then normalisation.
+fn volume_holds_as_one(dir: &Path) -> (bool, bool) {
+    let probe = dir.join("Twin-Probe-\u{e9}");
+    std::fs::write(&probe, "probe").unwrap();
+    let case = dir.join("twin-probe-\u{e9}").exists();
+    let normalization = dir.join("Twin-Probe-e\u{301}").exists();
+    std::fs::remove_file(&probe).unwrap();
+    (case, normalization)
+}
+
+/// A head holding letter-case, folder and normalisation twins.
+const TWINS: [(&str, &str); 7] = [
+    ("README.md", "README upper\n"),
+    ("Readme.md", "Readme mixed\n"),
+    ("Dir/a.md", "a in Dir\n"),
+    ("dir/b.md", "b in dir\n"),
+    ("cafe\u{301}.md", "cafe NFD\n"),
+    ("caf\u{e9}.md", "cafe NFC\n"),
+    ("ok.md", "ok\n"),
+];
+
+/// The twins a volume holding them as one leaves out: every spelling but
+/// the bytewise-smallest of each set.
+fn left_out_twins(case: bool, normalization: bool) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if case {
+        out.extend(["Readme.md", "dir/b.md"]);
+    }
+    if normalization {
+        out.push("caf\u{e9}.md");
+    }
+    out
+}
+
+/// Every file on disk under `dir`, its exact spelling and its text.
+fn spelled_on_disk(dir: &Path) -> BTreeMap<String, String> {
+    fn walk(root: &Path, at: &Path, out: &mut BTreeMap<String, String>) {
+        for entry in std::fs::read_dir(at).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, out);
+            } else {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.insert(rel, std::fs::read_to_string(&path).unwrap());
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+// A head holding two spellings a volume holds as one: a retrieval writes
+// the bytewise-smallest, names none silently and records only what it
+// wrote; a publication after it sends no copy of a twin and no deletion;
+// a removal of the kept twin publishes that removal alone, and the next
+// retrieval writes the other. Where the volume holds both, every spelling
+// is written, as before.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn convergence_writes_one_of_two_spellings_the_volume_holds_as_one() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let (case, normalization) = volume_holds_as_one(&dir);
+    e.fake.commit(&TWINS);
+    let client = e.fake.client();
+
+    let outcome = converge(
+        &client,
+        Some(TOKEN),
+        &copy,
+        ConvergeMode::Retrieve { overwrite: false },
+        e.opts(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, SyncOutcome::Synced { .. }), "{outcome:?}");
+    let left_out = left_out_twins(case, normalization);
+    let held: BTreeMap<String, String> = TWINS
+        .iter()
+        .filter(|(path, _)| !left_out.contains(path))
+        .map(|(p, c)| (p.to_string(), c.to_string()))
+        .collect();
+    assert_eq!(spelled_on_disk(&dir), held);
+
+    // Nothing edited: a publication sends nothing.
+    let outcome = converge(&client, Some(TOKEN), &copy, ConvergeMode::Publish, e.opts())
+        .await
+        .unwrap();
+    assert!(matches!(outcome, SyncOutcome::NoChanges), "{outcome:?}");
+    assert!(
+        e.fake.push_bodies().is_empty(),
+        "{:?}",
+        e.fake.push_bodies()
+    );
+
+    // The kept README removed here: its removal alone is published.
+    std::fs::remove_file(dir.join("README.md")).unwrap();
+    let outcome = converge(&client, Some(TOKEN), &copy, ConvergeMode::Publish, e.opts())
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            SyncOutcome::Synced {
+                published: Some(_),
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    let sent = e.fake.push_bodies().pop().unwrap();
+    assert_eq!(sent["deletions"], json!([{"path": "README.md"}]), "{sent}");
+    assert!(sent["files"].as_array().is_none_or(Vec::is_empty), "{sent}");
+    let mut want = tree_of(&TWINS);
+    want.remove("README.md");
+    assert_eq!(e.fake.head().1, want);
+
+    // Alone on the server now, the other spelling is written.
+    converge(
+        &client,
+        Some(TOKEN),
+        &copy,
+        ConvergeMode::Retrieve { overwrite: false },
+        e.opts(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(read(&dir, "Readme.md"), "Readme mixed\n");
+}
+
+// A file renamed on the server in letter case alone: the retrieval
+// removes the old spelling before it writes the new, so the folder holds
+// the file under its new spelling with its text, and the next publication
+// sends nothing — on a volume holding both spellings as one, the old
+// removal took the new file with it, and the next sync published its
+// deletion.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn convergence_takes_a_rename_in_letter_case_alone() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let h0 = e
+        .fake
+        .commit(&[("Readme.md", "readme text\n"), ("ok.md", "ok\n")]);
+    checkout(&e.fake, &copy, &h0);
+    let h1 = e
+        .fake
+        .commit_changes(&[("Readme.md", None), ("README.md", Some("readme text\n"))]);
+    let client = e.fake.client();
+
+    let outcome = converge(
+        &client,
+        Some(TOKEN),
+        &copy,
+        ConvergeMode::Retrieve { overwrite: false },
+        e.opts(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, SyncOutcome::Synced { .. }), "{outcome:?}");
+    assert_eq!(
+        spelled_on_disk(&dir),
+        tree_of(&[("README.md", "readme text\n"), ("ok.md", "ok\n")])
+    );
+    let outcome = converge(&client, Some(TOKEN), &copy, ConvergeMode::Publish, e.opts())
+        .await
+        .unwrap();
+    assert!(matches!(outcome, SyncOutcome::NoChanges), "{outcome:?}");
+    assert_eq!(e.fake.head().0, h1);
+}
+
+// A file renamed here in letter case alone is published as one rename:
+// the new spelling and the removal of the old, never the new beside the
+// old.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn convergence_publishes_a_rename_in_letter_case_alone() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let h0 = e
+        .fake
+        .commit(&[("Readme.md", "readme text\n"), ("ok.md", "ok\n")]);
+    checkout(&e.fake, &copy, &h0);
+    std::fs::rename(dir.join("Readme.md"), dir.join("README.md")).unwrap();
+    let client = e.fake.client();
+
+    let outcome = converge(&client, Some(TOKEN), &copy, ConvergeMode::Publish, e.opts())
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            SyncOutcome::Synced {
+                published: Some(_),
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        e.fake.head().1,
+        tree_of(&[("README.md", "readme text\n"), ("ok.md", "ok\n")])
+    );
+}
+
+/// Whether the volume holding `dir` holds `a` and `b` as one, asked of the
+/// volume itself.
+fn volume_holds_pair_as_one(dir: &Path, a: &str, b: &str) -> bool {
+    let probe = dir.join(format!("pair-probe-{a}"));
+    std::fs::write(&probe, "probe").unwrap();
+    let one = dir.join(format!("pair-probe-{b}")).exists();
+    std::fs::remove_file(&probe).unwrap();
+    one
+}
+
+// A pair the volume holds as one though no key the run computes says so
+// (`ß` and `ss` on macOS): the first spelling written stays with its own
+// text, the other is never written over it, and no publication names a
+// deletion or a change of either; the server keeps both.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn convergence_never_writes_a_name_over_another_the_volume_holds_as_one() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let one = volume_holds_pair_as_one(&dir, "Strasse.md", "Stra\u{df}e.md");
+    let files = [
+        ("Strasse.md", "with ss\n"),
+        ("Stra\u{df}e.md", "with sharp s\n"),
+        ("ok.md", "ok\n"),
+    ];
+    e.fake.commit(&files);
+    let client = e.fake.client();
+
+    converge(
+        &client,
+        Some(TOKEN),
+        &copy,
+        ConvergeMode::Retrieve { overwrite: false },
+        e.opts(),
+    )
+    .await
+    .unwrap();
+    let mut held = tree_of(&files);
+    if one {
+        held.remove("Stra\u{df}e.md");
+    }
+    assert_eq!(spelled_on_disk(&dir), held);
+
+    for _ in 0..2 {
+        let outcome = converge(&client, Some(TOKEN), &copy, ConvergeMode::Publish, e.opts())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, SyncOutcome::NoChanges), "{outcome:?}");
+    }
+    assert!(
+        e.fake.push_bodies().is_empty(),
+        "{:?}",
+        e.fake.push_bodies()
+    );
+    assert_eq!(e.fake.head().1, tree_of(&files));
+    assert_eq!(spelled_on_disk(&dir), held);
+}
+
+// A folder renamed on the server in letter case alone: its files stand
+// under the new spelling with their text, and the next publication sends
+// nothing.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn convergence_takes_a_folder_renamed_in_letter_case_alone() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let h0 = e.fake.commit(&[("dir/a.md", "a\n"), ("ok.md", "ok\n")]);
+    checkout(&e.fake, &copy, &h0);
+    let h1 = e
+        .fake
+        .commit_changes(&[("dir/a.md", None), ("Dir/a.md", Some("a\n"))]);
+    let client = e.fake.client();
+
+    converge(
+        &client,
+        Some(TOKEN),
+        &copy,
+        ConvergeMode::Retrieve { overwrite: false },
+        e.opts(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        spelled_on_disk(&dir),
+        tree_of(&[("Dir/a.md", "a\n"), ("ok.md", "ok\n")])
+    );
+    let outcome = converge(&client, Some(TOKEN), &copy, ConvergeMode::Publish, e.opts())
+        .await
+        .unwrap();
+    assert!(matches!(outcome, SyncOutcome::NoChanges), "{outcome:?}");
+    assert_eq!(e.fake.head().0, h1);
+}
+
+// A working copy whose base names both twins, as a release before this one
+// recorded them over the one file it wrote: the next publication sends no
+// deletion and no copy of either, and the twin on disk keeps its text.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn convergence_publishes_nothing_of_twins_an_earlier_base_recorded() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let (case, _) = volume_holds_as_one(&dir);
+    let files = [
+        ("README.md", "README upper\n"),
+        ("Readme.md", "Readme mixed\n"),
+        ("ok.md", "ok\n"),
+    ];
+    let h0 = e.fake.commit(&files);
+    // As 0.3.30 left it on such a volume: the first spelling written, the
+    // other read as standing there, both recorded.
+    write_files(&dir, &[("README.md", "README upper\n"), ("ok.md", "ok\n")]);
+    if !case {
+        write_files(&dir, &[("Readme.md", "Readme mixed\n")]);
+    }
+    copy.record_base(&h0, hashes(&tree_of(&files))).unwrap();
+    let on_disk = spelled_on_disk(&dir);
+    let client = e.fake.client();
+
+    let outcome = converge(&client, Some(TOKEN), &copy, ConvergeMode::Publish, e.opts())
+        .await
+        .unwrap();
+    assert!(matches!(outcome, SyncOutcome::NoChanges), "{outcome:?}");
+    assert!(
+        e.fake.push_bodies().is_empty(),
+        "{:?}",
+        e.fake.push_bodies()
+    );
+    assert_eq!(spelled_on_disk(&dir), on_disk);
+}
+
+// A folder renamed on the server in letter case alone while the folder
+// holds a file no publication carries (a Finder `.DS_Store`): the folder
+// takes the new spelling on disk with that file inside, its files stand
+// with their text, and no publication names a deletion.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn convergence_respells_a_folder_renamed_in_letter_case_over_other_files() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let h0 = e.fake.commit(&[("dir/a.md", "a\n"), ("ok.md", "ok\n")]);
+    checkout(&e.fake, &copy, &h0);
+    std::fs::write(dir.join("dir/.DS_Store"), "finder").unwrap();
+    let h1 = e
+        .fake
+        .commit_changes(&[("dir/a.md", None), ("Dir/a.md", Some("a\n"))]);
+    let client = e.fake.client();
+
+    converge(
+        &client,
+        Some(TOKEN),
+        &copy,
+        ConvergeMode::Retrieve { overwrite: false },
+        e.opts(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        spelled_on_disk(&dir),
+        tree_of(&[
+            ("Dir/.DS_Store", "finder"),
+            ("Dir/a.md", "a\n"),
+            ("ok.md", "ok\n")
+        ])
+    );
+    for _ in 0..2 {
+        let outcome = converge(&client, Some(TOKEN), &copy, ConvergeMode::Publish, e.opts())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, SyncOutcome::NoChanges), "{outcome:?}");
+    }
+    assert_eq!(e.fake.head().0, h1);
+}
+
+// A file and a folder renamed on the server in Unicode normalisation alone
+// (composed `é` to `e` and a combining acute): each stands under its new
+// spelling with its text, and no publication names a deletion.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn convergence_takes_a_rename_in_normalisation_alone() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let h0 = e.fake.commit(&[
+        ("caf\u{e9}.md", "cafe text\n"),
+        ("d\u{e9}j\u{e0}/a.md", "a\n"),
+        ("ok.md", "ok\n"),
+    ]);
+    checkout(&e.fake, &copy, &h0);
+    std::fs::write(dir.join("d\u{e9}j\u{e0}/.DS_Store"), "finder").unwrap();
+    let h1 = e.fake.commit_changes(&[
+        ("caf\u{e9}.md", None),
+        ("cafe\u{301}.md", Some("cafe text\n")),
+        ("d\u{e9}j\u{e0}/a.md", None),
+        ("de\u{301}ja\u{300}/a.md", Some("a\n")),
+    ]);
+    let client = e.fake.client();
+
+    converge(
+        &client,
+        Some(TOKEN),
+        &copy,
+        ConvergeMode::Retrieve { overwrite: false },
+        e.opts(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        spelled_on_disk(&dir),
+        tree_of(&[
+            ("cafe\u{301}.md", "cafe text\n"),
+            ("de\u{301}ja\u{300}/.DS_Store", "finder"),
+            ("de\u{301}ja\u{300}/a.md", "a\n"),
+            ("ok.md", "ok\n"),
+        ])
+    );
+    let outcome = converge(&client, Some(TOKEN), &copy, ConvergeMode::Publish, e.opts())
+        .await
+        .unwrap();
+    assert!(matches!(outcome, SyncOutcome::NoChanges), "{outcome:?}");
+    assert_eq!(e.fake.head().0, h1);
+}
+
+// Two folder levels renamed on the server in letter case alone, each
+// holding a file no publication carries: both levels take their new
+// spelling, the files stand with their text, and no publication names a
+// deletion.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn convergence_respells_every_level_of_a_folder_renamed_in_letter_case() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let h0 = e.fake.commit(&[
+        ("Dir/Sub/x.md", "x\n"),
+        ("Dir/y.md", "y\n"),
+        ("ok.md", "ok\n"),
+    ]);
+    checkout(&e.fake, &copy, &h0);
+    std::fs::write(dir.join("Dir/.DS_Store"), "finder").unwrap();
+    std::fs::write(dir.join("Dir/Sub/.DS_Store"), "finder").unwrap();
+    let h1 = e.fake.commit_changes(&[
+        ("Dir/Sub/x.md", None),
+        ("Dir/y.md", None),
+        ("dir/sub/x.md", Some("x\n")),
+        ("dir/y.md", Some("y\n")),
+    ]);
+    let client = e.fake.client();
+
+    converge(
+        &client,
+        Some(TOKEN),
+        &copy,
+        ConvergeMode::Retrieve { overwrite: false },
+        e.opts(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        spelled_on_disk(&dir),
+        tree_of(&[
+            ("dir/.DS_Store", "finder"),
+            ("dir/sub/.DS_Store", "finder"),
+            ("dir/sub/x.md", "x\n"),
+            ("dir/y.md", "y\n"),
+            ("ok.md", "ok\n"),
+        ])
+    );
+    let outcome = converge(&client, Some(TOKEN), &copy, ConvergeMode::Publish, e.opts())
+        .await
+        .unwrap();
+    assert!(matches!(outcome, SyncOutcome::NoChanges), "{outcome:?}");
+    assert_eq!(e.fake.head().0, h1);
+}
+
+/// A retrieval into `copy`, answered as it lands.
+async fn retrieve_twins(e: &Env, copy: &WorkingCopy) -> SyncOutcome {
+    converge(
+        &e.fake.client(),
+        Some(TOKEN),
+        copy,
+        ConvergeMode::Retrieve { overwrite: false },
+        e.opts(),
+    )
+    .await
+    .unwrap()
+}
+
+/// A publication of `copy`, answered as it lands.
+async fn publish_twins(e: &Env, copy: &WorkingCopy) -> SyncOutcome {
+    converge(
+        &e.fake.client(),
+        Some(TOKEN),
+        copy,
+        ConvergeMode::Publish,
+        e.opts(),
+    )
+    .await
+    .unwrap()
+}
+
+// The twin this copy kept is a fact of the copy once chosen: with the
+// larger spelling kept (`Readme.md`, on disk before `README.md` reached
+// the server) and then removed here, that removal is published, and the
+// other spelling, alone on the server then, is written and no longer left
+// out. Read again from the smallest spelling, the removal was dropped and
+// `README.md` written in its place.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn convergence_publishes_the_removal_of_the_twin_this_copy_kept() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let h0 = e
+        .fake
+        .commit(&[("Readme.md", "mixed\n"), ("ok.md", "ok\n")]);
+    checkout(&e.fake, &copy, &h0);
+    e.fake.commit_changes(&[("README.md", Some("upper\n"))]);
+    retrieve_twins(&e, &copy).await;
+    assert_eq!(read(&dir, "Readme.md"), "mixed\n");
+
+    std::fs::remove_file(dir.join("Readme.md")).unwrap();
+    let outcome = publish_twins(&e, &copy).await;
+    assert!(
+        matches!(
+            outcome,
+            SyncOutcome::Synced {
+                published: Some(_),
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        e.fake.head().1,
+        tree_of(&[("README.md", "upper\n"), ("ok.md", "ok\n")])
+    );
+    retrieve_twins(&e, &copy).await;
+    assert_eq!(
+        spelled_on_disk(&dir),
+        tree_of(&[("README.md", "upper\n"), ("ok.md", "ok\n")])
+    );
+    let outcome = publish_twins(&e, &copy).await;
+    assert!(matches!(outcome, SyncOutcome::NoChanges), "{outcome:?}");
+}
+
+// The kept twin removed here while the other is edited, or removed, on the
+// server: the removal is published either way, and the other twin's edit
+// reaches the disk once it stands alone.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn convergence_publishes_the_kept_twins_removal_beside_a_server_change_to_the_other() {
+    for edited in [true, false] {
+        let e = env().await;
+        let dir = e.dir();
+        let copy = e.copy(&dir);
+        let h0 = e
+            .fake
+            .commit(&[("Readme.md", "mixed\n"), ("ok.md", "ok\n")]);
+        checkout(&e.fake, &copy, &h0);
+        e.fake.commit_changes(&[("README.md", Some("upper\n"))]);
+        retrieve_twins(&e, &copy).await;
+        if edited {
+            e.fake
+                .commit_changes(&[("README.md", Some("upper, edited\n"))]);
+        } else {
+            e.fake.commit_changes(&[("README.md", None)]);
+        }
+        std::fs::remove_file(dir.join("Readme.md")).unwrap();
+        // The head moved under local work: a resolution, then its
+        // continuation, as for any head that moved.
+        if let SyncOutcome::ResolutionRequired(..) = publish_twins(&e, &copy).await {
+            continue_resolution(&e.fake.client(), TOKEN, &copy, e.opts())
+                .await
+                .unwrap();
+        }
+        let mut want = tree_of(&[("ok.md", "ok\n")]);
+        if edited {
+            want.insert("README.md".into(), "upper, edited\n".into());
+        }
+        assert_eq!(e.fake.head().1, want, "edited {edited}");
+        retrieve_twins(&e, &copy).await;
+        assert_eq!(spelled_on_disk(&dir), want, "edited {edited}");
+    }
+}
+
+// A folder twin removed here (`rm -r Dir` where the server's `dir/` was
+// left out): the removal of `Dir/` is published, and `dir/` is written
+// once it stands alone.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn convergence_publishes_the_removal_of_a_folder_twin_this_copy_kept() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let h0 = e.fake.commit(&[("Dir/a.md", "a\n"), ("ok.md", "ok\n")]);
+    checkout(&e.fake, &copy, &h0);
+    e.fake.commit_changes(&[("dir/b.md", Some("b\n"))]);
+    retrieve_twins(&e, &copy).await;
+    std::fs::remove_dir_all(dir.join("Dir")).unwrap();
+    let outcome = publish_twins(&e, &copy).await;
+    assert!(
+        matches!(
+            outcome,
+            SyncOutcome::Synced {
+                published: Some(_),
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        e.fake.head().1,
+        tree_of(&[("dir/b.md", "b\n"), ("ok.md", "ok\n")])
+    );
+    retrieve_twins(&e, &copy).await;
+    assert_eq!(
+        spelled_on_disk(&dir),
+        tree_of(&[("dir/b.md", "b\n"), ("ok.md", "ok\n")])
+    );
+}
+
+// A second copy that kept the same twin converges over the first copy's
+// removal of it: its file goes, and the other twin is written there.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn convergence_carries_a_kept_twins_removal_to_a_second_copy() {
+    let e = env().await;
+    let dir = e.dir();
+    let copy = e.copy(&dir);
+    let other_dir = tempfile::tempdir().unwrap();
+    let other = e.copy(other_dir.path());
+    let h0 = e
+        .fake
+        .commit(&[("Readme.md", "mixed\n"), ("ok.md", "ok\n")]);
+    checkout(&e.fake, &copy, &h0);
+    checkout(&e.fake, &other, &h0);
+    e.fake.commit_changes(&[("README.md", Some("upper\n"))]);
+    retrieve_twins(&e, &copy).await;
+    retrieve_twins(&e, &other).await;
+    std::fs::remove_file(dir.join("Readme.md")).unwrap();
+    publish_twins(&e, &copy).await;
+
+    retrieve_twins(&e, &other).await;
+    assert_eq!(
+        spelled_on_disk(other_dir.path()),
+        tree_of(&[("README.md", "upper\n"), ("ok.md", "ok\n")])
+    );
+    let outcome = publish_twins(&e, &other).await;
+    assert!(matches!(outcome, SyncOutcome::NoChanges), "{outcome:?}");
+    assert_eq!(
+        e.fake.head().1,
+        tree_of(&[("README.md", "upper\n"), ("ok.md", "ok\n")])
+    );
+}
+
+// A copy a release before this one wrote, its base naming both twins and
+// its disk holding one, the smaller or the larger: once the person removes
+// that file, which spelling it was is no longer known, so no deletion of
+// either is published, the server keeps both texts, and the twin kept
+// afresh (the smallest) is written back. Read through the smallest, the
+// removal of the larger deleted the smaller on the server.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn convergence_publishes_no_deletion_of_twins_an_earlier_release_recorded_as_one() {
+    for on_disk in ["README.md", "Readme.md"] {
+        let e = env().await;
+        let dir = e.dir();
+        let copy = e.copy(&dir);
+        let (case, _) = volume_holds_as_one(&dir);
+        let files = [
+            ("README.md", "upper\n"),
+            ("Readme.md", "mixed\n"),
+            ("ok.md", "ok\n"),
+        ];
+        let h0 = e.fake.commit(&files);
+        let text = tree_of(&files)[on_disk].clone();
+        write_files(&dir, &[(on_disk, text.as_str()), ("ok.md", "ok\n")]);
+        if !case {
+            let other = if on_disk == "README.md" {
+                "Readme.md"
+            } else {
+                "README.md"
+            };
+            let other_text = tree_of(&files)[other].clone();
+            write_files(&dir, &[(other, other_text.as_str())]);
+        }
+        copy.record_base(&h0, hashes(&tree_of(&files))).unwrap();
+
+        std::fs::remove_file(dir.join(on_disk)).unwrap();
+        publish_twins(&e, &copy).await;
+        let mut want = tree_of(&files);
+        if !case {
+            // A volume holding both: the removal is one file's, published.
+            want.remove(on_disk);
+        }
+        assert_eq!(e.fake.head().1, want, "{on_disk}");
+        retrieve_twins(&e, &copy).await;
+        let mut disk = tree_of(&[("ok.md", "ok\n")]);
+        if case {
+            disk.insert("README.md".into(), "upper\n".into());
+        } else {
+            let other = if on_disk == "README.md" {
+                "Readme.md"
+            } else {
+                "README.md"
+            };
+            disk.insert(other.into(), tree_of(&files)[other].clone());
+        }
+        assert_eq!(spelled_on_disk(&dir), disk, "{on_disk}");
+    }
+}

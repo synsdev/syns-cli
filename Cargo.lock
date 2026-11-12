@@ -2310,6 +2310,7 @@ dependencies = [
  "grep-regex",
  "grep-searcher",
  "hyper-util",
+ "icu_normalizer",
  "ignore",
  "libc",
  "open",

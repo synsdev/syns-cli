@@ -40,8 +40,9 @@ use crate::push::smart::{
     PushPipelineMeta, SmartPushOptions, smart_push, strict_refuses, tree_to_sha_map,
 };
 use crate::push::working_copy::{
-    Outbox, Resolution, Snapshot, SnapshotContent, StatRecord, WorkingCopy, folder_base,
-    left_out_here, not_held_here,
+    Folding, Outbox, PROBE_MARKS, Resolution, Snapshot, SnapshotContent, StatRecord, WorkingCopy,
+    folder_base, forget_held_as_one, held_as_one, held_out_as_one, left_out_here, name_held_as_one,
+    not_held_here, note_in_listing, spelled_otherwise_on_disk, stands_as_spelled,
 };
 use crate::repo::folder::{FolderScope, lies_under};
 use crate::repo::identity::identity_head;
@@ -412,13 +413,17 @@ async fn read_tree(
     // SPEC u291 `converge` 1: a folder copy reads the holder's tree
     // under its recorded path; SPEC u302 `converge` 1: a copy bound to an
     // identity reads the identity's whole tree, every path as served.
-    if let Some(path) = served_under(copy) {
-        return read_folder_tree(client, token, &repo_id(copy), path, at).await;
-    }
-    let (tree, _raw) = client
-        .get_tree(&repo_id(copy), token, None, true, at)
-        .await?;
-    Ok(head_of(&tree, None))
+    let mut head = match served_under(copy) {
+        Some(path) => read_folder_tree(client, token, &repo_id(copy), path, at).await?,
+        None => {
+            let (tree, _raw) = client
+                .get_tree(&repo_id(copy), token, None, true, at)
+                .await?;
+            head_of(&tree, None)
+        }
+    };
+    leave_out_held_as_one(copy, &mut head);
+    Ok(head)
 }
 
 /// The whole tree of a shared folder's identity at `at` or the tip, every
@@ -561,7 +566,10 @@ async fn read_head_collected(
         Err(err) => Err(err),
     };
     match read {
-        Ok(head) => Ok(head),
+        Ok(mut head) => {
+            leave_out_held_as_one(copy, &mut head);
+            Ok(head)
+        }
         Err(err)
             if reading == HeadReading::State && is_empty_repository(&err)
                 || !has_base
@@ -572,6 +580,62 @@ async fn read_head_collected(
             Ok(Head::default())
         }
         Err(err) => Err(err),
+    }
+}
+
+/// Takes out of `head` every path the copy's volume holds as one with
+/// another spelling, so no run writes, removes, compares or publishes a
+/// deletion of it and the server keeps it as it stands, each named once:
+/// - of two spellings the head holds, every one but the spelling kept
+///   (`held_as_one`);
+/// - a path the disk holds under another spelling the head also holds — a
+///   pair the volume holds as one whatever the key reads (`ß` and `ss` on
+///   macOS), and one this run already left out;
+/// - a path the head adds over a base that never held it, where the folder
+///   holds it under another spelling that is local work — a file the base
+///   never held, or one edited since — so the write would land on that work.
+fn leave_out_held_as_one(copy: &WorkingCopy, head: &mut Head) {
+    let root = &copy.root;
+    let base = load_base(copy);
+    // The spelling this copy kept before is the one its base records: a
+    // spelling left out is never recorded.
+    let kept_before = |path: &str| {
+        base.files.contains_key(path)
+            || base.files.keys().any(|recorded| lies_under(recorded, path))
+    };
+    let mut out: BTreeMap<String, String> =
+        held_as_one(root, head.files.keys().map(String::as_str), kept_before);
+    let head_holds = |spelled: &str| {
+        head.files
+            .keys()
+            .any(|path| path == spelled || lies_under(path, spelled))
+    };
+    let local_work = |spelled: &str| match base.files.get(spelled) {
+        Some(recorded) => {
+            disk_hash(copy, spelled).ok().flatten().as_deref() != Some(recorded.as_str())
+        }
+        None => !base.files.keys().any(|path| lies_under(path, spelled)),
+    };
+    for path in head.files.keys() {
+        if out.contains_key(path) {
+            continue;
+        }
+        if held_out_as_one(root, path) {
+            out.insert(path.clone(), String::new());
+            continue;
+        }
+        if let Some(spelled) = spelled_otherwise_on_disk(root, path)
+            && (head_holds(&spelled) || !base.files.contains_key(path) && local_work(&spelled))
+        {
+            out.insert(path.clone(), spelled);
+        }
+    }
+    for (path, kept) in out {
+        if !kept.is_empty() {
+            name_held_as_one(root, &path, &kept);
+        }
+        head.files.remove(&path);
+        head.sizes.remove(&path);
     }
 }
 
@@ -1207,11 +1271,51 @@ struct Base {
 
 /// The base a run reads `copy` against: a folder copy's through
 /// `folder_base` (SPEC u291 `converge` 3), every other copy's own.
+///
+/// A spelling the copy's volume holds as one with another the base also
+/// names (a base a release before this one recorded, naming both twins it
+/// wrote as one file) is taken out of it, as the head's is.
 fn base_of(copy: &WorkingCopy) -> Option<Manifest> {
-    match &copy.folder {
+    let mut base = match &copy.folder {
         Some(scope) => folder_base(copy.stores(), scope),
         None => copy.base(),
+    }?;
+    // And a spelling the disk holds under another the base also names, or
+    // one this run left out, whatever the key reads.
+    let mut twins = held_as_one(&copy.root, base.file_paths(), |_| false);
+    let paths: Vec<String> = base.file_paths().map(String::from).collect();
+    for path in &paths {
+        let aliased = spelled_otherwise_on_disk(&copy.root, path).is_some_and(|spelled| {
+            paths
+                .iter()
+                .any(|other| *other == spelled || lies_under(other, &spelled))
+        });
+        if aliased || held_out_as_one(&copy.root, path) {
+            twins.insert(path.clone(), String::new());
+        }
     }
+    // A base naming two spellings, neither of them standing on disk (an
+    // earlier release recorded both over the one file it wrote, and that
+    // file is gone): which of them the person removed is no longer known,
+    // so the base holds none of them and no deletion of either is sent.
+    let unknown: Vec<String> = twins
+        .values()
+        .filter(|kept| {
+            !kept.is_empty()
+                && !(std::fs::symlink_metadata(copy.root.join(kept.as_str())).is_ok()
+                    && stands_as_spelled(&copy.root, kept))
+        })
+        .cloned()
+        .collect();
+    if !twins.is_empty() {
+        base.retain_files(|path| {
+            !twins.contains_key(path)
+                && !unknown
+                    .iter()
+                    .any(|kept| path == kept || lies_under(path, kept))
+        });
+    }
+    Some(base)
 }
 
 fn load_base(copy: &WorkingCopy) -> Base {
@@ -1283,14 +1387,14 @@ fn check_server_paths<'a>(paths: impl IntoIterator<Item = &'a String>) -> Result
 /// Whether a file stands at `path` in the folder: a folder standing
 /// where the path names a file holds no file there.
 fn file_stands(copy: &WorkingCopy, path: &str) -> bool {
-    copy.root.join(path).is_file()
+    copy.root.join(path).is_file() && stands_as_spelled(&copy.root, path)
 }
 
 /// The blob hash of the file standing at `path`, read in pieces, none
 /// where no file stands there.
 fn disk_hash(copy: &WorkingCopy, path: &str) -> Result<Option<String>, CliError> {
     let target = copy.root.join(path);
-    if !target.is_file() {
+    if !target.is_file() || !stands_as_spelled(&copy.root, path) {
         return Ok(None);
     }
     let mut sink = std::io::sink();
@@ -1324,10 +1428,15 @@ const PARTIAL_PREFIX: &str = ".syns-partial-";
 
 /// Whether a folder path names the sibling of a write a killed run left
 /// part-way through: `PARTIAL_PREFIX` and the 16 lowercase hex characters
-/// `replace_file_whole` mints, and no other name.
+/// `replace_file_whole` mints, and no other name — or the probe
+/// `folding_at` mints the same way, marked with `é` in either form.
 pub(crate) fn is_partial_write(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
     name.strip_prefix(PARTIAL_PREFIX).is_some_and(|minted| {
+        let minted = PROBE_MARKS
+            .iter()
+            .find_map(|mark| minted.strip_suffix(mark))
+            .unwrap_or(minted);
         minted.len() == 16
             && minted
                 .bytes()
@@ -1382,7 +1491,20 @@ fn sweep_partial_writes(
 /// process may not write is refused, as an in-place write would be, and
 /// its permissions carry over. A held content is written as it stands, a
 /// staged or stored one copied in pieces (SPEC u280 `replace_file_whole`).
-pub(crate) fn replace_file_whole(root: &Path, path: &str, content: &Blob) -> Result<(), CliError> {
+///
+/// Answers whether it wrote: a path the disk holds under another spelling
+/// is held as one with that file, and writing it would replace that file's
+/// bytes, so it is left out for the rest of the run instead, named, and
+/// not written.
+pub(crate) fn replace_file_whole(
+    root: &Path,
+    path: &str,
+    content: &Blob,
+) -> Result<bool, CliError> {
+    if let Some(spelled) = spelled_otherwise_on_disk(root, path) {
+        name_held_as_one(root, path, &spelled);
+        return Ok(false);
+    }
     let target = root.join(path);
     let io = |err: std::io::Error| CliError::Io {
         message: format!("could not write {path}: {err}"),
@@ -1433,7 +1555,8 @@ pub(crate) fn replace_file_whole(root: &Path, path: &str, content: &Blob) -> Res
         let _ = std::fs::remove_file(&sibling);
         return Err(io(err));
     }
-    Ok(())
+    note_in_listing(parent, &file_name, true);
+    Ok(true)
 }
 
 /// Remove every folder under `dir` holding no file, deepest first, and
@@ -1486,8 +1609,18 @@ fn left_out_refusal(root: &Path, path: &str, target: &Path) -> CliError {
 
 fn remove_folder_file(copy: &WorkingCopy, path: &str) -> Result<(), CliError> {
     let target = copy.root.join(path);
+    // A file standing under another spelling the volume holds as one with
+    // this path's is no file at this path, and stays.
+    if std::fs::symlink_metadata(&target).is_ok() && !stands_as_spelled(&copy.root, path) {
+        return Ok(());
+    }
     match std::fs::remove_file(&target) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            if let (Some(parent), Some(name)) = (target.parent(), target.file_name()) {
+                note_in_listing(parent, &name.to_string_lossy(), false);
+            }
+            Ok(())
+        }
         // A folder standing where the path names a file holds no file
         // there.
         Err(err)
@@ -1504,27 +1637,85 @@ fn remove_folder_file(copy: &WorkingCopy, path: &str) -> Result<(), CliError> {
     }
 }
 
+/// Respells, on disk, every folder a write's path reaches under another
+/// spelling: the server renamed that folder in letter case or
+/// normalisation alone (a folder the head still spells the old way, or
+/// that is local work, was left out of the head before any write), so
+/// the folder takes the new spelling with whatever else it holds — a
+/// `.DS_Store`, a local new file — and the write lands under it. Taken
+/// after the removals clearing the writes' way, before any write.
+fn respell_reached_folders(root: &Path, written: &[&String]) -> Result<(), CliError> {
+    for path in written {
+        // Each folder level in turn, outermost first: `Dir/Sub` renamed to
+        // `dir/sub` respells `Dir`, then `Sub` under it.
+        let segments = path.split('/').count();
+        let mut last: Option<String> = None;
+        while let Some(spelled) = spelled_otherwise_on_disk(root, path) {
+            let depth = spelled.split('/').count();
+            let from = root.join(&spelled);
+            // A volume that would not take the new spelling answers the
+            // same folder again: the write is then refused as held as one.
+            if depth >= segments || !from.is_dir() || last.as_deref() == Some(spelled.as_str()) {
+                break;
+            }
+            last = Some(spelled.clone());
+            let respelled = path.split('/').take(depth).collect::<Vec<_>>().join("/");
+            let to = root.join(&respelled);
+            std::fs::rename(&from, &to).map_err(|err| CliError::Io {
+                message: format!("could not respell {spelled} as {respelled}: {err}"),
+            })?;
+            if let (Some(parent), Some(old), Some(new)) =
+                (from.parent(), from.file_name(), to.file_name())
+            {
+                note_in_listing(parent, &old.to_string_lossy(), false);
+                note_in_listing(parent, &new.to_string_lossy(), true);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Whether removing `removed` clears the way for writing `written`: a file
 /// standing where the write needs a folder, or a file inside a folder
-/// standing where the write puts a file.
+/// standing where the write puts a file — each read as a volume holding
+/// two spellings of a name as one may read it, so a file renamed on the
+/// server in letter case or normalisation alone is removed before its new
+/// spelling is written, never after, which would remove the file written.
 fn clears_way(removed: &str, written: &str) -> bool {
+    let key = |path: &str| {
+        path.split('/')
+            .map(|segment| Folding::WIDEST.key(segment))
+            .collect::<Vec<_>>()
+            .join("/")
+    };
+    let (removed, written) = (key(removed), key(written));
     let inside = |inner: &str, outer: &str| {
         inner
             .strip_prefix(outer)
             .is_some_and(|rest| rest.starts_with('/'))
     };
-    inside(written, removed) || inside(removed, written)
+    removed == written || inside(&written, &removed) || inside(&removed, &written)
 }
 
 /// Split a set of removals into those clearing the way for one of `writes`,
-/// taken before any write, and the rest, taken after every write.
+/// taken before any write, and the rest, taken after every write. A
+/// removal of the file or folder a write's path reaches under `root` under
+/// another spelling clears its way too, whatever the key reads.
 fn clearing_first<'a>(
+    root: &Path,
     written: &[&String],
     removals: &'a [String],
 ) -> (Vec<&'a String>, Vec<&'a String>) {
-    removals
+    let reached: Vec<String> = written
         .iter()
-        .partition(|removed| written.iter().any(|written| clears_way(removed, written)))
+        .filter_map(|written| spelled_otherwise_on_disk(root, written))
+        .collect();
+    removals.iter().partition(|removed| {
+        written.iter().any(|written| clears_way(removed, written))
+            || reached
+                .iter()
+                .any(|spelled| *removed == spelled || lies_under(removed, spelled))
+    })
 }
 
 /// What holds the place of a head file a candidate is to write.
@@ -1579,6 +1770,9 @@ fn remove_clearing(copy: &WorkingCopy, path: &str) -> Result<(), CliError> {
     while folder.pop() && folder != copy.root && folder.starts_with(&copy.root) {
         if std::fs::remove_dir(&folder).is_err() {
             break;
+        }
+        if let (Some(parent), Some(name)) = (folder.parent(), folder.file_name()) {
+            note_in_listing(parent, &name.to_string_lossy(), false);
         }
     }
     Ok(())
@@ -1638,10 +1832,14 @@ pub(crate) fn excluded_local_files<'a>(
         .filter(|path| {
             // A name this platform cannot hold is decided before the
             // constraint: on Windows a root `a:b.md` reads as a drive
-            // prefix there, and is held out like any other such name.
+            // prefix there, and is held out like any other such name. A
+            // file stands on disk only under its own spelling.
             !collected(path)
                 && (not_held_here(path).is_some()
-                    || (check_server_path(path).is_ok() && root.join(path).is_file()))
+                    || held_out_as_one(root, path)
+                    || (check_server_path(path).is_ok()
+                        && root.join(path).is_file()
+                        && stands_as_spelled(root, path)))
         })
         .cloned()
         .collect()
@@ -2742,7 +2940,7 @@ async fn prepare_candidate(
             Ok(disk_hash(copy, path)? == expected_before(path))
         };
         let written_paths: Vec<&String> = writes.iter().map(|(p, _, _)| p).collect();
-        let (clearing, later) = clearing_first(&written_paths, &removals);
+        let (clearing, later) = clearing_first(&copy.root, &written_paths, &removals);
         drop(written_paths);
         let mut left_untouched = false;
         let mut blocked: Vec<&String> = Vec::new();
@@ -2770,9 +2968,11 @@ async fn prepare_candidate(
                 })?,
                 WriteSource::Merged(blob) => blob,
             };
-            replace_file_whole(&copy.root, path, content)?;
-            written_this_run.insert(path.clone(), hash.clone());
-            written.insert(path.clone());
+            respell_reached_folders(&copy.root, &[path])?;
+            if replace_file_whole(&copy.root, path, content)? {
+                written_this_run.insert(path.clone(), hash.clone());
+                written.insert(path.clone());
+            }
             acted.insert(path);
         }
         head_blobs.clear();
@@ -3098,6 +3298,7 @@ async fn converge_locked(
     unlinked: bool,
 ) -> Result<SyncOutcome, CliError> {
     let _lock = copy.lock()?;
+    forget_held_as_one(&copy.root);
     if mode == ConvergeMode::Publish {
         refuse_unresolved_marked_identity(copy)?;
     }
@@ -3629,13 +3830,17 @@ async fn overwrite_with_head(
     }
 
     let written_paths: Vec<&String> = writes.iter().map(|(p, _)| p).collect();
-    let (clearing, later) = clearing_first(&written_paths, &removals);
+    let (clearing, later) = clearing_first(&copy.root, &written_paths, &removals);
     drop(written_paths);
     for path in clearing {
         remove_clearing(copy, path)?;
     }
+    let mut written = Vec::new();
     for (path, content) in &writes {
-        replace_file_whole(&copy.root, path, content)?;
+        respell_reached_folders(&copy.root, &[path])?;
+        if replace_file_whole(&copy.root, path, content)? {
+            written.push(path.clone());
+        }
     }
     for path in later {
         remove_folder_file(copy, path)?;
@@ -3647,7 +3852,7 @@ async fn overwrite_with_head(
     copy.remove_resolution()?;
 
     Ok(SyncOutcome::Synced {
-        written: writes.into_iter().map(|(p, _)| p).collect(),
+        written,
         removed: removals,
         published: None,
     })
@@ -4366,6 +4571,7 @@ async fn continue_locked(
 ) -> Result<SyncOutcome, CliError> {
     // 1
     let _lock = copy.lock()?;
+    forget_held_as_one(&copy.root);
     refuse_unresolved_marked_identity(copy)?;
     let opts = with_run_budget(opts);
     let staging = Staging::open(&opts.stores.write)?;
@@ -4446,6 +4652,7 @@ async fn continue_locked(
 /// `discard_resolution` 1–2).
 pub fn discard_resolution(copy: &WorkingCopy) -> Result<(), CliError> {
     let _lock = copy.lock()?;
+    forget_held_as_one(&copy.root);
     if copy.resolution()?.is_none() {
         return Ok(());
     }
@@ -4470,12 +4677,13 @@ pub fn discard_resolution(copy: &WorkingCopy) -> Result<(), CliError> {
     }
     // 2
     let written_paths: Vec<&String> = writes.iter().map(|(p, _)| p).collect();
-    let (clearing, later) = clearing_first(&written_paths, &removals);
+    let (clearing, later) = clearing_first(&copy.root, &written_paths, &removals);
     drop(written_paths);
     for path in clearing {
         remove_clearing(copy, path)?;
     }
     for (path, content) in &writes {
+        respell_reached_folders(&copy.root, &[path])?;
         replace_file_whole(&copy.root, path, content)?;
     }
     for path in later {
@@ -5405,6 +5613,9 @@ mod tests {
     fn is_partial_write_admits_only_the_minted_sibling_name() {
         assert!(is_partial_write(".syns-partial-0123456789abcdef"));
         assert!(is_partial_write("sub/.syns-partial-0123456789abcdef"));
+        assert!(is_partial_write(".syns-partial-0123456789abcdef\u{e9}"));
+        assert!(is_partial_write(".syns-partial-0123456789abcdefe\u{301}"));
+        assert!(!is_partial_write(".syns-partial-0123456789abcdef\u{e8}"));
         assert!(!is_partial_write(".syns-partial-notes.md"));
         assert!(!is_partial_write(".syns-partial-0123456789abcde"));
     }

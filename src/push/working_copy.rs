@@ -183,6 +183,415 @@ pub(crate) fn left_out_here(served: &str, local: &str) -> bool {
     true
 }
 
+/// How a volume compares two spellings of one name: where `case` holds,
+/// spellings differing in letter case alone name one file; where
+/// `normalization` holds, spellings differing in Unicode normalisation
+/// alone (`é` composed, `e` with a combining acute) name one file.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Folding {
+    pub(crate) case: bool,
+    pub(crate) normalization: bool,
+}
+
+impl Folding {
+    /// Every spelling a volume may hold as one with another: the test a
+    /// run applies before it asks the volume what it does.
+    pub(crate) const WIDEST: Folding = Folding {
+        case: true,
+        normalization: true,
+    };
+
+    /// The key every spelling of `name` this volume holds as one shares.
+    pub(crate) fn key(&self, name: &str) -> String {
+        let name: std::borrow::Cow<'_, str> = if self.normalization {
+            icu_normalizer::ComposingNormalizerBorrowed::new_nfc().normalize(name)
+        } else {
+            name.into()
+        };
+        if self.case {
+            name.to_lowercase()
+        } else {
+            name.into_owned()
+        }
+    }
+}
+
+/// The mark a probe's name carries after a minted partial-write name, in
+/// the composed form the probe is created under and the decomposed form a
+/// normalising volume may store it as: a probe a killed run left is swept
+/// as any partial write is.
+pub(crate) const PROBE_MARKS: [&str; 2] = ["\u{e9}", "e\u{301}"];
+
+/// What the volume holding `root` does with two spellings of one name,
+/// read once a run for each root by the volume itself, never assumed from
+/// the platform: a probe file is created under a minted partial-write
+/// name ending in `é` composed, looked up decomposed and in upper case,
+/// and removed. A root that is no directory yet, or takes no probe, reads
+/// as holding every spelling apart: nothing it holds can alias, and a
+/// write landing on another spelling is caught where it is made
+/// (`spelled_otherwise_on_disk`).
+pub(crate) fn folding_at(root: &Path) -> Folding {
+    static KNOWN: std::sync::Mutex<Vec<(PathBuf, Folding)>> = std::sync::Mutex::new(Vec::new());
+    if !root.is_dir() {
+        return Folding::default();
+    }
+    let dir = root.to_path_buf();
+    if let Some(known) = KNOWN.lock().ok().and_then(|known| {
+        known
+            .iter()
+            .find(|(probed, _)| *probed == dir)
+            .map(|(_, folding)| *folding)
+    }) {
+        return known;
+    }
+    let minted = mint_probe_name();
+    let probe = dir.join(format!("{minted}{}", PROBE_MARKS[0]));
+    let folding = match OpenOptions::new().write(true).create_new(true).open(&probe) {
+        Ok(file) => {
+            drop(file);
+            let normalization =
+                std::fs::symlink_metadata(dir.join(format!("{minted}{}", PROBE_MARKS[1]))).is_ok();
+            let case =
+                std::fs::symlink_metadata(dir.join(format!("{}\u{c9}", minted.to_uppercase())))
+                    .is_ok();
+            let _ = std::fs::remove_file(&probe);
+            Folding {
+                case,
+                normalization,
+            }
+        }
+        Err(_) => Folding::default(),
+    };
+    if let Ok(mut known) = KNOWN.lock() {
+        known.push((dir, folding));
+    }
+    folding
+}
+
+type Listing = std::sync::Arc<std::collections::HashSet<String>>;
+
+/// Each directory's listing as last read or kept true, and the
+/// modification time it stood at.
+static LISTINGS: std::sync::Mutex<Option<HashMap<PathBuf, (std::time::SystemTime, Listing)>>> =
+    std::sync::Mutex::new(None);
+
+/// The names a directory holds, as its listing spells them: read once for
+/// each state of the directory, the listing kept until the directory's
+/// modification time moves other than by this run's own writes
+/// (`note_in_listing`).
+fn listing(dir: &Path) -> Option<Listing> {
+    let modified = std::fs::metadata(dir)
+        .and_then(|meta| meta.modified())
+        .ok()?;
+    if let Some(names) = LISTINGS.lock().ok().and_then(|listings| {
+        listings
+            .as_ref()?
+            .get(dir)
+            .filter(|(at, _)| *at == modified)
+            .map(|(_, names)| names.clone())
+    }) {
+        return Some(names);
+    }
+    let names: std::collections::HashSet<String> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .collect();
+    let names = std::sync::Arc::new(names);
+    if let Ok(mut listings) = LISTINGS.lock() {
+        listings
+            .get_or_insert_with(HashMap::new)
+            .insert(dir.to_path_buf(), (modified, names.clone()));
+    }
+    Some(names)
+}
+
+/// Keeps the listing of `dir` true to a write (`stands`) or a removal this
+/// run made of `name` in it, at the directory's new modification time, so
+/// a folder written file by file is not read whole after each file.
+pub(crate) fn note_in_listing(dir: &Path, name: &str, stands: bool) {
+    let Ok(modified) = std::fs::metadata(dir).and_then(|meta| meta.modified()) else {
+        return;
+    };
+    if let Ok(mut listings) = LISTINGS.lock()
+        && let Some((at, names)) = listings.as_mut().and_then(|listings| listings.get_mut(dir))
+    {
+        let kept = std::sync::Arc::make_mut(names);
+        if stands {
+            kept.insert(name.to_string());
+        } else {
+            kept.remove(name);
+        }
+        *at = modified;
+    }
+}
+
+/// Whether the directory listing of `dir` spells a name `name` as written,
+/// a composed and a decomposed spelling read alike, since a normalising
+/// volume stores a name in its own form.
+fn lists_as_spelled(dir: &Path, name: &str) -> bool {
+    let Some(names) = listing(dir) else {
+        return false;
+    };
+    if names.contains(name) {
+        return true;
+    }
+    // A name standing under another normalisation is this name only where
+    // the volume rewrites every name it stores into its own form (HFS+
+    // stores names decomposed); on a volume keeping names as written it is
+    // another spelling, held as one with this one.
+    let nfc = |n: &str| {
+        icu_normalizer::ComposingNormalizerBorrowed::new_nfc()
+            .normalize(n)
+            .into_owned()
+    };
+    let wanted = nfc(name);
+    names.iter().any(|n| nfc(n) == wanted) && rewrites_names(dir)
+}
+
+/// Whether the volume holding `dir` stores a name in a normalisation form
+/// of its own rather than as written: asked once a run for each directory
+/// it is asked about, by a probe created composed under a minted
+/// partial-write name, read back from the listing, and removed.
+fn rewrites_names(dir: &Path) -> bool {
+    static KNOWN: std::sync::Mutex<Vec<(PathBuf, bool)>> = std::sync::Mutex::new(Vec::new());
+    if let Some(known) = KNOWN.lock().ok().and_then(|known| {
+        known
+            .iter()
+            .find(|(asked, _)| asked == dir)
+            .map(|(_, rewrites)| *rewrites)
+    }) {
+        return known;
+    }
+    let minted = mint_probe_name();
+    let written = format!("{minted}{}", PROBE_MARKS[0]);
+    let probe = dir.join(&written);
+    let rewrites = match OpenOptions::new().write(true).create_new(true).open(&probe) {
+        Ok(file) => {
+            drop(file);
+            let stored = std::fs::read_dir(dir).ok().is_some_and(|entries| {
+                let names: Vec<String> = entries
+                    .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+                    .collect();
+                !names.contains(&written) && names.contains(&format!("{minted}{}", PROBE_MARKS[1]))
+            });
+            let _ = std::fs::remove_file(&probe);
+            stored
+        }
+        Err(_) => false,
+    };
+    if let Ok(mut known) = KNOWN.lock() {
+        known.push((dir.to_path_buf(), rewrites));
+    }
+    rewrites
+}
+
+/// A fresh partial-write name for a probe: `PARTIAL_PREFIX`'s form, its
+/// 16 hex characters minted from the process, a counter and the clock.
+fn mint_probe_name() -> String {
+    static MINTED: AtomicU64 = AtomicU64::new(0);
+    let seed = format!(
+        "{}:{}:{:?}",
+        std::process::id(),
+        MINTED.fetch_add(1, Ordering::Relaxed),
+        std::time::SystemTime::now()
+    );
+    format!(".syns-partial-{}", &blob_sha1(seed.as_bytes())[..16])
+}
+
+/// Whether something stands at `path` under `root` under that path's own
+/// spelling, segment by segment: on a volume holding two spellings of one
+/// name as one, `Readme.md` reaches a file standing as `README.md`, and
+/// that file is no file at `Readme.md`.
+pub(crate) fn stands_as_spelled(root: &Path, path: &str) -> bool {
+    let mut dir = root.to_path_buf();
+    for segment in path.split('/') {
+        if !lists_as_spelled(&dir, segment) {
+            return false;
+        }
+        dir.push(segment);
+    }
+    true
+}
+
+/// Where `path` under `root` reaches something standing under another
+/// spelling: the path, counted from `root`, of the first segment the disk
+/// spells otherwise, as the disk spells it (`Readme.md` where the folder
+/// holds `README.md`, `Dir` where it holds `dir/`). None where every
+/// segment that stands stands as spelled, or nothing stands.
+pub(crate) fn spelled_otherwise_on_disk(root: &Path, path: &str) -> Option<String> {
+    let mut dir = root.to_path_buf();
+    let mut counted: Vec<String> = Vec::new();
+    for segment in path.split('/') {
+        let target = dir.join(segment);
+        if std::fs::symlink_metadata(&target).is_err() {
+            return None;
+        }
+        if !lists_as_spelled(&dir, segment) {
+            // The entry the volume reached: found by the key where the key
+            // reads the volume's folding, else by the file's own identity
+            // (`ß` reaching `ss` on macOS, which no key here reads).
+            let wanted = Folding::WIDEST.key(segment);
+            let names = listing(&dir)?;
+            let reached = FolderIdentity::of(&target);
+            let spelled = names
+                .iter()
+                .find(|name| Folding::WIDEST.key(name) == wanted)
+                .or_else(|| {
+                    let reached = reached.as_ref()?;
+                    names.iter().find(|name| {
+                        FolderIdentity::of(&dir.join(name.as_str())).is_some_and(|entry| {
+                            entry.dev == reached.dev && entry.ino == reached.ino
+                        })
+                    })
+                })
+                .cloned()
+                .unwrap_or_else(|| segment.to_string());
+            counted.push(spelled);
+            return Some(counted.join("/"));
+        }
+        counted.push(segment.to_string());
+        dir = target;
+    }
+    None
+}
+
+/// The spellings of `paths`, all counted from `root`, that the volume
+/// holding `root` holds as one with another of them, each with the
+/// spelling it is held as one with, at the folder or file where they meet.
+/// Of each such set the spelling kept is the one the folder already holds
+/// on disk; else the one the copy kept before, which `kept_before` answers
+/// for a path or a folder (the copy's base records only the spelling it
+/// kept), so a person's removal of that file is never read as the other
+/// spelling's; else the bytewise-smallest, so a fresh working copy keeps
+/// the same one on every machine. Every other spelling, and every path
+/// under it, is in the answer. The volume is asked what it does only where
+/// two spellings meet under the widest folding.
+pub(crate) fn held_as_one<'a>(
+    root: &Path,
+    paths: impl IntoIterator<Item = &'a str>,
+    kept_before: impl Fn(&str) -> bool,
+) -> BTreeMap<String, String> {
+    let paths: Vec<&str> = paths.into_iter().collect();
+    // Every spelling of each folder or file, grouped under its parent's
+    // spelling by the key the folding gives it.
+    let group = |folding: Folding| {
+        let mut groups: HashMap<(String, String), std::collections::BTreeSet<String>> =
+            HashMap::new();
+        for path in &paths {
+            let mut parent = String::new();
+            for segment in path.split('/') {
+                groups
+                    .entry((parent.clone(), folding.key(segment)))
+                    .or_default()
+                    .insert(segment.to_string());
+                if !parent.is_empty() {
+                    parent.push('/');
+                }
+                parent.push_str(segment);
+            }
+        }
+        groups
+    };
+    if group(Folding::WIDEST)
+        .values()
+        .all(|spellings| spellings.len() < 2)
+    {
+        return BTreeMap::new();
+    }
+    let folding = folding_at(root);
+    if folding == Folding::default() {
+        return BTreeMap::new();
+    }
+    let groups = group(folding);
+    let joined = |parent: &str, segment: &str| {
+        if parent.is_empty() {
+            segment.to_string()
+        } else {
+            format!("{parent}/{segment}")
+        }
+    };
+    let kept = |parent: &str, spellings: &std::collections::BTreeSet<String>| -> String {
+        let on_disk = listing(&root.join(parent));
+        spellings
+            .iter()
+            .find(|spelling| {
+                on_disk
+                    .as_ref()
+                    .is_some_and(|names| names.contains(*spelling))
+            })
+            .or_else(|| {
+                spellings
+                    .iter()
+                    .find(|spelling| kept_before(&joined(parent, spelling)))
+            })
+            .or_else(|| spellings.iter().next())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let mut answer = BTreeMap::new();
+    for path in &paths {
+        let mut parent = String::new();
+        for segment in path.split('/') {
+            let spellings = &groups[&(parent.clone(), folding.key(segment))];
+            if spellings.len() > 1 {
+                let keep = kept(&parent, spellings);
+                if keep != segment {
+                    answer.insert(path.to_string(), joined(&parent, &keep));
+                    break;
+                }
+            }
+            parent = joined(&parent, segment);
+        }
+    }
+    answer
+}
+
+/// Every served path this run left out under a root because the volume
+/// holds it as one with another spelling.
+static HELD_AS_ONE: std::sync::Mutex<std::collections::BTreeSet<(PathBuf, String)>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// `root` as the run's record of what it left out names it.
+fn root_key(root: &Path) -> PathBuf {
+    std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
+}
+
+/// Leaves `path` under `root` out for the rest of the run, the volume
+/// holding it as one with `kept`, and names it once, on stderr, in the
+/// words of the line naming a name Windows cannot hold.
+pub(crate) fn name_held_as_one(root: &Path, path: &str, kept: &str) {
+    let first = HELD_AS_ONE
+        .lock()
+        .map(|mut named| named.insert((root_key(root), path.to_string())))
+        .unwrap_or(true);
+    if first {
+        eprintln!(
+            "  warning: could not write {path:?}: this file system holds it as one with {kept:?}"
+        );
+    }
+}
+
+/// Starts a run's record of what it leaves out under `root` afresh: what
+/// a run left out is a fact of that run alone.
+pub(crate) fn forget_held_as_one(root: &Path) {
+    let root = root_key(root);
+    if let Ok(mut named) = HELD_AS_ONE.lock() {
+        named.retain(|(at, _)| *at != root);
+    }
+}
+
+/// Whether this run left `path` under `root` out, the volume holding it
+/// as one with another spelling, and it still reaches that spelling on
+/// disk: every later comparison, write and removal of the run holds it out
+/// too, until the file it reaches is gone.
+pub(crate) fn held_out_as_one(root: &Path, path: &str) -> bool {
+    HELD_AS_ONE
+        .lock()
+        .map(|named| named.contains(&(root_key(root), path.to_string())))
+        .unwrap_or(false)
+        && spelled_otherwise_on_disk(root, path).is_some()
+}
+
 /// Create the in-root home `dir` where it does not stand, at mode `0700`
 /// holding a `.gitignore` whose one line is `*`, and set its mode to
 /// `0700`; one standing as a link or owned by another account is refused
@@ -1108,6 +1517,11 @@ impl WorkingCopy {
         files: HashMap<String, String>,
         recorded_at: Option<u64>,
     ) -> Result<(), CliError> {
+        // A path this run left out, the volume holding it as one with
+        // another spelling, was never written here: recorded, the next run
+        // would read it as removed and publish its deletion.
+        let mut files = files;
+        files.retain(|path, _| !held_out_as_one(&self.root, path));
         let mut manifest = Manifest::default();
         manifest.update(commit.to_string(), files);
         manifest.set_recorded_at(recorded_at);
@@ -1851,6 +2265,96 @@ mod tests {
             assert_eq!(not_held_by_windows(path), None, "{path:?}");
         }
         assert_eq!(not_held_here("trail.md ").is_some(), cfg!(windows));
+    }
+
+    /// What the volume holding `dir` does, asked by hand: letter case,
+    /// then normalisation.
+    fn volume_holds_as_one(dir: &Path) -> (bool, bool) {
+        let probe = dir.join("Twin-Probe-\u{e9}");
+        std::fs::write(&probe, "probe").unwrap();
+        let case = dir.join("twin-probe-\u{e9}").exists();
+        let normalization = dir.join("Twin-Probe-e\u{301}").exists();
+        std::fs::remove_file(&probe).unwrap();
+        (case, normalization)
+    }
+
+    // The probe reads the volume as a hand-made check does, and leaves
+    // nothing behind.
+    #[test]
+    fn folding_at_reads_what_the_volume_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let (case, normalization) = volume_holds_as_one(dir.path());
+        assert_eq!(
+            folding_at(dir.path()),
+            Folding {
+                case,
+                normalization
+            }
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    // The key of every spelling a folding holds as one is one key.
+    #[test]
+    fn a_folding_keys_twins_alike() {
+        let both = Folding::WIDEST;
+        assert_eq!(both.key("README.md"), both.key("Readme.md"));
+        assert_eq!(both.key("caf\u{e9}.md"), both.key("cafe\u{301}.md"));
+        assert_eq!(both.key("\u{c4}"), both.key("\u{e4}"));
+        let case = Folding {
+            case: true,
+            normalization: false,
+        };
+        assert_ne!(case.key("caf\u{e9}.md"), case.key("cafe\u{301}.md"));
+        assert_eq!(Folding::default().key("Readme.md"), "Readme.md");
+    }
+
+    // Of each set of spellings the volume holds as one, the one on disk is
+    // kept, else the bytewise-smallest; a folder twin takes every path
+    // under it; spellings the volume holds apart are all kept.
+    #[test]
+    fn held_as_one_keeps_one_spelling_of_each_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (case, normalization) = volume_holds_as_one(root);
+        let paths = [
+            "README.md",
+            "Readme.md",
+            "Dir/a.md",
+            "dir/b.md",
+            "dir/c/d.md",
+            "cafe\u{301}.md",
+            "caf\u{e9}.md",
+            "a",
+            "A/x.md",
+        ];
+        let mut want = BTreeMap::new();
+        if case {
+            want.insert("Readme.md".to_string(), "README.md".to_string());
+            want.insert("dir/b.md".to_string(), "Dir".to_string());
+            want.insert("dir/c/d.md".to_string(), "Dir".to_string());
+            want.insert("a".to_string(), "A".to_string());
+        }
+        if normalization {
+            want.insert("caf\u{e9}.md".to_string(), "cafe\u{301}.md".to_string());
+        }
+        assert_eq!(held_as_one(root, paths, |_| false), want);
+        if case {
+            // The spelling the folder holds is kept, whatever its order.
+            std::fs::write(root.join("Readme.md"), "on disk").unwrap();
+            let kept = held_as_one(root, ["README.md", "Readme.md"], |_| false);
+            assert_eq!(
+                kept,
+                BTreeMap::from([("README.md".to_string(), "Readme.md".to_string())])
+            );
+            assert!(!stands_as_spelled(root, "README.md"));
+            assert!(stands_as_spelled(root, "Readme.md"));
+            assert_eq!(
+                spelled_otherwise_on_disk(root, "README.md").as_deref(),
+                Some("Readme.md")
+            );
+        }
+        assert!(held_as_one(root, ["a.md", "b.md"], |_| false).is_empty());
     }
 
     // The in-root home is judged on the path as served, a name this

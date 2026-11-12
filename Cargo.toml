@@ -38,6 +38,9 @@ comfy-table = "7"
 console = "0.16"
 dirs = "6"
 url = "2"
+# Names one file system holds as one: NFC, as a normalisation-insensitive
+# volume compares them (already in the tree through `idna`).
+icu_normalizer = { version = "2", default-features = false, features = ["compiled_data"] }
 urlencoding = "2"
 open = "5"
 tempfile = "3"

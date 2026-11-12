@@ -715,10 +715,21 @@ fn serialised(request: &PushRequest) -> Result<bytes::Bytes, CliError> {
 fn write_folder(folder: &Path, placed: &[Placed], identity: &str) -> Result<(), (PathBuf, String)> {
     let failed = |at: &Path, err: std::io::Error| (at.to_path_buf(), err.to_string());
     std::fs::create_dir_all(folder).map_err(|e| failed(folder, e))?;
+    // A spelling the volume holds as one with another the template holds
+    // is published and not written, as a name it cannot hold is.
+    let twins = crate::push::working_copy::held_as_one(
+        folder,
+        placed.iter().map(|file| file.path.as_str()),
+        |_| false,
+    );
     for file in placed {
         // A name this platform cannot hold is named and not written; the
         // publication carries it, and every later run holds it out.
         if left_out_here(&file.path, &file.path) {
+            continue;
+        }
+        if let Some(kept) = twins.get(&file.path) {
+            crate::push::working_copy::name_held_as_one(folder, &file.path, kept);
             continue;
         }
         let at = folder.join(&file.path);

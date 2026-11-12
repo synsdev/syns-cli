@@ -751,9 +751,19 @@ async fn pull_snapshot(
     };
     // SPEC u298 `IN_ROOT_HOME`: a served path in the in-root home is
     // written into the folder by no retrieval of a named version.
+    // A spelling the target's volume holds as one with another the version
+    // holds is written by none either, and named once (`held_as_one`).
+    let twins = crate::push::working_copy::held_as_one(
+        target_dir,
+        server_files.iter().map(|(path, _, _)| path.as_str()),
+        |_| false,
+    );
+    for (path, kept) in &twins {
+        crate::push::working_copy::name_held_as_one(target_dir, path, kept);
+    }
     let server_files: Vec<ServedFile> = server_files
         .into_iter()
-        .filter(|(path, _, _)| !left_out_here(path, path))
+        .filter(|(path, _, _)| !left_out_here(path, path) && !twins.contains_key(path))
         .collect();
 
     // 1 — every path the version's tree carries checked before anything
@@ -814,6 +824,7 @@ async fn pull_snapshot(
     )
     .await?;
 
+    let mut held_apart = 0;
     for (path, _, _) in &server_files {
         if identity_stands && path == ".syns.yaml" {
             continue;
@@ -830,7 +841,10 @@ async fn pull_snapshot(
         safe_join(target_dir, path)?;
         // 2 — replaced whole, so a run killed part-way leaves the file as
         // it stood rather than torn.
-        replace_file_whole(target_dir, path, content)?;
+        if !replace_file_whole(target_dir, path, content)? {
+            held_apart += 1;
+            continue;
+        }
         if !output.is_json() {
             eprintln!("  {}", style(format!("downloaded: {path}")).green());
         }
@@ -839,7 +853,7 @@ async fn pull_snapshot(
 
     write_identity_file(repository, target_dir, owner, name)?;
 
-    let downloaded = server_files.len() - excluded.len() - kept;
+    let downloaded = server_files.len() - excluded.len() - kept - held_apart;
     if output.is_json() {
         output.json(&json!({
             "repo": repo_id,
