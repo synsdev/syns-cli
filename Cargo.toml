@@ -62,9 +62,10 @@ webpki-root-certs = "1"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.184"
 
-# D-164: a folder's volume serial and file index, its identity on Windows.
+# D-164: a folder's volume serial and file index, its identity on Windows; the
+# computer's own name, which `syns login` sends.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_SystemInformation"] }
 
 [dev-dependencies]
 serial_test = "3"

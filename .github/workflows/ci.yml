@@ -40,6 +40,8 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
       - run: cargo test --locked --test cli_integration convergence
       - run: cargo test --locked --lib push::working_copy
+      # The name `syns login` sends for this computer, read from Windows itself.
+      - run: cargo test --locked --lib syns_machine
       # issue 325: Windows is the only platform whose `syns upgrade` unpacks a
       # zip (`extract_binary`, cfg windows); t10 builds a zip fixture only here.
       - run: cargo test --locked --test cli_integration upgrade

@@ -5,9 +5,64 @@ const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
 const SLOW_DOWN_INCREMENT_SECS: u64 = 5;
 const MAX_POLL_INTERVAL_SECS: u64 = 60;
 const MAX_EXPIRES_IN_SECS: u64 = 3600;
-const CLIENT_ID: &str = "syns-cli";
+/// The client `syns login` asks as: the Syns CLI on a computer it names (`EP-device-code`), so the login the
+/// approval makes may join that account's door as a machine of that name.
+const CLIENT_ID: &str = "syns-machine";
 const DEVICE_CODE_PATH: &str = "/api/auth/device/code";
 const DEVICE_TOKEN_PATH: &str = "/api/auth/device/token";
+
+/// At most this many characters of the system's name are sent; the server takes 1 to 255.
+const MACHINE_MAX_CHARS: usize = 255;
+/// What is sent as the computer's name when the system gives none.
+const MACHINE_FALLBACK: &str = "machine";
+
+/// The name `syns login` sends as `machine`: the system's own, as it gives it, unshaped (the server makes the
+/// kept name from it). Cut to 255 characters; `machine` when there is none or it is empty.
+pub(crate) fn machine_name_of(raw: Option<&str>) -> String {
+    match raw {
+        Some(name) if !name.is_empty() => name.chars().take(MACHINE_MAX_CHARS).collect(),
+        _ => MACHINE_FALLBACK.to_string(),
+    }
+}
+
+/// `machine_name_of` for a name the system gives as bytes: what is not UTF-8 becomes U+FFFD.
+pub(crate) fn machine_name_of_bytes(raw: Option<&[u8]>) -> String {
+    machine_name_of(raw.map(String::from_utf8_lossy).as_deref())
+}
+
+/// The computer's own name, as `hostname` prints it, read from the system.
+pub(crate) fn system_machine_name() -> String {
+    #[cfg(unix)]
+    {
+        let mut buf = [0u8; 1024];
+        // SAFETY: the buffer is valid for `buf.len()` bytes; gethostname writes at most that many.
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+        if rc != 0 {
+            return machine_name_of(None);
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        machine_name_of_bytes(Some(&buf[..end]))
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::SystemInformation::{
+            ComputerNameDnsHostname, GetComputerNameExW,
+        };
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        // SAFETY: `len` is the buffer's length in UTF-16 units; on success it is set to the name's length.
+        let ok = unsafe { GetComputerNameExW(ComputerNameDnsHostname, buf.as_mut_ptr(), &mut len) };
+        if ok == 0 {
+            return machine_name_of(None);
+        }
+        let name = String::from_utf16_lossy(&buf[..(len as usize).min(buf.len())]);
+        machine_name_of(Some(&name))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        machine_name_of(None)
+    }
+}
 
 #[derive(serde::Deserialize)]
 struct DeviceCodeResponse {
@@ -136,12 +191,12 @@ impl DeviceAuthFlow {
         // (SPEC u280 `SynsClient::new`).
         let client = api_client(server_url)?;
 
-        // 3. Request device code
+        // 3. Request device code, naming this computer
         let code_url = format!("{server_url}{DEVICE_CODE_PATH}");
         let response = post_json(
             &client,
             &code_url,
-            &serde_json::json!({"client_id": CLIENT_ID}),
+            &serde_json::json!({"client_id": CLIENT_ID, "machine": system_machine_name()}),
             server_url,
         )
         .await?;
@@ -305,6 +360,65 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    // The name `syns login` sends as `machine` (FEATURE_SPEC C2): the system's own, as it gives it.
+
+    #[test]
+    fn syns_machine_name_goes_out_whole() {
+        assert_eq!(
+            machine_name_of(Some("Barts-MacBook-Pro.local")),
+            "Barts-MacBook-Pro.local"
+        );
+        assert_eq!(machine_name_of(Some("Zoë's iMac")), "Zoë's iMac");
+        assert_eq!(machine_name_of(Some(" a b ")), " a b ");
+    }
+
+    #[test]
+    fn syns_machine_name_of_bytes_that_are_not_utf8_is_lossy() {
+        assert_eq!(machine_name_of_bytes(Some(b"lap\xfftop")), "lap\u{FFFD}top");
+        assert_eq!(machine_name_of_bytes(Some(b"\xff\xfe")), "\u{FFFD}\u{FFFD}");
+        assert_eq!(machine_name_of_bytes(Some(b"studio")), "studio");
+    }
+
+    #[test]
+    fn syns_machine_name_over_255_characters_is_cut_to_255() {
+        let long = "a".repeat(300);
+        assert_eq!(machine_name_of(Some(&long)), "a".repeat(255));
+        assert_eq!(machine_name_of(Some(&"a".repeat(255))), "a".repeat(255));
+        // Characters, not bytes: 300 two-byte characters keep 255 of them.
+        let wide = "é".repeat(300);
+        let sent = machine_name_of(Some(&wide));
+        assert_eq!(sent.chars().count(), 255);
+        assert_eq!(sent, "é".repeat(255));
+    }
+
+    #[test]
+    fn syns_machine_name_none_or_empty_is_machine() {
+        assert_eq!(machine_name_of(None), "machine");
+        assert_eq!(machine_name_of(Some("")), "machine");
+        assert_eq!(machine_name_of_bytes(None), "machine");
+        assert_eq!(machine_name_of_bytes(Some(b"")), "machine");
+    }
+
+    #[test]
+    fn syns_machine_name_of_the_system_is_what_it_gives() {
+        let name = system_machine_name();
+        assert!(!name.is_empty());
+        assert!(name.chars().count() <= 255);
+        // Every computer this runs on (CI's Linux, macOS and Windows runners) has a name: a read that failed would
+        // send the fallback, and every such computer would ask to join as `machine`.
+        assert_ne!(name, "machine");
+        // What `hostname` prints, where it is there to ask; Windows may print it in another case.
+        if let Ok(out) = std::process::Command::new("hostname").output() {
+            let printed = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
+            if !printed.is_empty() {
+                #[cfg(unix)]
+                assert_eq!(name, printed);
+                #[cfg(windows)]
+                assert_eq!(name.to_lowercase(), printed.to_lowercase());
+            }
+        }
     }
 
     #[test]
