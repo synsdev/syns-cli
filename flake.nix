@@ -78,7 +78,7 @@
           #
           # `cargoHash` covers Cargo.lock's whole closure, so it changes
           # whenever the lockfile does; `nix build` prints the new value.
-          cargoHash = "sha256-t8vc7C6Tr2EWc+vVjVnpcvV58lXXH0a6HFQV4KeAyTE=";
+          cargoHash = "sha256-3NWe0GV4VKzhciHtXDhFOo2PXzVO1F2xTe7czWGI5LY=";
 
           nativeBuildInputs = [ pkgs.pkg-config ];
           buildInputs = [ pkgs.openssl ];
