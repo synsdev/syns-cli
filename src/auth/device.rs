@@ -25,7 +25,8 @@ pub(crate) fn machine_name_of(raw: Option<&str>) -> String {
     }
 }
 
-/// `machine_name_of` for a name the system gives as bytes: what is not UTF-8 becomes U+FFFD.
+/// `machine_name_of` for a name the system gives as bytes, as Unix does: what is not UTF-8 becomes U+FFFD.
+#[cfg(any(unix, test))]
 pub(crate) fn machine_name_of_bytes(raw: Option<&[u8]>) -> String {
     machine_name_of(raw.map(String::from_utf8_lossy).as_deref())
 }
