@@ -7526,13 +7526,17 @@ async fn convergence_respells_a_folder_renamed_in_letter_case_over_other_files()
     )
     .await
     .unwrap();
+    // Where the volume holds the two spellings apart (Linux), `dir/` is
+    // another folder, and keeps what the server never held.
+    let (case, _) = volume_holds_as_one(&dir);
+    let finder = if case {
+        "Dir/.DS_Store"
+    } else {
+        "dir/.DS_Store"
+    };
     assert_eq!(
         spelled_on_disk(&dir),
-        tree_of(&[
-            ("Dir/.DS_Store", "finder"),
-            ("Dir/a.md", "a\n"),
-            ("ok.md", "ok\n")
-        ])
+        tree_of(&[(finder, "finder"), ("Dir/a.md", "a\n"), ("ok.md", "ok\n")])
     );
     for _ in 0..2 {
         let outcome = converge(&client, Some(TOKEN), &copy, ConvergeMode::Publish, e.opts())
@@ -7576,11 +7580,20 @@ async fn convergence_takes_a_rename_in_normalisation_alone() {
     )
     .await
     .unwrap();
+    // Where the volume holds the two spellings apart (NTFS, Linux), the
+    // folder of the old spelling is another folder, and keeps what the
+    // server never held.
+    let (_, normalization) = volume_holds_as_one(&dir);
+    let finder = if normalization {
+        "de\u{301}ja\u{300}/.DS_Store"
+    } else {
+        "d\u{e9}j\u{e0}/.DS_Store"
+    };
     assert_eq!(
         spelled_on_disk(&dir),
         tree_of(&[
             ("cafe\u{301}.md", "cafe text\n"),
-            ("de\u{301}ja\u{300}/.DS_Store", "finder"),
+            (finder, "finder"),
             ("de\u{301}ja\u{300}/a.md", "a\n"),
             ("ok.md", "ok\n"),
         ])
@@ -7627,11 +7640,17 @@ async fn convergence_respells_every_level_of_a_folder_renamed_in_letter_case() {
     )
     .await
     .unwrap();
+    let (case, _) = volume_holds_as_one(&dir);
+    let (outer, inner) = if case {
+        ("dir/.DS_Store", "dir/sub/.DS_Store")
+    } else {
+        ("Dir/.DS_Store", "Dir/Sub/.DS_Store")
+    };
     assert_eq!(
         spelled_on_disk(&dir),
         tree_of(&[
-            ("dir/.DS_Store", "finder"),
-            ("dir/sub/.DS_Store", "finder"),
+            (outer, "finder"),
+            (inner, "finder"),
             ("dir/sub/x.md", "x\n"),
             ("dir/y.md", "y\n"),
             ("ok.md", "ok\n"),

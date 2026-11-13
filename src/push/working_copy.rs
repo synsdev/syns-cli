@@ -280,16 +280,27 @@ static LISTINGS: std::sync::Mutex<Option<HashMap<PathBuf, (std::time::SystemTime
 /// modification time moves other than by this run's own writes
 /// (`note_in_listing`).
 fn listing(dir: &Path) -> Option<Listing> {
+    listing_read(dir, false)
+}
+
+/// `listing`, read from the directory itself where `afresh` holds, the
+/// read kept for later asks: a directory's modification time is no sure
+/// sign of its entries (NTFS may leave it standing over a new entry).
+fn listing_read(dir: &Path, afresh: bool) -> Option<Listing> {
     let modified = std::fs::metadata(dir)
         .and_then(|meta| meta.modified())
         .ok()?;
-    if let Some(names) = LISTINGS.lock().ok().and_then(|listings| {
-        listings
-            .as_ref()?
-            .get(dir)
-            .filter(|(at, _)| *at == modified)
-            .map(|(_, names)| names.clone())
-    }) {
+    if let Some(names) = (!afresh)
+        .then(|| LISTINGS.lock().ok())
+        .flatten()
+        .and_then(|listings| {
+            listings
+                .as_ref()?
+                .get(dir)
+                .filter(|(at, _)| *at == modified)
+                .map(|(_, names)| names.clone())
+        })
+    {
         return Some(names);
     }
     let names: std::collections::HashSet<String> = std::fs::read_dir(dir)
@@ -303,6 +314,14 @@ fn listing(dir: &Path) -> Option<Listing> {
             .insert(dir.to_path_buf(), (modified, names.clone()));
     }
     Some(names)
+}
+
+/// Whether the listing of `dir` holds `name` exactly: the kept listing
+/// first, then, where it lacks the name, the directory read afresh, so a
+/// listing kept from before an entry stood never reads it as absent.
+fn lists_exactly(dir: &Path, name: &str) -> bool {
+    listing(dir).is_some_and(|names| names.contains(name))
+        || listing_read(dir, true).is_some_and(|names| names.contains(name))
 }
 
 /// Keeps the listing of `dir` true to a write (`stands`) or a removal this
@@ -329,12 +348,12 @@ pub(crate) fn note_in_listing(dir: &Path, name: &str, stands: bool) {
 /// a composed and a decomposed spelling read alike, since a normalising
 /// volume stores a name in its own form.
 fn lists_as_spelled(dir: &Path, name: &str) -> bool {
+    if lists_exactly(dir, name) {
+        return true;
+    }
     let Some(names) = listing(dir) else {
         return false;
     };
-    if names.contains(name) {
-        return true;
-    }
     // A name standing under another normalisation is this name only where
     // the volume rewrites every name it stores into its own form (HFS+
     // stores names decomposed); on a volume keeping names as written it is
@@ -511,14 +530,10 @@ pub(crate) fn held_as_one<'a>(
         }
     };
     let kept = |parent: &str, spellings: &std::collections::BTreeSet<String>| -> String {
-        let on_disk = listing(&root.join(parent));
+        let dir = root.join(parent);
         spellings
             .iter()
-            .find(|spelling| {
-                on_disk
-                    .as_ref()
-                    .is_some_and(|names| names.contains(*spelling))
-            })
+            .find(|spelling| lists_exactly(&dir, spelling))
             .or_else(|| {
                 spellings
                     .iter()
@@ -2355,6 +2370,29 @@ mod tests {
             );
         }
         assert!(held_as_one(root, ["a.md", "b.md"], |_| false).is_empty());
+    }
+
+    // A listing kept from before an entry stood never reads it as absent,
+    // even where the directory's modification time stands where it was
+    // (NTFS may leave it so): the directory is read afresh on a miss.
+    #[test]
+    fn a_kept_listing_never_reads_a_new_entry_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.md"), "a").unwrap();
+        assert!(stands_as_spelled(root, "a.md"));
+        let before = std::fs::metadata(root).unwrap().modified().unwrap();
+        std::fs::create_dir(root.join("Dir")).unwrap();
+        std::fs::write(root.join("Dir/b.md"), "b").unwrap();
+        #[cfg(unix)]
+        std::fs::File::open(root)
+            .unwrap()
+            .set_modified(before)
+            .unwrap();
+        let _ = before;
+        assert!(stands_as_spelled(root, "Dir"));
+        assert!(stands_as_spelled(root, "Dir/b.md"));
+        assert_eq!(spelled_otherwise_on_disk(root, "Dir/b.md"), None);
     }
 
     // The in-root home is judged on the path as served, a name this

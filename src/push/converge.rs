@@ -1301,9 +1301,9 @@ fn base_of(copy: &WorkingCopy) -> Option<Manifest> {
     let unknown: Vec<String> = twins
         .values()
         .filter(|kept| {
-            !kept.is_empty()
-                && !(std::fs::symlink_metadata(copy.root.join(kept.as_str())).is_ok()
-                    && stands_as_spelled(&copy.root, kept))
+            let on_disk = std::fs::symlink_metadata(copy.root.join(kept.as_str())).is_ok()
+                && stands_as_spelled(&copy.root, kept);
+            !kept.is_empty() && !on_disk
         })
         .cloned()
         .collect();
