@@ -139,7 +139,7 @@ pub async fn return_to_holder(
     }
 
     // 3 — the base carried to the holder's copy, the scope rebound.
-    let copy = WorkingCopy::open(stores, &scope.owner, &scope.name, &scope.dir)?;
+    let copy = WorkingCopy::open_scoped(stores, &scope.owner, &scope.name, &scope.dir)?;
     copy.carry_base(&scope.address())?;
     let mut returned = scope.clone();
     returned.identity = None;

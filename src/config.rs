@@ -270,6 +270,16 @@ impl Config {
         &self.stores().write
     }
 
+    /// The root the working copies' default homes stand under — the
+    /// configured root where `SYNS_CACHE_DIR` names one, the platform
+    /// default otherwise, as `stores().default` names it — probing and
+    /// creating nothing.
+    pub fn working_copy_root(&self) -> &Path {
+        self.configured_cache
+            .as_deref()
+            .unwrap_or(&self.default_cache)
+    }
+
     /// Every root a content store can stand under, each once, probing and
     /// creating nothing (D-242 §8): the configured root where
     /// `SYNS_CACHE_DIR` names one, the platform default, and the

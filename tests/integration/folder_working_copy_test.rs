@@ -3374,3 +3374,125 @@ fn e22_a_resolution_lists_no_machine_local_path_and_its_continue_publishes_none(
             .contains_key(&in_folder("media/.DS_Store"))
     );
 }
+
+// ---- a checkout moved by hand (cli-checkouts-on-this-machine M16–M18) -----
+
+/// The deployment with a resolution pending in the folder's copy — an
+/// edit of the board inside it against a teammate's — beside its recovery
+/// id and `W`'s status document, both read before any move.
+fn resolution_pending_in_the_folder() -> (Deployment, String, Value) {
+    let mut tree = h1_tree();
+    tree.insert(in_folder(".page/board.json"), b"l1\nl2\nl3\nl4\n".to_vec());
+    let d = Deployment::converged_over(tree);
+    d.advance_head(&[(
+        &in_folder(".page/board.json"),
+        Some("l1 remote\nl2\nl3\nl4\n"),
+    )]);
+    write(
+        &d.folder().join(".page/board.json"),
+        "l1 folder\nl2\nl3\nl4\n",
+    );
+    let sync = d.run_in(&d.folder(), b"", &["--json", "sync"]);
+    assert_eq!(exit_of(&sync), 4, "{}", stderr_of(&sync));
+    let recovery = one_document(&sync)["resolution"]["recoveryId"]
+        .as_str()
+        .expect("a recovery id")
+        .to_string();
+    let status = d.run_in(&d.w, b"", &["--json", "status"]);
+    assert_eq!(exit_of(&status), 0, "{}", stderr_of(&status));
+    (d, recovery, one_document(&status))
+}
+
+/// `from` moved by hand to `<a new scratch folder>/moved`.
+fn moved_by_hand(from: &Path) -> (TempDir, PathBuf) {
+    let scratch = tempfile::tempdir().expect("scratch");
+    let to = std::fs::canonicalize(scratch.path())
+        .expect("canonical scratch")
+        .join("moved");
+    std::fs::rename(from, &to).expect("move W");
+    (scratch, to)
+}
+
+/// Whether the file system answers a folder's birth time: where it does
+/// not, a moved folder is not recognised.
+fn births_known(dir: &Path) -> bool {
+    std::fs::metadata(dir)
+        .and_then(|meta| meta.created())
+        .is_ok()
+}
+
+/// Every home of `alice/work` holding no record: each holds its lock file
+/// alone, and no set-aside stands.
+fn left_homes_hold_their_lock_alone(d: &Deployment) {
+    let repo = d.cache.path().join("working-copies/alice/work");
+    for entry in std::fs::read_dir(&repo)
+        .expect("the repository's homes")
+        .flatten()
+    {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        assert!(!name.ends_with(".gone"), "a set-aside stands: {name}");
+        if !entry.path().is_dir() || entry.path().join("folder.json").is_file() {
+            continue;
+        }
+        let held: Vec<String> = std::fs::read_dir(entry.path())
+            .expect("a home")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(held, vec!["state.lock".to_string()], "{name}");
+    }
+}
+
+fn shown_recovery(d: &Deployment, dir: &Path) -> String {
+    let shown = d.run_in(dir, b"", &["--json", "resolution", "show"]);
+    assert_eq!(exit_of(&shown), 4, "{}", stderr_of(&shown));
+    one_document(&shown)["resolution"]["recoveryId"]
+        .as_str()
+        .expect("a recovery id")
+        .to_string()
+}
+
+// Row M16: the first command at the moved root carries the folder's copy
+// with it: the root's state is as before the move, and the folder's
+// resolution is answered inside it.
+#[test]
+#[serial]
+fn a_moved_checkout_keeps_a_folder_resolution_when_its_root_runs_first() {
+    let (d, recovery, before) = resolution_pending_in_the_folder();
+    if !births_known(&d.w) {
+        return;
+    }
+    let (_scratch, moved) = moved_by_hand(&d.w);
+    let status = d.run_in(&moved, b"", &["--json", "status"]);
+    assert_eq!(exit_of(&status), 0, "{}", stderr_of(&status));
+    assert_eq!(one_document(&status), before);
+    assert_eq!(shown_recovery(&d, &moved.join(FOLDER)), recovery);
+    left_homes_hold_their_lock_alone(&d);
+}
+
+// Rows M17 and M18: the first command inside the moved folder carries
+// the root's copy too, so the listing names the new root at once; moved a
+// second time before any command at the root, every copy is carried again.
+#[test]
+#[serial]
+fn a_moved_checkout_is_listed_at_once_when_a_folder_runs_first_and_follows_a_second_move() {
+    let (d, recovery, before) = resolution_pending_in_the_folder();
+    if !births_known(&d.w) {
+        return;
+    }
+    let (_scratch, moved) = moved_by_hand(&d.w);
+    assert_eq!(shown_recovery(&d, &moved.join(FOLDER)), recovery);
+    let listed = d.run_in(&moved, b"", &["--json", "checkouts"]);
+    assert_eq!(exit_of(&listed), 0, "{}", stderr_of(&listed));
+    assert_eq!(
+        one_document(&listed),
+        json!({"checkouts": [{"repo": "alice/work", "path": moved.to_str().unwrap()}]})
+    );
+
+    let (_again_scratch, again) = moved_by_hand(&moved);
+    let status = d.run_in(&again, b"", &["--json", "status"]);
+    assert_eq!(exit_of(&status), 0, "{}", stderr_of(&status));
+    assert_eq!(one_document(&status), before);
+    assert_eq!(shown_recovery(&d, &again.join(FOLDER)), recovery);
+    left_homes_hold_their_lock_alone(&d);
+}

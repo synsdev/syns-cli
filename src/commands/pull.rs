@@ -425,6 +425,9 @@ pub async fn cmd_pull(
         convergence_options_for(config, output),
     )
     .await?;
+    // A pull in a folder is a use of it, a pull that changes nothing too:
+    // the stamp orders the checkouts the listing names.
+    copy.mark_used();
 
     // `cmd_pull` 4
     write_identity_file(&repository, &target_dir, &owner, &name)?;
@@ -553,6 +556,7 @@ async fn pull_into_folder(
         Ok(None) => return Ok(()),
         Ok(Some(outcome)) => outcome,
     };
+    copy.mark_used();
     let (written, removed) = match outcome {
         SyncOutcome::Synced {
             written, removed, ..

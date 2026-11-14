@@ -1,4 +1,5 @@
 pub mod cat;
+pub mod checkouts;
 pub mod collaborators;
 pub mod commit;
 pub mod commit_edits;

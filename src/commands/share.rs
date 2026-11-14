@@ -1103,7 +1103,7 @@ fn carry_identity_base(
     if !same_dir || !bound {
         return Ok(());
     }
-    let copy = WorkingCopy::open(stores, &scope.owner, &scope.name, dir)?;
+    let copy = WorkingCopy::open_scoped(stores, &scope.owner, &scope.name, dir)?;
     copy.carry_base(&scope.address())?;
     Ok(())
 }

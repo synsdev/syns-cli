@@ -710,6 +710,7 @@ fn repo_create_refuses_the_nouns_update_options() {
 /// `enable-checks` stand beside `fork`, `unregistered` in `CLI_IA.md`
 /// until that inventory carries them; SPEC u300: `share` and `unshare`
 /// stand beside them, `unregistered` in `CLI_IA.md` alike.
+/// `checkouts` stands beside `repos` (cli-checkouts-on-this-machine).
 const REGISTERED: &[(&str, &[&str])] = &[
     (
         "",
@@ -735,6 +736,7 @@ const REGISTERED: &[(&str, &[&str])] = &[
             "revert",
             "repo",
             "repos",
+            "checkouts",
             "collaborators",
             "delete",
             "explore",

@@ -6934,6 +6934,147 @@ async fn retrieval_into_a_re_created_directory_at_an_unmoved_head_takes_every_he
     re_created_directory_retrieval(false).await;
 }
 
+// cli-checkouts-on-this-machine, rows M3 and M4: a checkout moved by hand
+// within its file system keeps its base and its pending resolution at the
+// new path, so the first command run there meets them as the unmoved
+// checkout would.
+
+/// A checkout of `alice/proj` pulled to `<scratch>/p` from `files`, the
+/// scratch folder beside it.
+async fn pulled_to_p(e: &Env, files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf, String) {
+    let scratch = tempfile::tempdir().unwrap();
+    let p = std::fs::canonicalize(scratch.path()).unwrap().join("p");
+    let h0 = e.fake.commit(files);
+    let pulled = cmd_pull(
+        &e.config,
+        &e.output,
+        Some(("alice".into(), "proj".into())),
+        Some(p.display().to_string()),
+        None,
+        false,
+        false,
+        None,
+    )
+    .await;
+    assert!(pulled.is_ok(), "{pulled:?}");
+    (scratch, p, h0)
+}
+
+/// Whether the file system answers a folder's birth time: where it does
+/// not, a moved folder is not recognised.
+fn births_known(dir: &Path) -> bool {
+    std::fs::metadata(dir)
+        .and_then(|meta| meta.created())
+        .is_ok()
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_checkout_moved_by_hand_syncs_against_its_recorded_base() {
+    let e = env().await;
+    let (_scratch, p, h0) =
+        pulled_to_p(&e, &[("a.md", "a0\n"), ("b.md", "b0\n"), ("c.md", "c0\n")]).await;
+    if !births_known(&p) {
+        return;
+    }
+    write_files(&p, &[("a.md", "a local\n"), ("new.md", "new\n")]);
+    e.fake
+        .commit_changes(&[("b.md", Some("b remote\n")), ("c.md", None)]);
+    let q = p.with_file_name("q");
+    std::fs::rename(&p, &q).unwrap();
+
+    let synced = {
+        let _cwd = CwdGuard::enter(&q);
+        cmd_sync(&e.config, &e.output, false).await
+    };
+    let document = refusal_document(synced);
+    let resolution = &document["resolution"];
+    assert_eq!(resolution["baseCommit"], json!(h0), "{document}");
+    assert_eq!(
+        resolution["localPaths"],
+        json!(["a.md", "new.md"]),
+        "{document}"
+    );
+    assert_eq!(
+        resolution["remotePaths"],
+        json!(["b.md", "c.md"]),
+        "{document}"
+    );
+    assert_eq!(resolution["collisions"], json!([]), "{document}");
+    assert!(e.fake.push_bodies().is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_checkout_moved_by_hand_keeps_its_pending_resolution() {
+    let e = env().await;
+    let (_scratch, p, _) = pulled_to_p(&e, &[("a.md", "a0\n")]).await;
+    if !births_known(&p) {
+        return;
+    }
+    write_files(&p, &[("a.md", "a local\n")]);
+    e.fake.commit_changes(&[("a.md", Some("a remote\n"))]);
+    let prepared = {
+        let _cwd = CwdGuard::enter(&p);
+        cmd_sync(&e.config, &e.output, false).await
+    };
+    let recovery = refusal_document(prepared)["resolution"]["recoveryId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let q = p.with_file_name("q");
+    std::fs::rename(&p, &q).unwrap();
+
+    let shown = {
+        let _cwd = CwdGuard::enter(&q);
+        cmd_resolution(&e.config, &e.output, ResolutionAction::Show, false).await
+    };
+    assert_eq!(
+        refusal_document(shown)["resolution"]["recoveryId"],
+        json!(recovery)
+    );
+    let synced = {
+        let _cwd = CwdGuard::enter(&q);
+        cmd_sync(&e.config, &e.output, false).await
+    };
+    assert_eq!(
+        refusal_document(synced)["resolution"]["recoveryId"],
+        json!(recovery)
+    );
+    let marked = read(&q, "a.md");
+    assert_eq!(
+        marked.lines().filter(|l| l.starts_with("<<<<<<< ")).count(),
+        1,
+        "{marked}"
+    );
+    assert!(e.fake.push_bodies().is_empty());
+}
+
+// Verify D2: a pull in a folder is a use of it, one that downloads
+// nothing too: it restamps the copy, which orders the checkouts listed.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_pull_that_changes_nothing_restamps_the_copy() {
+    let e = env().await;
+    let (_scratch, p, _) = pulled_to_p(&e, &[("a.md", "a0\n")]).await;
+    let stamp =
+        || std::fs::read_to_string(e.copy(&p).state_dir.join("state.stamp")).expect("a stamp");
+    let pull_here = || async {
+        let _cwd = CwdGuard::enter(&p);
+        cmd_pull(&e.config, &e.output, None, None, None, false, false, None).await
+    };
+    // The first pull after the retrieval may still record what it read;
+    // the one after it has nothing left to write.
+    let settled = pull_here().await;
+    assert!(settled.is_ok(), "{settled:?}");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let before = stamp();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let pulled = pull_here().await;
+    assert!(pulled.is_ok(), "{pulled:?}");
+    assert_ne!(stamp(), before);
+}
+
 // ---- a path is taken as written ---------------------------------------------
 
 /// A head's paths with white space at an end, each beside the sibling it

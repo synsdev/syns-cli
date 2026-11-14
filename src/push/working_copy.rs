@@ -660,12 +660,26 @@ pub(crate) fn ensure_in_root_home(dir: &Path) -> Result<(), CliError> {
 /// its inode, and its birth time where the file system answers one, so an
 /// inode a removed folder freed and a new one took still differs. The
 /// device is recorded but not compared.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `unique_index` is never recorded: it is set on an identity read from
+/// disk where the volume is NTFS, whose file index alone names one folder
+/// (D-164), and is no part of the comparison of two records.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct FolderIdentity {
     dev: u64,
     ino: u64,
     born: Option<(u64, u32)>,
+    #[serde(skip)]
+    unique_index: bool,
 }
+
+impl PartialEq for FolderIdentity {
+    fn eq(&self, other: &FolderIdentity) -> bool {
+        (self.dev, self.ino, self.born) == (other.dev, other.ino, other.born)
+    }
+}
+
+impl Eq for FolderIdentity {}
 
 impl FolderIdentity {
     /// The identity of the folder at `root`, none where it cannot be read
@@ -683,6 +697,7 @@ impl FolderIdentity {
             dev: meta.dev(),
             ino: meta.ino(),
             born,
+            unique_index: false,
         })
     }
 
@@ -697,6 +712,7 @@ impl FolderIdentity {
         use windows_sys::Win32::Storage::FileSystem::{
             BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE,
             FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+            GetVolumeInformationByHandleW,
         };
         // Backup semantics open a directory; full sharing never blocks a
         // concurrent removal or rename of the folder.
@@ -721,10 +737,30 @@ impl FolderIdentity {
             .and_then(|meta| meta.created().ok())
             .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|since| (since.as_secs(), since.subsec_nanos()));
+        // NTFS alone: on FAT and exFAT the index names a directory entry's
+        // slot, and on ReFS a 64-bit index is not guaranteed unique.
+        let mut system = [0u16; 32];
+        // SAFETY: the handle is open for the call's length, the buffer is
+        // as long as the size passed, and every other out-pointer is null.
+        let answered = unsafe {
+            GetVolumeInformationByHandleW(
+                folder.as_raw_handle(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                system.as_mut_ptr(),
+                system.len() as u32,
+            )
+        } != 0;
+        let length = system.iter().position(|&c| c == 0).unwrap_or(system.len());
+        let unique_index = answered && String::from_utf16_lossy(&system[..length]) == "NTFS";
         Some(FolderIdentity {
             dev: u64::from(info.dwVolumeSerialNumber),
             ino: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
             born,
+            unique_index,
         })
     }
 
@@ -760,6 +796,64 @@ impl FolderIdentity {
             (Some(recorded), Some(current)) => current.replaces(&recorded),
             _ => false,
         }
+    }
+
+    /// Whether `self` and `other` are one folder wherever each was seen:
+    /// the same inode and the same birth time, both known. The device is
+    /// not compared (D-163), so a folder reached through another mount
+    /// is the same folder.
+    ///
+    /// Where either was read from an NTFS volume, the volume serial and the
+    /// file index alone: the index carries a sequence number NTFS changes
+    /// when a record is reused (D-164), so no other folder of that volume
+    /// answers it, and the serial, which a Windows volume keeps across
+    /// mounts, tells the volumes apart; while NTFS tunnelling hands a folder
+    /// renamed onto a name vacated within 15 seconds that name's old
+    /// creation time, which would make a swap of two folders unrecognisable.
+    fn same_folder(&self, other: &FolderIdentity) -> bool {
+        if self.unique_index || other.unique_index {
+            return self.dev == other.dev && self.ino == other.ino;
+        }
+        self.ino == other.ino && self.born.is_some() && self.born == other.born
+    }
+
+    /// Whether a move of this folder can be recognised at all: its birth
+    /// time is known, or its volume's file index alone tells it.
+    fn recognisable(&self) -> bool {
+        self.unique_index || self.born.is_some()
+    }
+}
+
+/// What `folder.json` records (D-163, and the record of
+/// `cli-checkouts-on-this-machine`): the folder's identity, the canonical
+/// root the home's name is the hash of, as text — none where it is not
+/// valid Unicode — and whether the copy is a checkout: a repository's at
+/// its checkout's root, or a shared folder's under its own name at that
+/// folder. A record an older build wrote carries neither of the two.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct FolderRecord {
+    #[serde(flatten)]
+    identity: FolderIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkout: Option<bool>,
+}
+
+impl FolderRecord {
+    /// The record `home` holds, none where none stands or it does not
+    /// parse.
+    fn read(home: &Path) -> Option<FolderRecord> {
+        let bytes = std::fs::read(home.join(FOLDER_FILE)).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// Write the record into `home`, whole.
+    fn write(&self, home: &Path) -> Result<(), CliError> {
+        let json = serde_json::to_vec(self).map_err(|err| CliError::Io {
+            message: format!("could not record {}: {err}", home.display()),
+        })?;
+        write_atomic(&home.join(FOLDER_FILE), &json, flush_directory)
     }
 }
 
@@ -1044,11 +1138,38 @@ impl WorkingCopy {
     /// The key is the canonical root, so two spellings of one directory
     /// — a link to it included — open one state directory. The write home
     /// is created where it does not stand (SPEC u298, `WorkingCopy::open`).
+    ///
+    /// The copy is recorded as a checkout: a repository's at its
+    /// checkout's root. A scoped folder's copy under its holder is opened
+    /// by `open_scoped` or `open_folder`.
     pub fn open(
         stores: &StoreRoots,
         owner: &str,
         name: &str,
         root: &Path,
+    ) -> Result<WorkingCopy, CliError> {
+        Self::open_recording(stores, owner, name, root, true)
+    }
+
+    /// Open the copy of `owner/name` a scoped folder's directory `dir`
+    /// holds under its holder, recorded as no checkout (the share
+    /// commands, `return_to_holder`).
+    pub fn open_scoped(
+        stores: &StoreRoots,
+        owner: &str,
+        name: &str,
+        dir: &Path,
+    ) -> Result<WorkingCopy, CliError> {
+        Self::open_recording(stores, owner, name, dir, false)
+    }
+
+    /// `open`, recording the copy as a checkout where `checkout` is set.
+    fn open_recording(
+        stores: &StoreRoots,
+        owner: &str,
+        name: &str,
+        root: &Path,
+        checkout: bool,
     ) -> Result<WorkingCopy, CliError> {
         let canonical = std::fs::canonicalize(root).map_err(|err| CliError::Io {
             message: format!("could not resolve working copy {}: {err}", root.display()),
@@ -1064,61 +1185,101 @@ impl WorkingCopy {
         }
         let mut copy = Self::at(stores, owner, name, canonical)?;
         if !stores.default_refused {
-            copy.settle_folder_identity()?;
+            copy.settle_folder(checkout)?;
         }
         copy.ensure_write_home()?;
         Ok(copy)
     }
 
-    /// Issue 173, D-163: under the default home's lock, discard the state
-    /// it holds for a removed folder that stood at this root, and record
-    /// the identity of the folder standing there now — where none is
-    /// recorded, state written before the identity was kept adopted as it
-    /// stands.
-    fn settle_folder_identity(&mut self) -> Result<(), CliError> {
+    /// Settle the default home's record for the folder standing at this
+    /// root (D-163, and the decision *a working copy follows its folder*):
+    ///
+    /// 1. the record matches — identity, path and checkout — and nothing
+    ///    is written, no lock taken;
+    /// 2. otherwise, under the repository's `folders.lock` and then this
+    ///    home's lock, a carry an earlier run left unfinished is finished;
+    /// 3. state recorded for another folder, one created at this root
+    ///    since, is set aside in `<sha1>.gone`, not discarded;
+    /// 4. where the home then holds no state file and the folder's birth
+    ///    time is known, the state of this very folder recorded under the
+    ///    path it left is carried here, every copy of the moved tree with
+    ///    it;
+    /// 5. the record is written.
+    fn settle_folder(&mut self, checkout: bool) -> Result<(), CliError> {
         let home = self.default_home().to_path_buf();
+        let Some(current) = FolderIdentity::of(&self.root) else {
+            return Ok(());
+        };
+        let wanted = FolderRecord {
+            identity: current.clone(),
+            path: self.root.to_str().map(str::to_string),
+            checkout: Some(checkout),
+        };
+        let repo = home
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| CliError::Io {
+                message: format!(
+                    "could not settle working copy state {}: no parent directory",
+                    home.display()
+                ),
+            })?;
+        // 1 — the record matches, and no carry of the repository is listed:
+        // a home a carry left unfinished may match while part of its state
+        // stands elsewhere.
+        if FolderRecord::read(&home).as_ref() == Some(&wanted) && !carry_listed(&repo) {
+            self.stale_default = false;
+            return Ok(());
+        }
         let io = |err: std::io::Error| CliError::Io {
             message: format!(
                 "could not settle working copy state {}: {err}",
                 home.display()
             ),
         };
-        let Some(current) = FolderIdentity::of(&self.root) else {
-            return Ok(());
+        let mut folders = FoldersLock::take(&repo).map_err(io)?;
+        let _own = lock_creating(&home.join(LOCK_FILE)).map_err(io)?;
+        let carry = Carry {
+            repo: &repo,
+            own: &home,
         };
-        if FolderIdentity::recorded(&home).as_ref() == Some(&current) {
+
+        // 2 — a carry left unfinished, finished first. One of this home's
+        // that still cannot be finished fails the run, so the copy is never
+        // worked on with a part of its state.
+        carry.finish(&mut folders).map_err(io)?;
+        let own = carry.own_name();
+        if folders
+            .kept
+            .iter()
+            .any(|kept| kept.leaves == own || kept.reaches == own)
+        {
+            return Err(io(std::io::Error::other(
+                "a carry of this folder's state could not be finished; run the command again",
+            )));
+        }
+        if FolderRecord::read(&home).as_ref() == Some(&wanted) {
             self.stale_default = false;
             return Ok(());
         }
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(home.join(LOCK_FILE))
-            .map_err(io)?;
-        lock.lock().map_err(io)?;
+
+        // 3 — another folder's state, set aside.
         if FolderIdentity::stale(&home, &self.root) {
-            for entry in std::fs::read_dir(&home).map_err(io)? {
-                let entry = entry.map_err(io)?;
-                if entry.file_name() == LOCK_FILE {
-                    continue;
-                }
-                let path = entry.path();
-                let removed = if entry.file_type().map_err(io)?.is_dir() {
-                    std::fs::remove_dir_all(&path)
-                } else {
-                    std::fs::remove_file(&path)
-                };
-                match removed {
-                    Ok(()) => {}
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(err) => return Err(io(err)),
-                }
-            }
+            carry.set_aside(&mut folders, &current).map_err(io)?;
         }
-        let json = serde_json::to_vec(&current).map_err(|err| io(std::io::Error::other(err)))?;
-        write_atomic(&home.join(FOLDER_FILE), &json, flush_directory)?;
+
+        // 4 — this folder's own state, carried from the path it left.
+        if !holds_state(&home)
+            && current.recognisable()
+            && let Some(found) = carry.moved_here(&current, &self.root)
+        {
+            carry
+                .carry_tree(&mut folders, found, &self.root)
+                .map_err(io)?;
+        }
+
+        // 5 — the record.
+        wanted.write(&home)?;
         self.stale_default = false;
         Ok(())
     }
@@ -1238,7 +1399,10 @@ impl WorkingCopy {
     /// base its holder's copy there recorded later carried to it.
     pub fn open_folder(stores: &StoreRoots, scope: &FolderScope) -> Result<WorkingCopy, CliError> {
         let (owner, name) = Self::addressed(scope);
-        let mut copy = Self::open(stores, &owner, &name, &scope.dir)?;
+        // A shared folder's copy under its own name at that folder is a
+        // checkout; every other scoped folder's is part of one.
+        let checkout = scope.identity.is_some() && scope.enclosing.is_empty();
+        let mut copy = Self::open_recording(stores, &owner, &name, &scope.dir, checkout)?;
         copy.folder = Some(scope.clone());
         if scope.identity.is_some() {
             copy.carry_base(&scope.holder())?;
@@ -1479,6 +1643,15 @@ impl WorkingCopy {
                 .map_err(|err| std::io::Error::other(err.to_string()))?;
         }
         Ok(())
+    }
+
+    /// Date the copy's last use: its write home's stamp rewritten under
+    /// its lock, though no state changed. A stamp that cannot be written
+    /// is left as it stood: it orders the listing and guards nothing.
+    pub fn mark_used(&self) {
+        if let Ok(_lock) = self.lock() {
+            let _ = self.restamp();
+        }
     }
 
     /// Rewrite the write home's stamp, dating its last change.
@@ -1942,6 +2115,798 @@ fn read_files(home: &Path) -> Vec<(String, std::time::SystemTime)> {
         }
     }
     files
+}
+
+// ---- a working copy follows its folder --------------------------------------
+
+/// The lock every run that sets aside or carries a repository's state
+/// takes first, beside its `review.lock`; while a carry is under way it
+/// holds that carry's list of members, one line of JSON.
+const FOLDERS_LOCK: &str = "folders.lock";
+
+/// The suffix of a set-aside: `<sha1>.gone` holds the state recorded for a
+/// folder that left the path `<sha1>` is the hash of.
+const SET_ASIDE: &str = ".gone";
+
+/// The name a set-aside that is the opening folder's own takes while a
+/// newer one is made beside it: `<sha1>.taking.gone`, a set-aside still.
+const TAKING: &str = ".taking";
+
+/// Open the lock file at `path`, created where absent, and take its lock,
+/// waiting.
+fn lock_creating(path: &Path) -> std::io::Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    file.lock()?;
+    Ok(file)
+}
+
+/// Whether `home` holds a state file: a base, a resolution, an outbox, a
+/// snapshot or a stat record.
+fn holds_state(home: &Path) -> bool {
+    !read_files(home).is_empty()
+}
+
+/// The stamp `home` carries, none where it carries none.
+fn stamp_of(home: &Path) -> Option<u128> {
+    std::fs::read_to_string(home.join(STATE_STAMP))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Whether the repository folder `repo` lists a carry or a set-aside under
+/// way, read without its lock: a first line in `folders.lock` that is not
+/// empty, or a file that cannot be read (Windows refuses a read of a file
+/// another process holds locked) — either sends the run to take the lock.
+fn carry_listed(repo: &Path) -> bool {
+    match std::fs::read(repo.join(FOLDERS_LOCK)) {
+        Ok(bytes) => bytes
+            .split(|b| *b == b'\n')
+            .next()
+            .is_some_and(|line| !line.is_empty()),
+        Err(err) => err.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Whether `name` is a default home's: the 40 hexadecimal digits of a
+/// root's hash.
+fn is_home_name(name: &str) -> bool {
+    name.len() == 40 && name.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Flush `dir`, a flush the file system does not support standing.
+fn flush_dir_quietly(dir: &Path) -> std::io::Result<()> {
+    match flush_directory(dir) {
+        Err(err) if !is_unsupported_flush(&err) => Err(err),
+        _ => Ok(()),
+    }
+}
+
+/// Move `source` to `target`, a directory merged into one standing there
+/// entry by entry, and anything else standing at `target` replaced.
+fn move_entry(source: &Path, target: &Path) -> std::io::Result<()> {
+    let source_is_dir = std::fs::symlink_metadata(source)?.is_dir();
+    match std::fs::symlink_metadata(target) {
+        Ok(meta) if meta.is_dir() && source_is_dir => {
+            for entry in std::fs::read_dir(source)? {
+                let entry = entry?;
+                move_entry(&entry.path(), &target.join(entry.file_name()))?;
+            }
+            return match std::fs::remove_dir(source) {
+                Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
+                _ => Ok(()),
+            };
+        }
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(target)?,
+        Ok(_) if source_is_dir => std::fs::remove_file(target)?,
+        _ => {}
+    }
+    std::fs::rename(source, target)
+}
+
+/// Move every entry of the home `from` into `to` but its lock file and its
+/// record, then flush both.
+fn move_state(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == LOCK_FILE || name == FOLDER_FILE {
+            continue;
+        }
+        move_entry(&entry.path(), &to.join(&name))?;
+    }
+    flush_dir_quietly(to)?;
+    flush_dir_quietly(from)
+}
+
+/// Remove the file at `path`, one already gone standing.
+fn remove_if_standing(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
+        _ => Ok(()),
+    }
+}
+
+/// The folder that was moved, and where it now stands, read from the path
+/// a copy's state was recorded at and the root it is opened at now: their
+/// common trailing folders taken off (`/a/p/docs` and `/a/q/docs` give
+/// `/a/p` and `/a/q`). Two equal paths are answered as they stand.
+fn moved_between(left: &Path, now: &Path) -> (PathBuf, PathBuf) {
+    let (mut from, mut to) = (left.to_path_buf(), now.to_path_buf());
+    if from == to {
+        return (from, to);
+    }
+    while let (Some(a), Some(b)) = (from.file_name(), to.file_name()) {
+        if a != b {
+            break;
+        }
+        let (Some(up_from), Some(up_to)) = (from.parent(), to.parent()) else {
+            break;
+        };
+        let (up_from, up_to) = (up_from.to_path_buf(), up_to.to_path_buf());
+        from = up_from;
+        to = up_to;
+    }
+    (from, to)
+}
+
+/// One copy a carry moves: the home it leaves and the home it reaches,
+/// both named within the repository's folder, the path it reaches, and
+/// the identity of its folder, which must stand there. A set-aside under
+/// way (`set_aside`) is listed the same way, reaching `<sha1>.gone`: its
+/// folder stands nowhere it is looked for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Member {
+    leaves: String,
+    reaches: String,
+    path: String,
+    /// The path the folder was recorded at in the home it leaves, where
+    /// one was: a carry undone puts the record back with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    left: Option<String>,
+    #[serde(default)]
+    dev: u64,
+    ino: u64,
+    born: Option<(u64, u32)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkout: Option<bool>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    set_aside: bool,
+}
+
+impl Member {
+    /// The identity the list holds for the member's folder.
+    fn identity(&self) -> FolderIdentity {
+        FolderIdentity {
+            dev: self.dev,
+            ino: self.ino,
+            born: self.born,
+            unique_index: false,
+        }
+    }
+
+    /// Whether the member leaves or reaches a home `other` leaves or
+    /// reaches.
+    fn meets(&self, other: &Member) -> bool {
+        [&self.leaves, &self.reaches]
+            .into_iter()
+            .any(|dir| *dir == other.leaves || *dir == other.reaches)
+    }
+
+    /// Whether the home the member reaches holds the record its move wrote
+    /// there: the listed one, or one naming the path it reaches and its
+    /// inode — the birth time is read again when the move writes it, and
+    /// NTFS tunnelling may have changed it. A record a released build
+    /// wrote names no path.
+    fn reached_in(&self, home: &Path) -> bool {
+        self.recorded_in(home)
+            || FolderRecord::read(home).is_some_and(|r| {
+                r.path.as_deref() == Some(self.path.as_str()) && r.identity.ino == self.ino
+            })
+    }
+
+    /// Whether `home` still holds the record the list names: the same
+    /// inode and birth time, exactly.
+    fn recorded_in(&self, home: &Path) -> bool {
+        FolderRecord::read(home)
+            .is_some_and(|r| r.identity.ino == self.ino && r.identity.born == self.born)
+    }
+}
+
+/// The repository's `folders.lock`, held.
+struct FoldersLock {
+    file: File,
+    /// Members a run could not finish, a file of theirs already moved:
+    /// kept at the head of every list this run writes, for a later run.
+    kept: Vec<Member>,
+}
+
+/// What one member's move came to.
+enum Moved {
+    /// Every file moved, the record with it.
+    Done,
+    /// Nothing moved: the member failed its test, or could not be begun.
+    Left(Option<std::io::Error>),
+    /// It failed once its files had begun to move: it stays listed.
+    Broken(std::io::Error),
+}
+
+impl FoldersLock {
+    /// Take the lock of the repository folder `repo`, waiting.
+    fn take(repo: &Path) -> std::io::Result<FoldersLock> {
+        std::fs::create_dir_all(repo)?;
+        Ok(FoldersLock {
+            file: lock_creating(&repo.join(FOLDERS_LOCK))?,
+            kept: Vec::new(),
+        })
+    }
+
+    /// The list of a carry under way, empty where none stands or the line
+    /// is torn: a torn list was being written before anything moved.
+    fn list(&mut self) -> Vec<Member> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut bytes = Vec::new();
+        if self.file.seek(SeekFrom::Start(0)).is_err() || self.file.read_to_end(&mut bytes).is_err()
+        {
+            return Vec::new();
+        }
+        let line = bytes.split(|b| *b == b'\n').next().unwrap_or_default();
+        serde_json::from_slice(line).unwrap_or_default()
+    }
+
+    /// Write `members` as the list, its one line ended by a newline, and
+    /// flush it; an empty list clears it. The file is written in place, so
+    /// a run waiting on its lock waits on the same file.
+    /// The members this run keeps for a later one stand first.
+    fn write(&mut self, members: &[Member]) -> std::io::Result<()> {
+        use std::io::{Seek, SeekFrom};
+        let listed: Vec<&Member> = self.kept.iter().chain(members).collect();
+        let mut bytes = if listed.is_empty() {
+            Vec::new()
+        } else {
+            serde_json::to_vec(&listed).map_err(std::io::Error::other)?
+        };
+        bytes.push(b'\n');
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.write_all(&bytes)?;
+        // Only the first line is read: a tail left where shortening the
+        // file is refused counts for nothing.
+        let _ = self.file.set_len(bytes.len() as u64);
+        self.file.sync_all()
+    }
+}
+
+/// One record a home or a set-aside of the repository holds.
+struct Recorded {
+    dir: String,
+    set_aside: bool,
+    record: FolderRecord,
+}
+
+/// The carry and the set-aside of one repository's homes, run holding its
+/// `folders.lock` and the opening home's `state.lock`.
+struct Carry<'a> {
+    repo: &'a Path,
+    own: &'a Path,
+}
+
+impl Carry<'_> {
+    /// The opening home's name within the repository's folder.
+    fn own_name(&self) -> String {
+        self.own
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    /// Every record the repository's other homes and its set-asides hold.
+    fn records(&self) -> Vec<Recorded> {
+        let own = self.own_name();
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(self.repo).into_iter().flatten().flatten() {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if name == own || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let set_aside = name.ends_with(SET_ASIDE);
+            if !set_aside && !is_home_name(&name) {
+                continue;
+            }
+            if let Some(record) = FolderRecord::read(&entry.path()) {
+                found.push(Recorded {
+                    dir: name,
+                    set_aside,
+                    record,
+                });
+            }
+        }
+        found
+    }
+
+    /// Step 2: finish the carry or the set-aside the list in `folders`
+    /// names, each member tested again before it moves, then clear the
+    /// list. A run finishing another folder's carry never fails on it: a
+    /// member that fails its test is struck, and one that meets an error
+    /// stays listed for a later run — it may be part-moved already — and
+    /// every home it touches is left to that run.
+    fn finish(&self, folders: &mut FoldersLock) -> std::io::Result<()> {
+        let list = folders.list();
+        if list.is_empty() {
+            return Ok(());
+        }
+        for member in list {
+            let moved = if member.set_aside {
+                self.set_aside_member(&member)
+            } else {
+                self.finish_member(&member)
+            };
+            // A listed member may already be part-moved, so an error, before
+            // or after its files begin to move, keeps it listed; only a
+            // failed test strikes it.
+            if !matches!(moved, Moved::Done | Moved::Left(None)) {
+                folders.kept.push(member);
+            }
+        }
+        folders.write(&[])
+    }
+
+    /// Step 3: set the opening home's files aside in `<sha1>.gone`, its
+    /// record last, the lock file kept, listed in `folders` as a member
+    /// while it moves so that a run killed part-way is finished by step 2.
+    /// A set-aside standing there recording the folder `current` — this
+    /// very folder's state, set aside when another folder stood here — is
+    /// kept aside as `<sha1>.taking.gone` for step 4 to take; any other is
+    /// replaced.
+    fn set_aside(
+        &self,
+        folders: &mut FoldersLock,
+        current: &FolderIdentity,
+    ) -> std::io::Result<()> {
+        let own = self.own_name();
+        let Some(record) = FolderRecord::read(self.own) else {
+            return Ok(());
+        };
+        let gone_name = format!("{own}{SET_ASIDE}");
+        let gone = self.repo.join(&gone_name);
+        if gone.is_dir() {
+            match FolderRecord::read(&gone) {
+                Some(older) if older.identity.same_folder(current) => {
+                    let taking = self.repo.join(format!("{own}{TAKING}{SET_ASIDE}"));
+                    if taking.exists() {
+                        std::fs::remove_dir_all(&taking)?;
+                    }
+                    std::fs::rename(&gone, &taking)?;
+                }
+                _ => std::fs::remove_dir_all(&gone)?,
+            }
+        }
+        let member = Member {
+            leaves: own,
+            reaches: gone_name,
+            path: record.path.clone().unwrap_or_default(),
+            left: record.path.clone(),
+            dev: record.identity.dev,
+            ino: record.identity.ino,
+            born: record.identity.born,
+            checkout: record.checkout,
+            set_aside: true,
+        };
+        if folders.kept.iter().any(|kept| kept.meets(&member)) {
+            return Err(std::io::Error::other(
+                "a carry of this folder's state could not be finished; run the command again",
+            ));
+        }
+        folders.write(std::slice::from_ref(&member))?;
+        match self.set_aside_member(&member) {
+            Moved::Done | Moved::Left(None) => folders.write(&[]),
+            Moved::Left(Some(err)) => {
+                folders.write(&[])?;
+                Err(err)
+            }
+            Moved::Broken(err) => {
+                folders.kept.push(member);
+                folders.write(&[])?;
+                Err(err)
+            }
+        }
+    }
+
+    /// Move a listed set-aside's files from the home it leaves into the
+    /// set-aside, its record last, where that home still holds the record
+    /// the list names; the home's lock held, the opening home's being held
+    /// already.
+    fn set_aside_member(&self, member: &Member) -> Moved {
+        let leaves = self.repo.join(&member.leaves);
+        let gone = self.repo.join(&member.reaches);
+        if !leaves.is_dir() {
+            return Moved::Left(None);
+        }
+        let _left = if leaves == self.own {
+            None
+        } else {
+            match lock_creating(&leaves.join(LOCK_FILE)) {
+                Ok(lock) => Some(lock),
+                Err(err) => return Moved::Left(Some(err)),
+            }
+        };
+        if !member.recorded_in(&leaves) {
+            return Moved::Left(None);
+        }
+        let moved = (|| {
+            move_state(&leaves, &gone)?;
+            std::fs::rename(leaves.join(FOLDER_FILE), gone.join(FOLDER_FILE))?;
+            flush_dir_quietly(&gone)?;
+            flush_dir_quietly(&leaves)?;
+            flush_dir_quietly(self.repo)
+        })();
+        match moved {
+            Ok(()) => Moved::Done,
+            Err(err) => Moved::Broken(err),
+        }
+    }
+
+    /// Step 4's search: the record of the folder `current`, now at `root`,
+    /// that no longer stands at its recorded path — a set-aside, or a home
+    /// whose path holds nothing, a folder of another identity, or no
+    /// longer resolves to itself — the one stamped last where several do.
+    /// A record whose path still holds this folder, reached there as well,
+    /// is never taken, nor one with no path.
+    fn moved_here(&self, current: &FolderIdentity, root: &Path) -> Option<Recorded> {
+        self.records()
+            .into_iter()
+            .filter(|found| found.record.identity.same_folder(current))
+            .filter(|found| {
+                let Some(path) = found.record.path.as_deref().map(Path::new) else {
+                    return false;
+                };
+                if path == root {
+                    return found.set_aside;
+                }
+                found.set_aside
+                    || match std::fs::canonicalize(path) {
+                        Err(_) => true,
+                        Ok(resolved) if resolved != path => true,
+                        Ok(_) => !FolderIdentity::of(path)
+                            .is_some_and(|at| at.same_folder(&found.record.identity)),
+                    }
+            })
+            .max_by_key(|found| stamp_of(&self.repo.join(&found.dir)))
+    }
+
+    /// Step 4's carry: every copy of the tree moved from where `found`
+    /// was recorded to `root`, each whose folder stands at the same place
+    /// under the new path and whose home there holds no state, carried in
+    /// one step — the list written into `folders.lock` before the first
+    /// file moves and cleared after the last, the opening home's own
+    /// member moved last.
+    fn carry_tree(
+        &self,
+        folders: &mut FoldersLock,
+        found: Recorded,
+        root: &Path,
+    ) -> std::io::Result<()> {
+        let (Some(left), Some(now)) = (found.record.path.as_deref(), root.to_str()) else {
+            return Ok(());
+        };
+        let (from, to) = moved_between(Path::new(left), root);
+        let mut candidates = vec![Member {
+            leaves: found.dir.clone(),
+            reaches: self.own_name(),
+            path: now.to_string(),
+            left: found.record.path.clone(),
+            dev: found.record.identity.dev,
+            ino: found.record.identity.ino,
+            born: found.record.identity.born,
+            checkout: found.record.checkout,
+            set_aside: false,
+        }];
+        for other in self.records() {
+            if other.dir == found.dir {
+                continue;
+            }
+            if let Some(member) = self.member(&other, &from, &to) {
+                candidates.push(member);
+            }
+        }
+        // A home an unfinished member touches is left to the run that
+        // finishes it; where that is this folder's own state, the run fails
+        // rather than record the folder without it.
+        candidates.retain(|m| !folders.kept.iter().any(|kept| kept.meets(m)));
+        if candidates.first().map(|m| &m.leaves) != Some(&found.dir) {
+            return Err(std::io::Error::other(
+                "a carry of this folder's state could not be finished; run the command again",
+            ));
+        }
+        // No home is reached twice, and none is both left and reached.
+        let leaving: std::collections::HashSet<String> =
+            candidates.iter().map(|m| m.leaves.clone()).collect();
+        let mut reached = std::collections::HashSet::new();
+        let members: Vec<Member> = candidates
+            .into_iter()
+            .filter(|m| !leaving.contains(&m.reaches) && reached.insert(m.reaches.clone()))
+            .collect();
+
+        folders.write(&members)?;
+        let mut listed = members.clone();
+        let own = members.first().cloned();
+        let mut failed = None;
+        for member in members.iter().skip(1).chain(members.first()) {
+            let is_own = Some(member) == own.as_ref();
+            match self.carry_member(member) {
+                Moved::Done => {}
+                // Struck: nothing of it moved, so it is left where it
+                // stands and out of the list.
+                Moved::Left(err) => {
+                    listed.retain(|m| m != member);
+                    folders.write(&listed)?;
+                    if is_own && let Some(err) = err {
+                        failed = Some(err);
+                    }
+                }
+                // Part of it moved: it stays listed, so the next run
+                // finishes it whole.
+                Moved::Broken(err) => {
+                    folders.kept.push(member.clone());
+                    if is_own {
+                        failed = Some(err);
+                    }
+                }
+            }
+        }
+        folders.write(&[])?;
+        // This folder's own state that could not be moved fails the run, so
+        // the next one tries again; another copy's waits for a run in it.
+        failed.map_or(Ok(()), Err)
+    }
+
+    /// The member `other` makes of the move from `from` to `to`: its path
+    /// at or under `from`, the folder at the same place under `to` of its
+    /// own identity, and the home for that place another and holding no
+    /// state file.
+    fn member(&self, other: &Recorded, from: &Path, to: &Path) -> Option<Member> {
+        let path = Path::new(other.record.path.as_deref()?);
+        let rel = path.strip_prefix(from).ok()?;
+        let place = if rel.as_os_str().is_empty() {
+            to.to_path_buf()
+        } else {
+            to.join(rel)
+        };
+        let place = std::fs::canonicalize(place).ok()?;
+        let at = FolderIdentity::of(&place)?;
+        if !at.same_folder(&other.record.identity) || self.repo.starts_with(&place) {
+            return None;
+        }
+        let reaches = blob_sha1(place.as_os_str().as_encoded_bytes());
+        if reaches == other.dir || holds_state(&self.repo.join(&reaches)) {
+            return None;
+        }
+        Some(Member {
+            leaves: other.dir.clone(),
+            reaches,
+            path: place.to_str()?.to_string(),
+            left: other.record.path.clone(),
+            dev: other.record.identity.dev,
+            ino: other.record.identity.ino,
+            born: other.record.identity.born,
+            checkout: other.record.checkout,
+            set_aside: false,
+        })
+    }
+
+    /// Take the locks a member's move holds: of the home it leaves — a
+    /// set-aside has none — and of the home it reaches, made where absent,
+    /// the opening home's being held already.
+    fn member_locks(&self, member: &Member) -> std::io::Result<[Option<File>; 2]> {
+        let leaves = self.repo.join(&member.leaves);
+        let reaches = self.repo.join(&member.reaches);
+        let left = if member.leaves.ends_with(SET_ASIDE) || leaves == self.own {
+            None
+        } else {
+            Some(lock_creating(&leaves.join(LOCK_FILE))?)
+        };
+        std::fs::create_dir_all(&reaches)?;
+        let reached = if reaches == self.own {
+            None
+        } else {
+            Some(lock_creating(&reaches.join(LOCK_FILE))?)
+        };
+        Ok([left, reached])
+    }
+
+    /// Write a member's record in the home it reaches with its new path,
+    /// then move its files there and remove the record it left, a
+    /// set-aside emptied being removed whole: the record goes first, so no
+    /// file of it ever stands in a home without a record, which a released
+    /// build would adopt as its own folder's.
+    fn move_forward(&self, member: &Member, identity: FolderIdentity) -> std::io::Result<()> {
+        let leaves = self.repo.join(&member.leaves);
+        let reaches = self.repo.join(&member.reaches);
+        FolderRecord {
+            identity,
+            path: Some(member.path.clone()),
+            checkout: member.checkout,
+        }
+        .write(&reaches)
+        .map_err(|err| std::io::Error::other(err.to_string()))?;
+        move_state(&leaves, &reaches)?;
+        remove_if_standing(&leaves.join(FOLDER_FILE))?;
+        flush_dir_quietly(&leaves)?;
+        if member.leaves.ends_with(SET_ASIDE) {
+            std::fs::remove_dir_all(&leaves)?;
+            flush_dir_quietly(self.repo)?;
+        }
+        Ok(())
+    }
+
+    /// Move a member's files back into the home it leaves, its record there
+    /// put back where it was removed, and the record it reached removed.
+    fn move_back(&self, member: &Member) -> std::io::Result<()> {
+        let leaves = self.repo.join(&member.leaves);
+        let reaches = self.repo.join(&member.reaches);
+        move_state(&reaches, &leaves)?;
+        if FolderRecord::read(&leaves).is_none() {
+            FolderRecord {
+                identity: member.identity(),
+                path: member.left.clone(),
+                checkout: member.checkout,
+            }
+            .write(&leaves)
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
+        }
+        if member.reached_in(&reaches) {
+            remove_if_standing(&reaches.join(FOLDER_FILE))?;
+        }
+        flush_dir_quietly(&reaches)?;
+        flush_dir_quietly(&leaves)
+    }
+
+    /// Step 4's move of one member this run listed: only where, tested once
+    /// its locks are held, the home it leaves still records its folder,
+    /// the folder stands at the path it reaches and the home there holds no
+    /// state file.
+    fn carry_member(&self, member: &Member) -> Moved {
+        if !self.repo.join(&member.leaves).is_dir() {
+            return Moved::Left(None);
+        }
+        let _locks = match self.member_locks(member) {
+            Ok(locks) => locks,
+            Err(err) => return Moved::Left(Some(err)),
+        };
+        let standing = FolderIdentity::of(Path::new(&member.path))
+            .filter(|at| at.same_folder(&member.identity()));
+        let Some(identity) = standing else {
+            return Moved::Left(None);
+        };
+        if !member.recorded_in(&self.repo.join(&member.leaves))
+            || holds_state(&self.repo.join(&member.reaches))
+        {
+            return Moved::Left(None);
+        }
+        match self.move_forward(member, identity) {
+            Ok(()) => Moved::Done,
+            Err(err) => Moved::Broken(err),
+        }
+    }
+
+    /// Step 2's move of one member an earlier run listed, possibly
+    /// part-moved: finished or undone whole, never left split. Where the
+    /// home it leaves or the home it reaches records another folder now — a
+    /// folder made since at that path, by an older build — neither home is
+    /// touched.
+    /// Otherwise, its folder standing at the path it reaches, the move is
+    /// finished; standing anywhere else — moved back, or on — every file is
+    /// moved back into the home it leaves, under its record, where a later
+    /// run finds the folder as any moved one.
+    fn finish_member(&self, member: &Member) -> Moved {
+        let leaves = self.repo.join(&member.leaves);
+        // A home left is never removed but a set-aside emptied, last.
+        if !leaves.is_dir() {
+            return Moved::Left(None);
+        }
+        let _locks = match self.member_locks(member) {
+            Ok(locks) => locks,
+            Err(err) => return Moved::Left(Some(err)),
+        };
+        let reaches = self.repo.join(&member.reaches);
+        let has_record = |home: &Path| FolderRecord::read(home).is_some();
+        if (has_record(&leaves) && !member.recorded_in(&leaves))
+            || (has_record(&reaches) && !member.reached_in(&reaches))
+        {
+            return Moved::Left(None);
+        }
+        let standing = FolderIdentity::of(Path::new(&member.path))
+            .filter(|at| at.same_folder(&member.identity()));
+        let moved = match standing {
+            Some(identity) => self.move_forward(member, identity),
+            None => self.move_back(member),
+        };
+        match moved {
+            Ok(()) => Moved::Done,
+            Err(err) => Moved::Broken(err),
+        }
+    }
+}
+
+/// One record a working copy's default home or a set-aside holds, as
+/// `syns checkouts` reads it: the repository its folder names, the path
+/// and whether the copy is a checkout as recorded, and the home's stamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedFolder {
+    pub owner: String,
+    pub name: String,
+    pub path: Option<PathBuf>,
+    pub checkout: bool,
+    pub set_aside: bool,
+    pub stamp: Option<u128>,
+}
+
+/// Every record under `cache_root`'s `working-copies`, `repo`'s alone
+/// where one is named (letter case aside), creating, locking and writing
+/// nothing. A cache holding no `working-copies` holds no record; a folder
+/// of it that cannot be read is refused as `could not read {path}`.
+pub fn recorded_folders(
+    cache_root: &Path,
+    repo: Option<(&str, &str)>,
+) -> Result<Vec<RecordedFolder>, CliError> {
+    let dirs_in = |dir: &Path| -> Result<Vec<(String, PathBuf)>, CliError> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => {
+                return Err(CliError::Io {
+                    message: format!("could not read {}: {err}", dir.display()),
+                });
+            }
+        };
+        let mut found = Vec::new();
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            if let Ok(name) = entry.file_name().into_string() {
+                found.push((name, entry.path()));
+            }
+        }
+        Ok(found)
+    };
+    let mut records = Vec::new();
+    for (owner, owner_dir) in dirs_in(&cache_root.join("working-copies"))? {
+        if repo.is_some_and(|(wanted, _)| !wanted.eq_ignore_ascii_case(&owner)) {
+            continue;
+        }
+        for (name, name_dir) in dirs_in(&owner_dir)? {
+            if repo.is_some_and(|(_, wanted)| !wanted.eq_ignore_ascii_case(&name)) {
+                continue;
+            }
+            for (dir, home) in dirs_in(&name_dir)? {
+                let set_aside = dir.ends_with(SET_ASIDE);
+                if !set_aside && !is_home_name(&dir) {
+                    continue;
+                }
+                let Some(record) = FolderRecord::read(&home) else {
+                    continue;
+                };
+                records.push(RecordedFolder {
+                    owner: owner.to_ascii_lowercase(),
+                    name: name.to_ascii_lowercase(),
+                    path: record.path.map(PathBuf::from),
+                    checkout: record.checkout == Some(true),
+                    set_aside,
+                    stamp: stamp_of(&home),
+                });
+            }
+        }
+    }
+    Ok(records)
 }
 
 /// Copy `source` over `target` through a sibling renamed over it, the
@@ -3710,5 +4675,1065 @@ mod tests {
         let reopened = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
         assert_eq!(commit_of(&reopened).as_deref(), Some("h0"));
         assert!(reopened.resolution().unwrap().is_some());
+    }
+
+    // ---- a working copy follows its folder (cli-checkouts-on-this-machine) ----
+
+    /// The default home of `alice/proj` at the folder standing at `dir`.
+    fn home_at(h: &Homes, dir: &Path) -> PathBuf {
+        WorkingCopy::state_dir_for(
+            &h.default,
+            "alice",
+            "proj",
+            &std::fs::canonicalize(dir).unwrap(),
+        )
+    }
+
+    /// The repository's folder holding every home of `alice/proj`.
+    fn repo_dir(h: &Homes) -> PathBuf {
+        h.default.join("working-copies").join("alice").join("proj")
+    }
+
+    /// The names under the repository's folder, sorted.
+    fn entries_of(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// The set-asides standing under the repository's folder.
+    fn set_asides(h: &Homes) -> Vec<String> {
+        entries_of(&repo_dir(h))
+            .into_iter()
+            .filter(|name| name.ends_with(SET_ASIDE))
+            .collect()
+    }
+
+    /// Whether the file system answers this folder's birth time: where it
+    /// does not, a moved folder is not recognised, as D-163's rows skip.
+    fn births_known(dir: &Path) -> bool {
+        FolderIdentity::of(dir).is_some_and(|id| id.recognisable())
+    }
+
+    /// The folder at `root` moved to a sibling named `to`.
+    fn move_to(root: &Path, to: &str) -> PathBuf {
+        let moved = root.with_file_name(to);
+        std::fs::rename(root, &moved).unwrap();
+        moved
+    }
+
+    #[test]
+    fn the_record_names_the_path_and_whether_the_copy_is_a_checkout() {
+        let h = homes();
+        let copy = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        let record = FolderRecord::read(&copy.state_dir).unwrap();
+        assert_eq!(record.path.as_deref(), h.root.to_str());
+        assert_eq!(record.checkout, Some(true));
+        assert_eq!(Some(record.identity), FolderIdentity::of(&h.root));
+
+        let docs = h.root.join("docs");
+        std::fs::create_dir(&docs).unwrap();
+        let scoped = WorkingCopy::open_scoped(&h.writable, "alice", "proj", &docs).unwrap();
+        let record = FolderRecord::read(&scoped.state_dir).unwrap();
+        assert_eq!(record.path.as_deref(), docs.to_str());
+        assert_eq!(record.checkout, Some(false));
+    }
+
+    // A record an older build wrote — identity alone — gains the path and
+    // the checkout at the next open, its state kept; an equal record is
+    // not rewritten.
+    #[test]
+    fn a_record_without_a_path_gains_it_at_the_next_open_and_keeps_its_state() {
+        let h = homes();
+        let copy = copy_with_state(&h);
+        let identity = FolderIdentity::of(&h.root).unwrap();
+        std::fs::write(
+            copy.state_dir.join(FOLDER_FILE),
+            serde_json::to_vec(&identity).unwrap(),
+        )
+        .unwrap();
+        let reopened = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        assert_eq!(commit_of(&reopened).as_deref(), Some("h0"));
+        assert!(reopened.resolution().unwrap().is_some());
+        let record = FolderRecord::read(&reopened.state_dir).unwrap();
+        assert_eq!(record.path.as_deref(), h.root.to_str());
+        assert_eq!(record.checkout, Some(true));
+
+        let before = std::fs::metadata(reopened.state_dir.join(FOLDER_FILE))
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        let after = std::fs::metadata(reopened.state_dir.join(FOLDER_FILE))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(before, after);
+    }
+
+    // Row M2: a folder moved within its file system keeps its base, its
+    // resolution and its outbox at the new path, under the new path's
+    // hash; the home it left holds its lock file alone.
+    #[test]
+    fn a_moved_folder_keeps_its_state_at_its_new_path() {
+        let h = homes();
+        let copy = copy_with_state(&h);
+        if !births_known(&h.root) {
+            return;
+        }
+        let old_home = copy.state_dir.clone();
+        let moved = move_to(&h.root, "moved");
+
+        let reopened = WorkingCopy::open(&h.writable, "alice", "proj", &moved).unwrap();
+        assert_eq!(reopened.state_dir, home_at(&h, &moved));
+        assert_eq!(commit_of(&reopened).as_deref(), Some("h0"));
+        assert!(reopened.resolution().unwrap().is_some());
+        assert!(reopened.outbox().unwrap().is_some());
+        assert!(reopened.state_dir.join(STATE_STAMP).is_file());
+        let record = FolderRecord::read(&reopened.state_dir).unwrap();
+        assert_eq!(record.path.as_deref(), moved.to_str());
+        assert_eq!(entries_of(&old_home), vec![LOCK_FILE.to_string()]);
+        assert!(set_asides(&h).is_empty());
+        assert_eq!(
+            std::fs::read_to_string(repo_dir(&h).join(FOLDERS_LOCK)).unwrap(),
+            "\n",
+            "no carry is listed once it is done"
+        );
+    }
+
+    // Row M9: the state follows the folder there and back, each time
+    // under the hash of where it stands.
+    #[test]
+    fn the_state_follows_a_folder_moved_there_and_back() {
+        let h = homes();
+        let copy = copy_with_state(&h);
+        if !births_known(&h.root) {
+            return;
+        }
+        let first = copy.state_dir.clone();
+        let moved = move_to(&h.root, "moved");
+        let there = WorkingCopy::open(&h.writable, "alice", "proj", &moved).unwrap();
+        assert_eq!(commit_of(&there).as_deref(), Some("h0"));
+        std::fs::rename(&moved, &h.root).unwrap();
+        let back = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        assert_eq!(back.state_dir, first);
+        assert_eq!(commit_of(&back).as_deref(), Some("h0"));
+        assert!(back.resolution().unwrap().is_some());
+        assert_eq!(entries_of(&there.state_dir), vec![LOCK_FILE.to_string()]);
+    }
+
+    // Row M6: a copy of a folder, the original standing, is another
+    // folder: it starts with no base and the original keeps its own.
+    #[test]
+    fn a_copied_folder_starts_with_no_base_and_leaves_the_original_its_own() {
+        let h = homes();
+        copy_with_state(&h);
+        let copied = h.root.with_file_name("copied");
+        std::fs::create_dir(&copied).unwrap();
+        let copy = WorkingCopy::open(&h.writable, "alice", "proj", &copied).unwrap();
+        assert!(copy.base().is_none());
+        let original = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        assert_eq!(commit_of(&original).as_deref(), Some("h0"));
+        assert!(original.resolution().unwrap().is_some());
+    }
+
+    // Row M10: state recorded before the path was kept is not carried.
+    #[test]
+    fn a_folder_moved_before_its_path_was_recorded_is_not_carried() {
+        let h = homes();
+        let copy = copy_with_state(&h);
+        let identity = FolderIdentity::of(&h.root).unwrap();
+        std::fs::write(
+            copy.state_dir.join(FOLDER_FILE),
+            serde_json::to_vec(&identity).unwrap(),
+        )
+        .unwrap();
+        let moved = move_to(&h.root, "moved");
+        let reopened = WorkingCopy::open(&h.writable, "alice", "proj", &moved).unwrap();
+        assert!(reopened.base().is_none());
+        assert!(copy.state_dir.join(BASE_FILE).is_file());
+    }
+
+    // Row M8: a folder removed and made again at its path starts with no
+    // base each time (D-163); the removed folder's state is set aside, and
+    // one set-aside stands per path.
+    #[test]
+    fn a_folder_made_again_sets_the_state_aside_once_per_path() {
+        let h = homes();
+        copy_with_state(&h);
+        re_create(&h.root);
+        let again = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        assert!(again.base().is_none());
+        assert!(again.resolution().unwrap().is_none());
+        let gone = repo_dir(&h).join(format!(
+            "{}{SET_ASIDE}",
+            again.state_dir.file_name().unwrap().to_string_lossy()
+        ));
+        assert!(gone.join(BASE_FILE).is_file());
+        again.record_base("h1", files(&[("b.md", "b1")])).unwrap();
+
+        re_create(&h.root);
+        let third = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        assert!(third.base().is_none());
+        assert_eq!(set_asides(&h).len(), 1, "{:?}", set_asides(&h));
+        let aside: Manifest =
+            serde_json::from_slice(&std::fs::read(gone.join(BASE_FILE)).unwrap()).unwrap();
+        assert_eq!(
+            aside.commit_sha(),
+            Some("h1"),
+            "the newer replaced the older"
+        );
+    }
+
+    // Row M5: moved, then a fresh copy at the old path, then the moved
+    // folder opened: the fresh copy keeps a state of its own, the moved one
+    // takes its own from the set-aside, and no set-aside is left.
+    #[test]
+    fn a_fresh_copy_at_the_old_path_and_the_moved_folder_each_keep_their_own() {
+        let h = homes();
+        copy_with_state(&h);
+        if !births_known(&h.root) {
+            return;
+        }
+        let moved = move_to(&h.root, "moved");
+        std::fs::create_dir(&h.root).unwrap();
+        let fresh = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        assert!(fresh.base().is_none());
+        fresh.record_base("h9", files(&[("n.md", "n9")])).unwrap();
+        assert_eq!(set_asides(&h).len(), 1);
+
+        let found = WorkingCopy::open(&h.writable, "alice", "proj", &moved).unwrap();
+        assert_eq!(commit_of(&found).as_deref(), Some("h0"));
+        assert!(found.resolution().unwrap().is_some());
+        assert!(found.outbox().unwrap().is_some());
+        assert!(set_asides(&h).is_empty());
+        let again = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        assert_eq!(commit_of(&again).as_deref(), Some("h9"));
+        assert!(again.resolution().unwrap().is_none());
+    }
+
+    // A folder moved away, a fresh copy made at its path and removed, then
+    // the folder moved back: its own set-aside is taken back, the removed
+    // copy's state set aside in its place.
+    #[test]
+    fn a_folder_moved_back_over_a_removed_fresh_copy_takes_its_own_state_back() {
+        let h = homes();
+        copy_with_state(&h);
+        if !births_known(&h.root) {
+            return;
+        }
+        let moved = move_to(&h.root, "moved");
+        std::fs::create_dir(&h.root).unwrap();
+        let fresh = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        fresh.record_base("h9", files(&[("n.md", "n9")])).unwrap();
+        std::fs::remove_dir_all(&h.root).unwrap();
+        std::fs::rename(&moved, &h.root).unwrap();
+
+        let back = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        assert_eq!(commit_of(&back).as_deref(), Some("h0"));
+        assert!(back.resolution().unwrap().is_some());
+        let asides = set_asides(&h);
+        assert_eq!(asides.len(), 1, "{asides:?}");
+        let aside: Manifest = serde_json::from_slice(
+            &std::fs::read(repo_dir(&h).join(&asides[0]).join(BASE_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(aside.commit_sha(), Some("h9"));
+    }
+
+    // Row M12: two opens at once in a moved folder: one carries, the
+    // other waits and finds the record matching; the state stands once.
+    #[test]
+    fn two_opens_at_once_in_a_moved_folder_carry_once() {
+        let h = homes();
+        copy_with_state(&h);
+        if !births_known(&h.root) {
+            return;
+        }
+        let moved = move_to(&h.root, "moved");
+        let opens: Vec<_> = (0..2)
+            .map(|_| {
+                let stores = h.writable.clone();
+                let moved = moved.clone();
+                std::thread::spawn(move || {
+                    let copy = WorkingCopy::open(&stores, "alice", "proj", &moved).unwrap();
+                    commit_of(&copy)
+                })
+            })
+            .collect();
+        for open in opens {
+            assert_eq!(open.join().unwrap().as_deref(), Some("h0"));
+        }
+        let homes_holding: Vec<String> = entries_of(&repo_dir(&h))
+            .into_iter()
+            .filter(|name| repo_dir(&h).join(name).join(BASE_FILE).is_file())
+            .collect();
+        assert_eq!(homes_holding.len(), 1, "{homes_holding:?}");
+    }
+
+    // Row M13: a fresh copy opened at the old path at once with the moved
+    // folder, repeated: every time the moved folder has its whole state
+    // and the fresh one none of it.
+    #[test]
+    fn a_fresh_copy_at_the_old_path_at_once_with_the_moved_folder_never_mixes() {
+        for round in 0..8 {
+            let h = homes();
+            copy_with_state(&h);
+            if !births_known(&h.root) {
+                return;
+            }
+            let moved = move_to(&h.root, "moved");
+            std::fs::create_dir(&h.root).unwrap();
+            let open = |dir: PathBuf| {
+                let stores = h.writable.clone();
+                std::thread::spawn(move || {
+                    let copy = WorkingCopy::open(&stores, "alice", "proj", &dir).unwrap();
+                    (
+                        commit_of(&copy),
+                        copy.resolution().unwrap().is_some(),
+                        copy.outbox().unwrap().is_some(),
+                    )
+                })
+            };
+            let (at_old, at_moved) = if round % 2 == 0 {
+                let a = open(h.root.clone());
+                let b = open(moved.clone());
+                (a, b)
+            } else {
+                let b = open(moved.clone());
+                let a = open(h.root.clone());
+                (a, b)
+            };
+            assert_eq!(
+                at_old.join().unwrap(),
+                (None, false, false),
+                "round {round}"
+            );
+            assert_eq!(
+                at_moved.join().unwrap(),
+                (Some("h0".to_string()), true, true),
+                "round {round}"
+            );
+            assert!(set_asides(&h).is_empty(), "round {round}");
+        }
+    }
+
+    // Row M14: two checkouts of one repository swapped by hand, each then
+    // opened at once: each ends with its own state, and neither hangs.
+    #[test]
+    fn two_checkouts_swapped_by_hand_each_keep_their_own_state() {
+        let h = homes();
+        let a = h.root.with_file_name("a");
+        let b = h.root.with_file_name("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        if !births_known(&a) {
+            return;
+        }
+        let copy_a = WorkingCopy::open(&h.writable, "alice", "proj", &a).unwrap();
+        copy_a.record_base("ha", files(&[("a.md", "a")])).unwrap();
+        let copy_b = WorkingCopy::open(&h.writable, "alice", "proj", &b).unwrap();
+        copy_b.record_base("hb", files(&[("b.md", "b")])).unwrap();
+        std::fs::write(a.join("mark"), "a").unwrap();
+        std::fs::write(b.join("mark"), "b").unwrap();
+
+        let t = h.root.with_file_name("t");
+        std::fs::rename(&a, &t).unwrap();
+        std::fs::rename(&b, &a).unwrap();
+        std::fs::rename(&t, &b).unwrap();
+
+        let opens: Vec<_> = [a.clone(), b.clone()]
+            .into_iter()
+            .map(|dir| {
+                let stores = h.writable.clone();
+                std::thread::spawn(move || {
+                    let copy = WorkingCopy::open(&stores, "alice", "proj", &dir).unwrap();
+                    (
+                        std::fs::read_to_string(dir.join("mark")).unwrap(),
+                        commit_of(&copy),
+                    )
+                })
+            })
+            .collect();
+        for open in opens {
+            let (mark, commit) = open.join().unwrap();
+            assert_eq!(commit, Some(format!("h{mark}")));
+        }
+        assert!(set_asides(&h).is_empty(), "{:?}", set_asides(&h));
+    }
+
+    /// Lay a carry under way by hand, as a run killed after its first file
+    /// moved leaves it: the list in `folders.lock`, the record written in the
+    /// home reached, the base moved, the rest and the record still in the
+    /// home left.
+    fn killed_after_the_first_file(h: &Homes, from: &Path, to: &Path) {
+        let leaves = home_at(h, from);
+        std::fs::rename(from, to).unwrap();
+        let reaches = home_at(h, to);
+        std::fs::create_dir_all(&reaches).unwrap();
+        let identity = FolderIdentity::of(to).unwrap();
+        let member = Member {
+            leaves: leaves.file_name().unwrap().to_string_lossy().into_owned(),
+            reaches: reaches.file_name().unwrap().to_string_lossy().into_owned(),
+            path: to.to_str().unwrap().to_string(),
+            left: from.to_str().map(str::to_string),
+            dev: identity.dev,
+            ino: identity.ino,
+            born: identity.born,
+            checkout: Some(true),
+            set_aside: false,
+        };
+        let mut folders = FoldersLock::take(&repo_dir(h)).unwrap();
+        folders.write(&[member]).unwrap();
+        drop(folders);
+        // The record in the home reached first, as a carry writes it.
+        FolderRecord {
+            identity: identity.clone(),
+            path: to.to_str().map(str::to_string),
+            checkout: Some(true),
+        }
+        .write(&reaches)
+        .unwrap();
+        std::fs::rename(leaves.join(BASE_FILE), reaches.join(BASE_FILE)).unwrap();
+    }
+
+    // Row M15: a carry killed after its first file moved is finished by
+    // the next open in the moved folder: the outcome of M2, the list
+    // cleared.
+    #[test]
+    fn a_carry_killed_part_way_is_finished_by_the_next_open() {
+        let h = homes();
+        copy_with_state(&h);
+        if !births_known(&h.root) {
+            return;
+        }
+        let moved = h.root.with_file_name("moved");
+        killed_after_the_first_file(&h, &h.root, &moved);
+
+        let reopened = WorkingCopy::open(&h.writable, "alice", "proj", &moved).unwrap();
+        assert_eq!(commit_of(&reopened).as_deref(), Some("h0"));
+        assert!(reopened.resolution().unwrap().is_some());
+        assert!(reopened.outbox().unwrap().is_some());
+        assert_eq!(
+            entries_of(&WorkingCopy::state_dir_for(
+                &h.default, "alice", "proj", &h.root
+            )),
+            vec![LOCK_FILE.to_string()]
+        );
+        let mut folders = FoldersLock::take(&repo_dir(&h)).unwrap();
+        assert!(folders.list().is_empty());
+    }
+
+    // Row M15, second half: a released build opening a folder made again
+    // at the old path before the carry is finished discards what was left
+    // there and records its own; finishing the carry then moves none of
+    // that new folder's state.
+    #[test]
+    fn a_killed_carry_leaves_a_folder_made_since_at_the_old_path_its_own_state() {
+        let h = homes();
+        copy_with_state(&h);
+        if !births_known(&h.root) {
+            return;
+        }
+        let moved = h.root.with_file_name("moved");
+        killed_after_the_first_file(&h, &h.root, &moved);
+        // What the released build does at the old path: every file but the
+        // lock removed, its folder's identity recorded, its own base.
+        let old_home = WorkingCopy::state_dir_for(&h.default, "alice", "proj", &h.root);
+        std::fs::create_dir(&h.root).unwrap();
+        for entry in std::fs::read_dir(&old_home).unwrap().flatten() {
+            if entry.file_name() != LOCK_FILE {
+                let path = entry.path();
+                if path.is_dir() {
+                    std::fs::remove_dir_all(path).unwrap();
+                } else {
+                    std::fs::remove_file(path).unwrap();
+                }
+            }
+        }
+        let identity = FolderIdentity::of(&h.root).unwrap();
+        std::fs::write(
+            old_home.join(FOLDER_FILE),
+            serde_json::to_vec(&identity).unwrap(),
+        )
+        .unwrap();
+        let mut base = Manifest::default();
+        base.update("h7".into(), files(&[("z.md", "z7")]));
+        std::fs::write(old_home.join(BASE_FILE), serde_json::to_vec(&base).unwrap()).unwrap();
+
+        let reopened = WorkingCopy::open(&h.writable, "alice", "proj", &moved).unwrap();
+        assert_eq!(commit_of(&reopened).as_deref(), Some("h0"));
+        assert!(
+            reopened.resolution().unwrap().is_none(),
+            "removed by the released build"
+        );
+        let at_old = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        assert_eq!(commit_of(&at_old).as_deref(), Some("h7"));
+        let mut folders = FoldersLock::take(&repo_dir(&h)).unwrap();
+        assert!(folders.list().is_empty());
+    }
+
+    // Row M15 for step 3: a set-aside killed after its first file moved —
+    // a fresh copy pulled at the old path of a moved folder, the run
+    // killed — is finished by the next open, so the moved folder still
+    // takes its whole state back.
+    #[test]
+    fn a_set_aside_killed_part_way_is_finished_before_the_moved_folder_takes_it() {
+        let h = homes();
+        let copy = copy_with_state(&h);
+        if !births_known(&h.root) {
+            return;
+        }
+        let old_home = copy.state_dir.clone();
+        let moved = move_to(&h.root, "moved");
+        std::fs::create_dir(&h.root).unwrap();
+        let own = old_home.file_name().unwrap().to_string_lossy().into_owned();
+        let record = FolderRecord::read(&old_home).unwrap();
+        let member = Member {
+            leaves: own.clone(),
+            reaches: format!("{own}{SET_ASIDE}"),
+            path: record.path.clone().unwrap(),
+            left: record.path.clone(),
+            dev: record.identity.dev,
+            ino: record.identity.ino,
+            born: record.identity.born,
+            checkout: record.checkout,
+            set_aside: true,
+        };
+        let gone = repo_dir(&h).join(&member.reaches);
+        let mut folders = FoldersLock::take(&repo_dir(&h)).unwrap();
+        folders.write(&[member]).unwrap();
+        drop(folders);
+        std::fs::create_dir_all(&gone).unwrap();
+        std::fs::rename(old_home.join(BASE_FILE), gone.join(BASE_FILE)).unwrap();
+
+        let found = WorkingCopy::open(&h.writable, "alice", "proj", &moved).unwrap();
+        assert_eq!(commit_of(&found).as_deref(), Some("h0"));
+        assert!(found.resolution().unwrap().is_some());
+        assert!(found.outbox().unwrap().is_some());
+        assert!(set_asides(&h).is_empty(), "{:?}", set_asides(&h));
+        let fresh = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        assert!(fresh.base().is_none());
+        let mut folders = FoldersLock::take(&repo_dir(&h)).unwrap();
+        assert!(folders.list().is_empty());
+    }
+
+    // A carry of this folder's own state that fails once its files have
+    // begun to move fails the run and stays listed: the next run finishes
+    // it whole, never working the copy with a part of its state.
+    #[cfg(unix)]
+    #[test]
+    fn a_carry_failing_part_way_is_retried_whole() {
+        use std::os::unix::fs::PermissionsExt;
+        let h = homes();
+        copy_with_state(&h);
+        if !births_known(&h.root) {
+            return;
+        }
+        let moved = move_to(&h.root, "moved");
+        let reaches = home_at(&h, &moved);
+        // Not a state file, so the home still holds none; a folder the
+        // resolution cannot be renamed over.
+        let block = reaches.join(RESOLUTION_FILE).join("sub");
+        std::fs::create_dir_all(&block).unwrap();
+        std::fs::write(block.join("x"), "x").unwrap();
+        std::fs::set_permissions(&block, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let refused = std::fs::remove_file(block.join("x")).is_err();
+        let first = WorkingCopy::open(&h.writable, "alice", "proj", &moved);
+        if !refused {
+            return; // run as an account no permission refuses
+        }
+        std::fs::set_permissions(&block, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(first.is_err(), "{first:?}");
+        assert!(
+            FolderRecord::read(&reaches).is_some(),
+            "no file of the carry stands in a home without a record"
+        );
+        let mut folders = FoldersLock::take(&repo_dir(&h)).unwrap();
+        assert_eq!(folders.list().len(), 1, "the carry stays listed");
+        drop(folders);
+
+        let second = WorkingCopy::open(&h.writable, "alice", "proj", &moved).unwrap();
+        assert_eq!(commit_of(&second).as_deref(), Some("h0"));
+        assert!(second.resolution().unwrap().is_some());
+        assert!(second.outbox().unwrap().is_some());
+        let mut folders = FoldersLock::take(&repo_dir(&h)).unwrap();
+        assert!(folders.list().is_empty());
+    }
+
+    // A run whose moved folder's state is held by an unfinished set-aside
+    // fails rather than record the folder without it; once the cause is
+    // gone the folder takes its whole state back.
+    #[cfg(unix)]
+    #[test]
+    fn a_moved_folder_held_by_an_unfinished_set_aside_is_not_recorded_without_its_state() {
+        use std::os::unix::fs::PermissionsExt;
+        let h = homes();
+        let copy = copy_with_state(&h);
+        if !births_known(&h.root) {
+            return;
+        }
+        let old_home = copy.state_dir.clone();
+        let moved = move_to(&h.root, "moved");
+        std::fs::create_dir(&h.root).unwrap();
+        let own = old_home.file_name().unwrap().to_string_lossy().into_owned();
+        let record = FolderRecord::read(&old_home).unwrap();
+        let member = Member {
+            leaves: own.clone(),
+            reaches: format!("{own}{SET_ASIDE}"),
+            path: record.path.clone().unwrap(),
+            left: record.path.clone(),
+            dev: record.identity.dev,
+            ino: record.identity.ino,
+            born: record.identity.born,
+            checkout: record.checkout,
+            set_aside: true,
+        };
+        let gone = repo_dir(&h).join(&member.reaches);
+        let mut folders = FoldersLock::take(&repo_dir(&h)).unwrap();
+        folders.write(&[member]).unwrap();
+        drop(folders);
+        let block = gone.join(RESOLUTION_FILE).join("sub");
+        std::fs::create_dir_all(&block).unwrap();
+        std::fs::write(block.join("x"), "x").unwrap();
+        std::fs::set_permissions(&block, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let refused = std::fs::remove_file(block.join("x")).is_err();
+        let first = WorkingCopy::open(&h.writable, "alice", "proj", &moved);
+        if !refused {
+            return; // run as an account no permission refuses
+        }
+        std::fs::set_permissions(&block, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(first.is_err(), "{first:?}");
+        assert!(FolderRecord::read(&home_at(&h, &moved)).is_none());
+
+        let second = WorkingCopy::open(&h.writable, "alice", "proj", &moved).unwrap();
+        assert_eq!(commit_of(&second).as_deref(), Some("h0"));
+        assert!(second.resolution().unwrap().is_some());
+        assert!(second.outbox().unwrap().is_some());
+    }
+
+    // A listed member, part-moved by a killed run, that meets an error when
+    // it is finished stays listed: the folder is never worked with a part
+    // of its state, and takes it whole once the cause is gone.
+    #[cfg(unix)]
+    #[test]
+    fn a_listed_member_meeting_an_error_stays_listed() {
+        use std::os::unix::fs::PermissionsExt;
+        let h = homes();
+        copy_with_state(&h);
+        if !births_known(&h.root) {
+            return;
+        }
+        let moved = h.root.with_file_name("moved");
+        killed_after_the_first_file(&h, &h.root, &moved);
+        let old_home = WorkingCopy::state_dir_for(&h.default, "alice", "proj", &h.root);
+        std::fs::remove_file(old_home.join(LOCK_FILE)).unwrap();
+        std::fs::set_permissions(&old_home, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let refused = std::fs::File::create(old_home.join(LOCK_FILE)).is_err();
+        let first = WorkingCopy::open(&h.writable, "alice", "proj", &moved);
+        std::fs::set_permissions(&old_home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if !refused {
+            return; // run as an account no permission refuses
+        }
+        assert!(first.is_err(), "{first:?}");
+        let mut folders = FoldersLock::take(&repo_dir(&h)).unwrap();
+        assert_eq!(folders.list().len(), 1, "the carry stays listed");
+        drop(folders);
+
+        let second = WorkingCopy::open(&h.writable, "alice", "proj", &moved).unwrap();
+        assert_eq!(commit_of(&second).as_deref(), Some("h0"));
+        assert!(second.resolution().unwrap().is_some());
+        assert!(second.outbox().unwrap().is_some());
+    }
+
+    // A copy of the moved tree whose home cannot be opened is left where
+    // it stands: the carry of the rest goes on, no list is left behind,
+    // and later opens of the repository are not refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_copy_that_cannot_be_moved_is_struck_and_blocks_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let h = homes();
+        copy_with_state(&h);
+        if !births_known(&h.root) {
+            return;
+        }
+        let docs = h.root.join("docs");
+        std::fs::create_dir(&docs).unwrap();
+        let folder = WorkingCopy::open_scoped(&h.writable, "alice", "proj", &docs).unwrap();
+        folder
+            .record_base("hf", files(&[("docs/d.md", "d")]))
+            .unwrap();
+        let locked = folder.state_dir.clone();
+        std::fs::remove_file(locked.join(LOCK_FILE)).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let refused = std::fs::File::create(locked.join(LOCK_FILE)).is_err();
+
+        let moved = move_to(&h.root, "moved");
+        let at_root = WorkingCopy::open(&h.writable, "alice", "proj", &moved);
+        let elsewhere = h.root.with_file_name("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let fresh = WorkingCopy::open(&h.writable, "alice", "proj", &elsewhere);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if !refused {
+            return; // run as an account no permission refuses
+        }
+        assert_eq!(commit_of(&at_root.unwrap()).as_deref(), Some("h0"));
+        assert!(fresh.is_ok(), "{fresh:?}");
+        let mut folders = FoldersLock::take(&repo_dir(&h)).unwrap();
+        assert!(folders.list().is_empty());
+        assert!(locked.join(BASE_FILE).is_file(), "left where it stands");
+    }
+
+    // Verify D1: a carry killed part-way, then the folder moved back to the
+    // path it left (Finder's Undo Move) before any command ran at the new
+    // one: the run at the old path does not trust its record while the
+    // carry is listed, and moves every file back.
+    #[test]
+    fn a_killed_carry_then_a_move_back_keeps_the_whole_state() {
+        let h = homes();
+        copy_with_state(&h);
+        if !births_known(&h.root) {
+            return;
+        }
+        let moved = h.root.with_file_name("moved");
+        killed_after_the_first_file(&h, &h.root, &moved);
+        std::fs::rename(&moved, &h.root).unwrap();
+        let back = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        assert_eq!(commit_of(&back).as_deref(), Some("h0"));
+        assert!(back.resolution().unwrap().is_some());
+        assert!(back.outbox().unwrap().is_some());
+        let reached = WorkingCopy::state_dir_for(&h.default, "alice", "proj", &moved);
+        assert_eq!(entries_of(&reached), vec![LOCK_FILE.to_string()]);
+        let mut folders = FoldersLock::take(&repo_dir(&h)).unwrap();
+        assert!(folders.list().is_empty());
+    }
+
+    // The same, killed later: every file moved and the record written in
+    // the home reached, or the record left removed too; moved back, the
+    // state and the record return whole to the old path.
+    #[test]
+    fn a_carry_killed_after_its_files_moved_is_undone_whole_on_a_move_back() {
+        for remove_left_record in [false, true] {
+            let h = homes();
+            copy_with_state(&h);
+            if !births_known(&h.root) {
+                return;
+            }
+            let moved = h.root.with_file_name("moved");
+            killed_after_the_first_file(&h, &h.root, &moved);
+            let leaves = WorkingCopy::state_dir_for(&h.default, "alice", "proj", &h.root);
+            let reaches = home_at(&h, &moved);
+            move_state(&leaves, &reaches).unwrap();
+            let mut record = FolderRecord::read(&leaves).unwrap();
+            record.path = moved.to_str().map(str::to_string);
+            record.write(&reaches).unwrap();
+            if remove_left_record {
+                std::fs::remove_file(leaves.join(FOLDER_FILE)).unwrap();
+            }
+            std::fs::rename(&moved, &h.root).unwrap();
+
+            let back = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+            assert_eq!(
+                commit_of(&back).as_deref(),
+                Some("h0"),
+                "{remove_left_record}"
+            );
+            assert!(back.resolution().unwrap().is_some());
+            assert!(back.outbox().unwrap().is_some());
+            assert_eq!(
+                FolderRecord::read(&leaves).unwrap().path.as_deref(),
+                h.root.to_str()
+            );
+            assert!(FolderRecord::read(&reaches).is_none());
+        }
+    }
+
+    // A carry killed part-way, the folder moved back, and an older build
+    // then pulling a new folder at the path the carry was going to: the
+    // home reached records that folder now, so neither home is touched.
+    #[test]
+    fn a_move_back_never_takes_another_folders_files() {
+        let h = homes();
+        copy_with_state(&h);
+        if !births_known(&h.root) {
+            return;
+        }
+        let moved = h.root.with_file_name("moved");
+        killed_after_the_first_file(&h, &h.root, &moved);
+        std::fs::rename(&moved, &h.root).unwrap();
+        // What a released build does at the path left empty: the half
+        // moved there discarded, its own folder recorded, its own base.
+        std::fs::create_dir(&moved).unwrap();
+        let reaches = home_at(&h, &moved);
+        for entry in std::fs::read_dir(&reaches).unwrap().flatten() {
+            if entry.file_name() != LOCK_FILE {
+                std::fs::remove_file(entry.path()).unwrap();
+            }
+        }
+        let z = FolderIdentity::of(&moved).unwrap();
+        std::fs::write(reaches.join(FOLDER_FILE), serde_json::to_vec(&z).unwrap()).unwrap();
+        let mut base = Manifest::default();
+        base.update("hZ".into(), files(&[("z.md", "z")]));
+        std::fs::write(reaches.join(BASE_FILE), serde_json::to_vec(&base).unwrap()).unwrap();
+
+        let back = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        assert_ne!(commit_of(&back).as_deref(), Some("hZ"));
+        assert!(back.resolution().unwrap().is_some());
+        let at_z = WorkingCopy::open(&h.writable, "alice", "proj", &moved).unwrap();
+        assert_eq!(commit_of(&at_z).as_deref(), Some("hZ"));
+    }
+
+    // A carry killed after the record in the home reached was written with
+    // a birth time other than the listed one (NTFS tunnelling), then moved
+    // back: that record is still the member's own, and the state returns.
+    #[test]
+    fn a_reached_record_whose_birth_time_moved_is_still_the_members() {
+        let h = homes();
+        copy_with_state(&h);
+        if !births_known(&h.root) {
+            return;
+        }
+        let moved = h.root.with_file_name("moved");
+        killed_after_the_first_file(&h, &h.root, &moved);
+        let leaves = WorkingCopy::state_dir_for(&h.default, "alice", "proj", &h.root);
+        let reaches = home_at(&h, &moved);
+        move_state(&leaves, &reaches).unwrap();
+        let mut record = FolderRecord::read(&leaves).unwrap();
+        record.path = moved.to_str().map(str::to_string);
+        record.identity.born = record.identity.born.map(|(secs, nanos)| (secs + 60, nanos));
+        record.write(&reaches).unwrap();
+        std::fs::rename(&moved, &h.root).unwrap();
+
+        let back = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        assert_eq!(commit_of(&back).as_deref(), Some("h0"));
+        assert!(back.resolution().unwrap().is_some());
+        assert!(FolderRecord::read(&reaches).is_none());
+    }
+
+    // A carry killed part-way, then the folder moved on to a third path:
+    // the state is gathered back whole in the home it left, and the
+    // command at the third path carries it there as any move.
+    #[test]
+    fn a_killed_carry_then_a_move_on_carries_the_whole_state_to_the_third_path() {
+        let h = homes();
+        copy_with_state(&h);
+        if !births_known(&h.root) {
+            return;
+        }
+        let moved = h.root.with_file_name("moved");
+        killed_after_the_first_file(&h, &h.root, &moved);
+        let third = move_to(&moved, "third");
+        let found = WorkingCopy::open(&h.writable, "alice", "proj", &third).unwrap();
+        assert_eq!(commit_of(&found).as_deref(), Some("h0"));
+        assert!(found.resolution().unwrap().is_some());
+        assert!(found.outbox().unwrap().is_some());
+    }
+
+    // A command in another checkout of the repository, whose record
+    // matches, finishes a listed carry first: the moved folder then has
+    // its whole state at once.
+    #[test]
+    fn a_command_in_another_checkout_finishes_a_listed_carry() {
+        let h = homes();
+        copy_with_state(&h);
+        let other = h.root.with_file_name("other");
+        std::fs::create_dir(&other).unwrap();
+        WorkingCopy::open(&h.writable, "alice", "proj", &other).unwrap();
+        if !births_known(&h.root) {
+            return;
+        }
+        let moved = h.root.with_file_name("moved");
+        killed_after_the_first_file(&h, &h.root, &moved);
+        WorkingCopy::open(&h.writable, "alice", "proj", &other).unwrap();
+        let mut folders = FoldersLock::take(&repo_dir(&h)).unwrap();
+        assert!(folders.list().is_empty());
+        drop(folders);
+        let reached = home_at(&h, &moved);
+        assert!(reached.join(RESOLUTION_FILE).is_file());
+        assert!(reached.join(OUTBOX_FILE).is_file());
+        assert_eq!(
+            FolderRecord::read(&reached).unwrap().path.as_deref(),
+            moved.to_str()
+        );
+    }
+
+    // Verify D5: where the file index alone is the rule (an NTFS volume),
+    // the volume serial is compared with it, so one index on two volumes
+    // is two folders.
+    #[test]
+    fn the_file_index_alone_is_compared_within_one_volume() {
+        let on = |dev: u64, unique_index: bool| FolderIdentity {
+            dev,
+            ino: 42,
+            born: Some((1, 0)),
+            unique_index,
+        };
+        let tunnelled = FolderIdentity {
+            born: Some((9, 0)),
+            ..on(7, true)
+        };
+        assert!(tunnelled.same_folder(&on(7, false)));
+        assert!(!on(8, true).same_folder(&on(7, false)));
+        assert!(
+            on(8, false).same_folder(&on(7, false)),
+            "unix: the device moves across mounts"
+        );
+    }
+
+    // Rows M16 to M18 at the level of the homes: a checkout holding a
+    // folder copy of its own, moved; the first open, inside the folder,
+    // carries every copy of the moved tree, the root's record naming its
+    // new path at once; moved again before the root is opened, every copy
+    // is carried again.
+    #[test]
+    fn every_copy_of_a_moved_checkout_is_carried_by_the_first_open_in_it() {
+        let h = homes();
+        let root = copy_with_state(&h);
+        if !births_known(&h.root) {
+            return;
+        }
+        let docs = h.root.join("docs");
+        std::fs::create_dir(&docs).unwrap();
+        let folder = WorkingCopy::open_scoped(&h.writable, "alice", "proj", &docs).unwrap();
+        folder
+            .record_base("hf", files(&[("docs/d.md", "d")]))
+            .unwrap();
+        folder
+            .write_resolution(&Resolution {
+                recovery_id: "rec-docs".into(),
+                ..root.resolution().unwrap().unwrap()
+            })
+            .unwrap();
+
+        let moved = move_to(&h.root, "moved");
+        let inside =
+            WorkingCopy::open_scoped(&h.writable, "alice", "proj", &moved.join("docs")).unwrap();
+        assert_eq!(commit_of(&inside).as_deref(), Some("hf"));
+        assert_eq!(
+            inside.resolution().unwrap().unwrap().recovery_id,
+            "rec-docs"
+        );
+        let root_home = home_at(&h, &moved);
+        let record = FolderRecord::read(&root_home).unwrap();
+        assert_eq!(record.path.as_deref(), moved.to_str());
+        assert_eq!(record.checkout, Some(true));
+        assert!(root_home.join(BASE_FILE).is_file());
+
+        let again = move_to(&moved, "again");
+        let at_root = WorkingCopy::open(&h.writable, "alice", "proj", &again).unwrap();
+        assert_eq!(commit_of(&at_root).as_deref(), Some("h0"));
+        assert!(at_root.resolution().unwrap().is_some());
+        let inside =
+            WorkingCopy::open_scoped(&h.writable, "alice", "proj", &again.join("docs")).unwrap();
+        assert_eq!(
+            inside.resolution().unwrap().unwrap().recovery_id,
+            "rec-docs"
+        );
+        for name in entries_of(&repo_dir(&h)) {
+            let home = repo_dir(&h).join(&name);
+            if home != at_root.state_dir && home != inside.state_dir && home.is_dir() {
+                assert_eq!(entries_of(&home), vec![LOCK_FILE.to_string()], "{name}");
+            }
+        }
+    }
+
+    // Row M11: on a volume holding two spellings as one, a folder renamed
+    // in letter case alone has its state carried to the new spelling.
+    #[test]
+    fn a_folder_renamed_in_letter_case_keeps_its_state() {
+        let h = homes();
+        copy_with_state(&h);
+        if !births_known(&h.root) {
+            return;
+        }
+        let upper = h.root.with_file_name("FOLDER");
+        std::fs::rename(&h.root, &upper).unwrap();
+        if !h.root.exists() {
+            return; // a case-sensitive volume: another folder, as M2
+        }
+        let reopened = WorkingCopy::open(&h.writable, "alice", "proj", &upper).unwrap();
+        assert_eq!(
+            reopened.root.file_name().and_then(|n| n.to_str()),
+            Some("FOLDER")
+        );
+        assert_eq!(commit_of(&reopened).as_deref(), Some("h0"));
+        assert!(reopened.resolution().unwrap().is_some());
+    }
+
+    // A run whose default root refuses writes records and carries nothing.
+    #[test]
+    fn a_refused_default_root_carries_nothing() {
+        let h = homes();
+        let copy = copy_with_state(&h);
+        let moved = move_to(&h.root, "moved");
+        let sandboxed = WorkingCopy::open(&h.refused, "alice", "proj", &moved).unwrap();
+        assert!(sandboxed.base().is_none());
+        assert!(copy.state_dir.join(BASE_FILE).is_file());
+        assert!(!home_at(&h, &moved).exists());
+    }
+
+    #[test]
+    fn the_moved_folder_is_read_from_the_two_paths() {
+        let p = |s: &str| PathBuf::from(s);
+        assert_eq!(
+            moved_between(&p("/a/p/docs"), &p("/a/q/docs")),
+            (p("/a/p"), p("/a/q"))
+        );
+        assert_eq!(
+            moved_between(&p("/a/proj"), &p("/b/proj")),
+            (p("/a"), p("/b"))
+        );
+        assert_eq!(
+            moved_between(&p("/a/p"), &p("/a/P")),
+            (p("/a/p"), p("/a/P"))
+        );
+        assert_eq!(
+            moved_between(&p("/a/p"), &p("/a/p")),
+            (p("/a/p"), p("/a/p"))
+        );
+        assert_eq!(moved_between(&p("/p"), &p("/x/p")), (p("/"), p("/x")));
+    }
+
+    // The listing's read: every record with its path, checkout and stamp,
+    // set-asides marked; a cache with no working copies holds none.
+    #[test]
+    fn recorded_folders_reads_every_record_and_writes_nothing() {
+        let h = homes();
+        assert_eq!(recorded_folders(&h.default, None).unwrap(), Vec::new());
+        copy_with_state(&h);
+        re_create(&h.root);
+        let copy = WorkingCopy::open(&h.writable, "alice", "proj", &h.root).unwrap();
+        let before = entries_of(&repo_dir(&h));
+        let records = recorded_folders(&h.default, Some(("Alice", "PROJ"))).unwrap();
+        assert_eq!(entries_of(&repo_dir(&h)), before);
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert!(
+            records
+                .iter()
+                .all(|r| r.owner == "alice" && r.name == "proj")
+        );
+        assert!(
+            records
+                .iter()
+                .all(|r| r.path.as_deref() == Some(h.root.as_path()))
+        );
+        assert_eq!(records.iter().filter(|r| r.set_aside).count(), 1);
+        assert!(records.iter().all(|r| r.checkout));
+        let live = records.iter().find(|r| !r.set_aside).unwrap();
+        assert_eq!(live.stamp, stamp_of(&copy.state_dir));
+        assert!(
+            recorded_folders(&h.default, Some(("alice", "other")))
+                .unwrap()
+                .is_empty()
+        );
     }
 }

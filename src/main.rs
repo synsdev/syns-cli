@@ -404,6 +404,12 @@ enum Commands {
     },
     /// List the caller's repositories
     Repos(ReposArgs),
+    /// List the checkouts on this machine, and where a new copy of a repository goes
+    Checkouts {
+        /// Only this repository's checkouts, as OWNER/NAME
+        #[arg(value_name = "OWNER/NAME", value_parser = read::parse_repo_id)]
+        repo: Option<String>,
+    },
     /// Manage repository collaborators
     Collaborators {
         #[command(subcommand)]
@@ -897,6 +903,7 @@ async fn run(
             .await?
         }
         Commands::Repos(args) => commands::repos::cmd_repos(config, output, &args).await?,
+        Commands::Checkouts { repo } => commands::checkouts::cmd_checkouts(config, output, repo)?,
         Commands::Collaborators {
             action,
             limit,
